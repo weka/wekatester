@@ -1,3 +1,5 @@
+# the next line tells wekatester to report only iops, bandwidth or latency.
+# report bandwidth
 [global]
 filesize=100M
 time_based=1

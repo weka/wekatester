@@ -1,4 +1,4 @@
-# the next line tells wekatester to report only latency.
+# the next line tells wekatester to report only iops, bandwidth or latency.
 # report latency
 [fio-latency-00]
 description='wekatester latency workload'
