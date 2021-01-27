@@ -22,4 +22,4 @@ file_service_type=normal
 create_serialize=0
 direct=1
 directory=/mnt/wekatester
-filename_format=$filenum/$jobnum/
+filename_format=$filenum/$jobnum
