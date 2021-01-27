@@ -1,7 +1,7 @@
 # the next line tells wekatester to report only latency.
 # report latency
 [global]
-filesize=1G
+filesize=100M
 time_based=1
 startdelay=5
 exitall_on_error=1
