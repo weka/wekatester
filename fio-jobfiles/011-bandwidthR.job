@@ -1,7 +1,7 @@
 # the next line tells wekatester to report only bandwidth.
 # report bandwidth 
 [global]
-filesize=1G
+filesize=100M
 time_based=1
 startdelay=5
 exitall_on_error=1
@@ -21,4 +21,3 @@ blocksize=1Mi
 rw=read
 numjobs=32
 iodepth=1
-
