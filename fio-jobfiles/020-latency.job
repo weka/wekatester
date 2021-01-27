@@ -21,4 +21,4 @@ filesize=1G
 create_serialize=0
 direct=1
 directory=/mnt/wekatester
-filename_format=$jobname/$jobnum/$filenum
+filename_format=$filenum/$jobnum/
