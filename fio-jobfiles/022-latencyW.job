@@ -1,0 +1,29 @@
+# the next line tells wekatester to report only iops, bandwidth or latency.
+# report latency
+[global]
+filesize=100M
+time_based=1
+startdelay=5
+exitall_on_error=1
+create_serialize=0
+filename_format=$filenum/$jobnum
+directory=/mnt/wekatester
+group_reporting=1
+clocksource=gettimeofday
+runtime=30
+ioengine=posixaio
+disk_util=0
+direct=1
+
+[fio-createfiles-00]
+description='wekatester file creation for workload'
+create_only=1
+numjobs=192
+
+[fio-latencyR-00]
+stonewall
+description='wekatester Write latency workload'
+numjobs=1
+bs=4k
+rw=randwrite
+iodepth=1

@@ -11,6 +11,8 @@ import time
 from subprocess import Popen, PIPE, STDOUT
 from shutil import copyfile
 from contextlib import contextmanager
+import threading
+from threading import Lock
 
 
 """A Python context to move in and out of directories"""
@@ -24,10 +26,11 @@ def pushd(new_dir):
         os.chdir(previous_dir)
 
 # print( something without a newline )
+announce_lock = Lock()
 def announce( text ):
-    sys.stdout.flush()
-    sys.stdout.write(text + " ")
-    #sys.stdout.flush()
+    with announce_lock:
+        sys.stdout.flush()
+        sys.stdout.write(text + " ")
 
 # format a number of bytes in GiB/MiB/KiB 
 def format_units_bytes( bytes ):
@@ -87,6 +90,32 @@ def run_shell_command( command ):
 
     return output
 
+
+ssh_sessions={}
+def open_ssh_connection( server ):
+    global ssh_sessions
+    try:
+        sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
+        from plumbum import SshMachine, colors
+        connection = SshMachine( server )  # open an ssh session
+        s = connection.session()
+        ssh_sessions[server] = connection      # save the sessions
+        announce(server)
+    except:
+        traceback.print_exc(file=sys.stdout)
+        announce( "Error ssh'ing to server " + server )
+        announce( "Passwordless ssh not configured properly, exiting" )
+        ssh_sessions[server] = None
+        return -1
+
+#host_session = {}
+#ssh_token = {}
+#def open_ssh_session(host):
+#    rem = SshMachine( host )  # open an ssh session
+#    ssh_token[host] = rem
+#    host_session[host] = rem.session()
+#    announce( host )
+
 # parse arguments
 progname=sys.argv[0]
 parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
@@ -94,18 +123,23 @@ parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
 #                    help='Server Dataplane IPs to execute on')
 parser.add_argument("-c", "--clients", dest='use_clients_flag', action='store_true', help="run fio on weka clients")
 parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true', help="run fio on weka servers")
+#parser.add_argument("-a", "--al", dest='use_all_flag', action='store_true', help="run fio on weka servers and clients")
+parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output")
 
 #parser.add_argument("-v", "--verbose", dest='verbose_flag', action='store_true', help="enable verbose mode")
 
 args = parser.parse_args()
 
-if args.use_clients_flag and args.use_servers_flag:
-    print( "Error: you must specify either clients or servers, not both" )
-    sys.exit(1)
+#if args.use_clients_flag and args.use_servers_flag:
+#    print( "Error: you must specify either clients or servers, not both" )
+#    sys.exit(1)
 
 # default to servers
-if not args.use_clients_flag and not args.use_servers_flag:
+use_all = False
+if not args.use_clients_flag and not args.use_servers_flag: # neither flag
     args.use_servers_flag = True
+elif args.use_clients_flag and args.use_servers_flag:   # both flags
+    use_all = True
 
 
 # Make sure weka is installed
@@ -171,13 +205,17 @@ numcpu = cpu_attrs["CPU(s)"]
 #        # must be a server - not all FEs
 #        weka_hosts[hostid] = hostconfig
 
-if args.use_servers_flag:
+if use_all:
+    print( "Using weka clients and servers to generate load (dedicated and converged mode)" )
+    all_hosts = run_json_shell_command( 'weka cluster host -J' )    # all hosts
+elif args.use_servers_flag:
     print( "Using weka servers to generate load (converged mode)" )
     all_hosts = run_json_shell_command( 'weka cluster host -b -J' )    # just the backends
 else:
     print( "Using weka clients to generate load (dedicated mode)" )
     all_hosts = run_json_shell_command( 'weka cluster host -c -J' )    # just the clients
 
+    
 weka_hosts = {}
 if type ( all_hosts ) == list:
     for hostconfig in all_hosts:
@@ -200,8 +238,8 @@ print( str( len( hostips ) ) + " weka hosts detected" )
 
 
 
-print( "This cluster has " + str( weka_status["capacity"]["total_bytes"]/1024/1024/1024/1024 ) + " TB of capacity and " + \
-    str( weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024 ) + " TB of unprovisioned capacity" )
+print( "This cluster has " + str(round((weka_status["capacity"]["total_bytes"]/1024/1024/1024/1024),1)) + " TB of capacity and " + \
+    str(round((weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024 ),1)) + " TB of unprovisioned capacity" )
 
 # Get a list of filesystems to work on, create as needed
 weka_fs = run_json_shell_command( 'weka fs -J' )
@@ -259,7 +297,7 @@ if wekatester_fs == False:
         sys.exit(1)
 
     print( "Creating wekatester-fs..." )
-    run_json_shell_command( 'weka fs create wekatester-fs wekatester-group 1TB -J' )    # vince - for testing.  Should be about 5TB?
+    run_json_shell_command( 'weka fs create wekatester-fs wekatester-group 5TB -J' )    # vince - for testing.  Should be about 5TB?
 else:
     print( "Using existing wekatester-fs" )
 
@@ -274,7 +312,6 @@ except subprocess.CalledProcessError as err:
     run_shell_command( "sudo mount -t wekafs wekatester-fs /mnt/wekatester" )
     run_shell_command( "sudo chmod 777 /mnt/wekatester" )
 
-
 # setup phase complete... now we get to work
 #        uname = ssh_token[host]["uname"]
 #        print( uname )
@@ -284,31 +321,75 @@ except subprocess.CalledProcessError as err:
 
 # do a pushd so we know where we are
 with pushd( os.path.dirname( progname ) ):
+    # make sure passwordless ssh works to all the servers because nothing will work if not set up
+    announce( "Opening ssh sessions to all servers\n" )
+    parallel_threads={}
+    for server in hostips:
+        # create and start the threads
+        parallel_threads[server] = threading.Thread( target=open_ssh_connection, args=(server,) )
+        parallel_threads[server].start()
+
+    # wait for and reap threads
+    time.sleep( 0.1 )
+    #print( "parallel_threads = " + str( len( parallel_threads ) ) )
+    while len( parallel_threads ) > 0:
+        #print( "parallel_threads = " + str( len( parallel_threads ) ) )
+        dead_threads = {}
+        for server, thread in parallel_threads.items():
+            if not thread.is_alive():   # is it dead?
+                #print( "    Thread on " + server + " is dead, reaping" )
+                thread.join()       # reap it
+                dead_threads[server] = thread
+
+        #print( "dead_threads = " + str( dead_threads ) )
+        # remove it from the list so we don't try to reap it twice
+        for server, thread in dead_threads.items():
+            #print( "    removing " + server + "'s thread from list" )
+            parallel_threads.pop( server )
+
+        # sleep a little so we limit cpu use
+        time.sleep( 0.1 )
+
+        #ret = open_ssh_connection( server )
+        #if ret == -1:
+        #    sys.exit( 1 )
+
+    #print( ssh_sessions )
+    if len( ssh_sessions ) == 0:
+        print( "Error opening ssh sessions" )
+        sys.exit( 1 )
+    for server, session in ssh_sessions.items():
+        if session == None:
+            print( "Error opening ssh session to " + server )
+
     # use our own version of plumbum - Ubuntu is broken. (one line change from orig plumbum... /bin/sh changed to /bin/bash
     # this works for both ubuntu and centos
-    sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
-    from plumbum import SshMachine, colors
+    #sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
+    #from plumbum import SshMachine, colors
 
-    host_session = {}
-    ssh_token = {}
     # open ssh sessions to all the hosts
-    announce( "Opening ssh session to hosts:" )
-    for host in hostips:
-        try:
-            rem = SshMachine( host )  # open an ssh session
-            ssh_token[host] = rem
-            host_session[host] = rem.session()
-            announce( host )
-        except:
-            print()
-            print( "Error opening ssh session - have you configured passwordless ssh?" )
-            sys.exit( 1 )
+    #run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester/weka_fio_out ]; then mkdir /mnt/wekatester/weka_fio_out; fi'" )
+    #run_shell_command( "sudo chmod 777 /mnt/wekatester/weka_fio_out" )
+    #announce( "Opening ssh session to hosts:" )
+    #for host in hostips:
+    #    try:
+    #        #open_ssh_session(host)
+    #        rem = SshMachine( host )  # open an ssh session
+    #        ssh_token[host] = rem
+    #        host_session[host] = rem.session()
+    #        announce( host )
+    #    except:
+    #        print()
+    #        print( "Error opening ssh session - have you configured passwordless ssh?" )
+    #        sys.exit( 1 )
 
     print()
 
     # mount filesystems
     announce( "Mounting wekatester-fs on hosts:" )
-    for host, s in sorted(host_session.items()):
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in sorted(host_session.items()):
         #print( "Check that /mnt/wekatester mountpoint dir is present on host " + host )
 
         retcode = s.run( "sudo bash -c 'if [ ! -d /mnt/wekatester ]; then mkdir /mnt/wekatester; fi'" )
@@ -339,19 +420,23 @@ with pushd( os.path.dirname( progname ) ):
     # don't need to copy the fio scripts - we can run them in place
 
     # start fio --server on all servers
-    for host, s in sorted(host_session.items()):    # make sure it's dead
+    #for host, s in sorted(host_session.items()):    # make sure it's dead
+    for host, session in ssh_sessions.items():
+        s = session.session()
         s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
         s.run( "rm -f /tmp/fio.pid", retcode=None )
 
     time.sleep( 1 )
 
     announce( "starting fio --server on hosts:" )
-    for host, s in sorted(host_session.items()):
+    #for host, s in sorted(host_session.items()):
+    for host, session in ssh_sessions.items():
+        s = session.session()
         announce( host )
         s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
         s.run( "rm -f /tmp/fio.pid", retcode=None )
         #s.run( "pkill fio", retcode=None )
-        s.run( "/mnt/wekatester/fio --server --daemonize=/tmp/fio.pid" )
+        s.run( "/mnt/wekatester/fio --server --alloc-size=1048576 --daemonize=/tmp/fio.pid" )
 
     print()
     time.sleep( 1 )
@@ -375,23 +460,24 @@ with pushd( os.path.dirname( progname ) ):
             for lineno, line in enumerate( jobfile ):
                 line.strip()
                 linelist = line.split()
-                if linelist[0][0] == "#":         # first char is '#'
-                    if linelist[0] == "#report":
-                        linelist.pop(0) # get rid of the "#report"
-                    elif len( linelist ) < 2:
-                        continue        # blank comment line?
-                    elif linelist[1] == "report":      # we're interested
-                        linelist.pop(0) # get rid of the "#"
-                        linelist.pop(0) # get rid of the "report"
-                    else:
-                        continue
-
-                    # found a "# report" directive in the file
-                    for keyword in linelist:
-                        if not keyword in reportitem.keys():
-                            print( "Syntax error in # report directive in " + script + ", line " + str( lineno +1 ) + ": keyword '" + keyword + "' undefined. Ignored." )
+                if len(linelist) > 0:
+                    if linelist[0][0] == "#":         # first char is '#'
+                        if linelist[0] == "#report":
+                            linelist.pop(0) # get rid of the "#report"
+                        elif len( linelist ) < 2:
+                            continue        # blank comment line?
+                        elif linelist[1] == "report":      # we're interested
+                            linelist.pop(0) # get rid of the "#"
+                            linelist.pop(0) # get rid of the "report"
                         else:
-                            reportitem[keyword] = True
+                            continue
+
+                        # found a "# report" directive in the file
+                        for keyword in linelist:
+                            if not keyword in reportitem.keys():
+                                print( "Syntax error in # report directive in " + script + ", line " + str( lineno +1 ) + ": keyword '" + keyword + "' undefined. Ignored." )
+                            else:
+                                reportitem[keyword] = True
 
 
         if not reportitem["bandwidth"] and not reportitem["iops"] and not reportitem["latency"]:
@@ -404,17 +490,20 @@ with pushd( os.path.dirname( progname ) ):
         for host in hostips:
             script_args = script_args + " --client=" + host + " " + script
 
-    
         print()
         print( "starting fio script " + script )
         fio_output = run_json_shell_command( './fio/fio' + script_args + " --output-format=json" )
 
-        #print( json.dumps(fio_output, indent=8, sort_keys=True) )
+       # print( json.dumps(fio_output, indent=8, sort_keys=True) )
         #print( fio_output )
         #bw_bytes = []
         #iops = []
         #latency = []
-
+        if args.use_output_flag:
+            fp = open( "fio_results.json", "a+" )          # Vin - add date/time to file name
+            fp.write( json.dumps(fio_output, indent=4, sort_keys=True) )
+            fp.write( "\n" )
+            fp.close()
 
         jobs = fio_output["client_stats"]
         print( "Job is " + jobs[0]["jobname"] + " " + jobs[0]["desc"] )
@@ -447,10 +536,12 @@ with pushd( os.path.dirname( progname ) ):
             print( "    total bandwidth: " + format_units_bytes( bw["read"] + bw["write"] ) + "/s" )
             print( "    avg bandwidth: " + format_units_bytes( float( bw["read"] + bw["write"] )/float( hostcount) ) + "/s per host" )
         if reportitem["iops"]:
-            print( "    read iops: " + ("{:,}".format(int(iops["read"]))) + "/s" )
-            print( "    write iops: " + ("{:,}".format(int(iops["write"]))) + "/s" )
-            print( "    total iops: " + ("{:,}".format(int(iops["read"])+int(iops["write"]))) + "/s" )
-            print( "    avg iops: " + ("{:,}".format(int(iops["read"])+int(iops["write"]) /hostcount)) + "/s per host" )
+            reads = int(iops["read"])
+            writes = int(iops["write"])
+            print(f"    read iops: {reads:,}/s" )
+            print(f"    write iops: {writes:,}/s" )
+            print(f"    total iops: {reads+writes:,}/s" )
+            print(f"    avg iops: {int((reads+writes)/hostcount):,}/s per host" )
         if reportitem["latency"]:
             print( "    read latency: " +  format_units_ns( float( latency["read"] ) ) )
             print( "    write latency: " +  format_units_ns( float( latency["write"] ) ) )
@@ -464,7 +555,9 @@ with pushd( os.path.dirname( progname ) ):
     print()
     announce( "killing fio slaves:" )
 
-    for host, s in host_session.items():
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in host_session.items():
         announce( host )
         #s.run( "pkill fio" )
         s.run( "kill -9 `cat /tmp/fio.pid`" )
@@ -474,7 +567,9 @@ with pushd( os.path.dirname( progname ) ):
     time.sleep( 1 )
 
     announce( "Unmounting filesystems:" )
-    for host, s in host_session.items():
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in host_session.items():
         announce( host )
         s.run( "sudo umount /mnt/wekatester" )
 
