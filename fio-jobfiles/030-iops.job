@@ -1,4 +1,4 @@
-# the next line tells wekatester to report only iops.
+# the next line tells wekatester to report only iops, bandwidth or latency.
 # report iops
 [fio-iops-00]
 description='wekatester iops workload'
@@ -22,4 +22,4 @@ file_service_type=normal
 create_serialize=0
 direct=1
 directory=/mnt/wekatester
-filename_format=$jobname/$jobnum/$filenum
+filename_format=$filenum/$jobnum
