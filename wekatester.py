@@ -90,13 +90,31 @@ def run_shell_command( command ):
 
     return output
 
-host_session = {}
-ssh_token = {}
-def open_ssh_session(host):
-    rem = SshMachine( host )  # open an ssh session
-    ssh_token[host] = rem
-    host_session[host] = rem.session()
-    announce( host )
+
+ssh_sessions={}
+def open_ssh_connection( server ):
+    global ssh_sessions
+    try:
+        sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
+        from plumbum import SshMachine, colors
+        connection = SshMachine( server )  # open an ssh session
+        s = connection.session()
+        ssh_sessions[server] = connection      # save the sessions
+        announce(server)
+    except:
+        traceback.print_exc(file=sys.stdout)
+        announce( "Error ssh'ing to server " + server )
+        announce( "Passwordless ssh not configured properly, exiting" )
+        ssh_sessions[server] = None
+        return -1
+
+#host_session = {}
+#ssh_token = {}
+#def open_ssh_session(host):
+#    rem = SshMachine( host )  # open an ssh session
+#    ssh_token[host] = rem
+#    host_session[host] = rem.session()
+#    announce( host )
 
 # parse arguments
 progname=sys.argv[0]
@@ -303,32 +321,75 @@ except subprocess.CalledProcessError as err:
 
 # do a pushd so we know where we are
 with pushd( os.path.dirname( progname ) ):
+    # make sure passwordless ssh works to all the servers because nothing will work if not set up
+    announce( "Opening ssh sessions to all servers\n" )
+    parallel_threads={}
+    for server in hostips:
+        # create and start the threads
+        parallel_threads[server] = threading.Thread( target=open_ssh_connection, args=(server,) )
+        parallel_threads[server].start()
+
+    # wait for and reap threads
+    time.sleep( 0.1 )
+    #print( "parallel_threads = " + str( len( parallel_threads ) ) )
+    while len( parallel_threads ) > 0:
+        #print( "parallel_threads = " + str( len( parallel_threads ) ) )
+        dead_threads = {}
+        for server, thread in parallel_threads.items():
+            if not thread.is_alive():   # is it dead?
+                #print( "    Thread on " + server + " is dead, reaping" )
+                thread.join()       # reap it
+                dead_threads[server] = thread
+
+        #print( "dead_threads = " + str( dead_threads ) )
+        # remove it from the list so we don't try to reap it twice
+        for server, thread in dead_threads.items():
+            #print( "    removing " + server + "'s thread from list" )
+            parallel_threads.pop( server )
+
+        # sleep a little so we limit cpu use
+        time.sleep( 0.1 )
+
+        #ret = open_ssh_connection( server )
+        #if ret == -1:
+        #    sys.exit( 1 )
+
+    #print( ssh_sessions )
+    if len( ssh_sessions ) == 0:
+        print( "Error opening ssh sessions" )
+        sys.exit( 1 )
+    for server, session in ssh_sessions.items():
+        if session == None:
+            print( "Error opening ssh session to " + server )
+
     # use our own version of plumbum - Ubuntu is broken. (one line change from orig plumbum... /bin/sh changed to /bin/bash
     # this works for both ubuntu and centos
-    sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
-    from plumbum import SshMachine, colors
+    #sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
+    #from plumbum import SshMachine, colors
 
     # open ssh sessions to all the hosts
     #run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester/weka_fio_out ]; then mkdir /mnt/wekatester/weka_fio_out; fi'" )
     #run_shell_command( "sudo chmod 777 /mnt/wekatester/weka_fio_out" )
-    announce( "Opening ssh session to hosts:" )
-    for host in hostips:
-        try:
-            #open_ssh_session(host)
-            rem = SshMachine( host )  # open an ssh session
-            ssh_token[host] = rem
-            host_session[host] = rem.session()
-            announce( host )
-        except:
-            print()
-            print( "Error opening ssh session - have you configured passwordless ssh?" )
-            sys.exit( 1 )
+    #announce( "Opening ssh session to hosts:" )
+    #for host in hostips:
+    #    try:
+    #        #open_ssh_session(host)
+    #        rem = SshMachine( host )  # open an ssh session
+    #        ssh_token[host] = rem
+    #        host_session[host] = rem.session()
+    #        announce( host )
+    #    except:
+    #        print()
+    #        print( "Error opening ssh session - have you configured passwordless ssh?" )
+    #        sys.exit( 1 )
 
     print()
 
     # mount filesystems
     announce( "Mounting wekatester-fs on hosts:" )
-    for host, s in sorted(host_session.items()):
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in sorted(host_session.items()):
         #print( "Check that /mnt/wekatester mountpoint dir is present on host " + host )
 
         retcode = s.run( "sudo bash -c 'if [ ! -d /mnt/wekatester ]; then mkdir /mnt/wekatester; fi'" )
@@ -359,14 +420,18 @@ with pushd( os.path.dirname( progname ) ):
     # don't need to copy the fio scripts - we can run them in place
 
     # start fio --server on all servers
-    for host, s in sorted(host_session.items()):    # make sure it's dead
+    #for host, s in sorted(host_session.items()):    # make sure it's dead
+    for host, session in ssh_sessions.items():
+        s = session.session()
         s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
         s.run( "rm -f /tmp/fio.pid", retcode=None )
 
     time.sleep( 1 )
 
     announce( "starting fio --server on hosts:" )
-    for host, s in sorted(host_session.items()):
+    #for host, s in sorted(host_session.items()):
+    for host, session in ssh_sessions.items():
+        s = session.session()
         announce( host )
         s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
         s.run( "rm -f /tmp/fio.pid", retcode=None )
@@ -395,23 +460,24 @@ with pushd( os.path.dirname( progname ) ):
             for lineno, line in enumerate( jobfile ):
                 line.strip()
                 linelist = line.split()
-                if linelist[0][0] == "#":         # first char is '#'
-                    if linelist[0] == "#report":
-                        linelist.pop(0) # get rid of the "#report"
-                    elif len( linelist ) < 2:
-                        continue        # blank comment line?
-                    elif linelist[1] == "report":      # we're interested
-                        linelist.pop(0) # get rid of the "#"
-                        linelist.pop(0) # get rid of the "report"
-                    else:
-                        continue
-
-                    # found a "# report" directive in the file
-                    for keyword in linelist:
-                        if not keyword in reportitem.keys():
-                            print( "Syntax error in # report directive in " + script + ", line " + str( lineno +1 ) + ": keyword '" + keyword + "' undefined. Ignored." )
+                if len(linelist) > 0:
+                    if linelist[0][0] == "#":         # first char is '#'
+                        if linelist[0] == "#report":
+                            linelist.pop(0) # get rid of the "#report"
+                        elif len( linelist ) < 2:
+                            continue        # blank comment line?
+                        elif linelist[1] == "report":      # we're interested
+                            linelist.pop(0) # get rid of the "#"
+                            linelist.pop(0) # get rid of the "report"
                         else:
-                            reportitem[keyword] = True
+                            continue
+
+                        # found a "# report" directive in the file
+                        for keyword in linelist:
+                            if not keyword in reportitem.keys():
+                                print( "Syntax error in # report directive in " + script + ", line " + str( lineno +1 ) + ": keyword '" + keyword + "' undefined. Ignored." )
+                            else:
+                                reportitem[keyword] = True
 
 
         if not reportitem["bandwidth"] and not reportitem["iops"] and not reportitem["latency"]:
@@ -434,7 +500,7 @@ with pushd( os.path.dirname( progname ) ):
         #iops = []
         #latency = []
         if args.use_output_flag:
-            fp = open( "fio_results.json", "w+" )          # Vin - add date/time to file name
+            fp = open( "fio_results.json", "a+" )          # Vin - add date/time to file name
             fp.write( json.dumps(fio_output, indent=4, sort_keys=True) )
             fp.write( "\n" )
             fp.close()
@@ -489,7 +555,9 @@ with pushd( os.path.dirname( progname ) ):
     print()
     announce( "killing fio slaves:" )
 
-    for host, s in host_session.items():
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in host_session.items():
         announce( host )
         #s.run( "pkill fio" )
         s.run( "kill -9 `cat /tmp/fio.pid`" )
@@ -499,7 +567,9 @@ with pushd( os.path.dirname( progname ) ):
     time.sleep( 1 )
 
     announce( "Unmounting filesystems:" )
-    for host, s in host_session.items():
+    for host, session in ssh_sessions.items():
+        s = session.session()
+    #for host, s in host_session.items():
         announce( host )
         s.run( "sudo umount /mnt/wekatester" )
 

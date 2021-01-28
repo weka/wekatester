@@ -2,7 +2,7 @@
 # report bandwidth
 [global]
 filesize=100M
-time_based=1
+;time_based=1
 startdelay=5
 exitall_on_error=1
 create_serialize=0
@@ -10,9 +10,9 @@ filename_format=$filenum/$jobnum
 directory=/mnt/wekatester
 group_reporting=1
 clocksource=gettimeofday
-runtime=30
+;runtime=30
 ioengine=posixaio
-disk_util=0
+;disk_util=0
 direct=1
 
 [fio-createfiles-00]
