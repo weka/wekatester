@@ -11,6 +11,8 @@ import time
 from subprocess import Popen, PIPE, STDOUT
 from shutil import copyfile
 from contextlib import contextmanager
+import threading
+from threading import Lock
 
 
 """A Python context to move in and out of directories"""
@@ -24,10 +26,11 @@ def pushd(new_dir):
         os.chdir(previous_dir)
 
 # print( something without a newline )
+announce_lock = Lock()
 def announce( text ):
-    sys.stdout.flush()
-    sys.stdout.write(text + " ")
-    #sys.stdout.flush()
+    with announce_lock:
+        sys.stdout.flush()
+        sys.stdout.write(text + " ")
 
 # format a number of bytes in GiB/MiB/KiB 
 def format_units_bytes( bytes ):
@@ -87,6 +90,14 @@ def run_shell_command( command ):
 
     return output
 
+host_session = {}
+ssh_token = {}
+def open_ssh_session(host):
+    rem = SshMachine( host )  # open an ssh session
+    ssh_token[host] = rem
+    host_session[host] = rem.session()
+    announce( host )
+
 # parse arguments
 progname=sys.argv[0]
 parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
@@ -94,20 +105,23 @@ parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
 #                    help='Server Dataplane IPs to execute on')
 parser.add_argument("-c", "--clients", dest='use_clients_flag', action='store_true', help="run fio on weka clients")
 parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true', help="run fio on weka servers")
-parser.add_argument("-a", "--al", dest='use_all_flag', action='store_true', help="run fio on weka servers and clients")
+#parser.add_argument("-a", "--al", dest='use_all_flag', action='store_true', help="run fio on weka servers and clients")
 parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output")
 
 #parser.add_argument("-v", "--verbose", dest='verbose_flag', action='store_true', help="enable verbose mode")
 
 args = parser.parse_args()
 
-if args.use_clients_flag and args.use_servers_flag:
-    print( "Error: you must specify either clients or servers, not both" )
-    sys.exit(1)
+#if args.use_clients_flag and args.use_servers_flag:
+#    print( "Error: you must specify either clients or servers, not both" )
+#    sys.exit(1)
 
 # default to servers
-if not args.use_clients_flag and not args.use_servers_flag and not args.use_all_flag:
+use_all = False
+if not args.use_clients_flag and not args.use_servers_flag: # neither flag
     args.use_servers_flag = True
+elif args.use_clients_flag and args.use_servers_flag:   # both flags
+    use_all = True
 
 
 # Make sure weka is installed
@@ -173,15 +187,16 @@ numcpu = cpu_attrs["CPU(s)"]
 #        # must be a server - not all FEs
 #        weka_hosts[hostid] = hostconfig
 
-if args.use_servers_flag:
-    print( "Using weka servers to generate load (converged mode)" )
-    all_hosts = run_json_shell_command( 'weka cluster host -b -J' )    # just the backends
-elif args.use_clients_flag:
-    print( "Using weka clients to generate load (dedicated mode)" )
-    all_hosts = run_json_shell_command( 'weka cluster host -c -J' )    # just the clients
-else:
+if use_all:
     print( "Using weka clients and servers to generate load (dedicated and converged mode)" )
     all_hosts = run_json_shell_command( 'weka cluster host -J' )    # all hosts
+elif args.use_servers_flag:
+    print( "Using weka servers to generate load (converged mode)" )
+    all_hosts = run_json_shell_command( 'weka cluster host -b -J' )    # just the backends
+else:
+    print( "Using weka clients to generate load (dedicated mode)" )
+    all_hosts = run_json_shell_command( 'weka cluster host -c -J' )    # just the clients
+
     
 weka_hosts = {}
 if type ( all_hosts ) == list:
@@ -205,8 +220,8 @@ print( str( len( hostips ) ) + " weka hosts detected" )
 
 
 
-print( "This cluster has " + str( weka_status["capacity"]["total_bytes"]/1024/1024/1024/1024 ) + " TB of capacity and " + \
-    str( weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024 ) + " TB of unprovisioned capacity" )
+print( "This cluster has " + str(round((weka_status["capacity"]["total_bytes"]/1024/1024/1024/1024),1)) + " TB of capacity and " + \
+    str(round((weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024 ),1)) + " TB of unprovisioned capacity" )
 
 # Get a list of filesystems to work on, create as needed
 weka_fs = run_json_shell_command( 'weka fs -J' )
@@ -293,14 +308,13 @@ with pushd( os.path.dirname( progname ) ):
     sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
     from plumbum import SshMachine, colors
 
-    host_session = {}
-    ssh_token = {}
     # open ssh sessions to all the hosts
-    run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester/weka_fio_out ]; then mkdir /mnt/wekatester/weka_fio_out; fi'" )
-    run_shell_command( "sudo chmod 777 /mnt/wekatester/weka_fio_out" )
+    #run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester/weka_fio_out ]; then mkdir /mnt/wekatester/weka_fio_out; fi'" )
+    #run_shell_command( "sudo chmod 777 /mnt/wekatester/weka_fio_out" )
     announce( "Opening ssh session to hosts:" )
     for host in hostips:
         try:
+            #open_ssh_session(host)
             rem = SshMachine( host )  # open an ssh session
             ssh_token[host] = rem
             host_session[host] = rem.session()
@@ -456,10 +470,12 @@ with pushd( os.path.dirname( progname ) ):
             print( "    total bandwidth: " + format_units_bytes( bw["read"] + bw["write"] ) + "/s" )
             print( "    avg bandwidth: " + format_units_bytes( float( bw["read"] + bw["write"] )/float( hostcount) ) + "/s per host" )
         if reportitem["iops"]:
-            print( "    read iops: " + ("{:,}".format(int(iops["read"]))) + "/s" )
-            print( "    write iops: " + ("{:,}".format(int(iops["write"]))) + "/s" )
-            print( "    total iops: " + ("{:,}".format(int(iops["read"])+int(iops["write"]))) + "/s" )
-            print( "    avg iops: " + ("{:,}".format(int(iops["read"])+int(iops["write"]) /hostcount)) + "/s per host" )
+            reads = int(iops["read"])
+            writes = int(iops["write"])
+            print(f"    read iops: {reads:,}/s" )
+            print(f"    write iops: {writes:,}/s" )
+            print(f"    total iops: {reads+writes:,}/s" )
+            print(f"    avg iops: {int((reads+writes)/hostcount):,}/s per host" )
         if reportitem["latency"]:
             print( "    read latency: " +  format_units_ns( float( latency["read"] ) ) )
             print( "    write latency: " +  format_units_ns( float( latency["write"] ) ) )
