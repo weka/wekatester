@@ -15,7 +15,13 @@ ioengine=posixaio
 disk_util=0
 direct=1
 
+[fio-createfiles-00]
+description='wekatester file creation for workload'
+create_only=1
+numjobs=192
+
 [fio-bandwidthSW-00]
+stonewall
 description='wekatester Sequential Write bandwidth workload'
 blocksize=1Mi
 rw=write
