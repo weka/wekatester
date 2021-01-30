@@ -13,6 +13,7 @@ from shutil import copyfile
 from contextlib import contextmanager
 import threading
 from threading import Lock
+import datetime
 
 
 """A Python context to move in and out of directories"""
@@ -450,7 +451,7 @@ with pushd( os.path.dirname( progname ) ):
     print( "Starting tests on " + str(hostcount) + " weka hosts" )
     print( "On " + numcpu + " cores of " + cpuname + " per host" )  # assuming they're all the same... )
 
-
+    saved_results = {}    # save the results
     for script in fio_scripts:
         # check for comments in the job file, telling us what to output.  Keywords are "report", "bandwidth", "latency", and "iops".
         # example: "# report latency bandwidth"  or "# report iops"
@@ -496,17 +497,14 @@ with pushd( os.path.dirname( progname ) ):
 
        # print( json.dumps(fio_output, indent=8, sort_keys=True) )
         #print( fio_output )
-        #bw_bytes = []
-        #iops = []
-        #latency = []
-        if args.use_output_flag:
-            fp = open( "fio_results.json", "a+" )          # Vin - add date/time to file name
-            fp.write( json.dumps(fio_output, indent=4, sort_keys=True) )
-            fp.write( "\n" )
-            fp.close()
 
         jobs = fio_output["client_stats"]
-        print( "Job is " + jobs[0]["jobname"] + " " + jobs[0]["desc"] )
+        print(f"number of jobs = {len(jobs)}")
+        # ok, number of jobs - we always get job results, plus aggregate results.  If more than 1 job (such as 
+        # pre-create + work jobs, there will be 3 or more - we really only want the last "job" and not the aggregate for
+        # this name and description
+        index = len(jobs) -2
+        print( "Job is " + jobs[index]["jobname"] + " " + jobs[index]["desc"] )
 
         # gather interesting stats so we don't have to hunt for them later
         #for stats in jobs:
@@ -518,18 +516,16 @@ with pushd( os.path.dirname( progname ) ):
         iops={}
         latency={}
 
-        # ok, it's a hack, but we're really only interested in the last one.
-        for stats in jobs:
-            try:
-                bw["read"] = stats["read"]["bw_bytes"]
-                bw["write"] = stats["write"]["bw_bytes"]
-                iops["read"] = stats["read"]["iops"]
-                iops["write"] = stats["write"]["iops"]
-                latency["read"] = stats["read"]["lat_ns"]["mean"]
-                latency["write"] = stats["write"]["lat_ns"]["mean"]
-            except:     # don't worry about keyerrors.
-                pass
-                
+        # ok, it's a hack, but we're really only interested in the last one - the aggregate
+        stats = jobs[len(jobs) -1]
+        saved_results[script] = stats   # save for output file
+        bw["read"] = stats["read"]["bw_bytes"]
+        bw["write"] = stats["write"]["bw_bytes"]
+        iops["read"] = stats["read"]["iops"]
+        iops["write"] = stats["write"]["iops"]
+        latency["read"] = stats["read"]["lat_ns"]["mean"]
+        latency["write"] = stats["write"]["lat_ns"]["mean"]
+
         if reportitem["bandwidth"]:
             print( "    read bandwidth: " + format_units_bytes( bw["read"] ) + "/s" )
             print( "    write bandwidth: " + format_units_bytes( bw["write"] ) + "/s" )
@@ -551,6 +547,14 @@ with pushd( os.path.dirname( progname ) ):
 
     print()
     print( "Tests complete." )
+
+    if args.use_output_flag:
+        #timestring = datetime.datetime.now().isoformat()
+        timestring = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        fp = open(f"fio_results_{timestring}.json", "a+" )          # Vin - add date/time to file name
+        fp.write( json.dumps(saved_results, indent=4, sort_keys=True) )
+        fp.write( "\n" )
+        fp.close()
 
     print()
     announce( "killing fio slaves:" )
