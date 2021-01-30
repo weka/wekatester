@@ -75,11 +75,8 @@ def format_units_ns( nanosecs ):
 
 # run a command via the shell, expect json output and return it.
 def run_json_shell_command( command ):
-    #print( command )
     tmpvar = json.loads( run_shell_command( command ) )
-    #print( tmpvar )
     return tmpvar
-    #return json.loads( run_shell_command( command ) )[0]	# py3 version returns a list of dicts, instead of a dict, so add [0]
 
 # run a command via the shell, check return code, exit on error.
 def run_shell_command( command ):
@@ -109,14 +106,6 @@ def open_ssh_connection( server ):
         ssh_sessions[server] = None
         return -1
 
-#host_session = {}
-#ssh_token = {}
-#def open_ssh_session(host):
-#    rem = SshMachine( host )  # open an ssh session
-#    ssh_token[host] = rem
-#    host_session[host] = rem.session()
-#    announce( host )
-
 # parse arguments
 progname=sys.argv[0]
 parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
@@ -127,13 +116,7 @@ parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_tr
 #parser.add_argument("-a", "--al", dest='use_all_flag', action='store_true', help="run fio on weka servers and clients")
 parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output")
 
-#parser.add_argument("-v", "--verbose", dest='verbose_flag', action='store_true', help="enable verbose mode")
-
 args = parser.parse_args()
-
-#if args.use_clients_flag and args.use_servers_flag:
-#    print( "Error: you must specify either clients or servers, not both" )
-#    sys.exit(1)
 
 # default to servers
 use_all = False
@@ -159,27 +142,15 @@ if weka_status["is_cluster"] != True:
     sys.exit()
 
 # inserted to capture the number of servers
-#hostcount = weka_status["hosts"]["active_count"]
 drivecount = weka_status["drives"]["active"]
 nettype = weka_status["net"]["link_layer"]
 clustdrivecap = weka_status["licensing"]["usage"]["drive_capacity_gb"]
 clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
 wekaver = weka_status["release"]
 
-# get cpu information
-#lscpu_out = run_json_shell_command( 'lscpu -J' )
-
-#for attrs in lscpu_out["lscpu"]:  # list of dicts, each with 2 entries, "field" and "data"
-#    if attrs["field"] == "Model name:":
-#        cpuname = attrs["data"]
-#    elif attrs["field"] == "CPU(s):":
-#        numcpu = attrs["data"]
 cpu_attrs = {}
 temp_bytes = run_shell_command( 'lscpu' )
-#print( temp_bytes )
-#print( lscpu_out.split("\n") )
 lscpu_out = temp_bytes.decode('utf-8')
-#print( lscpu_out )
 for line in lscpu_out.split("\n"):
     line_list = line.split(":")
     if len( line_list[0] ) >= 1:    # there's a blank line at the end?
@@ -187,24 +158,6 @@ for line in lscpu_out.split("\n"):
 
 cpuname = cpu_attrs["Model name"]
 numcpu = cpu_attrs["CPU(s)"]
-#print( cpu_attrs )
-    
-
-
-# get a list of server nodes
-#all_hosts = run_json_shell_command( 'weka cluster host -J' )
-#weka_hosts = {}
-#if type ( all_hosts ) == list:
-#    for hostconfig in all_hosts:
-#        hostid = hostconfig["host_id"]
-#        if hostconfig["cores"] != hostconfig["frontend_dedicated_cores"]:
-#        # must be a server - not all FEs
-#        weka_hosts[hostid] = hostconfig
-#else:
-#    for hostid, hostconfig in all_hosts.items():
-#        if hostconfig["cores"] != hostconfig["frontend_dedicated_cores"]:
-#        # must be a server - not all FEs
-#        weka_hosts[hostid] = hostconfig
 
 if use_all:
     print( "Using weka clients and servers to generate load (dedicated and converged mode)" )
@@ -245,23 +198,17 @@ print( "This cluster has " + str(round((weka_status["capacity"]["total_bytes"]/1
 # Get a list of filesystems to work on, create as needed
 weka_fs = run_json_shell_command( 'weka fs -J' )
 
-#print( json.dumps(weka_fs, indent=8, sort_keys=True) )
-
 # Is there an existing fs?
 wekatester_fs = False
 wekatester_group = False
 if type ( weka_fs ) == list:
     for fsconfig in weka_fs:    # do we already have a wekatester fs?
-        #print( "Looking at " + fsid )
-        #print( fsconfig["group_name"] )
         if fsconfig["group_name"] == "wekatester-group":
             wekatester_group = True
         if fsconfig["name"] == "wekatester-fs":
             wekatester_fs = True
 else:
     for fsid, fsconfig in weka_fs.items():    # do we already have a wekatester fs?
-        #print( "Looking at " + fsid )
-        #print( fsconfig["group_name"] )
         if fsconfig["group_name"] == "wekatester-group":
             wekatester_group = True
         if fsconfig["name"] == "wekatester-fs":
@@ -272,7 +219,6 @@ if wekatester_group == False:   # did we find the group when we looked for the f
 
     if type ( weka_fs_group ) == list:
         for groupconfig in weka_fs_group:    # do we already have a wekatester fs group?
-            #print( "looking at " + fsgroupid + " " + groupconfig["name"] )
             if groupconfig["name"] == "wekatester-group":
                 wekatester_group = True
                 print( "wekatester-group exists" )
@@ -313,13 +259,6 @@ except subprocess.CalledProcessError as err:
     run_shell_command( "sudo mount -t wekafs wekatester-fs /mnt/wekatester" )
     run_shell_command( "sudo chmod 777 /mnt/wekatester" )
 
-# setup phase complete... now we get to work
-#        uname = ssh_token[host]["uname"]
-#        print( uname )
-#        output = (uname)("-a")
-#        print( output )
-#        sys.exit()
-
 # do a pushd so we know where we are
 with pushd( os.path.dirname( progname ) ):
     # make sure passwordless ssh works to all the servers because nothing will work if not set up
@@ -332,9 +271,7 @@ with pushd( os.path.dirname( progname ) ):
 
     # wait for and reap threads
     time.sleep( 0.1 )
-    #print( "parallel_threads = " + str( len( parallel_threads ) ) )
     while len( parallel_threads ) > 0:
-        #print( "parallel_threads = " + str( len( parallel_threads ) ) )
         dead_threads = {}
         for server, thread in parallel_threads.items():
             if not thread.is_alive():   # is it dead?
@@ -342,7 +279,6 @@ with pushd( os.path.dirname( progname ) ):
                 thread.join()       # reap it
                 dead_threads[server] = thread
 
-        #print( "dead_threads = " + str( dead_threads ) )
         # remove it from the list so we don't try to reap it twice
         for server, thread in dead_threads.items():
             #print( "    removing " + server + "'s thread from list" )
@@ -350,10 +286,6 @@ with pushd( os.path.dirname( progname ) ):
 
         # sleep a little so we limit cpu use
         time.sleep( 0.1 )
-
-        #ret = open_ssh_connection( server )
-        #if ret == -1:
-        #    sys.exit( 1 )
 
     #print( ssh_sessions )
     if len( ssh_sessions ) == 0:
@@ -363,35 +295,12 @@ with pushd( os.path.dirname( progname ) ):
         if session == None:
             print( "Error opening ssh session to " + server )
 
-    # use our own version of plumbum - Ubuntu is broken. (one line change from orig plumbum... /bin/sh changed to /bin/bash
-    # this works for both ubuntu and centos
-    #sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
-    #from plumbum import SshMachine, colors
-
-    # open ssh sessions to all the hosts
-    #run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester/weka_fio_out ]; then mkdir /mnt/wekatester/weka_fio_out; fi'" )
-    #run_shell_command( "sudo chmod 777 /mnt/wekatester/weka_fio_out" )
-    #announce( "Opening ssh session to hosts:" )
-    #for host in hostips:
-    #    try:
-    #        #open_ssh_session(host)
-    #        rem = SshMachine( host )  # open an ssh session
-    #        ssh_token[host] = rem
-    #        host_session[host] = rem.session()
-    #        announce( host )
-    #    except:
-    #        print()
-    #        print( "Error opening ssh session - have you configured passwordless ssh?" )
-    #        sys.exit( 1 )
-
     print()
 
     # mount filesystems
     announce( "Mounting wekatester-fs on hosts:" )
     for host, session in ssh_sessions.items():
         s = session.session()
-    #for host, s in sorted(host_session.items()):
-        #print( "Check that /mnt/wekatester mountpoint dir is present on host " + host )
 
         retcode = s.run( "sudo bash -c 'if [ ! -d /mnt/wekatester ]; then mkdir /mnt/wekatester; fi'" )
         if retcode[0] == 1:
@@ -499,18 +408,12 @@ with pushd( os.path.dirname( progname ) ):
         #print( fio_output )
 
         jobs = fio_output["client_stats"]
-        print(f"number of jobs = {len(jobs)}")
+        #print(f"number of jobs = {len(jobs)}")
         # ok, number of jobs - we always get job results, plus aggregate results.  If more than 1 job (such as 
         # pre-create + work jobs, there will be 3 or more - we really only want the last "job" and not the aggregate for
         # this name and description
         index = len(jobs) -2
         print( "Job is " + jobs[index]["jobname"] + " " + jobs[index]["desc"] )
-
-        # gather interesting stats so we don't have to hunt for them later
-        #for stats in jobs:
-        #    bw_bytes.append( stats["read"]["bw_bytes"] )
-        #    iops.append( stats["read"]["iops"] )
-        #    latency.append( stats["read"]["lat_ns"]["mean"] )
 
         bw={}
         iops={}
@@ -518,7 +421,7 @@ with pushd( os.path.dirname( progname ) ):
 
         # ok, it's a hack, but we're really only interested in the last one - the aggregate
         stats = jobs[len(jobs) -1]
-        saved_results[script] = stats   # save for output file
+        saved_results[os.path.basename(script)] = stats   # save for output file
         bw["read"] = stats["read"]["bw_bytes"]
         bw["write"] = stats["write"]["bw_bytes"]
         iops["read"] = stats["read"]["iops"]
@@ -549,9 +452,8 @@ with pushd( os.path.dirname( progname ) ):
     print( "Tests complete." )
 
     if args.use_output_flag:
-        #timestring = datetime.datetime.now().isoformat()
         timestring = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-        fp = open(f"fio_results_{timestring}.json", "a+" )          # Vin - add date/time to file name
+        fp = open(f"results_{timestring}.json", "a+" )          # Vin - add date/time to file name
         fp.write( json.dumps(saved_results, indent=4, sort_keys=True) )
         fp.write( "\n" )
         fp.close()
@@ -579,9 +481,3 @@ with pushd( os.path.dirname( progname ) ):
 
 
     print()
-    #print( "Unmount fs locally" )
-    #try:
-    #    run_shell_command( "sudo umount /mnt/wekatester" )
-    #except:
-    #    print( "FS is not mounted locally" )
-    #print()
