@@ -25,5 +25,5 @@ stonewall
 description='Sequential Write bandwidth workload'
 blocksize=1Mi
 rw=write
-numjobs=32
+numjobs=64
 iodepth=1
