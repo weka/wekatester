@@ -25,5 +25,5 @@ stonewall
 description='Sequential Read bandwidth workload'
 blocksize=1Mi
 rw=read
-numjobs=32
+numjobs=64
 iodepth=1
