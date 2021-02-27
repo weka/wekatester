@@ -1,7 +1,7 @@
 #!/bin/sh
 
 GVF=FIO-VERSION-FILE
-DEF_VER=fio-3.18
+DEF_VER=fio.last-3.18
 
 LF='
 '
@@ -15,7 +15,7 @@ elif test -d .git -o -f .git &&
 	VN=`git describe --match "fio-[0-9]*" --abbrev=4 HEAD 2>/dev/null` &&
 	case "$VN" in
 	*$LF*) (exit 1) ;;
-	fio-[0-9]*)
+	fio.last-[0-9]*)
 		git update-index -q --refresh
 		test -z "`git diff-index --name-only HEAD --`" ||
 		VN="$VN-dirty" ;;

@@ -3,9 +3,9 @@
 #
 # steadystate_tests.py
 #
-# Test option parsing and functonality for fio's steady state detection feature.
+# Test option parsing and functonality for fio.last's steady state detection feature.
 #
-# steadystate_tests.py --read file-for-read-testing --write file-for-write-testing ./fio
+# steadystate_tests.py --read file-for-read-testing --write file-for-write-testing ./fio.last
 #
 # REQUIREMENTS
 # Python 2.6+
@@ -14,7 +14,7 @@
 # KNOWN ISSUES
 # only option parsing and read tests are carried out
 # On Windows this script works under Cygwin but not from cmd.exe
-# On Windows I encounter frequent fio problems generating JSON output (nothing to decode)
+# On Windows I encounter frequent fio.last problems generating JSON output (nothing to decode)
 # min runtime:
 # if ss attained: min runtime = ss_dur + ss_ramp
 # if not attained: runtime = timeout
@@ -31,7 +31,7 @@ from scipy import stats
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('fio', help='path to fio executable')
+    parser.add_argument('fio.last', help='path to fio.last executable')
     args = parser.parse_args()
 
     return args
@@ -174,14 +174,14 @@ if __name__ == '__main__':
                             dur=job['ss_dur'],
                             criterion=jsonjob['steadystate']['criterion'])
                         if not objsame:
-                            line = 'FAILED ' + line + ' fio criterion {0} != calculated criterion {1} '.format(jsonjob['steadystate']['criterion'], target)
+                            line = 'FAILED ' + line + ' fio.last criterion {0} != calculated criterion {1} '.format(jsonjob['steadystate']['criterion'], target)
                             failed = failed + 1
                         else:
                             if met:
                                 line = 'PASSED ' + line + ' target {0} < limit {1}'.format(target, job['ss_limit'])
                                 passed = passed + 1
                             else:
-                                line = 'FAILED ' + line + ' target {0} < limit {1} but fio reports ss not attained '.format(target, job['ss_limit'])
+                                line = 'FAILED ' + line + ' target {0} < limit {1} but fio.last reports ss not attained '.format(target, job['ss_limit'])
                                 failed = failed + 1
                 else:
                     # check runtime, confirm criterion calculation, and confirm that criterion was not met
@@ -200,14 +200,14 @@ if __name__ == '__main__':
                             criterion=jsonjob['steadystate']['criterion'])
                         if not objsame:
                             if actual > (job['ss_dur'] + job['ss_ramp'])*1000:
-                                line = 'FAILED ' + line + ' fio criterion {0} != calculated criterion {1} '.format(jsonjob['steadystate']['criterion'], target)
+                                line = 'FAILED ' + line + ' fio.last criterion {0} != calculated criterion {1} '.format(jsonjob['steadystate']['criterion'], target)
                                 failed = failed + 1
                             else:
-                                line = 'PASSED ' + line + ' fio criterion {0} == 0.0 since ss_dur + ss_ramp has not elapsed '.format(jsonjob['steadystate']['criterion'])
+                                line = 'PASSED ' + line + ' fio.last criterion {0} == 0.0 since ss_dur + ss_ramp has not elapsed '.format(jsonjob['steadystate']['criterion'])
                                 passed = passed + 1
                         else:
                             if met:
-                                line = 'FAILED ' + line + ' target {0} < threshold {1} but fio reports ss not attained '.format(target, job['ss_limit'])
+                                line = 'FAILED ' + line + ' target {0} < threshold {1} but fio.last reports ss not attained '.format(target, job['ss_limit'])
                                 failed = failed + 1
                             else:
                                 line = 'PASSED ' + line + ' criterion {0} > threshold {1}'.format(target, job['ss_limit'])

@@ -9,13 +9,13 @@
 # a minimum size of 32MiB is recommended.
 #
 # USAGE
-# python strided.py fio-executable [-f file/device]
+# python strided.py fio.last-executable [-f file/device]
 #
 # EXAMPLES
-# python t/strided.py ./fio
-# python t/strided.py ./fio -f /dev/sda
+# python t/strided.py ./fio.last
+# python t/strided.py ./fio.last -f /dev/sda
 # dd if=/dev/zero of=temp bs=1M count=32
-# python t/strided.py ./fio -f temp
+# python t/strided.py ./fio.last -f temp
 #
 # REQUIREMENTS
 # Python 2.6+
@@ -41,8 +41,8 @@ import subprocess
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('fio',
-                        help='path to fio executable (e.g., ./fio)')
+    parser.add_argument('fio.last',
+                        help='path to fio.last executable (e.g., ./fio.last)')
     parser.add_argument('-f', '--filename', help="file/device to test")
     args = parser.parse_args()
 

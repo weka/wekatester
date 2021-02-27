@@ -3,27 +3,27 @@
 #
 # fio_jsonplus_clat2csv
 #
-# This script converts fio's json+ completion latency data to CSV format.
+# This script converts fio.last's json+ completion latency data to CSV format.
 #
 # For example:
 #
-# Run the following fio jobs:
-# ../fio --output=fio-jsonplus.output --output-format=json+ --name=test1
+# Run the following fio.last jobs:
+# ../fio.last --output=fio.last-jsonplus.output --output-format=json+ --name=test1
 #  	--ioengine=null --time_based --runtime=5s --size=1G --rw=randrw
 # 	--name=test2 --ioengine=null --time_based --runtime=3s --size=1G
 # 	--rw=read --name=test3 --ioengine=null --time_based --runtime=4s
 # 	--size=8G --rw=write
 #
 # Then run:
-# fio_jsonplus_clat2csv fio-jsonplus.output fio-latency.csv
+# fio_jsonplus_clat2csv fio.last-jsonplus.output fio.last-latency.csv
 #
 # You will end up with the following 3 files
 #
-# -rw-r--r-- 1 root root  6467 Jun 27 14:57 fio-latency_job0.csv
-# -rw-r--r-- 1 root root  3985 Jun 27 14:57 fio-latency_job1.csv
-# -rw-r--r-- 1 root root  4490 Jun 27 14:57 fio-latency_job2.csv
+# -rw-r--r-- 1 root root  6467 Jun 27 14:57 fio.last-latency_job0.csv
+# -rw-r--r-- 1 root root  3985 Jun 27 14:57 fio.last-latency_job1.csv
+# -rw-r--r-- 1 root root  4490 Jun 27 14:57 fio.last-latency_job2.csv
 #
-# fio-latency_job0.csv will look something like:
+# fio.last-latency_job0.csv will look something like:
 #
 # clat_nsec, read_count, read_cumulative, read_percentile, write_count,
 # 	write_cumulative, write_percentile, trim_count, trim_cumulative,
@@ -73,7 +73,7 @@ from six.moves import range
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('source',
-                        help='fio json+ output file containing completion '
+                        help='fio.last json+ output file containing completion '
                              'latency data')
     parser.add_argument('dest',
                         help='destination file stub for latency data in CSV '

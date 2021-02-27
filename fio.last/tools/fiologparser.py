@@ -3,7 +3,7 @@
 #
 # fiologparser.py
 #
-# This tool lets you parse multiple fio log files and look at interaval
+# This tool lets you parse multiple fio.last log files and look at interaval
 # statistics even when samples are non-uniform.  For instance:
 #
 # fiologparser.py -s *bw*

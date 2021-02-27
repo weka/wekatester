@@ -4,20 +4,20 @@
 # Copyright (c) 2019 Western Digital Corporation or its affiliates.
 #
 """
-# run-fio-tests.py
+# run-fio.last-tests.py
 #
-# Automate running of fio tests
+# Automate running of fio.last tests
 #
 # USAGE
-# python3 run-fio-tests.py [-r fio-root] [-f fio-path] [-a artifact-root]
+# python3 run-fio.last-tests.py [-r fio.last-root] [-f fio.last-path] [-a artifact-root]
 #                           [--skip # # #...] [--run-only # # #...]
 #
 #
 # EXAMPLE
-# # git clone git://git.kernel.dk/fio.git
-# # cd fio
+# # git clone git://git.kernel.dk/fio.last.git
+# # cd fio.last
 # # make -j
-# # python3 t/run-fio-tests.py
+# # python3 t/run-fio.last-tests.py
 #
 #
 # REQUIREMENTS
@@ -55,7 +55,7 @@ from pathlib import Path
 
 
 class FioTest(object):
-    """Base for all fio tests."""
+    """Base for all fio.last tests."""
 
     def __init__(self, exe_path, parameters, success):
         self.exe_path = exe_path
@@ -136,7 +136,7 @@ class FioExeTest(FioTest):
         try:
             proc = None
             # Avoid using subprocess.run() here because when a timeout occurs,
-            # fio will be stopped with SIGKILL. This does not give fio a
+            # fio.last will be stopped with SIGKILL. This does not give fio.last a
             # chance to clean up and means that child processes may continue
             # running and submitting IO.
             proc = subprocess.Popen(command,
@@ -203,18 +203,18 @@ class FioExeTest(FioTest):
 
 
 class FioJobTest(FioExeTest):
-    """Test consists of a fio job"""
+    """Test consists of a fio.last job"""
 
     def __init__(self, fio_path, fio_job, success, fio_pre_job=None,
                  fio_pre_success=None, output_format="normal"):
         """Construct a FioJobTest which is a FioExeTest consisting of a
-        single fio job file with an optional setup step.
+        single fio.last job file with an optional setup step.
 
-        fio_path:           location of fio executable
-        fio_job:            location of fio job file
+        fio_path:           location of fio.last executable
+        fio_job:            location of fio.last job file
         success:            Definition of test success
-        fio_pre_job:        fio job for preconditioning
-        fio_pre_success:    Definition of test success for fio precon job
+        fio_pre_job:        fio.last job for preconditioning
+        fio_pre_success:    Definition of test success for fio.last precon job
         output_format:      normal (default), json, jsonplus, or terse
         """
 
@@ -233,7 +233,7 @@ class FioJobTest(FioExeTest):
         FioExeTest.__init__(self, fio_path, self.fio_args, success)
 
     def setup(self, artifact_root, testnum):
-        """Setup instance variables for fio job test."""
+        """Setup instance variables for fio.last job test."""
 
         super(FioJobTest, self).setup(artifact_root, testnum)
 
@@ -251,7 +251,7 @@ class FioJobTest(FioExeTest):
             "{0}.exitcode".format(os.path.basename(self.fio_job)))
 
     def run_pre_job(self):
-        """Run fio job precondition step."""
+        """Run fio.last job precondition step."""
 
         precon = FioJobTest(self.exe_path, self.fio_pre_job,
                             self.fio_pre_success,
@@ -263,7 +263,7 @@ class FioJobTest(FioExeTest):
         self.failure_reason = precon.failure_reason
 
     def run(self):
-        """Run fio job test."""
+        """Run fio.last job test."""
 
         if self.fio_pre_job:
             self.run_pre_job()
@@ -274,7 +274,7 @@ class FioJobTest(FioExeTest):
             logging.debug("Test %d: precondition step failed", self.testnum)
 
     def check_result(self):
-        """Check fio job results."""
+        """Check fio.last job results."""
 
         if self.precon_failed:
             self.passed = False
@@ -298,7 +298,7 @@ class FioJobTest(FioExeTest):
             return
 
         #
-        # Sometimes fio informational messages are included at the top of the
+        # Sometimes fio.last informational messages are included at the top of the
         # JSON output, especially under Windows. Try to decode output as JSON
         # data, lopping off up to the first four lines
         #
@@ -318,7 +318,7 @@ class FioJobTest(FioExeTest):
 
 
 class FioJobTest_t0005(FioJobTest):
-    """Test consists of fio test job t0005
+    """Test consists of fio.last test job t0005
     Confirm that read['io_kbytes'] == write['io_kbytes'] == 102400"""
 
     def check_result(self):
@@ -336,7 +336,7 @@ class FioJobTest_t0005(FioJobTest):
 
 
 class FioJobTest_t0006(FioJobTest):
-    """Test consists of fio test job t0006
+    """Test consists of fio.last test job t0006
     Confirm that read['io_kbytes'] ~ 2*write['io_kbytes']"""
 
     def check_result(self):
@@ -354,7 +354,7 @@ class FioJobTest_t0006(FioJobTest):
 
 
 class FioJobTest_t0007(FioJobTest):
-    """Test consists of fio test job t0007
+    """Test consists of fio.last test job t0007
     Confirm that read['io_kbytes'] = 87040"""
 
     def check_result(self):
@@ -369,12 +369,12 @@ class FioJobTest_t0007(FioJobTest):
 
 
 class FioJobTest_t0008(FioJobTest):
-    """Test consists of fio test job t0008
+    """Test consists of fio.last test job t0008
     Confirm that read['io_kbytes'] = 32768 and that
                 write['io_kbytes'] ~ 16568
 
-    I did runs with fio-ae2fafc8 and saw write['io_kbytes'] values of
-    16585, 16588. With two runs of fio-3.16 I obtained 16568"""
+    I did runs with fio.last-ae2fafc8 and saw write['io_kbytes'] values of
+    16585, 16588. With two runs of fio.last-3.16 I obtained 16568"""
 
     def check_result(self):
         super(FioJobTest_t0008, self).check_result()
@@ -394,7 +394,7 @@ class FioJobTest_t0008(FioJobTest):
 
 
 class FioJobTest_t0009(FioJobTest):
-    """Test consists of fio test job t0009
+    """Test consists of fio.last test job t0009
     Confirm that runtime >= 60s"""
 
     def check_result(self):
@@ -411,10 +411,10 @@ class FioJobTest_t0009(FioJobTest):
 
 
 class FioJobTest_t0011(FioJobTest):
-    """Test consists of fio test job t0009
+    """Test consists of fio.last test job t0009
     Confirm that job0 iops == 1000
     and that job1_iops / job0_iops ~ 8
-    With two runs of fio-3.16 I observed a ratio of 8.3"""
+    With two runs of fio.last-3.16 I observed a ratio of 8.3"""
 
     def check_result(self):
         super(FioJobTest_t0011, self).check_result()
@@ -563,7 +563,7 @@ TEST_LIST = [
     {
         'test_id':          1,
         'test_class':       FioJobTest,
-        'job':              't0001-52c58027.fio',
+        'job':              't0001-52c58027.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -572,25 +572,25 @@ TEST_LIST = [
     {
         'test_id':          2,
         'test_class':       FioJobTest,
-        'job':              't0002-13af05ae-post.fio',
+        'job':              't0002-13af05ae-post.fio.last',
         'success':          SUCCESS_DEFAULT,
-        'pre_job':          't0002-13af05ae-pre.fio',
+        'pre_job':          't0002-13af05ae-pre.fio.last',
         'pre_success':      None,
         'requirements':     [Requirements.linux, Requirements.libaio],
     },
     {
         'test_id':          3,
         'test_class':       FioJobTest,
-        'job':              't0003-0ae2c6e1-post.fio',
+        'job':              't0003-0ae2c6e1-post.fio.last',
         'success':          SUCCESS_NONZERO,
-        'pre_job':          't0003-0ae2c6e1-pre.fio',
+        'pre_job':          't0003-0ae2c6e1-pre.fio.last',
         'pre_success':      SUCCESS_DEFAULT,
         'requirements':     [Requirements.linux, Requirements.libaio],
     },
     {
         'test_id':          4,
         'test_class':       FioJobTest,
-        'job':              't0004-8a99fdf6.fio',
+        'job':              't0004-8a99fdf6.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -599,7 +599,7 @@ TEST_LIST = [
     {
         'test_id':          5,
         'test_class':       FioJobTest_t0005,
-        'job':              't0005-f7078f7b.fio',
+        'job':              't0005-f7078f7b.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -609,7 +609,7 @@ TEST_LIST = [
     {
         'test_id':          6,
         'test_class':       FioJobTest_t0006,
-        'job':              't0006-82af2a7c.fio',
+        'job':              't0006-82af2a7c.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -619,7 +619,7 @@ TEST_LIST = [
     {
         'test_id':          7,
         'test_class':       FioJobTest_t0007,
-        'job':              't0007-37cf9e3c.fio',
+        'job':              't0007-37cf9e3c.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -629,7 +629,7 @@ TEST_LIST = [
     {
         'test_id':          8,
         'test_class':       FioJobTest_t0008,
-        'job':              't0008-ae2fafc8.fio',
+        'job':              't0008-ae2fafc8.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -639,7 +639,7 @@ TEST_LIST = [
     {
         'test_id':          9,
         'test_class':       FioJobTest_t0009,
-        'job':              't0009-f8b0bd10.fio',
+        'job':              't0009-f8b0bd10.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -651,7 +651,7 @@ TEST_LIST = [
     {
         'test_id':          10,
         'test_class':       FioJobTest,
-        'job':              't0010-b7aae4ba.fio',
+        'job':              't0010-b7aae4ba.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -660,7 +660,7 @@ TEST_LIST = [
     {
         'test_id':          11,
         'test_class':       FioJobTest_t0011,
-        'job':              't0011-5d2788d5.fio',
+        'job':              't0011-5d2788d5.fio.last',
         'success':          SUCCESS_DEFAULT,
         'pre_job':          None,
         'pre_success':      None,
@@ -764,10 +764,10 @@ def parse_args():
     """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-r', '--fio-root',
-                        help='fio root path')
-    parser.add_argument('-f', '--fio',
-                        help='path to fio executable (e.g., ./fio)')
+    parser.add_argument('-r', '--fio.last-root',
+                        help='fio.last root path')
+    parser.add_argument('-f', '--fio.last',
+                        help='path to fio.last executable (e.g., ./fio.last)')
     parser.add_argument('-a', '--artifact-root',
                         help='artifact root directory')
     parser.add_argument('-s', '--skip', nargs='+', type=int,
@@ -796,22 +796,22 @@ def main():
         fio_root = args.fio_root
     else:
         fio_root = str(Path(__file__).absolute().parent.parent)
-    print("fio root is %s" % fio_root)
+    print("fio.last root is %s" % fio_root)
 
     if args.fio:
         fio_path = args.fio
     else:
         if platform.system() == "Windows":
-            fio_exe = "fio.exe"
+            fio_exe = "fio.last.exe"
         else:
-            fio_exe = "fio"
+            fio_exe = "fio.last"
         fio_path = os.path.join(fio_root, fio_exe)
-    print("fio path is %s" % fio_path)
+    print("fio.last path is %s" % fio_path)
     if not shutil.which(fio_path):
-        print("Warning: fio executable not found")
+        print("Warning: fio.last executable not found")
 
     artifact_root = args.artifact_root if args.artifact_root else \
-        "fio-test-{0}".format(time.strftime("%Y%m%d-%H%M%S"))
+        "fio.last-test-{0}".format(time.strftime("%Y%m%d-%H%M%S"))
     os.mkdir(artifact_root)
     print("Artifact directory is %s" % artifact_root)
 

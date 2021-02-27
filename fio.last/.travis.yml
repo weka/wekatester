@@ -54,4 +54,4 @@ before_install:
 script:
   - ./configure --extra-cflags="${EXTRA_CFLAGS}" && make
   - make test
-  - sudo python3 t/run-fio-tests.py --skip 6 1007 1008 --debug
+  - sudo python3 t/run-fio.last-tests.py --skip 6 1007 1008 --debug

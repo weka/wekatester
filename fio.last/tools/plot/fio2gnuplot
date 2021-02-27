@@ -4,7 +4,7 @@
 #  Copyright (C) 2013 eNovance SAS <licensing@enovance.com>
 #  Author: Erwan Velu  <erwan@enovance.com>
 #
-#  The license below covers all files distributed with fio unless otherwise
+#  The license below covers all files distributed with fio.last unless otherwise
 #  noted in the file itself.
 #
 #  This program is free software; you can redistribute it and/or modify
@@ -94,7 +94,7 @@ set style line 1 lt 1 lw 3 pt 3 linecolor rgb "green"
 		compare_trend.write("plot %s w l ls 1 ti 'Global average value (%.2f)'" % (global_avg,global_avg));
 
 		pos=0
-		# Let's create a temporary file for each selected fio file
+		# Let's create a temporary file for each selected fio.last file
 		for file in fio_data_file:
 			tmp_filename = "gnuplot_temp_file.%d" % pos
 
@@ -133,7 +133,7 @@ def compute_aggregated_file(fio_data_file, gnuplot_output_filename, gnuplot_outp
 	temp_files=[]
 	pos=0
 
-	# Let's create a temporary file for each selected fio file
+	# Let's create a temporary file for each selected fio.last file
 	for file in fio_data_file:
 		tmp_filename = "%sgnuplot_temp_file.%d" % (gnuplot_output_dir, pos)
 		temp_files.append(open(tmp_filename,'r'))
@@ -366,7 +366,7 @@ def print_help():
     print('fio2gnuplot -ghbiodvk -t <title> -o <outputfile> -p <pattern> -G <type> -m <time> -M <time>')
     print()
     print('-h --help                           : Print this help')
-    print('-p <pattern> or --pattern <pattern> : A glob pattern to select fio input files')
+    print('-p <pattern> or --pattern <pattern> : A glob pattern to select fio.last input files')
     print('-b           or --bandwidth         : A predefined pattern for selecting *_bw.log files')
     print('-i           or --iops              : A predefined pattern for selecting *_iops.log files')
     print('-g           or --gnuplot           : Render gnuplot traces before exiting')
@@ -374,7 +374,7 @@ def print_help():
     print('                                       - Basename is set with the pattern if defined')
     print('-d           or --outputdir <dir>   : The directory where gnuplot shall render files')
     print('-t           or --title <title>     : The title of the gnuplot traces')
-    print('                                       - Title is set with the block size detected in fio traces')
+    print('                                       - Title is set with the block size detected in fio.last traces')
     print('-G           or --Global <type>     : Search for <type> in .global files match by a pattern')
     print('                                       - Available types are : min, max, avg, stddev')
     print('                                       - The .global extension is added automatically to the pattern')
@@ -390,7 +390,7 @@ def main(argv):
     title='No title'
     gnuplot_output_filename='result'
     gnuplot_output_dir='./'
-    gpm_dir="/usr/share/fio/"
+    gpm_dir="/usr/share/fio.last/"
     disk_perf=[]
     run_gnuplot=False
     parse_global=False
@@ -406,9 +406,9 @@ def main(argv):
     force_keep_temp_files=False
 
     if not os.path.isfile(gpm_dir+'math.gpm'):
-        gpm_dir="/usr/local/share/fio/"
+        gpm_dir="/usr/local/share/fio.last/"
         if not os.path.isfile(gpm_dir+'math.gpm'):
-            print("Looks like fio didn't get installed properly as no gpm files found in '/usr/share/fio' or '/usr/local/share/fio'\n")
+            print("Looks like fio.last didn't get installed properly as no gpm files found in '/usr/share/fio.last' or '/usr/local/share/fio.last'\n")
             sys.exit(3)
 
     try:
@@ -484,9 +484,9 @@ def main(argv):
             mode="IO per Seconds (IO/sec)"
     if (title == 'No title') and (mode != 'unknown'):
         if "Bandwidth" in mode:
-            title='Bandwidth benchmark with %d fio results' % len(fio_data_file)
+            title='Bandwidth benchmark with %d fio.last results' % len(fio_data_file)
         if "IO" in mode:
-            title='IO benchmark with %d fio results' % len(fio_data_file)
+            title='IO benchmark with %d fio.last results' % len(fio_data_file)
 
     print()
     #We need to adjust the output filename regarding the pattern required by the user

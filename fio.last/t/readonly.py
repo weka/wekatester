@@ -9,11 +9,11 @@
 # Do some basic tests of the --readonly paramter
 #
 # USAGE
-# python readonly.py [-f fio-executable]
+# python readonly.py [-f fio.last-executable]
 #
 # EXAMPLES
 # python t/readonly.py
-# python t/readonly.py -f ./fio
+# python t/readonly.py -f ./fio.last
 #
 # REQUIREMENTS
 # Python 3.5+
@@ -27,8 +27,8 @@ import subprocess
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--fio',
-                        help='path to fio executable (e.g., ./fio)')
+    parser.add_argument('-f', '--fio.last',
+                        help='path to fio.last executable (e.g., ./fio.last)')
     args = parser.parse_args()
 
     return args
@@ -121,7 +121,7 @@ if __name__ == '__main__':
     if args.fio:
         fio_path = args.fio
     else:
-        fio_path = 'fio'
+        fio_path = 'fio.last'
 
     for test in tests:
         output = run_fio(fio_path, test, index)

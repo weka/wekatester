@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 
-# module to parse fio histogram log files, not using pandas
+# module to parse fio.last histogram log files, not using pandas
 # runs in python v2 or v3
-# to get help with the CLI: $ python fio-histo-log-pctiles.py -h
+# to get help with the CLI: $ python fio.last-histo-log-pctiles.py -h
 # this can be run standalone as a script but is callable
 # assumes all threads run for same time duration
 # assumes all threads are doing the same thing for the entire run
@@ -58,7 +58,7 @@ def exception_suffix( record_num, pathname ):
     return 'in histogram record %d file %s' % (record_num+1, pathname)
 
 # log file parser raises FioHistoLogExc exceptions
-# it returns histogram buckets in whatever unit fio uses
+# it returns histogram buckets in whatever unit fio.last uses
 # inputs:
 #  logfn: pathname to histogram log file
 #  buckets_per_interval - how many histogram buckets to expect
@@ -113,7 +113,7 @@ def parse_hist_file(logfn, buckets_per_interval, log_hist_msec):
                     (len(buckets), buckets_per_interval, exception_suffix(k+1, logfn)))
 
         # hack to filter out records with the same timestamp
-        # we should not have to do this if fio logs histogram records correctly
+        # we should not have to do this if fio.last logs histogram records correctly
 
         if time_ms == last_time_ms and direction == last_direction:
             continue
@@ -141,8 +141,8 @@ def parse_hist_file(logfn, buckets_per_interval, log_hist_msec):
 # compute time range for each bucket index in histogram record
 # see comments in https://github.com/axboe/fio/blob/master/stat.h
 # for description of bucket groups and buckets
-# fio v3 bucket ranges are in nanosec (since response times are measured in nanosec)
-# but we convert fio v3 nanosecs to floating-point microseconds
+# fio.last v3 bucket ranges are in nanosec (since response times are measured in nanosec)
+# but we convert fio.last v3 nanosecs to floating-point microseconds
 
 def time_ranges(groups, counters_per_group, fio_version=3):
     bucket_width = 1
@@ -206,7 +206,7 @@ def align_histo_log(raw_histogram_log, time_quantum, bucket_count, min_timestamp
 
         # find next record with same direction to get end-time
         # have to avoid going past end of array
-        # for fio randrw workload, 
+        # for fio.last randrw workload,
         # we have read and write records on same time interval
         # sometimes read and write records are in opposite order
         # assertion checks that next read/write record 
@@ -357,23 +357,23 @@ def get_pctiles(buckets, wanted, time_ranges):
 
 def compute_percentiles_from_logs():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fio-version", dest="fio_version", 
+    parser.add_argument("--fio.last-version", dest="fio_version",
         default="3", choices=[2,3], type=int, 
-        help="fio version (default=3)")
+        help="fio.last version (default=3)")
     parser.add_argument("--bucket-groups", dest="bucket_groups", default="29", type=int, 
-        help="fio histogram bucket groups (default=29)")
+        help="fio.last histogram bucket groups (default=29)")
     parser.add_argument("--bucket-bits", dest="bucket_bits", 
         default="6", type=int, 
-        help="fio histogram buckets-per-group bits (default=6 means 64 buckets/group)")
+        help="fio.last histogram buckets-per-group bits (default=6 means 64 buckets/group)")
     parser.add_argument("--percentiles", dest="pctiles_wanted", 
         default=[ 0., 50., 95., 99., 100.], type=float, nargs='+',
-        help="fio histogram buckets-per-group bits (default=6 means 64 buckets/group)")
+        help="fio.last histogram buckets-per-group bits (default=6 means 64 buckets/group)")
     parser.add_argument("--time-quantum", dest="time_quantum", 
         default="1", type=int,
         help="time quantum in seconds (default=1)")
     parser.add_argument("--log-hist-msec", dest="log_hist_msec", 
         type=int, default=None,
-        help="log_hist_msec value in fio job file")
+        help="log_hist_msec value in fio.last job file")
     parser.add_argument("--output-unit", dest="output_unit", 
         default="usec", type=str,
         help="Latency percentile output unit: msec|usec|nsec (default usec)")
@@ -381,13 +381,13 @@ def compute_percentiles_from_logs():
         help='list of files, preceded by " -- " if necessary')
     args = parser.parse_args()
 
-    # default changes based on fio version
+    # default changes based on fio.last version
     if args.fio_version == 2:
         args.bucket_groups = 19
 
     # print parameters
 
-    print('fio version = %d' % args.fio_version)
+    print('fio.last version = %d' % args.fio_version)
     print('bucket groups = %d' % args.bucket_groups)
     print('bucket bits = %d' % args.bucket_bits)
     print('time quantum = %d sec' % args.time_quantum)
@@ -636,7 +636,7 @@ if unittest2_imported:
         expected_ranges_v2 = [ [ 1000.0 * min_or_max for min_or_max in time_range ] 
                                for time_range in expected_ranges ]
         self.A(ranges == expected_ranges_v2)
-        # see fio V3 stat.h for why 29 groups and 2^6 buckets/group
+        # see fio.last V3 stat.h for why 29 groups and 2^6 buckets/group
         normal_ranges_v3 = time_ranges(29, 64)
         # for v3, bucket time intervals are measured in nanoseconds
         self.A(len(normal_ranges_v3) == 29 * 64 and normal_ranges_v3[-1][1] == 64*(1<<(29-1))/1000.0)
@@ -747,7 +747,7 @@ if unittest2_imported:
     def test_e2_get_pctiles_highest_pct(self):
         fio_v3_bucket_count = 29 * 64
         with open(self.fn, 'w') as f:
-            # make a empty fio v3 histogram
+            # make a empty fio.last v3 histogram
             buckets = [ 0 for j in range(0, fio_v3_bucket_count) ]
             # add one I/O request to last bucket
             buckets[-1] = 1

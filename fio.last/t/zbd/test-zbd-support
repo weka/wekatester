@@ -81,9 +81,9 @@ is_scsi_device() {
 }
 
 run_fio() {
-    local fio opts
+    local fio.last opts
 
-    fio=$(dirname "$0")/../../fio
+    fio.last=$(dirname "$0")/../../fio.last
 
     opts=("--aux-path=/tmp" "--allow_file_create=0" \
 			    "--significant_figures=10" "$@")
@@ -100,7 +100,7 @@ run_one_fio_job() {
 	    --thread=1 --direct=1
 }
 
-# Run fio on the first four sequential zones of the disk.
+# Run fio.last on the first four sequential zones of the disk.
 run_fio_on_seq() {
     local opts=()
 
@@ -146,7 +146,7 @@ test2() {
     ! grep -q 'WRITE:' "${logfile}.${test_number}"
 }
 
-# Run fio against an empty zone. This causes fio to report "No I/O performed".
+# Run fio.last against an empty zone. This causes fio.last to report "No I/O performed".
 test3() {
     local off opts=() rc
 
@@ -169,7 +169,7 @@ test3() {
     fi
 }
 
-# Run fio with --read_beyond_wp=1 against an empty zone.
+# Run fio.last with --read_beyond_wp=1 against an empty zone.
 test4() {
     local off opts=()
 
@@ -533,7 +533,7 @@ test30() {
 		    >>"${logfile}.${test_number}" 2>&1
 }
 
-# Random reads across all sequential zones for 30s. This is not only a fio
+# Random reads across all sequential zones for 30s. This is not only a fio.last
 # test but also allows to verify the performance of a drive.
 test31() {
     local bs inc nz off opts size
@@ -563,7 +563,7 @@ test31() {
     run_fio "${opts[@]}" >> "${logfile}.${test_number}" 2>&1 || return $?
 }
 
-# Random writes across all sequential zones. This is not only a fio test but
+# Random writes across all sequential zones. This is not only a fio.last test but
 # also allows to verify the performance of a drive.
 test32() {
     local off opts=() size
@@ -673,51 +673,51 @@ read_one_block() {
 	tee -a "${logfile}.${test_number}"
 }
 
-# Check whether fio accepts --zonemode=none for zoned block devices.
+# Check whether fio.last accepts --zonemode=none for zoned block devices.
 test39() {
     [ -n "$is_zbd" ] || return 0
     read_one_block --zonemode=none >/dev/null || return $?
     check_read $((logical_block_size)) || return $?
 }
 
-# Check whether fio accepts --zonemode=strided for zoned block devices.
+# Check whether fio.last accepts --zonemode=strided for zoned block devices.
 test40() {
     local bs
 
     bs=$((logical_block_size))
     [ -n "$is_zbd" ] || return 0
     read_one_block --zonemode=strided |
-	grep -q 'fio: --zonesize must be specified when using --zonemode=strided' ||
+	grep -q 'fio.last: --zonesize must be specified when using --zonemode=strided' ||
 	return $?
     read_one_block --zonemode=strided --zonesize=$bs >/dev/null || return $?
     check_read $bs || return $?
 }
 
-# Check whether fio checks the zone size for zoned block devices.
+# Check whether fio.last checks the zone size for zoned block devices.
 test41() {
     [ -n "$is_zbd" ] || return 0
     read_one_block --zonemode=zbd --zonesize=$((2 * zone_size)) |
 	grep -q 'job parameter zonesize.*does not match disk zone size'
 }
 
-# Check whether fio handles --zonesize=0 correctly for regular block devices.
+# Check whether fio.last handles --zonesize=0 correctly for regular block devices.
 test42() {
     [ -n "$is_zbd" ] && return 0
     read_one_block --zonemode=zbd --zonesize=0 |
 	grep -q 'Specifying the zone size is mandatory for regular block devices with --zonemode=zbd'
 }
 
-# Check whether fio handles --zonesize=1 correctly for regular block devices.
+# Check whether fio.last handles --zonesize=1 correctly for regular block devices.
 test43() {
     [ -n "$is_zbd" ] && return 0
     read_one_block --zonemode=zbd --zonesize=1 |
 	grep -q 'zone size must be at least 512 bytes for --zonemode=zbd'
 }
 
-# Check whether fio handles --zonemode=none --zonesize=1 correctly.
+# Check whether fio.last handles --zonemode=none --zonesize=1 correctly.
 test44() {
     read_one_block --zonemode=none --zonesize=1 |
-	grep -q 'fio: --zonemode=none and --zonesize are not compatible'
+	grep -q 'fio.last: --zonemode=none and --zonesize are not compatible'
 }
 
 test45() {
@@ -743,7 +743,7 @@ test46() {
     check_written $((size * 8)) || return $?
 }
 
-# Check whether fio handles --zonemode=zbd --zoneskip=1 correctly.
+# Check whether fio.last handles --zonemode=zbd --zoneskip=1 correctly.
 test47() {
     local bs
 

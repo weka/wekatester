@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# fio documentation build configuration file, created by
+# fio.last documentation build configuration file, created by
 # sphinx-quickstart on Mon Nov 14 13:56:30 2016.
 #
 # This file is execfile()d with the current directory set to its
@@ -51,7 +51,7 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = 'fio'
+project = 'fio.last'
 copyright = '2017, Jens Axboe <axboe@kernel.dk>'
 author = 'Jens Axboe <axboe@kernel.dk>'
 
@@ -157,7 +157,7 @@ html_theme = 'alabaster'
 # The name for this set of Sphinx documents.
 # "<project> v<release> documentation" by default.
 #
-# html_title = 'fio v1'
+# html_title = 'fio.last v1'
 
 # A shorter title for the navigation bar.  Default is the same as html_title.
 #
@@ -283,7 +283,7 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, 'fio.tex', 'fio Documentation',
+    (master_doc, 'fio.last.tex', 'fio.last Documentation',
      'a', 'manual'),
 ]
 
@@ -325,7 +325,7 @@ latex_documents = [
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    ('fio_man', 'fio', 'flexible I/O tester',
+    ('fio_man', 'fio.last', 'flexible I/O tester',
      [author], 1)
 ]
 
@@ -340,8 +340,8 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    (master_doc, 'fio', 'fio Documentation',
-     author, 'fio', 'One line description of project.',
+    (master_doc, 'fio.last', 'fio.last Documentation',
+     author, 'fio.last', 'One line description of project.',
      'Miscellaneous'),
 ]
 

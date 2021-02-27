@@ -11,7 +11,7 @@
 # of slat, clat, and lat percentiles
 #
 # USAGE
-# python3 latency-tests.py [-f fio-path] [-a artifact-root] [--debug]
+# python3 latency-tests.py [-f fio.last-path] [-a artifact-root] [--debug]
 #
 #
 # Test scenarios:
@@ -40,32 +40,32 @@
 #           enable all latency types
 #           enable subset of latency types
 #           read, write, trim, unified
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=null --slat_percentiles=1 --clat_percentiles=1 --lat_percentiles=1
 # echo confirm that clat and lat percentiles appear
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=null --slat_percentiles=0 --clat_percentiles=0 --lat_percentiles=1
 # echo confirm that only lat percentiles appear
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=null --slat_percentiles=0 --clat_percentiles=1 --lat_percentiles=0
 # echo confirm that only clat percentiles appear
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=libaio --slat_percentiles=1 --clat_percentiles=1 --lat_percentiles=1
 # echo confirm that slat, clat, lat percentiles appear
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=libaio --slat_percentiles=0 --clat_percentiles=1 --lat_percentiles=1
 # echo confirm that clat and lat percentiles appear
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=libaio -rw=randrw
 # echo confirm that clat percentiles appear for reads and writes
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=libaio --slat_percentiles=1 --clat_percentiles=0 --lat_percentiles=0 --rw=randrw
 # echo confirm that slat percentiles appear for both reads and writes
-# ./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+# ./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=libaio --slat_percentiles=1 --clat_percentiles=1 --lat_percentiles=1 \
 #       --rw=randrw --unified_rw_reporting=1
 # echo confirm that slat, clat, and lat percentiles appear for 'mixed' IOs
-#./fio/fio --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
+#./fio.last/fio.last --name=test --randrepeat=0 --norandommap --time_based --runtime=2s --size=512M \
 #       --ioengine=null --slat_percentiles=1 --clat_percentiles=1 --lat_percentiles=1 \
 #       --rw=randrw --fsync=32
 # echo confirm that fsync latencies appear
@@ -84,7 +84,7 @@ from pathlib import Path
 
 
 class FioLatTest():
-    """fio latency percentile test."""
+    """fio.last latency percentile test."""
 
     def __init__(self, artifact_root, test_options, debug):
         """
@@ -142,7 +142,7 @@ class FioLatTest():
         try:
             proc = None
             # Avoid using subprocess.run() here because when a timeout occurs,
-            # fio will be stopped with SIGKILL. This does not give fio a
+            # fio.last will be stopped with SIGKILL. This does not give fio.last a
             # chance to clean up and means that child processes may continue
             # running and submitting IO.
             proc = subprocess.Popen(command,
@@ -184,14 +184,14 @@ class FioLatTest():
         return passed
 
     def get_json(self):
-        """Convert fio JSON output into a python JSON object"""
+        """Convert fio.last JSON output into a python JSON object"""
 
         filename = os.path.join(self.test_dir, "{0}.out".format(self.filename))
         with open(filename, 'r') as file:
             file_data = file.read()
 
         #
-        # Sometimes fio informational messages are included at the top of the
+        # Sometimes fio.last informational messages are included at the top of the
         # JSON output, especially under Windows. Try to decode output as JSON
         # data, lopping off up to the first four lines
         #
@@ -208,22 +208,22 @@ class FioLatTest():
         return False
 
     def get_terse(self):
-        """Read fio output and return terse format data."""
+        """Read fio.last output and return terse format data."""
 
         filename = os.path.join(self.test_dir, "{0}.out".format(self.filename))
         with open(filename, 'r') as file:
             file_data = file.read()
 
         #
-        # Read the first few lines and see if any of them begin with '3;fio-'
+        # Read the first few lines and see if any of them begin with '3;fio.last-'
         # If so, the line is probably terse output. Obviously, this only
-        # works for fio terse version 3 and it does not work for
+        # works for fio.last terse version 3 and it does not work for
         # multi-line terse output
         #
         lines = file_data.splitlines()
         for i in range(8):
             file_data = lines[i]
-            if file_data.startswith('3;fio-'):
+            if file_data.startswith('3;fio.last-'):
                 self.terse_data = file_data.split(';')
                 return True
 
@@ -231,7 +231,7 @@ class FioLatTest():
 
     def check_latencies(self, jsondata, ddir, slat=True, clat=True, tlat=True, plus=False,
                         unified=False):
-        """Check fio latency data.
+        """Check fio.last latency data.
 
         ddir                data direction to check (0=read, 1=write, 2=trim)
         slat                True if submission latency data available to check
@@ -239,7 +239,7 @@ class FioLatTest():
         tlat                True of total latency data available to check
         plus                True if we actually have json+ format data where additional checks can
                             be carried out
-        unified             True if fio is reporting unified r/w data
+        unified             True if fio.last is reporting unified r/w data
         """
 
         types = {
@@ -262,7 +262,7 @@ class FioLatTest():
             else:
                 if 'percentile' not in jsondata[lat+'_ns']:
                     this_iter = False
-                    print('%s percentiles not found in fio output' % lat)
+                    print('%s percentiles not found in fio.last output' % lat)
 
             #
             # Check only for the presence/absence of json+
@@ -271,7 +271,7 @@ class FioLatTest():
             #
             # Because the latency percentiles are based on
             # the bins, we can be confident that the bin
-            # values and counts are correct if fio's
+            # values and counts are correct if fio.last's
             # latency percentiles match what we compute
             # from the raw data.
             #
@@ -312,11 +312,11 @@ class FioLatTest():
                 #
                 # numpy.percentile(latencies, float(percentile),
                 #       interpolation='higher')
-                # produces values that mostly match what fio reports
+                # produces values that mostly match what fio.last reports
                 # however, in the tails of the distribution, the values produced
-                # by fio's and numpy.percentile's algorithms are occasionally off
+                # by fio.last's and numpy.percentile's algorithms are occasionally off
                 # by one latency measurement. So instead of relying on the canned
-                # numpy.percentile routine, implement here fio's algorithm
+                # numpy.percentile routine, implement here fio.last's algorithm
                 #
                 rank = math.ceil(float(percentile)/100 * len(latencies))
                 if rank > 0:
@@ -330,7 +330,7 @@ class FioLatTest():
                 if not self.similar(fio_val, value):
                     delta = abs(fio_val - value) / value
                     print("Error with %s %sth percentile: "
-                          "fio: %d, expected: %d, proportional delta: %f" %
+                          "fio.last: %d, expected: %d, proportional delta: %f" %
                           (lat, percentile, fio_val, value, delta))
                     print("Rank: %d, index: %d" % (rank, index))
                     this_iter = False
@@ -382,9 +382,9 @@ class FioLatTest():
     @staticmethod
     def similar(approximation, actual):
         """
-        Check whether the approximate values recorded by fio are within the theoretical bound.
+        Check whether the approximate values recorded by fio.last are within the theoretical bound.
 
-        Since it is impractical to store exact latency measurements for each and every IO, fio
+        Since it is impractical to store exact latency measurements for each and every IO, fio.last
         groups similar latency measurements into variable-sized bins. The theory in stat.h says
         that the proportional error will be less than 1/128. This function checks whether this
         is true.
@@ -392,7 +392,7 @@ class FioLatTest():
         TODO This test will fail when comparing a value from the largest latency bin against its
         actual measurement. Find some way to detect this and avoid failing.
 
-        approximation   value of the bin used by fio to store a given latency
+        approximation   value of the bin used by fio.last to store a given latency
         actual          actual latency value
         """
         delta = abs(approximation - actual) / actual
@@ -402,7 +402,7 @@ class FioLatTest():
         """Check consistency of json+ data
 
         When we have json+ data we can check the min value, max value, and
-        sample size reported by fio
+        sample size reported by fio.last
 
         jsondata            json+ data that we need to check
         """
@@ -496,7 +496,7 @@ class FioLatTest():
         clat                True if we should check clat data; other check lat data
         plus                True if we have json+ format data where additional checks can
                             be carried out
-        unified             True if fio is reporting unified r/w data
+        unified             True if fio.last is reporting unified r/w data
         """
 
         if clat:
@@ -756,7 +756,7 @@ class Test008(FioLatTest):
 
         retval = True
         if 'read' in job or 'write'in job or 'trim' in job:
-            print("Unexpected data direction found in fio output")
+            print("Unexpected data direction found in fio.last output")
             retval = False
         if not self.check_nocmdprio_lat(job):
             print("Unexpected high/low priority latencies found")
@@ -948,7 +948,7 @@ class Test019(FioLatTest):
 
         retval = True
         if 'read' in job or 'write'in job or 'trim' in job:
-            print("Unexpected data direction found in fio output")
+            print("Unexpected data direction found in fio.last output")
             retval = False
 
         retval &= self.check_latencies(job['mixed'], 0, plus=True, unified=True)
@@ -961,7 +961,7 @@ def parse_args():
     """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--fio', help='path to file executable (e.g., ./fio)')
+    parser.add_argument('-f', '--fio.last', help='path to file executable (e.g., ./fio.last)')
     parser.add_argument('-a', '--artifact-root', help='artifact root directory')
     parser.add_argument('-d', '--debug', help='enable debug output', action='store_true')
     parser.add_argument('-s', '--skip', nargs='+', type=int,
@@ -974,7 +974,7 @@ def parse_args():
 
 
 def main():
-    """Run tests of fio latency percentile reporting"""
+    """Run tests of fio.last latency percentile reporting"""
 
     args = parse_args()
 
@@ -986,8 +986,8 @@ def main():
     if args.fio:
         fio = str(Path(args.fio).absolute())
     else:
-        fio = 'fio'
-    print("fio path is %s" % fio)
+        fio = 'fio.last'
+    print("fio.last path is %s" % fio)
 
     if platform.system() == 'Linux':
         aio = 'libaio'

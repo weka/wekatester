@@ -2,13 +2,13 @@
 #
 # sgunmap-test.py
 #
-# Basic performance testing using fio's sg ioengine
+# Basic performance testing using fio.last's sg ioengine
 #
 # USAGE
-# sgunmap-perf.py char-device block-device fio-executable
+# sgunmap-perf.py char-device block-device fio.last-executable
 #
 # EXAMPLE
-# t/sgunmap-perf.py /dev/sg1 /dev/sdb ./fio
+# t/sgunmap-perf.py /dev/sg1 /dev/sdb ./fio.last
 #
 # REQUIREMENTS
 # Python 2.6+
@@ -31,9 +31,9 @@ def parse_args():
     parser.add_argument('bdev',
                         help='block device target (e.g., /dev/sda)')
     parser.add_argument('fioc',
-                        help='path to candidate fio executable (e.g., ./fio)')
+                        help='path to candidate fio.last executable (e.g., ./fio.last)')
     parser.add_argument('fior',
-                        help='path to reference fio executable (e.g., ./fio)')
+                        help='path to reference fio.last executable (e.g., ./fio.last)')
     args = parser.parse_args()
 
     return args
@@ -91,25 +91,25 @@ if __name__ == '__main__':
     fulldevice(args.fior, args.cdev, ioengine='sg')
 
     print("Running rand read tests on {0}"
-        " with fio candidate build {1}".format(args.cdev, args.fioc))
+        " with fio.last candidate build {1}".format(args.cdev, args.fioc))
     randread, rrmean = runtests(args.fioc, args.cdev, 16, 1, 'randread',
         trials=5)
     print("IOPS mean {0}, trials {1}".format(rrmean, randread))
 
     print("Running rand read tests on {0}"
-        " with fio reference build {1}".format(args.cdev, args.fior))
+        " with fio.last reference build {1}".format(args.cdev, args.fior))
     randread, rrmean = runtests(args.fior, args.cdev, 16, 1, 'randread',
         trials=5)
     print("IOPS mean {0}, trials {1}".format(rrmean, randread))
 
     print("Running rand write tests on {0}"
-        " with fio candidate build {1}".format(args.cdev, args.fioc))
+        " with fio.last candidate build {1}".format(args.cdev, args.fioc))
     randwrite, rwmean = runtests(args.fioc, args.cdev, 16, 1, 'randwrite',
         trials=5)
     print("IOPS mean {0}, trials {1}".format(rwmean, randwrite))
 
     print("Running rand write tests on {0}"
-        " with fio reference build {1}".format(args.cdev, args.fior))
+        " with fio.last reference build {1}".format(args.cdev, args.fior))
     randwrite, rwmean = runtests(args.fior, args.cdev, 16, 1, 'randwrite',
         trials=5)
     print("IOPS mean {0}, trials {1}".format(rwmean, randwrite))

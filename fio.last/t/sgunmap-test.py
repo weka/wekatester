@@ -3,7 +3,7 @@
 #
 # sgunmap-test.py
 #
-# Limited functonality test for trim workloads using fio's sg ioengine
+# Limited functonality test for trim workloads using fio.last's sg ioengine
 # This checks only the three sets of reported iodepths
 #
 # !!!WARNING!!!
@@ -11,10 +11,10 @@
 # there is no data you want to keep on the supplied devices.
 #
 # USAGE
-# sgunmap-test.py char-device block-device fio-executable
+# sgunmap-test.py char-device block-device fio.last-executable
 #
 # EXAMPLE
-# t/sgunmap-test.py /dev/sg1 /dev/sdb ./fio
+# t/sgunmap-test.py /dev/sg1 /dev/sdb ./fio.last
 #
 # REQUIREMENTS
 # Python 2.6+
@@ -53,8 +53,8 @@ def parse_args():
                         help='character device target (e.g., /dev/sg0)')
     parser.add_argument('blockdev',
                         help='block device target (e.g., /dev/sda)')
-    parser.add_argument('fio',
-                        help='path to fio executable (e.g., ./fio)')
+    parser.add_argument('fio.last',
+                        help='path to fio.last executable (e.g., ./fio.last)')
     args = parser.parse_args()
 
     return args

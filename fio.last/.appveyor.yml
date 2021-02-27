@@ -24,8 +24,8 @@ after_build:
   - cd os\windows && dobuild.cmd %PLATFORM%
 
 test_script:
-  - 'bash.exe -lc "cd \"${APPVEYOR_BUILD_FOLDER}\" && file.exe fio.exe && make.exe test'
-  - 'bash.exe -lc "cd \"${APPVEYOR_BUILD_FOLDER}\" && python.exe t/run-fio-tests.py --debug'
+  - 'bash.exe -lc "cd \"${APPVEYOR_BUILD_FOLDER}\" && file.exe fio.last.exe && make.exe test'
+  - 'bash.exe -lc "cd \"${APPVEYOR_BUILD_FOLDER}\" && python.exe t/run-fio.last-tests.py --debug'
 
 artifacts:
   - path: os\windows\*.msi
