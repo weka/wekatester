@@ -56,7 +56,7 @@ class WorkerServer:
         self.ssh = None
         self.ssh_config = sshconfig
 
-    @threaded
+    #@threaded
     def open(self):
         self.ssh = SSHClient()
         self.config = self.ssh_config.lookup(self.hostname)
@@ -99,7 +99,7 @@ class WorkerServer:
                 output[line_split[0].strip()] = line_split[1].strip()
         return output
 
-    @threaded
+    #@threaded
     def gather_facts(self):
         """ build a dict from the output of lscpu """
         self.cpu_info = dict()
@@ -111,8 +111,35 @@ class WorkerServer:
         self.run("cat /etc/os-release")
         self.os_info = self._linux_to_dict('=')
 
+    def file_exists(self, path):
+        """ see if a file exists on another server """
+        self.run(f"if [ -f '{path}' ]; then echo 'True'; else echo 'False'; fi")
+        if self.last_output['response'][:-1] == "True":
+            return True
+        else:
+            return False
+
+    def last_response(self):
+        return self.last_output['response'][:-1]
+
+    @threaded
+    def threaded_run(self, cmd):
+        self.run(cmd)
 
 
+@threaded
+def threaded_method(instance, method, *args, **kwargs):
+    """ makes ANY method of ANY class threaded """
+    method(instance, *args, **kwargs)
+
+def parallel(servers, method, *args, **kwargs):
+    for server in servers:
+        threaded_method(server, method, *args, **kwargs)
+    default_threader.run()
+
+
+def pdsh(servers, command):
+    parallel(servers, WorkerServer.run, command)
 
 # print( something without a newline )
 announce_lock = Lock()
@@ -314,17 +341,13 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # open ssh sessions to the servers
-    for server in workers:
-        server.open()
+    parallel(workers, WorkerServer.open)
 
-    default_threader.run()  # open runs in parallel
     print()
 
     # gather some info about the servers
-    for server in workers:
-        server.gather_facts()
+    parallel(workers, WorkerServer.gather_facts)
 
-    default_threader.run()  # gather_facts runs in parallel
 
     # Display some info about the workers
     arch_list = list()
@@ -346,6 +369,15 @@ if __name__ == '__main__':
                 " of capacity and " + format_units_bytes(weka_status["capacity"]["unprovisioned_bytes"]) +
                 " of unprovisioned capacity")
 
+    # for server in workers:
+    #     server.file_exists("/tmp/fio")
+    pdsh(workers, 'date')
+    for server in workers:
+        print(f"{server.hostname}: {server.last_response()}")
+
+    parallel(workers, WorkerServer.file_exists, "/tmp/fio")
+    for server in workers:
+        print(f"{server.hostname}: {server.last_response()}")
 
     # vin - left off here
     sys.exit(1)
