@@ -66,7 +66,7 @@ class WorkerServer:
             self.last_output = {'status': -123,
                                 'description': 'Failed to run command',
                                 'traceback': str(exc)}
-        log.debug(f"output is: {self.last_output}")
+        # log.debug(f"output is: {self.last_output}") # makes logger puke
 
     def _linux_to_dict(self, separator):
         output = dict()

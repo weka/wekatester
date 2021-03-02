@@ -99,6 +99,7 @@ class FioJobfile:
             self.jobfile.set('global', item, value)
 
     def write(self, filename):
+        log.debug(f"writing jobfile {filename}")
         with open(filename, 'w') as f:
             self.jobfile.write(f, space_around_delimiters=False)
 
@@ -140,7 +141,7 @@ class FioResult:
         iops = dict()
         latency = dict()
 
-        log.debug(f"{self.summary}")
+        # log.debug(f"{self.summary}") - makes logger puke - too long
 
         bw["read"] = self.summary["read"]["bw_bytes"]
         bw["write"] = self.summary["write"]["bw_bytes"]
@@ -170,6 +171,12 @@ class FioResult:
                 _log_perf("average", "latency", latency["read"] + latency["write"] / 2)
 
         log.info("")
+
+    def dumps(self):
+        return json.dumps(self.fio_output, indent=2)
+
+
+
 
 
 # some debugging functions - show structure of a dict (useful for fio json output)

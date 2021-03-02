@@ -41,7 +41,10 @@ def configure_logging(logger, verbosity):
 
     # create handler to log to console
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    if loglevel == logging.INFO:
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        console_handler.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
     logger.addHandler(console_handler)
 
     # create handler to log to syslog
@@ -73,20 +76,20 @@ if __name__ == '__main__':
     # parse arguments
     progname = sys.argv[0]
     parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
-    parser.add_argument('servers', metavar='servername', type=str, nargs='+',
-                        help='Weka clusterspec of Server Dataplane IPs to execute on')
+    parser.add_argument("-v", "--verbosity", action="count", default=0, help="increase output verbosity")
     parser.add_argument("-c", "--clients", dest='use_clients_flag', action='store_true',
                         help="run fio on weka clients")
     parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true',
                         help="run fio on weka servers")
-    parser.add_argument("-v", "--verbosity", action="count", default=0, help="increase output verbosity")
-    parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
     parser.add_argument("-d", "--directory", dest='directory', default="/mnt/weka",
                         help="target directory for workload")
     parser.add_argument("-w", "--workload", dest='workload', default="default",
                         help="workload definition directory (a subdir of fio-jobfiles)")
+    parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
     parser.add_argument("-a", "--autotune", dest='autotune', action='store_true',
                         help="automatically tune num_jobs to maximize performance (experimental)")
+    parser.add_argument('servers', metavar='servername', type=str, nargs='+',
+                        help='Weka clusterspec of Server Dataplane IPs to execute on')
 
     args = parser.parse_args()
 
@@ -264,10 +267,12 @@ if __name__ == '__main__':
         pass
 
     # copy jobfiles to /tmp, and edit them
+    server_count = 0
     for num_cores, serverlist in sorted_workers.items():
         with open(f'/tmp/fio-jobfiles/{num_cores}', "w") as f:
             for server in serverlist:
                 f.write(str(server) + "\n")
+                server_count += 1
         for job in jobs:
             if args.autotune:
                 job.override('numjobs', str(num_cores * 2), nolower=True)
@@ -287,12 +292,12 @@ if __name__ == '__main__':
         for num_cores, serverlist in sorted_workers.items():
             cmdline += \
                 f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "
-        log.info(f"starting test run for job {jobname} on {master_server.hostname}:")
+        log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
         logging.debug(f"running on {master_server.hostname}: {cmdline}")
         master_server.run(cmdline)
         # fio_output[jobname] = master_server.last_response()
 
-        logging.debug(master_server.last_response())
+        # logging.debug(master_server.last_response()) # makes logger puke - message too long
         fio_results[jobname] = FioResult(job, master_server.last_response())
         fio_results[jobname].summarize()
 
@@ -303,7 +308,16 @@ if __name__ == '__main__':
 
     # output log file
     if args.use_output_flag:
+        output_dict = dict()
         timestring = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        for name, result in fio_results.items():
+            output_dict[name] = result.fio_output
+
         with open(f"results_{timestring}.json", "a+") as fp:  # Vin - add date/time to file name
-            fp.write(json.dumps(fio_results, indent=4, sort_keys=True))
-            fp.write("\n")
+            json.dump(output_dict, fp, indent=2)
+
+        #     if len(fio_results) > 1:
+        #         fp.write('[\n')
+        #     for result in fio_results:
+        #         fp.write(result.dumps())
+        #         fp.write("\n")
