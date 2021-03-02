@@ -88,8 +88,8 @@ if __name__ == '__main__':
     parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
     parser.add_argument("-a", "--autotune", dest='autotune', action='store_true',
                         help="automatically tune num_jobs to maximize performance (experimental)")
-    parser.add_argument('servers', metavar='servername', type=str, nargs='+',
-                        help='Weka clusterspec of Server Dataplane IPs to execute on')
+    parser.add_argument('servers', metavar='servername', type=str, nargs='*', default=['localhost'],
+                        help='Weka clusterspec or Server Dataplane IPs to execute on')
 
     args = parser.parse_args()
 
@@ -123,20 +123,20 @@ if __name__ == '__main__':
 
         try:
             # try to create a weka cluster object.  If this fails, assume it's just a single server
-            logging.info("Probing for a weka cluster...")
+            log.info("Probing for a weka cluster...")
             wekacluster = WekaCluster(clusterspec, authfile=auth)
-            logging.info("Found Weka cluster " + wekacluster.name)
+            log.info("Found Weka cluster " + wekacluster.name)
 
             weka_status = wekacluster.call_api(method="status", parms={})
 
             if weka_status["io_status"] != "STARTED":
-                logging.critical("Weka Cluster is not healthy - not started.")
+                log.critical("Weka Cluster is not healthy - not started.")
                 sys.exit()
             if not weka_status["is_cluster"]:
-                logging.critical("Weka Cluster is not healthy - cluster not formed?")
+                log.critical("Weka Cluster is not healthy - cluster not formed?")
                 sys.exit()
 
-            logging.info("Cluster is v" + wekacluster.release)
+            log.info("Cluster is v" + wekacluster.release)
 
             # Take some notes
             drivecount = weka_status["drives"]["active"]
@@ -146,10 +146,12 @@ if __name__ == '__main__':
             wekaver = weka_status["release"]
 
         except:
-            logging.info(f"Unable to communicate via API with {clusterspec}. Assuming it's not a weka cluster...")
-            workers.append(WorkerServer(clusterspec, sshconfig))
+            log.info(f"Unable to communicate via API with {clusterspec}. Assuming it's not a weka cluster...")
+            workers.append(WorkerServer(args.servers[0], sshconfig))
         else:
+            workers = list()    # re-init workers so we don't duplicate a host
             if args.use_servers_flag:
+                log.debug(f"workers={workers}, weka hosts: {wekacluster.hosts.list}")
                 for wekahost in wekacluster.hosts.list:  # rats - not a list - a curicular_list :(
                     workers.append(WorkerServer(wekahost.name, sshconfig))
             if args.use_clients_flag:
@@ -159,7 +161,7 @@ if __name__ == '__main__':
         weka = True
     else:
         # it's a list of hosts...
-        logging.info("Non-Weka Mode selected.  Contacting servers...")
+        log.info("Non-Weka Mode selected.  Contacting servers...")
         for host in args.servers:
             workers.append(WorkerServer(host, sshconfig))
 
@@ -167,7 +169,7 @@ if __name__ == '__main__':
 
     # workers should be a list of servers we can ssh to
     if len(workers) == 0:
-        logging.critical("No servers to work with?")
+        log.critical("No servers to work with?")
         sys.exit(1)
 
     # open ssh sessions to the servers
@@ -176,14 +178,14 @@ if __name__ == '__main__':
     # print()
 
     # gather some info about the servers
-    logging.info("Gathering Facts on servers")
+    log.info("Gathering Facts on servers")
     parallel(workers, WorkerServer.gather_facts, weka)
 
     if weka:
         abort = False
         for server in workers:
             if not server.weka_mounted:
-                logging.critical(f"Error: server {server.hostname} does not have a weka filesystem mounted!")
+                log.critical(f"Error: server {server.hostname} does not have a weka filesystem mounted!")
                 abort = True
         if abort:
             sys.exit(1)
@@ -201,7 +203,7 @@ if __name__ == '__main__':
             archcount[arch_list.index(server.cpu_info)] += 1
         server_os = server.os_info['PRETTY_NAME'].strip('\n')
 
-        logging.debug(f"{server.hostname} is running {server_os}")
+        log.debug(f"{server.hostname} is running {server_os}")
         if server_os not in oslist:
             oslist[server_os] = [server.hostname]
         else:
@@ -214,27 +216,27 @@ if __name__ == '__main__':
         sorted_workers[workingcores].append(server)
 
     for server_os, _servers in oslist.items():
-        logging.info(f"Servers running {server_os}: {' '.join(servername for servername in _servers)}")
+        log.info(f"Servers running {server_os}: {' '.join(servername for servername in _servers)}")
 
     for index in range(0, len(arch_list)):
-        logging.info(
+        log.info(
             f"{archcount[index]} workers with {arch_list[index]['Model name']} cpus, {arch_list[index]['CPU(s)']} cores")
 
     if weka:
-        logging.info("This cluster has " + format_units_bytes(weka_status["capacity"]["total_bytes"]) +
+        log.info("This cluster has " + format_units_bytes(weka_status["capacity"]["total_bytes"]) +
                      " of capacity and " + format_units_bytes(weka_status["capacity"]["unprovisioned_bytes"]) +
                      " of unprovisioned capacity")
 
-    logging.info("checking if fio is present on the workers...")
+    log.info("checking if fio is present on the workers...")
     parallel(workers, WorkerServer.file_exists, "/tmp/fio")
     needs_fio = list()
     for server in workers:
-        logging.debug(f"{server.hostname}: {server.last_response()}")
+        log.debug(f"{server.hostname}: {server.last_response()}")
         if server.last_response() == 'False':
             needs_fio.append(server)
 
     if len(needs_fio) > 0:
-        logging.info("Copying fio to any servers that need it...")
+        log.info("Copying fio to any servers that need it...")
         pscp(needs_fio, os.path.dirname(progname) + '/fio', '/tmp/fio')
 
         # print()
@@ -243,13 +245,13 @@ if __name__ == '__main__':
     need_to_exit = False
     for server in workers:
         if server.last_response() != "True":
-            logging.error(f"{server.hostname}: fio copy did not complete; is present: {server.last_response()}")
+            log.error(f"{server.hostname}: fio copy did not complete; is present: {server.last_response()}")
             server.close()
             need_to_exit = True
     if need_to_exit:
         sys.exit(1)
 
-    logging.info("starting fio servers")
+    log.info("starting fio servers")
     start_fio_servers(workers)
 
     # get a list of script files
@@ -286,18 +288,18 @@ if __name__ == '__main__':
     fio_results = dict()
     for job in jobs:
         jobname = os.path.basename(job.filename)
-        logging.debug(job.reportitem)
+        log.debug(job.reportitem)
         # cmdline = f"{os.path.dirname(progname)}/fio --output-format=json "  # if running locally
         cmdline = "/tmp/fio --output-format=json "  # if running remotely
         for num_cores, serverlist in sorted_workers.items():
             cmdline += \
                 f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "
         log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
-        logging.debug(f"running on {master_server.hostname}: {cmdline}")
+        log.debug(f"running on {master_server.hostname}: {cmdline}")
         master_server.run(cmdline)
         # fio_output[jobname] = master_server.last_response()
 
-        # logging.debug(master_server.last_response()) # makes logger puke - message too long
+        # log.debug(master_server.last_response()) # makes logger puke - message too long
         fio_results[jobname] = FioResult(job, master_server.last_response())
         fio_results[jobname].summarize()
 

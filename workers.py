@@ -36,6 +36,11 @@ class WorkerServer:
         self.config = self.ssh_config.lookup(self.hostname)
         self.ssh.set_missing_host_key_policy(AutoAddPolicy())
 
+        if "user" in self.config:
+            user = self.config["user"]
+        else:
+            user = getpass.getuser()
+
         try:
             self.ssh.connect(self.hostname, username=self.config["user"], key_filename=self.config["identityfile"],
                              timeout=10, auth_timeout=10)

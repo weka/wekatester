@@ -108,12 +108,19 @@ class FioJobfile:
 def _log_perf(operation, unit, value):
     if unit == "latency":
         log_formatter = format_units_time
+        per = ""
     elif unit == "iops":
         log_formatter = format_units_iops
+        per = "/s"
     else:
         log_formatter = format_units_bytes
+        per = "/s"
+
+    if operation == "average" and unit != "latency":
+        per += " per host"
+
     if value != 0:
-        log.info(f"    {operation} {unit}: {log_formatter(value)}/s")
+        log.info(f"    {operation} {unit}: {log_formatter(value)}{per}")
 
 
 class FioResult:
