@@ -1,7 +1,7 @@
 # the next line tells to report only iops, bandwidth or latency.
-# report bandwidth 
+# report latency
 [global]
-filesize=20G
+filesize=2G
 time_based=1
 startdelay=5
 exitall_on_error=1
@@ -11,19 +11,18 @@ directory=/mnt/wekatester
 group_reporting=1
 clocksource=gettimeofday
 runtime=30
-ioengine=posixaio
+ioengine=libaio
 disk_util=0
 direct=1
+numjobs=1
 
 [fio-createfiles-00]
 description='pre-create files'
 create_only=1
-numjobs=192
 
-[fio-bandwidthSW-00]
+[fio-latencyR-00]
 stonewall
-description='Sequential Write bandwidth workload'
-blocksize=1Mi
-rw=write
-numjobs=64
+description='Read latency workload'
+bs=4k
+rw=randread
 iodepth=1
