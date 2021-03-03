@@ -183,10 +183,9 @@ if __name__ == '__main__':
         log.critical("No servers to work with?")
         sys.exit(1)
 
-    # open ssh sessions to the servers
+    # open ssh sessions to the servers - should puke if any of the open's fail.
     parallel(workers, WorkerServer.open)
 
-    # print()
 
     # gather some info about the servers
     log.info("Gathering Facts on servers")
@@ -264,8 +263,6 @@ if __name__ == '__main__':
 
     log.info("starting fio servers")
     start_fio_servers(workers)
-    #time.sleep(1)
-    #log.debug(f"{default_threader.num_active()} running")
 
     # get a list of script files
     fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
@@ -305,9 +302,13 @@ if __name__ == '__main__':
         log.debug(job.reportitem)
         # cmdline = f"{os.path.dirname(progname)}/fio --output-format=json "  # if running locally
         cmdline = "/tmp/fio --output-format=json "  # if running remotely
-        for num_cores, serverlist in sorted_workers.items():
+        for server in workers:
             cmdline += \
-                f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "
+                f"--client={str(server)} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
+
+        #for num_cores, serverlist in sorted_workers.items():
+        #    cmdline += \
+        #        f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "   # multiple --client=<file> doesn't work
         log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
         log.debug(f"running on {master_server.hostname}: {cmdline}")
         master_server.run(cmdline)
@@ -331,9 +332,3 @@ if __name__ == '__main__':
 
         with open(f"results_{timestring}.json", "a+") as fp:  # Vin - add date/time to file name
             json.dump(output_dict, fp, indent=2)
-
-        #     if len(fio_results) > 1:
-        #         fp.write('[\n')
-        #     for result in fio_results:
-        #         fp.write(result.dumps())
-        #         fp.write("\n")

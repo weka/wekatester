@@ -66,12 +66,25 @@ class WorkerServer:
             status = stdout.channel.recv_exit_status()
             response = stdout.read().decode("utf-8")
             error = stderr.read().decode("utf-8")
-            log.debug(f"run: stdout {len(response)} bytes, stderr {len(error)} bytes")
-            self.last_output = {'status': status, 'response': response, 'error': error}
+            self.last_output = {'status': status, 'response': response, 'error': error, "exc": None}
+            if status != 0:
+                log.error(f"run: Bad return code: {status}.  Output is:")
+                if len(response) > 0 and len(response) < 5000:
+                    log.debug(f"response is '{response}'")
+                if len(error) > 0 and len(error) < 5000:
+                    log.debug(f"stderr is '{error}'")
+            else:
+                log.debug(f"run: '{cmd}', status {status}, stdout {len(response)} bytes, stderr {len(error)} bytes")
         except Exception as exc:
-            self.last_output = {'status': -123,
-                                'description': 'Failed to run command',
-                                'traceback': str(exc)}
+            log.debug(f"run: '{cmd}', status {status}, stdout {len(response)} bytes, stderr {len(error)} bytes, exception='{exc}'")
+            if len(response) > 0 and len(response) < 5000:
+                log.debug(f"response is '{response}'")
+            if len(error) > 0 and len(error) < 5000:
+                log.debug(f"stderr is '{error}'")
+            self.last_output = {'status': status, 'response': response, 'error': error, "exc": exc}
+            #self.last_output = {'status': -123,
+            #                    'description': 'Failed to run command',
+            #                    'traceback': str(exc)}
         # log.debug(f"output is: {self.last_output}") # makes logger puke
 
     def _linux_to_dict(self, separator):
@@ -154,7 +167,7 @@ def parallel(obj_list, method, *args, **kwargs):
 
 def start_fio_servers(servers):
     for server in servers:
-        threaded_method(server, WorkerServer.run, "/tmp/fio --output-format=json --server")
+        threaded_method(server, WorkerServer.run, "/tmp/fio --server")
     default_threader.starter()
 
 
