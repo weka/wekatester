@@ -14,6 +14,7 @@ from contextlib import contextmanager
 
 from urllib3 import add_stderr_logger
 
+import fio
 from fio import FioJobfile, format_units_bytes, FioResult
 from wekalib.wekacluster import WekaCluster
 
@@ -33,18 +34,26 @@ def pushd(new_dir):
 
 
 def configure_logging(logger, verbosity):
-    loglevel = logging.INFO
-    if verbosity > 0:
-        loglevel = logging.DEBUG
+    loglevel = logging.INFO     # default logging level
 
-    logger.setLevel(loglevel)
+    # default message formats
+    console_format = "%(message)s"
+    syslog_format =  "%(levelname)s:%(message)s"
+
+    syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+
+    if verbosity == 1:
+        loglevel = logging.DEBUG
+        console_format = "%(levelname)s:%(message)s"
+        syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+    elif verbosity > 1:
+        loglevel = logging.DEBUG
+        console_format = "%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+        syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
 
     # create handler to log to console
     console_handler = logging.StreamHandler()
-    if loglevel == logging.INFO:
-        console_handler.setFormatter(logging.Formatter("%(message)s"))
-    else:
-        console_handler.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+    console_handler.setFormatter(logging.Formatter(console_format))
     logger.addHandler(console_handler)
 
     # create handler to log to syslog
@@ -54,12 +63,14 @@ def configure_logging(logger, verbosity):
     else:
         syslogaddr = "/dev/log"
     syslog_handler = logging.handlers.SysLogHandler(syslogaddr)
-    syslog_handler.setFormatter(logging.Formatter(
-        "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"))
+    syslog_handler.setFormatter(logging.Formatter(syslog_format))
 
     # add syslog handler to root logger
     if syslog_handler is not None:
         logger.addHandler(syslog_handler)
+
+    # set default loglevel
+    logger.setLevel(loglevel)
 
     logging.getLogger("wekalib.wekacluster").setLevel(logging.ERROR)
     logging.getLogger("wekalib.wekaapi").setLevel(logging.ERROR)
@@ -253,10 +264,13 @@ if __name__ == '__main__':
 
     log.info("starting fio servers")
     start_fio_servers(workers)
+    #time.sleep(1)
+    #log.debug(f"{default_threader.num_active()} running")
 
     # get a list of script files
     fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
     fio_scripts.sort()
+    log.debug(f"There are {len(fio_scripts)} scripts in the {args.workload} directory")
 
     saved_results = {}  # save the results
     jobs = list()
