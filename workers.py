@@ -1,5 +1,6 @@
 import os
 from logging import getLogger
+import getpass
 
 from paramiko import SSHClient, AutoAddPolicy, SSHConfig
 from scp import SCPClient
@@ -42,7 +43,7 @@ class WorkerServer:
             user = getpass.getuser()
 
         try:
-            self.ssh.connect(self.hostname, username=self.config["user"], key_filename=self.config["identityfile"],
+            self.ssh.connect(self.hostname, username=user, key_filename=self.config["identityfile"],
                              timeout=10, auth_timeout=10)
         except Exception as exc:
             log.critical(f"Exception opening ssh session: {exc}")
