@@ -2,3 +2,4 @@ python.dateutil
 setuptools_rust
 paramiko
 scp
+wekalib
