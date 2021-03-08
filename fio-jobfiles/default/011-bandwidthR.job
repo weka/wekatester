@@ -7,7 +7,7 @@ startdelay=5
 exitall_on_error=1
 create_serialize=0
 filename_format=$filenum/$jobnum
-directory=/mnt/wekatester
+directory=/mnt/weka
 group_reporting=1
 clocksource=gettimeofday
 runtime=30
@@ -17,6 +17,7 @@ direct=1
 numjobs=32
 
 [fio-createfiles-00]
+blocksize=1Mi
 description='pre-create files'
 create_only=1
 
