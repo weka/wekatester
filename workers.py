@@ -33,6 +33,7 @@ class WorkerServer:
         self.ssh_config = sshconfig
 
     def open(self):
+        kwargs = dict()
         self.ssh = SSHClient()
         self.config = self.ssh_config.lookup(self.hostname)
         self.ssh.set_missing_host_key_policy(AutoAddPolicy())
@@ -42,18 +43,23 @@ class WorkerServer:
         else:
             user = getpass.getuser()
 
+        self.ssh.load_system_host_keys()
+        if "identityfile" in self.config:
+            identityfile = self.config["identityfile"]
+        else:
+            identityfile = None
+
         try:
-            self.ssh.connect(self.hostname, username=user, key_filename=self.config["identityfile"],
+            self.ssh.connect(self.hostname, username=user, key_filename=identityfile,
                              timeout=10, auth_timeout=10)
         except Exception as exc:
-            log.critical(f"Exception opening ssh session: {exc}")
-            raise
+            log.critical(f"Exception opening ssh session to {self.hostname}: {exc}")
+            self.ssh = None
 
     def close(self):
         if self.ssh:
+            self.end_unending()     # kills the fio --server process
             self.ssh.close()
-        # if self.scp:
-        #     self.scp.close()
 
     def scp(self, source, dest):
         log.info(f"copying {source} to {self.hostname}")
@@ -62,7 +68,7 @@ class WorkerServer:
 
     def run(self, cmd):
         try:
-            stdin, stdout, stderr = self.ssh.exec_command(cmd)  # , get_pty=True)
+            stdin, stdout, stderr = self.ssh.exec_command(cmd)
             status = stdout.channel.recv_exit_status()
             response = stdout.read().decode("utf-8")
             error = stderr.read().decode("utf-8")
@@ -152,6 +158,23 @@ class WorkerServer:
     def __str__(self):
         return self.hostname
 
+    def run_unending(self, command):
+        """ run a command that never ends - needs to be terminated by ^c or something """
+        transport = self.ssh.get_transport()
+        self.unending_session = transport.open_session()
+        self.unending_session.setblocking(0) # Set to non-blocking mode
+        self.unending_session.get_pty()
+        self.unending_session.invoke_shell()
+        self.unending_session.command = command
+
+        # Send command
+        log.debug(f"starting daemon {self.unending_session.command}")
+        self.unending_session.send(command + '\n')
+
+    def end_unending(self):
+        log.debug(f"terminating daemon {self.unending_session.command}")
+        self.unending_session.send(chr(3)) # send a ^C
+        self.unending_session.close()
 
 @threaded
 def threaded_method(instance, method, *args, **kwargs):
@@ -167,8 +190,9 @@ def parallel(obj_list, method, *args, **kwargs):
 
 def start_fio_servers(servers):
     for server in servers:
-        threaded_method(server, WorkerServer.run, "/tmp/fio --server")
-    default_threader.starter()
+        #threaded_method(server, WorkerServer.run, "sudo /tmp/fio --server")
+        server.run_unending("sudo /tmp/fio --server")
+    #default_threader.starter()
 
 
 def pdsh(servers, command):

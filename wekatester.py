@@ -17,9 +17,12 @@ from urllib3 import add_stderr_logger
 import fio
 from fio import FioJobfile, format_units_bytes, FioResult
 from wekalib.wekacluster import WekaCluster
+from wekalib.signals import signal_handling
 
 # import paramiko
 from workers import WorkerServer, parallel, get_clients, start_fio_servers, pscp, SshConfig
+
+import threading
 
 
 @contextmanager
@@ -77,12 +80,19 @@ def configure_logging(logger, verbosity):
     logging.getLogger("wekalib.sthreads").setLevel(logging.ERROR)
     logging.getLogger("wekalib.circular").setLevel(logging.ERROR)
 
+    # local modules
+    logging.getLogger("workers").setLevel(logging.DEBUG)
+
     # paramiko.util.log_to_file("demo.log")
     add_stderr_logger(level=logging.ERROR)  # for paramiko
     logging.getLogger("paramiko").setLevel(logging.ERROR)
 
+def graceful_exit(workers):
+    for server in workers:
+        server.close()  # terminates fio --server commands
 
-if __name__ == '__main__':
+
+def main():
 
     # parse arguments
     progname = sys.argv[0]
@@ -122,6 +132,9 @@ if __name__ == '__main__':
     # initialize the list of workers
     workers = list()
 
+    # make sure we close all connections and kill all threads upon ^c or something
+    signal_handling(graceful_exit, workers)
+
     # clusterspec is <host>,<host>,..,<host>:auth
     if len(args.servers) == 1:  # either they gave us only one server, or it's a clusterspec
         clusterspeclist = args.servers[0].split(':')
@@ -145,7 +158,7 @@ if __name__ == '__main__':
                 sys.exit()
             if not weka_status["is_cluster"]:
                 log.critical("Weka Cluster is not healthy - cluster not formed?")
-                sys.exit()
+                eys.exit()
 
             log.info("Cluster is v" + wekacluster.release)
 
@@ -319,9 +332,6 @@ if __name__ == '__main__':
         fio_results[jobname].summarize()
 
     time.sleep(1)
-    # vin - left off here
-    for server in workers:
-        server.close()  # terminates fio --server commands
 
     # output log file
     if args.use_output_flag:
@@ -332,3 +342,8 @@ if __name__ == '__main__':
 
         with open(f"results_{timestring}.json", "a+") as fp:  # Vin - add date/time to file name
             json.dump(output_dict, fp, indent=2)
+
+    graceful_exit(workers)
+
+if __name__ == '__main__':
+    main()
