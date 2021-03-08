@@ -36,7 +36,7 @@ The idea of wekatester is to bring some order to this chaos.   To make running f
 # Options
 Clusterspec/Servers - you can list a set of servers (ie: non-weka mode) that will run the workload as workers.   Optionally, you can give a weka 'clusterspec' and it will use the indicated weka cluster.
 
-A Weka Clusterspec is in the form: `<server>,<server>,...,<server>:<authfile>` where <server> is a weka server (ie: weka1,weka2,weka3) and authfile is a ~/weka/auth-token.json file.   An example clusterspec would be "weka1,weka2,weka3" (uses default user/pass), or "weka1,weka2,weka3:~/.weka/auth-token.json" (uses token file from a previous login).
+A Weka Clusterspec is in the form: `<server>,<server>,...,<server>:<authfile>` where <server> is a weka server (ie: weka1,weka2,weka3) and authfile is a `~/weka/auth-token.json` file.   An example clusterspec would be `weka1,weka2,weka` (uses default user/pass), or `weka1,weka2,weka3:~/.weka/auth-token.json` (uses token file from a previous login).
 
 `-c` makes wekatester query the cluster for what clients exist and uses ALL of them as workers
 
