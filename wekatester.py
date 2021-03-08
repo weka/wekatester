@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 
-import json
-import decimal
 import argparse
-import glob
-import os, sys, stat
-import logging
-import subprocess
-import time
-from subprocess import Popen, PIPE, STDOUT
-from shutil import copyfile
-from contextlib import contextmanager
-import threading
-from threading import Lock
 import datetime
+import glob
+import json
+import logging
+import logging.handlers
+import os
+import platform
+import sys
+import time
+from contextlib import contextmanager
+
+from urllib3 import add_stderr_logger
+
+import fio
+from fio import FioJobfile, format_units_bytes, FioResult
+from wekalib.wekacluster import WekaCluster
+from wekalib.signals import signal_handling
+
+# import paramiko
+from workers import WorkerServer, parallel, get_clients, start_fio_servers, pscp, SshConfig
+
+import threading
 
 
-"""A Python context to move in and out of directories"""
 @contextmanager
 def pushd(new_dir):
+    """A Python context to move in and out of directories"""
     previous_dir = os.getcwd()
     os.chdir(new_dir)
     try:
@@ -26,458 +35,316 @@ def pushd(new_dir):
     finally:
         os.chdir(previous_dir)
 
-# print( something without a newline )
-announce_lock = Lock()
-def announce( text ):
-    with announce_lock:
-        sys.stdout.flush()
-        sys.stdout.write(text + " ")
 
-# format a number of bytes in GiB/MiB/KiB 
-def format_units_bytes( bytes ):
-    if bytes > 1024*1024*1024*1024:
-        units = "TiB"
-        value = float( bytes )/1024/1024/1024/1024
-    elif bytes > 1024*1024*1024:
-        units = "GiB"
-        value = float( bytes )/1024/1024/1024
-    elif bytes > 1024*1024:
-        units = "MiB"
-        value = float( bytes )/1024/1024
-    elif bytes > 1024:
-        units = "KiB"
-        value = float( bytes )/1024
+def configure_logging(logger, verbosity):
+    loglevel = logging.INFO     # default logging level
+
+    # default message formats
+    console_format = "%(message)s"
+    syslog_format =  "%(levelname)s:%(message)s"
+
+    syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+
+    if verbosity == 1:
+        loglevel = logging.DEBUG
+        console_format = "%(levelname)s:%(message)s"
+        syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+    elif verbosity > 1:
+        loglevel = logging.DEBUG
+        console_format = "%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+        syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
+
+    # create handler to log to console
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(console_format))
+    logger.addHandler(console_handler)
+
+    # create handler to log to syslog
+    logger.info(f"setting syslog on {platform.platform()}")
+    if platform.platform()[:5] == "macOS":
+        syslogaddr = "/var/run/syslog"
     else:
-        units = "bytes"
-        value = bytes
-        return "%d %s" % (int(value), units)
+        syslogaddr = "/dev/log"
+    syslog_handler = logging.handlers.SysLogHandler(syslogaddr)
+    syslog_handler.setFormatter(logging.Formatter(syslog_format))
 
-    return "%0.2f %s" % (value, units)
+    # add syslog handler to root logger
+    if syslog_handler is not None:
+        logger.addHandler(syslog_handler)
+
+    # set default loglevel
+    logger.setLevel(loglevel)
+
+    logging.getLogger("wekalib.wekacluster").setLevel(logging.ERROR)
+    logging.getLogger("wekalib.wekaapi").setLevel(logging.ERROR)
+    logging.getLogger("wekalib.sthreads").setLevel(logging.ERROR)
+    logging.getLogger("wekalib.circular").setLevel(logging.ERROR)
+
+    # local modules
+    logging.getLogger("workers").setLevel(loglevel)
+    logging.getLogger("fio").setLevel(loglevel)
+
+    # paramiko.util.log_to_file("demo.log")
+    add_stderr_logger(level=logging.ERROR)  # for paramiko
+    logging.getLogger("paramiko").setLevel(logging.ERROR)
+
+def graceful_exit(workers):
+    for server in workers:
+        server.close()  # terminates fio --server commands
 
 
-# format a number of bytes in GiB/MiB/KiB 
-def format_units_ns( nanosecs ):
-    if nanosecs > 1000*1000*1000:
-        units = "s"
-        value = float( nanosecs/1000/1000/1000 )
-    elif nanosecs > 1000*1000:
-        units = "ms"
-        value = float( nanosecs/1000/1000 )
-    elif nanosecs > 1000:
-        units = "us"
-        value = float( nanosecs/1000 )
+def main():
+
+    # parse arguments
+    progname = sys.argv[0]
+    parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
+    parser.add_argument("-v", "--verbosity", action="count", default=0, help="increase output verbosity")
+    parser.add_argument("-c", "--clients", dest='use_clients_flag', action='store_true',
+                        help="run fio on weka clients")
+    parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true',
+                        help="run fio on weka servers")
+    parser.add_argument("-d", "--directory", dest='directory', default="/mnt/weka",
+                        help="target directory for workload")
+    parser.add_argument("-w", "--workload", dest='workload', default="default",
+                        help="workload definition directory (a subdir of fio-jobfiles)")
+    parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
+    parser.add_argument("-a", "--autotune", dest='autotune', action='store_true',
+                        help="automatically tune num_jobs to maximize performance (experimental)")
+    parser.add_argument('servers', metavar='servername', type=str, nargs='*', default=['localhost'],
+                        help='Weka clusterspec or Server Dataplane IPs to execute on')
+
+    args = parser.parse_args()
+
+    # set the root logger
+    log = logging.getLogger()
+    configure_logging(log, args.verbosity)
+
+    # load our ssh configuration
+    sshconfig = SshConfig()
+
+    # Figure out if we were given a weka clusterspec or a list of servers...
+    use_all = False
+    if not args.use_clients_flag and not args.use_servers_flag and len(args.servers) == 1:  # neither flag
+        servers = ["localhost"]
+        args.use_servers_flag = True
+    elif args.use_clients_flag and args.use_servers_flag:  # both flags
+        use_all = True
+
+    # initialize the list of workers
+    workers = list()
+
+    # make sure we close all connections and kill all threads upon ^c or something
+    signal_handling(graceful_exit, workers)
+
+    # clusterspec is <host>,<host>,..,<host>:auth
+    if len(args.servers) == 1:  # either they gave us only one server, or it's a clusterspec
+        clusterspeclist = args.servers[0].split(':')
+        clusterspec = clusterspeclist[0]
+
+        if len(clusterspeclist) == 2:
+            auth = clusterspeclist[1]
+        else:
+            auth = None
+
+        try:
+            # try to create a weka cluster object.  If this fails, assume it's just a single server
+            log.info("Probing for a weka cluster...")
+            wekacluster = WekaCluster(clusterspec, authfile=auth)
+            log.info("Found Weka cluster " + wekacluster.name)
+
+            weka_status = wekacluster.call_api(method="status", parms={})
+
+            if weka_status["io_status"] != "STARTED":
+                log.critical("Weka Cluster is not healthy - not started.")
+                sys.exit()
+            if not weka_status["is_cluster"]:
+                log.critical("Weka Cluster is not healthy - cluster not formed?")
+                eys.exit()
+
+            log.info("Cluster is v" + wekacluster.release)
+
+            # Take some notes
+            drivecount = weka_status["drives"]["active"]
+            nettype = weka_status["net"]["link_layer"]
+            clustdrivecap = weka_status["licensing"]["usage"]["drive_capacity_gb"]
+            clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
+            wekaver = weka_status["release"]
+
+        except:
+            log.info(f"Unable to communicate via API with {clusterspec}. Assuming it's not a weka cluster...")
+            workers.append(WorkerServer(args.servers[0], sshconfig))
+        else:
+            workers = list()    # re-init workers so we don't duplicate a host
+            if args.use_servers_flag:
+                log.debug(f"workers={workers}, weka hosts: {wekacluster.hosts.list}")
+                for wekahost in wekacluster.hosts.list:  # rats - not a list - a curicular_list :(
+                    workers.append(WorkerServer(wekahost.name, sshconfig))
+            if args.use_clients_flag:
+                for client in get_clients(wekacluster):
+                    workers.append(WorkerServer(client, sshconfig))
+
+        weka = True
     else:
-        units = "nanosecs"
-        value = nanosecs
-        return "%d %s" % (int(value), units)
+        # it's a list of hosts...
+        log.info("Non-Weka Mode selected.  Contacting servers...")
+        for host in args.servers:
+            workers.append(WorkerServer(host, sshconfig))
 
-    return "%0.2f %s" % (value, units)
+        weka = False
 
-# run a command via the shell, expect json output and return it.
-def run_json_shell_command( command ):
-    tmpvar = json.loads( run_shell_command( command ) )
-    return tmpvar
-
-# run a command via the shell, check return code, exit on error.
-def run_shell_command( command ):
-    try:
-        output = subprocess.check_output( command, shell=True )
-    except subprocess.CalledProcessError as err:
-        print( sys.argv[0] + ": " + str( err ) )
+    # workers should be a list of servers we can ssh to
+    if len(workers) == 0:
+        log.critical("No servers to work with?")
         sys.exit(1)
 
-    return output
+    # open ssh sessions to the servers - should puke if any of the open's fail.
+    parallel(workers, WorkerServer.open)
 
 
-ssh_sessions={}
-def open_ssh_connection( server ):
-    global ssh_sessions
-    try:
-        sys.path.insert( 1, os.getcwd() + "/plumbum-1.6.8" )
-        from plumbum import SshMachine, colors
-        connection = SshMachine( server )  # open an ssh session
-        s = connection.session()
-        ssh_sessions[server] = connection      # save the sessions
-        announce(server)
-    except:
-        traceback.print_exc(file=sys.stdout)
-        announce( "Error ssh'ing to server " + server )
-        announce( "Passwordless ssh not configured properly, exiting" )
-        ssh_sessions[server] = None
-        return -1
+    # gather some info about the servers
+    log.info("Gathering Facts on servers")
+    parallel(workers, WorkerServer.gather_facts, weka)
 
-# parse arguments
-progname=sys.argv[0]
-parser = argparse.ArgumentParser(description='Acceptance Test a weka cluster')
-#parser.add_argument('servers', metavar='servername', type=str, nargs='+',
-#                    help='Server Dataplane IPs to execute on')
-parser.add_argument("-c", "--clients", dest='use_clients_flag', action='store_true', help="run fio on weka clients")
-parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true', help="run fio on weka servers")
-#parser.add_argument("-a", "--al", dest='use_all_flag', action='store_true', help="run fio on weka servers and clients")
-parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output")
+    if weka:
+        abort = False
+        for server in workers:
+            if not server.weka_mounted:
+                log.critical(f"Error: server {server.hostname} does not have a weka filesystem mounted!")
+                abort = True
+        if abort:
+            sys.exit(1)
 
-args = parser.parse_args()
+    # Display some info about the workers, organize things
+    arch_list = list()
+    archcount = dict()
+    sorted_workers = dict()
+    oslist = dict()
+    for server in workers:
+        if server.cpu_info not in arch_list:
+            arch_list.append(server.cpu_info)
+            archcount[arch_list.index(server.cpu_info)] = 1
+        else:
+            archcount[arch_list.index(server.cpu_info)] += 1
+        server_os = server.os_info['PRETTY_NAME'].strip('\n')
 
-# default to servers
-use_all = False
-if not args.use_clients_flag and not args.use_servers_flag: # neither flag
-    args.use_servers_flag = True
-elif args.use_clients_flag and args.use_servers_flag:   # both flags
-    use_all = True
+        log.debug(f"{server.hostname} is running {server_os}")
+        if server_os not in oslist:
+            oslist[server_os] = [server.hostname]
+        else:
+            oslist[server_os].append(server.hostname)
 
+        # sort servers into groups with the same number of cores
+        workingcores = server.usable_cpus
+        if workingcores not in sorted_workers:
+            sorted_workers[workingcores] = list()
+        sorted_workers[workingcores].append(server)
 
-# Make sure weka is installed
-weka_status = run_json_shell_command( 'weka status -J' )
+    for server_os, _servers in oslist.items():
+        log.info(f"Servers running {server_os}: {' '.join(servername for servername in _servers)}")
 
-print( "Testing Weka cluster " + weka_status["name"] )
-print( run_shell_command( "date" ).decode("utf-8") )
-print( "Cluster is v" + weka_status["release"] )
+    for index in range(0, len(arch_list)):
+        log.info(
+            f"{archcount[index]} workers with {arch_list[index]['Model name']} cpus, {arch_list[index]['CPU(s)']} cores")
 
-if weka_status["io_status"] != "STARTED":
-    print( "Weka not healthy - not started." )
-    sys.exit()
+    if weka:
+        log.info("This cluster has " + format_units_bytes(weka_status["capacity"]["total_bytes"]) +
+                     " of capacity and " + format_units_bytes(weka_status["capacity"]["unprovisioned_bytes"]) +
+                     " of unprovisioned capacity")
 
-if weka_status["is_cluster"] != True:
-    print( "Weka not healthy - cluster not formed?" )
-    sys.exit()
+    log.info("checking if fio is present on the workers...")
+    parallel(workers, WorkerServer.file_exists, "/tmp/fio")
+    needs_fio = list()
+    for server in workers:
+        log.debug(f"{server.hostname}: {server.last_response()}")
+        if server.last_response() == 'False':
+            needs_fio.append(server)
 
-# inserted to capture the number of servers
-drivecount = weka_status["drives"]["active"]
-nettype = weka_status["net"]["link_layer"]
-clustdrivecap = weka_status["licensing"]["usage"]["drive_capacity_gb"]
-clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
-wekaver = weka_status["release"]
+    if len(needs_fio) > 0:
+        log.info("Copying fio to any servers that need it...")
+        pscp(needs_fio, os.path.dirname(progname) + '/fio', '/tmp/fio')
 
-cpu_attrs = {}
-temp_bytes = run_shell_command( 'lscpu' )
-lscpu_out = temp_bytes.decode('utf-8')
-for line in lscpu_out.split("\n"):
-    line_list = line.split(":")
-    if len( line_list[0] ) >= 1:    # there's a blank line at the end?
-        cpu_attrs[line_list[0]] = line_list[1].strip()
+        # print()
+        parallel(workers, WorkerServer.file_exists, "/tmp/fio")
 
-cpuname = cpu_attrs["Model name"]
-numcpu = cpu_attrs["CPU(s)"]
-
-if use_all:
-    print( "Using weka clients and servers to generate load (dedicated and converged mode)" )
-    all_hosts = run_json_shell_command( 'weka cluster host -J' )    # all hosts
-elif args.use_servers_flag:
-    print( "Using weka servers to generate load (converged mode)" )
-    all_hosts = run_json_shell_command( 'weka cluster host -b -J' )    # just the backends
-else:
-    print( "Using weka clients to generate load (dedicated mode)" )
-    all_hosts = run_json_shell_command( 'weka cluster host -c -J' )    # just the clients
-
-    
-weka_hosts = {}
-if type ( all_hosts ) == list:
-    for hostconfig in all_hosts:
-        hostid = hostconfig["host_id"]
-        weka_hosts[hostid] = hostconfig
-else:
-    for hostid, hostconfig in all_hosts.items():
-        weka_hosts[hostid] = hostconfig
-
-
-hostcount = len( weka_hosts )
-hostips = []
-#print( "Hosts detected:" )
-for hostid, hostconfig in sorted( weka_hosts.items() ):
-    #print( "HostId: " + hostid )
-    hostips.append( hostconfig["host_ip"] )  # create a list of host ips that we'll mount the fs and run fio on
-
-hostips.sort()
-print( str( len( hostips ) ) + " weka hosts detected" )
-
-
-
-print( "This cluster has " + str(round((weka_status["capacity"]["total_bytes"]/1024/1024/1024/1024),1)) + " TB of capacity and " + \
-    str(round((weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024 ),1)) + " TB of unprovisioned capacity" )
-
-# Get a list of filesystems to work on, create as needed
-weka_fs = run_json_shell_command( 'weka fs -J' )
-
-# Is there an existing fs?
-wekatester_fs = False
-wekatester_group = False
-if type ( weka_fs ) == list:
-    for fsconfig in weka_fs:    # do we already have a wekatester fs?
-        if fsconfig["group_name"] == "wekatester-group":
-            wekatester_group = True
-        if fsconfig["name"] == "wekatester-fs":
-            wekatester_fs = True
-else:
-    for fsid, fsconfig in weka_fs.items():    # do we already have a wekatester fs?
-        if fsconfig["group_name"] == "wekatester-group":
-            wekatester_group = True
-        if fsconfig["name"] == "wekatester-fs":
-            wekatester_fs = True
-
-if wekatester_group == False:   # did we find the group when we looked for the fs?
-    weka_fs_group = run_json_shell_command( 'weka fs group -J' )
-
-    if type ( weka_fs_group ) == list:
-        for groupconfig in weka_fs_group:    # do we already have a wekatester fs group?
-            if groupconfig["name"] == "wekatester-group":
-                wekatester_group = True
-                print( "wekatester-group exists" )
-    else:
-        for fsgroupid, groupconfig in weka_fs_group.items():    # do we already have a wekatester fs group?
-            #print( "looking at " + fsgroupid + " " + groupconfig["name"] )
-            if groupconfig["name"] == "wekatester-group":
-                wekatester_group = True
-                print( "wekatester-group exists" )
-
-
-# do we need to create one?
-if wekatester_group == False:
-    print( "Creating wekatester-group..." )
-    run_json_shell_command( 'weka fs group create wekatester-group -J' )
-else:
-    print( "Using existing wekatester-group" )
-
-if wekatester_fs == False:
-    unprovisioned = weka_status["capacity"]["unprovisioned_bytes"]/1024/1024/1024/1024
-    if unprovisioned < 1:        # vince - for testing.  Should be about 5TB?
-        print( sys.argv[0] + ": " + "Not enough unprovisioned capacity - please free at least 5TB of capacity" )
+    need_to_exit = False
+    for server in workers:
+        if server.last_response() != "True":
+            log.error(f"{server.hostname}: fio copy did not complete; is present: {server.last_response()}")
+            server.close()
+            need_to_exit = True
+    if need_to_exit:
         sys.exit(1)
 
-    print( "Creating wekatester-fs..." )
-    run_json_shell_command( 'weka fs create wekatester-fs wekatester-group 5TB -J' )    # vince - for testing.  Should be about 5TB?
-else:
-    print( "Using existing wekatester-fs" )
-
-# make sure the wekatester fs is mounted locally - just in case we're running on a machine not part of the testing.
-
-print( "Mount wekatester fs locally..." )
-run_shell_command( "sudo bash -c 'if [ ! -d /mnt/wekatester ]; then mkdir /mnt/wekatester; fi'" )
-command="mount | grep wekatester-fs"
-try:
-    output = subprocess.check_output( command, shell=True )
-except subprocess.CalledProcessError as err:
-    run_shell_command( "sudo mount -t wekafs wekatester-fs /mnt/wekatester" )
-    run_shell_command( "sudo chmod 777 /mnt/wekatester" )
-
-# do a pushd so we know where we are
-with pushd( os.path.dirname( progname ) ):
-    # make sure passwordless ssh works to all the servers because nothing will work if not set up
-    announce( "Opening ssh sessions to all servers\n" )
-    parallel_threads={}
-    for server in hostips:
-        # create and start the threads
-        parallel_threads[server] = threading.Thread( target=open_ssh_connection, args=(server,) )
-        parallel_threads[server].start()
-
-    # wait for and reap threads
-    time.sleep( 0.1 )
-    while len( parallel_threads ) > 0:
-        dead_threads = {}
-        for server, thread in parallel_threads.items():
-            if not thread.is_alive():   # is it dead?
-                #print( "    Thread on " + server + " is dead, reaping" )
-                thread.join()       # reap it
-                dead_threads[server] = thread
-
-        # remove it from the list so we don't try to reap it twice
-        for server, thread in dead_threads.items():
-            #print( "    removing " + server + "'s thread from list" )
-            parallel_threads.pop( server )
-
-        # sleep a little so we limit cpu use
-        time.sleep( 0.1 )
-
-    #print( ssh_sessions )
-    if len( ssh_sessions ) == 0:
-        print( "Error opening ssh sessions" )
-        sys.exit( 1 )
-    for server, session in ssh_sessions.items():
-        if session == None:
-            print( "Error opening ssh session to " + server )
-
-    print()
-
-    # mount filesystems
-    announce( "Mounting wekatester-fs on hosts:" )
-    for host, session in ssh_sessions.items():
-        s = session.session()
-
-        retcode = s.run( "sudo bash -c 'if [ ! -d /mnt/wekatester ]; then mkdir /mnt/wekatester; fi'" )
-        if retcode[0] == 1:
-            print( "Error creating /mnt/wekatester on node " + host )
-        retcode = s.run( "mount | grep wekatester-fs", retcode=None )
-        if retcode[0] == 1:
-            # not mounted
-            announce( host )
-            s.run( "sudo mount -t wekafs wekatester-fs /mnt/wekatester" )
-            s.run( "sudo chmod 777 /mnt/wekatester" )
-        #else:
-        #    print( "wekatester-fs already mounted on host " + host )
-
-    print()
-        
-    # do we need to build fio?
-    if not os.path.exists( "./fio/fio" ):
-        with pushd( "./fio" ):
-            print( "Building fio" )
-            run_shell_command( './configure' )
-            run_shell_command( 'make' )
-
-    # do we need to copy fio onto the fs?
-    if not os.path.exists( "/mnt/wekatester/fio" ):
-        run_shell_command( 'cp ./fio/fio /mnt/wekatester/fio; chmod 777 /mnt/wekatester/fio' )
-
-    # don't need to copy the fio scripts - we can run them in place
-
-    # start fio --server on all servers
-    #for host, s in sorted(host_session.items()):    # make sure it's dead
-    for host, session in ssh_sessions.items():
-        s = session.session()
-        s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
-        s.run( "rm -f /tmp/fio.pid", retcode=None )
-
-    time.sleep( 1 )
-
-    announce( "starting fio --server on hosts:" )
-    #for host, s in sorted(host_session.items()):
-    for host, session in ssh_sessions.items():
-        s = session.session()
-        announce( host )
-        s.run( "kill -9 `cat /tmp/fio.pid`", retcode=None )
-        s.run( "rm -f /tmp/fio.pid", retcode=None )
-        #s.run( "pkill fio", retcode=None )
-        s.run( "/mnt/wekatester/fio --server --alloc-size=1048576 --daemonize=/tmp/fio.pid" )
-
-    print()
-    time.sleep( 1 )
+    log.info("starting fio servers")
+    start_fio_servers(workers)
 
     # get a list of script files
-    fio_scripts = [f for f in glob.glob( "./fio-jobfiles/[0-9]*")]
+    fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
     fio_scripts.sort()
+    log.debug(f"There are {len(fio_scripts)} scripts in the {args.workload} directory")
 
-    print( "setup complete." )
-    print()
-    print( "Starting tests on " + str(hostcount) + " weka hosts" )
-    print( "On " + numcpu + " cores of " + cpuname + " per host" )  # assuming they're all the same... )
-
-    saved_results = {}    # save the results
+    saved_results = {}  # save the results
+    jobs = list()
     for script in fio_scripts:
-        # check for comments in the job file, telling us what to output.  Keywords are "report", "bandwidth", "latency", and "iops".
-        # example: "# report latency bandwidth"  or "# report iops"
-        # can appear anywhere in the job file.  Can be multiple lines.
-        reportitem = { "bandwidth":False, "latency":False, "iops":False }  # reset to all off
-        with open( script ) as jobfile:
-            for lineno, line in enumerate( jobfile ):
-                line.strip()
-                linelist = line.split()
-                if len(linelist) > 0:
-                    if linelist[0][0] == "#":         # first char is '#'
-                        if linelist[0] == "#report":
-                            linelist.pop(0) # get rid of the "#report"
-                        elif len( linelist ) < 2:
-                            continue        # blank comment line?
-                        elif linelist[1] == "report":      # we're interested
-                            linelist.pop(0) # get rid of the "#"
-                            linelist.pop(0) # get rid of the "report"
-                        else:
-                            continue
+        jobs.append(FioJobfile(script))
 
-                        # found a "# report" directive in the file
-                        for keyword in linelist:
-                            if not keyword in reportitem.keys():
-                                print( "Syntax error in # report directive in " + script + ", line " + str( lineno +1 ) + ": keyword '" + keyword + "' undefined. Ignored." )
-                            else:
-                                reportitem[keyword] = True
+    try:
+        os.mkdir('/tmp/fio-jobfiles', 0o777)
+    except:
+        pass
 
+    # copy jobfiles to /tmp, and edit them
+    server_count = 0
+    for num_cores, serverlist in sorted_workers.items():
+        with open(f'/tmp/fio-jobfiles/{num_cores}', "w") as f:
+            for server in serverlist:
+                f.write(str(server) + "\n")
+                server_count += 1
+        for job in jobs:
+            if args.autotune:
+                job.override('numjobs', str(num_cores * 2), nolower=True)
+            job.override('directory', args.directory)
+            job.write(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}')
 
-        if not reportitem["bandwidth"] and not reportitem["iops"] and not reportitem["latency"]:
-            print( "NOTE: No valid # report specification in " + script + "; reporting all" )
-            reportitem = { "bandwidth":True, "latency":True, "iops":True }  # set to all
+    # copy the jobfiles to the server that will run the tests
+    master_server = workers[0]  # use the first server in the list to run the workload
+    master_server.scp('/tmp/fio-jobfiles', '/tmp')
 
+    fio_results = dict()
+    for job in jobs:
+        jobname = os.path.basename(job.filename)
+        log.debug(job.reportitem)
+        # cmdline = f"{os.path.dirname(progname)}/fio --output-format=json "  # if running locally
+        cmdline = "/tmp/fio --output-format=json "  # if running remotely
+        for server in workers:
+            cmdline += \
+                f"--client={str(server)} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
 
-        # build the arguments
-        script_args = ""
-        for host in hostips:
-            script_args = script_args + " --client=" + host + " " + script
+        #for num_cores, serverlist in sorted_workers.items():
+        #    cmdline += \
+        #        f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "   # multiple --client=<file> doesn't work
+        log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
+        log.debug(f"running on {master_server.hostname}: {cmdline}")
+        master_server.run(cmdline)
+        # fio_output[jobname] = master_server.last_response()
 
-        print()
-        print( "starting fio script " + script )
-        fio_output = run_json_shell_command( './fio/fio' + script_args + " --output-format=json" )
+        # log.debug(master_server.last_response()) # makes logger puke - message too long
+        fio_results[jobname] = FioResult(job, master_server.last_response())
+        fio_results[jobname].summarize()
 
-       # print( json.dumps(fio_output, indent=8, sort_keys=True) )
-        #print( fio_output )
+    time.sleep(1)
 
-        jobs = fio_output["client_stats"]
-        #print(f"number of jobs = {len(jobs)}")
-        # ok, number of jobs - we always get job results, plus aggregate results.  If more than 1 job (such as 
-        # pre-create + work jobs, there will be 3 or more - we really only want the last "job" and not the aggregate for
-        # this name and description
-        index = len(jobs) -2
-        print( "Job is " + jobs[index]["jobname"] + " " + jobs[index]["desc"] )
-
-        bw={}
-        iops={}
-        latency={}
-
-        # ok, it's a hack, but we're really only interested in the last one - the aggregate
-        stats = jobs[len(jobs) -1]
-        saved_results[os.path.basename(script)] = stats   # save for output file
-        bw["read"] = stats["read"]["bw_bytes"]
-        bw["write"] = stats["write"]["bw_bytes"]
-        iops["read"] = stats["read"]["iops"]
-        iops["write"] = stats["write"]["iops"]
-        latency["read"] = stats["read"]["lat_ns"]["mean"]
-        latency["write"] = stats["write"]["lat_ns"]["mean"]
-
-        if reportitem["bandwidth"]:
-            print( "    read bandwidth: " + format_units_bytes( bw["read"] ) + "/s" )
-            print( "    write bandwidth: " + format_units_bytes( bw["write"] ) + "/s" )
-            print( "    total bandwidth: " + format_units_bytes( bw["read"] + bw["write"] ) + "/s" )
-            print( "    avg bandwidth: " + format_units_bytes( float( bw["read"] + bw["write"] )/float( hostcount) ) + "/s per host" )
-        if reportitem["iops"]:
-            reads = int(iops["read"])
-            writes = int(iops["write"])
-            print(f"    read iops: {reads:,}/s" )
-            print(f"    write iops: {writes:,}/s" )
-            print(f"    total iops: {reads+writes:,}/s" )
-            print(f"    avg iops: {int((reads+writes)/hostcount):,}/s per host" )
-        if reportitem["latency"]:
-            print( "    read latency: " +  format_units_ns( float( latency["read"] ) ) )
-            print( "    write latency: " +  format_units_ns( float( latency["write"] ) ) )
-            if (latency["read"] > 0.0) and (latency["write"] > 0.0):
-                print( "    avg latency: " +  format_units_ns( float( latency["write"] + latency["read"] / 2 ) ) )
-
-
-    print()
-    print( "Tests complete." )
-
+    # output log file
     if args.use_output_flag:
+        output_dict = dict()
         timestring = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-        fp = open(f"results_{timestring}.json", "a+" )          # Vin - add date/time to file name
-        fp.write( json.dumps(saved_results, indent=4, sort_keys=True) )
-        fp.write( "\n" )
-        fp.close()
+        for name, result in fio_results.items():
+            output_dict[name] = result.fio_output
 
-    print()
-    announce( "killing fio slaves:" )
+        with open(f"results_{timestring}.json", "a+") as fp:  # Vin - add date/time to file name
+            json.dump(output_dict, fp, indent=2)
 
-    for host, session in ssh_sessions.items():
-        s = session.session()
-    #for host, s in host_session.items():
-        announce( host )
-        #s.run( "pkill fio" )
-        s.run( "kill -9 `cat /tmp/fio.pid`" )
-        s.run( "rm -f /tmp/fio.pid" )
+    graceful_exit(workers)
 
-    print()
-    time.sleep( 1 )
-
-    announce( "Unmounting filesystems:" )
-    for host, session in ssh_sessions.items():
-        s = session.session()
-    #for host, s in host_session.items():
-        announce( host )
-        s.run( "sudo umount /mnt/wekatester" )
-
-
-    print()
+if __name__ == '__main__':
+    main()
