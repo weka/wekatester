@@ -81,7 +81,8 @@ def configure_logging(logger, verbosity):
     logging.getLogger("wekalib.circular").setLevel(logging.ERROR)
 
     # local modules
-    logging.getLogger("workers").setLevel(logging.DEBUG)
+    logging.getLogger("workers").setLevel(loglevel)
+    logging.getLogger("fio").setLevel(loglevel)
 
     # paramiko.util.log_to_file("demo.log")
     add_stderr_logger(level=logging.ERROR)  # for paramiko
