@@ -46,24 +46,19 @@ class WorkerServer:
         self.ssh.set_missing_host_key_policy(AutoAddPolicy())
 
         if "user" in self.hostconfig:
-            user = self.hostconfig["user"]
             kwargs["username"] = self.hostconfig["user"]
         else:
-            user = getpass.getuser()
             kwargs["username"] = getpass.getuser()
 
         self.ssh.load_system_host_keys()
         if "identityfile" in self.hostconfig:
-            identityfile = self.hostconfig["identityfile"]
             kwargs["key_filename"] = self.hostconfig["identityfile"]
         else:
-            identityfile = None
             kwargs["key_filename"] = None
             kwargs["look_for_keys"] = True # actually the default...
 
         try:
-            # self.ssh.connect(self.hostname, username=user, key_filename=identityfile,
-            #                  timeout=10, auth_timeout=10)
+
             self.ssh.connect(self.hostname,**kwargs)
         except paramiko.ssh_exception.AuthenticationException as exc:
             log.critical(f"Authentication error opening ssh session to {self.hostname}: {exc}")
@@ -104,10 +99,7 @@ class WorkerServer:
             if len(error) > 0 and len(error) < 5000:
                 log.debug(f"stderr is '{error}'")
             self.last_output = {'status': status, 'response': response, 'error': error, "exc": exc}
-            #self.last_output = {'status': -123,
-            #                    'description': 'Failed to run command',
-            #                    'traceback': str(exc)}
-        # log.debug(f"output is: {self.last_output}") # makes logger puke
+
 
     def _linux_to_dict(self, separator):
         output = dict()
