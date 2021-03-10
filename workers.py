@@ -2,6 +2,7 @@ import os
 from logging import getLogger
 import getpass
 
+import paramiko
 from paramiko import SSHClient, AutoAddPolicy, SSHConfig
 from scp import SCPClient
 
@@ -13,16 +14,22 @@ log = getLogger(__name__)
 class SshConfig:
     def __init__(self):
         self.config = SSHConfig()
-        try:
-            self.config.parse(open(os.path.expanduser('~/.ssh/config')))
-            # ssh_config.parse()
+        self.config_file = True
 
-        except Exception as exc:
-            log.critical(exc)
-            raise
+        # handle missing config file
+        try:
+            fp = open(os.path.expanduser('~/.ssh/config'))
+        except IOError:
+            self.config_file = False
+        else:
+            try:
+                self.config.parse(fp)
+            except Exception as exc:    # malformed config file?
+                log.critical(exc)
+                raise
 
     def lookup(self, hostname):
-        return self.config.lookup(hostname)
+        return self.config.lookup(hostname) # if self.config_file else None
 
 
 # Connection class to perform SSH commands on remote server
@@ -35,23 +42,32 @@ class WorkerServer:
     def open(self):
         kwargs = dict()
         self.ssh = SSHClient()
-        self.config = self.ssh_config.lookup(self.hostname)
+        self.hostconfig = self.ssh_config.lookup(self.hostname)
         self.ssh.set_missing_host_key_policy(AutoAddPolicy())
 
-        if "user" in self.config:
-            user = self.config["user"]
+        if "user" in self.hostconfig:
+            user = self.hostconfig["user"]
+            kwargs["username"] = self.hostconfig["user"]
         else:
             user = getpass.getuser()
+            kwargs["username"] = getpass.getuser()
 
         self.ssh.load_system_host_keys()
-        if "identityfile" in self.config:
-            identityfile = self.config["identityfile"]
+        if "identityfile" in self.hostconfig:
+            identityfile = self.hostconfig["identityfile"]
+            kwargs["key_filename"] = self.hostconfig["identityfile"]
         else:
             identityfile = None
+            kwargs["key_filename"] = None
+            kwargs["look_for_keys"] = True # actually the default...
 
         try:
-            self.ssh.connect(self.hostname, username=user, key_filename=identityfile,
-                             timeout=10, auth_timeout=10)
+            # self.ssh.connect(self.hostname, username=user, key_filename=identityfile,
+            #                  timeout=10, auth_timeout=10)
+            self.ssh.connect(self.hostname,**kwargs)
+        except paramiko.ssh_exception.AuthenticationException as exc:
+            log.critical(f"Authentication error opening ssh session to {self.hostname}: {exc}")
+            self.ssh = None
         except Exception as exc:
             log.critical(f"Exception opening ssh session to {self.hostname}: {exc}")
             self.ssh = None
@@ -74,7 +90,7 @@ class WorkerServer:
             error = stderr.read().decode("utf-8")
             self.last_output = {'status': status, 'response': response, 'error': error, "exc": None}
             if status != 0:
-                log.error(f"run: Bad return code: {status}.  Output is:")
+                log.error(f"run: Bad return code from {cmd}: {status}.  Output is:")
                 if len(response) > 0 and len(response) < 5000:
                     log.debug(f"response is '{response}'")
                 if len(error) > 0 and len(error) < 5000:

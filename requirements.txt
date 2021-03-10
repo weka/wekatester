@@ -2,4 +2,5 @@ python.dateutil
 setuptools_rust
 paramiko
 scp
+urllib3
 wekalib

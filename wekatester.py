@@ -85,7 +85,7 @@ def configure_logging(logger, verbosity):
     logging.getLogger("fio").setLevel(loglevel)
 
     # paramiko.util.log_to_file("demo.log")
-    add_stderr_logger(level=logging.ERROR)  # for paramiko
+    # add_stderr_logger(level=logging.ERROR)  # for paramiko
     logging.getLogger("paramiko").setLevel(logging.ERROR)
 
 def graceful_exit(workers):
@@ -159,7 +159,7 @@ def main():
                 sys.exit()
             if not weka_status["is_cluster"]:
                 log.critical("Weka Cluster is not healthy - cluster not formed?")
-                eys.exit()
+                sys.exit()
 
             log.info("Cluster is v" + wekacluster.release)
 
@@ -199,6 +199,15 @@ def main():
 
     # open ssh sessions to the servers - should puke if any of the open's fail.
     parallel(workers, WorkerServer.open)
+
+    errors = False
+    for server in workers:
+        if server.ssh is None:
+            log.critical(f"Failed to establish ssh session to {server.hostname}")
+            errors = True
+    if errors:
+        log.critical("SSH Errors encountered, exiting")
+        sys.exit(1)
 
 
     # gather some info about the servers
