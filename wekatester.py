@@ -20,7 +20,7 @@ from wekalib.wekacluster import WekaCluster
 from wekalib.signals import signal_handling
 
 # import paramiko
-from workers import WorkerServer, parallel, get_clients, start_fio_servers, pscp, SshConfig
+from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
 
 import threading
 
@@ -55,7 +55,7 @@ def configure_logging(logger, verbosity):
         syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
 
     # create handler to log to console
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(console_format))
     logger.addHandler(console_handler)
 
@@ -75,8 +75,8 @@ def configure_logging(logger, verbosity):
     # set default loglevel
     logger.setLevel(loglevel)
 
-    logging.getLogger("wekalib.wekacluster").setLevel(logging.ERROR)
-    logging.getLogger("wekalib.wekaapi").setLevel(logging.ERROR)
+    logging.getLogger("wekalib.wekacluster").setLevel(loglevel)
+    logging.getLogger("wekalib.wekaapi").setLevel(loglevel)
     logging.getLogger("wekalib.sthreads").setLevel(logging.ERROR)
     logging.getLogger("wekalib.circular").setLevel(logging.ERROR)
 
@@ -110,8 +110,12 @@ def main():
     parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
     parser.add_argument("-a", "--autotune", dest='autotune', action='store_true',
                         help="automatically tune num_jobs to maximize performance (experimental)")
-    parser.add_argument('servers', metavar='servername', type=str, nargs='*', default=['localhost'],
-                        help='Weka clusterspec or Server Dataplane IPs to execute on')
+    parser.add_argument("--no-weka", dest='no_weka', action='store_true', default=False,
+                        help="force non-weka mode")
+    parser.add_argument("--auth", dest='authfile', default="auth-token.json",
+                        help="auth file for authenticating with weka")
+    parser.add_argument('serverlist', type=str, nargs='*', default=['localhost'], #dest='serverlist', 
+                        help='One or more Servers to use a workers (weka mode [default] will get names from the cluster)')
 
     args = parser.parse_args()
 
@@ -124,11 +128,11 @@ def main():
 
     # Figure out if we were given a weka clusterspec or a list of servers...
     use_all = False
-    if not args.use_clients_flag and not args.use_servers_flag and len(args.servers) == 1:  # neither flag
-        servers = ["localhost"]
-        args.use_servers_flag = True
-    elif args.use_clients_flag and args.use_servers_flag:  # both flags
-        use_all = True
+    servers = args.serverlist
+    #if not args.use_clients_flag and not args.use_servers_flag and len(args.servers) == 1:  # neither flag
+    #    args.use_servers_flag = True
+    #elif args.use_clients_flag and args.use_servers_flag:  # both flags
+    #    use_all = True
 
     # initialize the list of workers
     workers = list()
@@ -136,20 +140,11 @@ def main():
     # make sure we close all connections and kill all threads upon ^c or something
     signal_handling(graceful_exit, workers)
 
-    # clusterspec is <host>,<host>,..,<host>:auth
-    if len(args.servers) == 1:  # either they gave us only one server, or it's a clusterspec
-        clusterspeclist = args.servers[0].split(':')
-        clusterspec = clusterspeclist[0]
-
-        if len(clusterspeclist) == 2:
-            auth = clusterspeclist[1]
-        else:
-            auth = None
-
+    if not args.no_weka:
+        log.info(f"Probing for a weka cluster... {args.serverlist}/{args.authfile}")
         try:
             # try to create a weka cluster object.  If this fails, assume it's just a single server
-            log.info("Probing for a weka cluster...")
-            wekacluster = WekaCluster(clusterspec, authfile=auth)
+            wekacluster = WekaCluster(args.serverlist, authfile=args.authfile)
             log.info("Found Weka cluster " + wekacluster.name)
 
             weka_status = wekacluster.call_api(method="status", parms={})
@@ -171,23 +166,30 @@ def main():
             wekaver = weka_status["release"]
 
         except:
-            log.info(f"Unable to communicate via API with {clusterspec}. Assuming it's not a weka cluster...")
-            workers.append(WorkerServer(args.servers[0], sshconfig))
+            log.info(f"Unable to communicate via API with {args.serverlist}. If this is not a Weka Cluster, use --no-weka")
+            sys.exit(1)
+            #workers.append(WorkerServer(args.servers[0], sshconfig))
         else:
-            workers = list()    # re-init workers so we don't duplicate a host
-            if args.use_servers_flag:
-                log.debug(f"workers={workers}, weka hosts: {wekacluster.hosts.list}")
-                for wekahost in wekacluster.hosts.list:  # rats - not a list - a curicular_list :(
-                    workers.append(WorkerServer(wekahost.name, sshconfig))
-            if args.use_clients_flag:
-                for client in get_clients(wekacluster):
-                    workers.append(WorkerServer(client, sshconfig))
+            # workers = list()    # re-init workers so we don't duplicate a host
+            if args.use_clients_flag and args.use_servers_flag:
+                workerlist = get_workers(wekacluster, "backend")
+                workerlist += get_workers(wekacluster, "client")
+            elif args.use_servers_flag:
+                workerlist = get_workers(wekacluster, "backend")
+            elif args.use_clients_flag:
+                workerlist = get_workers(wekacluster, "client")
+            else:
+                log.info("No worker type specified, assuming backends")
+                workerlist = get_workers(wekacluster, "backend")
 
-        weka = True
+            for worker in workerlist:
+                workers.append(WorkerServer(worker, sshconfig))
+
+            weka = True
     else:
         # it's a list of hosts...
-        log.info("Non-Weka Mode selected.  Contacting servers...")
-        for host in args.servers:
+        log.info("No-Weka Mode selected.  Contacting servers...")
+        for host in args.serverlist:
             workers.append(WorkerServer(host, sshconfig))
 
         weka = False
@@ -229,11 +231,12 @@ def main():
     sorted_workers = dict()
     oslist = dict()
     for server in workers:
-        if server.cpu_info not in arch_list:
-            arch_list.append(server.cpu_info)
-            archcount[arch_list.index(server.cpu_info)] = 1
+        #log.debug(f"{server.cpu_info}")
+        cpu_info = f"{server.cpu_info['Model name']} cpus, {server.cpu_info['CPU(s)']} cores"
+        if cpu_info not in archcount:
+            archcount[cpu_info] = 1
         else:
-            archcount[arch_list.index(server.cpu_info)] += 1
+            archcount[cpu_info] += 1
         server_os = server.os_info['PRETTY_NAME'].strip('\n')
 
         log.debug(f"{server.hostname} is running {server_os}")
@@ -251,9 +254,8 @@ def main():
     for server_os, _servers in oslist.items():
         log.info(f"Servers running {server_os}: {' '.join(servername for servername in _servers)}")
 
-    for index in range(0, len(arch_list)):
-        log.info(
-            f"{archcount[index]} workers with {arch_list[index]['Model name']} cpus, {arch_list[index]['CPU(s)']} cores")
+    for arch, count in archcount.items():
+        log.info(f"{count} workers with {arch}")
 
     if weka:
         log.info("This cluster has " + format_units_bytes(weka_status["capacity"]["total_bytes"]) +

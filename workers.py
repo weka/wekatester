@@ -212,8 +212,26 @@ def pscp(servers, source, dest):
     parallel(servers, WorkerServer.scp, source, dest)
 
 
+def get_workers(wekacluster, workertype):
+    if workertype not in ["backend","client"]:
+        raise Exception("invalid workertype - must be 'backend' or 'client'")
+
+    workerlist = list()
+
+    try:
+        api_return = wekacluster.call_api(method="hosts_list", parms={})
+    except:
+        raise
+
+    for host in api_return:
+        hostname = host["hostname"]
+        if host["mode"] == workertype:
+            if host["state"] == "ACTIVE" and host["status"] == "UP":
+                workerlist.append(hostname)
+
+    return workerlist
+
 def get_clients(wekacluster):
-    # get the rest of the cluster (bring back any that had previously disappeared, or have been added)
     clientlist = list()
 
     try:
