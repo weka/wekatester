@@ -24,6 +24,7 @@ from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp
 
 import threading
 
+VERSION = "2.1.0"
 
 @contextmanager
 def pushd(new_dir):
@@ -84,8 +85,6 @@ def configure_logging(logger, verbosity):
     logging.getLogger("workers").setLevel(loglevel)
     logging.getLogger("fio").setLevel(loglevel)
 
-    # paramiko.util.log_to_file("demo.log")
-    # add_stderr_logger(level=logging.ERROR)  # for paramiko
     logging.getLogger("paramiko").setLevel(logging.ERROR)
 
 def graceful_exit(workers):
@@ -104,7 +103,7 @@ def main():
     parser.add_argument("-s", "--servers", dest='use_servers_flag', action='store_true',
                         help="run fio on weka servers")
     parser.add_argument("-d", "--directory", dest='directory', default="/mnt/weka",
-                        help="target directory for workload")
+                        help="target directory for workload (default is /mnt/weka)")
     parser.add_argument("-w", "--workload", dest='workload', default="default",
                         help="workload definition directory (a subdir of fio-jobfiles)")
     parser.add_argument("-o", "--output", dest='use_output_flag', action='store_true', help="run fio with output file")
@@ -113,11 +112,16 @@ def main():
     parser.add_argument("--no-weka", dest='no_weka', action='store_true', default=False,
                         help="force non-weka mode")
     parser.add_argument("--auth", dest='authfile', default="auth-token.json",
-                        help="auth file for authenticating with weka")
-    parser.add_argument('serverlist', type=str, nargs='*', default=['localhost'], #dest='serverlist', 
+                        help="auth file for authenticating with weka (default is auth-token.json)")
+    parser.add_argument('serverlist', metavar="server", type=str, nargs='*', default=['localhost'], #dest='serverlist', 
                         help='One or more Servers to use a workers (weka mode [default] will get names from the cluster)')
+    parser.add_argument("--version", dest="version", default=False, action="store_true", help="Display version number")
 
     args = parser.parse_args()
+
+    if args.version:
+        print(f"{sys.argv[0]} version {VERSION}")
+        sys.exit(0)
 
     # set the root logger
     log = logging.getLogger()
