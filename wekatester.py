@@ -169,8 +169,8 @@ def main():
             clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
             wekaver = weka_status["release"]
 
-        except:
-            log.info(f"Unable to communicate via API with {args.serverlist}. If this is not a Weka Cluster, use --no-weka")
+        except Exception as exc:
+            log.info(f"Unable to communicate via API with {args.serverlist} - {exc}. If this is not a Weka Cluster, use --no-weka")
             sys.exit(1)
             #workers.append(WorkerServer(args.servers[0], sshconfig))
         else:
