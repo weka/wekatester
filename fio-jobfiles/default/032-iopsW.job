@@ -24,5 +24,6 @@ create_only=1
 [fio-iopsW-00]
 stonewall
 description='Write iops workload'
+iodepth=8
 bs=4k
 rw=randwrite
