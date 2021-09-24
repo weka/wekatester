@@ -10,6 +10,7 @@ import os
 import platform
 import sys
 import time
+import socket
 from contextlib import contextmanager
 
 from urllib3 import add_stderr_logger
@@ -323,7 +324,11 @@ def main():
 
     # copy the jobfiles to the server that will run the tests
     master_server = workers[0]  # use the first server in the list to run the workload
-    master_server.scp('/tmp/fio-jobfiles', '/tmp')
+    try:
+        master_server.scp('/tmp/fio-jobfiles', '/tmp')
+    except Exception as exc:
+        log.error(f"Error copying jobfiles to {master_server}: {exc}")
+        sys.exit(1)
 
     fio_results = dict()
     for job in jobs:
@@ -333,7 +338,7 @@ def main():
         cmdline = "/tmp/fio --output-format=json "  # if running remotely
         for server in workers:
             cmdline += \
-                f"--client={str(server)} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
+                f"--client={socket.gethostbyname(str(server))} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
 
         #for num_cores, serverlist in sorted_workers.items():
         #    cmdline += \
@@ -344,8 +349,11 @@ def main():
         # fio_output[jobname] = master_server.last_response()
 
         # log.debug(master_server.last_response()) # makes logger puke - message too long
-        fio_results[jobname] = FioResult(job, master_server.last_response())
-        fio_results[jobname].summarize()
+        try:
+            fio_results[jobname] = FioResult(job, master_server.last_response())
+            fio_results[jobname].summarize()
+        except:
+            log.error(f"Error parsing fio output - output was: {master_server.last_response()}")
 
     time.sleep(1)
 

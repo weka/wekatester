@@ -1,4 +1,4 @@
-pyinstaller --onefile wekatester.py
+pyinstaller --clean --onefile wekatester.py
 
 TARGET=tarball/wekatester
 mkdir -p $TARGET
