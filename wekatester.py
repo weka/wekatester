@@ -25,7 +25,7 @@ from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp
 
 import threading
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 @contextmanager
 def pushd(new_dir):
