@@ -87,17 +87,17 @@ class WorkerServer:
             if status != 0:
                 log.error(f"run: Bad return code from {cmd}: {status}.  Output is:")
                 if len(response) > 0 and len(response) < 5000:
-                    log.debug(f"response is '{response}'")
+                    log.error(f"stdout is '{response}'")
                 if len(error) > 0 and len(error) < 5000:
-                    log.debug(f"stderr is '{error}'")
+                    log.error(f"stderr is '{error}'")
             else:
                 log.debug(f"run: '{cmd}', status {status}, stdout {len(response)} bytes, stderr {len(error)} bytes")
         except Exception as exc:
-            log.debug(f"run: '{cmd}', status {status}, stdout {len(response)} bytes, stderr {len(error)} bytes, exception='{exc}'")
+            log.error(f"run: '{cmd}', status {status}, stdout {len(response)} bytes, stderr {len(error)} bytes, exception='{exc}'")
             if len(response) > 0 and len(response) < 5000:
-                log.debug(f"response is '{response}'")
+                log.error(f"stdout is '{response}'")
             if len(error) > 0 and len(error) < 5000:
-                log.debug(f"stderr is '{error}'")
+                log.error(f"stderr is '{error}'")
             self.last_output = {'status': status, 'response': response, 'error': error, "exc": exc}
 
 
@@ -198,9 +198,7 @@ def parallel(obj_list, method, *args, **kwargs):
 
 def start_fio_servers(servers):
     for server in servers:
-        #threaded_method(server, WorkerServer.run, "sudo /tmp/fio --server")
-        server.run_unending("sudo /tmp/fio --server")
-    #default_threader.starter()
+        server.run_unending("/tmp/fio --server")
 
 
 def pdsh(servers, command):

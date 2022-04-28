@@ -128,6 +128,11 @@ def main():
     log = logging.getLogger()
     configure_logging(log, args.verbosity)
 
+#    root = logging.getLogger()
+#    root.setLevel(logging.DEBUG)
+#    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+#    logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
     # load our ssh configuration
     sshconfig = SshConfig()
 
