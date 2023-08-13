@@ -1,4 +1,5 @@
 python.dateutil
+#setuptools_rust==1.6.0
 setuptools_rust
 paramiko
 scp

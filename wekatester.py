@@ -25,7 +25,7 @@ from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp
 
 import threading
 
-VERSION = "2.1.1"
+VERSION = "2.1.5"
 
 @contextmanager
 def pushd(new_dir):
@@ -354,6 +354,9 @@ def main():
         # fio_output[jobname] = master_server.last_response()
 
         # log.debug(master_server.last_response()) # makes logger puke - message too long
+        if master_server.last_error() != "":
+            log.error(f"Error running fio on {master_server.hostname}: {master_server.last_error()}")
+            sys.exit(1)
         try:
             fio_results[jobname] = FioResult(job, master_server.last_response())
             fio_results[jobname].summarize()

@@ -83,6 +83,12 @@ class WorkerServer:
             status = stdout.channel.recv_exit_status()
             response = stdout.read().decode("utf-8")
             error = stderr.read().decode("utf-8")
+            temp_list = error.split('\n')
+            error_list = list()
+            for line in temp_list:
+                if len(line) > 0 and line.find("setaffinity") == -1: # ignore blank lines and setaffinity errors
+                    error_list.append(line + '\n')
+            error = ''.join(error_list)
             self.last_output = {'status': status, 'response': response, 'error': error, "exc": None}
             if status != 0:
                 log.error(f"run: Bad return code from {cmd}: {status}.  Output is:")
@@ -163,6 +169,9 @@ class WorkerServer:
     def last_response(self):
         return self.last_output['response'].strip(' \n')
 
+    def last_error(self):
+        return self.last_output['error']
+
     def __str__(self):
         return self.hostname
 
@@ -225,7 +234,8 @@ def get_workers(wekacluster, workertype):
         hostname = host["hostname"]
         if host["mode"] == workertype:
             if host["state"] == "ACTIVE" and host["status"] == "UP":
-                workerlist.append(hostname)
+                if hostname not in workerlist:
+                    workerlist.append(hostname)
 
     return workerlist
 
