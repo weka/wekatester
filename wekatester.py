@@ -44,11 +44,11 @@ def pushd(new_dir):
 def configure_logging(logger, verbosity):
     loglevel = logging.INFO     # default logging level
 
-    logging.basicConfig(encoding='utf-8', level=loglevel)
+    logging.basicConfig(filename='wekatester.log', encoding='utf-8', level=loglevel)
 
     # default message formats
     console_format = "%(message)s"
-    syslog_format =  "%(levelname)s:%(message)s"
+    #syslog_format =  "%(levelname)s:%(message)s"
 
     syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
 
