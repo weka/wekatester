@@ -117,7 +117,7 @@ def main():
                         help="automatically tune num_jobs to maximize performance (experimental)")
     parser.add_argument("--no-weka", dest='no_weka', action='store_true', default=False,
                         help="force non-weka mode")
-    parser.add_argument("--local-fio", dest='local-fio', action='store_true', default=False,
+    parser.add_argument("--local-fio", dest='local_fio', action='store_true', default=False,
                         help="Use the fio binary on the target servers")
     parser.add_argument("--auth", dest='authfile', default="auth-token.json",
                         help="auth file for authenticating with weka (default is auth-token.json)")
