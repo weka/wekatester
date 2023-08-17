@@ -44,6 +44,8 @@ def pushd(new_dir):
 def configure_logging(logger, verbosity):
     loglevel = logging.INFO     # default logging level
 
+    logging.basicConfig(encoding='utf-8', level=loglevel)
+
     # default message formats
     console_format = "%(message)s"
     syslog_format =  "%(levelname)s:%(message)s"
@@ -62,7 +64,7 @@ def configure_logging(logger, verbosity):
     # create handler to log to console
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(console_format))
-    logger.addHandler(console_handler, encoding='utf8')
+    logger.addHandler(console_handler)
 
     # create handler to log to syslog
     logger.info(f"setting syslog on {platform.platform()}")
@@ -75,7 +77,7 @@ def configure_logging(logger, verbosity):
 
     # add syslog handler to root logger
     if syslog_handler is not None:
-        logger.addHandler(syslog_handler,encoding='utf8')
+        logger.addHandler(syslog_handler)
 
     # set default loglevel
     logger.setLevel(loglevel)
