@@ -8,6 +8,9 @@ from scp import SCPClient
 
 from wekalib.sthreads import threaded, default_threader
 
+#FIO_BIN="/tmp/fio"
+FIO_BIN="/usr/bin/fio"
+
 log = getLogger(__name__)
 
 
@@ -207,7 +210,7 @@ def parallel(obj_list, method, *args, **kwargs):
 
 def start_fio_servers(servers):
     for server in servers:
-        server.run_unending("/tmp/fio --server")
+        server.run_unending(FIO_BIN + " --server")
 
 
 def pdsh(servers, command):
