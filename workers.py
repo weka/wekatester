@@ -8,6 +8,9 @@ from scp import SCPClient
 
 from wekalib.sthreads import threaded, default_threader
 
+#FIO_BIN="/tmp/fio"
+FIO_BIN="/usr/bin/fio"
+
 log = getLogger(__name__)
 
 
@@ -78,6 +81,9 @@ class WorkerServer:
             scp.put(source, recursive=True, remote_path=dest)
 
     def run(self, cmd):
+        status = None
+        response = None
+        error = None
         try:
             stdin, stdout, stderr = self.ssh.exec_command(cmd)
             status = stdout.channel.recv_exit_status()
@@ -205,9 +211,9 @@ def parallel(obj_list, method, *args, **kwargs):
     default_threader.run()  # wait for them
 
 
-def start_fio_servers(servers):
+def start_fio_servers(servers, fio_bin='/tmp/fio'):
     for server in servers:
-        server.run_unending("/tmp/fio --server")
+        server.run_unending(FIO_BIN + " --server")
 
 
 def pdsh(servers, command):

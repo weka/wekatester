@@ -297,7 +297,7 @@ def main():
         sys.exit(1)
 
     log.info("starting fio servers")
-    start_fio_servers(workers)
+    start_fio_servers(workers, FIO_BIN)
 
     # get a list of script files
     fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
