@@ -21,11 +21,14 @@ from wekalib.wekacluster import WekaCluster
 from wekalib.signals import signal_handling
 
 # import paramiko
-from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
+from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig, FIO_BIN
 
 import threading
 
 VERSION = "2.1.5"
+
+#FIO_BIN="/tmp/fio"
+#FIO_BIN="/usr/bin/fio"
 
 @contextmanager
 def pushd(new_dir):
@@ -41,9 +44,11 @@ def pushd(new_dir):
 def configure_logging(logger, verbosity):
     loglevel = logging.INFO     # default logging level
 
+    logging.basicConfig(filename='wekatester.log', encoding='utf-8', level=loglevel)
+
     # default message formats
     console_format = "%(message)s"
-    syslog_format =  "%(levelname)s:%(message)s"
+    #syslog_format =  "%(levelname)s:%(message)s"
 
     syslog_format =  "%(process)s:%(filename)s:%(lineno)s:%(funcName)s():%(levelname)s:%(message)s"
 
@@ -112,6 +117,8 @@ def main():
                         help="automatically tune num_jobs to maximize performance (experimental)")
     parser.add_argument("--no-weka", dest='no_weka', action='store_true', default=False,
                         help="force non-weka mode")
+    parser.add_argument("--local-fio", dest='local_fio', action='store_true', default=False,
+                        help="Use the fio binary on the target servers")
     parser.add_argument("--auth", dest='authfile', default="auth-token.json",
                         help="auth file for authenticating with weka (default is auth-token.json)")
     parser.add_argument('serverlist', metavar="server", type=str, nargs='*', default=['localhost'], #dest='serverlist', 
@@ -149,6 +156,11 @@ def main():
 
     # make sure we close all connections and kill all threads upon ^c or something
     signal_handling(graceful_exit, workers)
+
+    if args.local_fio:
+        FIO_BIN = "/usr/bin/fio"
+    else:
+        FIO_BIN = "/tmp/fio"
 
     if not args.no_weka:
         log.info(f"Probing for a weka cluster... {args.serverlist}/{args.authfile}")
@@ -273,7 +285,7 @@ def main():
                      " of unprovisioned capacity")
 
     log.info("checking if fio is present on the workers...")
-    parallel(workers, WorkerServer.file_exists, "/tmp/fio")
+    parallel(workers, WorkerServer.file_exists, FIO_BIN)
     needs_fio = list()
     for server in workers:
         log.debug(f"{server.hostname}: {server.last_response()}")
@@ -282,10 +294,10 @@ def main():
 
     if len(needs_fio) > 0:
         log.info("Copying fio to any servers that need it...")
-        pscp(needs_fio, os.path.dirname(progname) + '/fio', '/tmp/fio')
+        pscp(needs_fio, os.path.dirname(progname) + '/fio', FIO_BIN)
 
         # print()
-        parallel(workers, WorkerServer.file_exists, "/tmp/fio")
+        parallel(workers, WorkerServer.file_exists, FIO_BIN)
 
     need_to_exit = False
     for server in workers:
@@ -340,7 +352,7 @@ def main():
         jobname = os.path.basename(job.filename)
         log.debug(job.reportitem)
         # cmdline = f"{os.path.dirname(progname)}/fio --output-format=json "  # if running locally
-        cmdline = "/tmp/fio --output-format=json "  # if running remotely
+        cmdline = FIO_BIN + " --output-format=json "  # if running remotely
         for server in workers:
             cmdline += \
                 f"--client={socket.gethostbyname(str(server))} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
