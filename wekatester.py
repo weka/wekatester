@@ -21,11 +21,11 @@ from wekalib.wekacluster import WekaCluster
 from wekalib.signals import signal_handling
 
 # import paramiko
-from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig, FIO_BIN
+from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
 
 import threading
 
-VERSION = "2.1.5"
+VERSION = "2.1.6"
 
 #FIO_BIN="/tmp/fio"
 #FIO_BIN="/usr/bin/fio"
@@ -309,7 +309,7 @@ def main():
         sys.exit(1)
 
     log.info("starting fio servers")
-    start_fio_servers(workers)
+    start_fio_servers(workers, FIO_BIN)
 
     # get a list of script files
     fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
