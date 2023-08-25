@@ -33,7 +33,7 @@ def format_units_bytes(numbytes):
 
 # format a number of seconds in s/ms/us/ns
 def format_units_time(nanosecs):
-    val, units = formatter(nanosecs, {"s": 1000 ** 3, "ms": 1000 ** 2, "\u03bcs": 1000, "ns": 0})
+    val, units = formatter(nanosecs, {"s": 1000 ** 3, "ms": 1000 ** 2, "us": 1000, "ns": 0})
     return "%d %s" % (int(val), units)
 
 
