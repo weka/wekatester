@@ -21,7 +21,7 @@ from wekalib.wekacluster import WekaCluster
 from wekalib.signals import signal_handling
 
 # import paramiko
-from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig, FIO_BIN
+from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
 
 import threading
 
@@ -29,6 +29,7 @@ VERSION = "2.1.5"
 
 #FIO_BIN="/tmp/fio"
 #FIO_BIN="/usr/bin/fio"
+FIO_BIN=None
 
 @contextmanager
 def pushd(new_dir):
@@ -117,8 +118,8 @@ def main():
                         help="automatically tune num_jobs to maximize performance (experimental)")
     parser.add_argument("--no-weka", dest='no_weka', action='store_true', default=False,
                         help="force non-weka mode")
-    parser.add_argument("--local-fio", dest='local_fio', action='store_true', default=False,
-                        help="Use the fio binary on the target servers")
+    parser.add_argument("--local-fio", dest='local_fio', default='/tmp/fio',
+                        help="Specify the fio binary on the target servers")
     parser.add_argument("--auth", dest='authfile', default="auth-token.json",
                         help="auth file for authenticating with weka (default is auth-token.json)")
     parser.add_argument('serverlist', metavar="server", type=str, nargs='*', default=['localhost'], #dest='serverlist', 
@@ -157,10 +158,11 @@ def main():
     # make sure we close all connections and kill all threads upon ^c or something
     signal_handling(graceful_exit, workers)
 
-    if args.local_fio:
-        FIO_BIN = "/usr/bin/fio"
-    else:
-        FIO_BIN = "/tmp/fio"
+    #if args.local_fio:
+    #    FIO_BIN = "/usr/bin/fio"
+    #else:
+    #    FIO_BIN = "/tmp/fio"
+    FIO_BIN = args.local_fio
 
     if not args.no_weka:
         log.info(f"Probing for a weka cluster... {args.serverlist}/{args.authfile}")
@@ -293,8 +295,12 @@ def main():
             needs_fio.append(server)
 
     if len(needs_fio) > 0:
-        log.info("Copying fio to any servers that need it...")
-        pscp(needs_fio, os.path.dirname(progname) + '/fio', FIO_BIN)
+        if FIO_BIN == '/tmp/fio':
+            log.info("Copying fio to any servers that need it...")
+            pscp(needs_fio, os.path.dirname(progname) + '/fio', FIO_BIN)
+        else:
+            log.info(f"Some servers do not have {FIO_BIN} installed.  Please install it and re-run.")
+            sys.exit(1)
 
         # print()
         parallel(workers, WorkerServer.file_exists, FIO_BIN)
