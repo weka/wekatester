@@ -208,11 +208,9 @@ def parallel(obj_list, method, *args, **kwargs):
     default_threader.run()  # wait for them
 
 
-<<<<<<< HEAD
+
 def start_fio_servers(servers, fio_bin='/tmp/fio'):
-=======
-def start_fio_servers(servers, fio_bin):
->>>>>>> c77179fe1dec162fdb79304a656586953094164e
+
     for server in servers:
         server.run_unending(fio_bin + " --server")
 
