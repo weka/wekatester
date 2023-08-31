@@ -120,7 +120,7 @@ def _log_perf(operation, unit, value):
         per += " per host"
 
     if value != 0:
-        log.info(f"    {operation} {unit}: {log_formatter(value)}{per}")
+        log.info(f"    {operation} {unit}: {log_formatter(value)}{per}".encode().decode())
 
 
 class FioResult:
