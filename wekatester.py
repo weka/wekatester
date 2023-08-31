@@ -25,7 +25,7 @@ from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp
 
 import threading
 
-VERSION = "2.1.5"
+VERSION = "2.1.7"
 
 #FIO_BIN="/tmp/fio"
 #FIO_BIN="/usr/bin/fio"
