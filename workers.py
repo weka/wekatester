@@ -209,6 +209,7 @@ def parallel(obj_list, method, *args, **kwargs):
 
 
 def start_fio_servers(servers, fio_bin='/tmp/fio'):
+
     for server in servers:
         server.run_unending(fio_bin + " --server")
 
