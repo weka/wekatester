@@ -379,7 +379,7 @@ def main():
             fio_results[jobname] = FioResult(job, master_server.last_response())
             fio_results[jobname].summarize()
         except:
-            log.error(f"Error parsing fio output - output was: {master_server.last_response()}")
+            log.error(f"Error parsing fio output")
 
     time.sleep(1)
 
