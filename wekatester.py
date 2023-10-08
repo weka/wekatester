@@ -363,9 +363,9 @@ def main():
             cmdline += \
                 f"--client={socket.gethostbyname(str(server))} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
 
-        #for num_cores, serverlist in sorted_workers.items():
-        #    cmdline += \
-        #        f"--client=/tmp/fio-jobfiles/{num_cores} /tmp/fio-jobfiles/{num_cores}.{jobname} "   # multiple --client=<file> doesn't work
+        # wait a little to make sure the fio servers are ready...
+        sys.sleep(3)
+
         log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
         log.debug(f"running on {master_server.hostname}: {cmdline}")
         master_server.run(cmdline)
