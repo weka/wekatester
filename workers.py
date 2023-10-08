@@ -208,7 +208,9 @@ def parallel(obj_list, method, *args, **kwargs):
     default_threader.run()  # wait for them
 
 
+
 def start_fio_servers(servers, fio_bin='/tmp/fio'):
+
     for server in servers:
         server.run_unending(fio_bin + " --server")
 

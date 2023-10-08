@@ -33,7 +33,7 @@ def format_units_bytes(numbytes):
 
 # format a number of seconds in s/ms/us/ns
 def format_units_time(nanosecs):
-    val, units = formatter(nanosecs, {"s": 1000 ** 3, "ms": 1000 ** 2, "\u03bcs": 1000, "ns": 0})
+    val, units = formatter(nanosecs, {"s": 1000 ** 3, "ms": 1000 ** 2, "us": 1000, "ns": 0})
     return "%d %s" % (int(val), units)
 
 
@@ -120,7 +120,7 @@ def _log_perf(operation, unit, value):
         per += " per host"
 
     if value != 0:
-        log.info(f"    {operation} {unit}: {log_formatter(value)}{per}")
+        log.info(f"    {operation} {unit}: {log_formatter(value)}{per}".encode().decode())
 
 
 class FioResult:
@@ -148,7 +148,6 @@ class FioResult:
         iops = dict()
         latency = dict()
 
-        # log.debug(f"{self.summary}") - makes logger puke - too long
 
         bw["read"] = self.summary["read"]["bw_bytes"]
         bw["write"] = self.summary["write"]["bw_bytes"]
@@ -160,8 +159,10 @@ class FioResult:
 
         # print(bw)
         log.debug(f"hostcount={hostcount}")
+        log.debug(f"{self.jobfile.reportitem}")
 
         if self.jobfile.reportitem["bandwidth"]:
+            log.debug(f"reporting bandwidth {bw}")
             _log_perf("read", "bandwidth", bw["read"])
             _log_perf("write", "bandwidth", bw["write"])
             _log_perf("total", "bandwidth", bw["read"] + bw["write"])
