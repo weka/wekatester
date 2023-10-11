@@ -364,7 +364,7 @@ def main():
                 f"--client={socket.gethostbyname(str(server))} /tmp/fio-jobfiles/{server.usable_cpus}.{jobname} "
 
         # wait a little to make sure the fio servers are ready...
-        sys.sleep(3)
+        time.sleep(3)
 
         log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
         log.debug(f"running on {master_server.hostname}: {cmdline}")
