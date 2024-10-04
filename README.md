@@ -6,7 +6,7 @@ Includes fio both consistency (versions vary) and convienience.
 
 ```
 # ./wekatester --help
-usage: wekatester [-h] [-v] [-c] [-s] [-d DIRECTORY] [-w WORKLOAD] [-o] [-a] [--no-weka] [--local-fio LOCAL_FIO] [--auth AUTHFILE] [--version] [server ...]
+usage: wekatester.py [-h] [-v] [-c] [-s] [-d DIRECTORY] [-w WORKLOAD] [-o] [-a] [--no-weka] [--local-fio LOCAL_FIO] [--auth AUTHFILE] [--version] [server ...]
 
 Acceptance Test a weka cluster
 
