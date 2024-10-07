@@ -7,25 +7,29 @@ import json
 import logging
 import logging.handlers
 import os
-import platform
+#import platform
 import sys
 import time
 import socket
 from contextlib import contextmanager
 
-from urllib3 import add_stderr_logger
+#from urllib3 import add_stderr_logger
+from wekapyutils.wekalogging import configure_logging, register_module
 
-import fio
+#import fio
 from fio import FioJobfile, format_units_bytes, FioResult
 from wekalib.wekacluster import WekaCluster
 from wekalib.signals import signal_handling
 
 # import paramiko
-from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
+#from workers import WorkerServer, parallel, get_workers, start_fio_servers, pscp, SshConfig
+from wekapyutils.wekassh import RemoteServer, pscp, parallel
 
-import threading
+from workers import start_fio_servers, get_workers
 
-VERSION = "2.1.7"
+#import threading
+
+VERSION = "2.2.0"
 
 #FIO_BIN="/tmp/fio"
 #FIO_BIN="/usr/bin/fio"
@@ -42,6 +46,7 @@ def pushd(new_dir):
         os.chdir(previous_dir)
 
 
+"""
 def configure_logging(logger, verbosity):
     loglevel = logging.INFO     # default logging level
 
@@ -93,6 +98,7 @@ def configure_logging(logger, verbosity):
     logging.getLogger("fio").setLevel(loglevel)
 
     logging.getLogger("paramiko").setLevel(logging.ERROR)
+"""
 
 def graceful_exit(workers):
     for server in workers:
@@ -134,7 +140,11 @@ def main():
 
     # set the root logger
     log = logging.getLogger()
+    register_module("fabric", logging.ERROR)
+    register_module("paramiko", logging.ERROR)
     configure_logging(log, args.verbosity)
+
+    # Vince - add wekatester.log...
 
 #    root = logging.getLogger()
 #    root.setLevel(logging.DEBUG)
@@ -142,7 +152,7 @@ def main():
 #    logging.getLogger("paramiko").setLevel(logging.DEBUG)
 
     # load our ssh configuration
-    sshconfig = SshConfig()
+    #sshconfig = SshConfig()
 
     # Figure out if we were given a weka clusterspec or a list of servers...
     use_all = False
@@ -183,11 +193,11 @@ def main():
             log.info("Cluster is v" + wekacluster.release)
 
             # Take some notes
-            drivecount = weka_status["drives"]["active"]
-            nettype = weka_status["net"]["link_layer"]
-            clustdrivecap = weka_status["licensing"]["usage"]["drive_capacity_gb"]
-            clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
-            wekaver = weka_status["release"]
+            #drivecount = weka_status["drives"]["active"]
+            #nettype = weka_status["net"]["link_layer"]
+            #clustdrivecap = weka_status["licensing"]["usage"]["drive_capacity_gb"]
+            #clustobjcap = weka_status["licensing"]["usage"]["obs_capacity_gb"]
+            #wekaver = weka_status["release"]
 
         except Exception as exc:
             log.info(f"Unable to communicate via API with {args.serverlist} - {exc}. If this is not a Weka Cluster, use --no-weka")
@@ -207,14 +217,16 @@ def main():
                 workerlist = get_workers(wekacluster, "backend")
 
             for worker in workerlist:
-                workers.append(WorkerServer(worker, sshconfig))
+                #workers.append(WorkerServer(worker, sshconfig))
+                workers.append(RemoteServer(worker))
 
             weka = True
     else:
         # it's a list of hosts...
         log.info("No-Weka Mode selected.  Contacting servers...")
         for host in args.serverlist:
-            workers.append(WorkerServer(host, sshconfig))
+            #workers.append(WorkerServer(host, sshconfig))
+            workers.append(RemoteServer(host))
 
         weka = False
 
@@ -224,12 +236,12 @@ def main():
         sys.exit(1)
 
     # open ssh sessions to the servers - should puke if any of the open's fail.
-    parallel(workers, WorkerServer.open)
+    parallel(workers, RemoteServer.connect)
 
     errors = False
     for server in workers:
-        if server.ssh is None:
-            log.critical(f"Failed to establish ssh session to {server.hostname}")
+        if not server.connected:
+            log.critical(f"Failed to establish ssh session to {str(server)}")
             errors = True
     if errors:
         log.critical("SSH Errors encountered, exiting")
@@ -238,13 +250,13 @@ def main():
 
     # gather some info about the servers
     log.info("Gathering Facts on servers")
-    parallel(workers, WorkerServer.gather_facts, weka)
+    parallel(workers, RemoteServer.gather_facts, weka)
 
     if weka:
         abort = False
         for server in workers:
             if not server.weka_mounted:
-                log.critical(f"Error: server {server.hostname} does not have a weka filesystem mounted!")
+                log.critical(f"Error: server {str(server)} does not have a weka filesystem mounted!")
                 abort = True
         if abort:
             sys.exit(1)
@@ -263,11 +275,11 @@ def main():
             archcount[cpu_info] += 1
         server_os = server.os_info['PRETTY_NAME'].strip('\n')
 
-        log.debug(f"{server.hostname} is running {server_os}")
+        log.debug(f"{str(server)} is running {server_os}")
         if server_os not in oslist:
-            oslist[server_os] = [server.hostname]
+            oslist[server_os] = [str(server)]
         else:
-            oslist[server_os].append(server.hostname)
+            oslist[server_os].append(str(server))
 
         # sort servers into groups with the same number of cores
         workingcores = server.usable_cpus
@@ -287,11 +299,11 @@ def main():
                      " of unprovisioned capacity")
 
     log.info("checking if fio is present on the workers...")
-    parallel(workers, WorkerServer.file_exists, FIO_BIN)
+    parallel(workers, RemoteServer.file_exists, FIO_BIN)
     needs_fio = list()
     for server in workers:
-        log.debug(f"{server.hostname}: {server.last_response()}")
-        if server.last_response() == 'False':
+        log.debug(f"{str(server)}: {server.last_response()}")
+        if server.last_response().strip('\n') == 'False':
             needs_fio.append(server)
 
     if len(needs_fio) > 0:
@@ -303,12 +315,12 @@ def main():
             sys.exit(1)
 
         # print()
-        parallel(workers, WorkerServer.file_exists, FIO_BIN)
+        parallel(workers, RemoteServer.file_exists, FIO_BIN)
 
     need_to_exit = False
     for server in workers:
-        if server.last_response() != "True":
-            log.error(f"{server.hostname}: fio copy did not complete; is present: {server.last_response()}")
+        if server.last_response().strip('\n') != "True":
+            log.error(f"{str(server)}: fio copy did not complete; is present: {server.last_response()}")
             server.close()
             need_to_exit = True
     if need_to_exit:
@@ -334,24 +346,35 @@ def main():
 
     # copy jobfiles to /tmp, and edit them
     server_count = 0
-    for num_cores, serverlist in sorted_workers.items():
-        with open(f'/tmp/fio-jobfiles/{num_cores}', "w") as f:
-            for server in serverlist:
-                f.write(str(server) + "\n")
-                server_count += 1
-        for job in jobs:
-            if args.autotune:
-                job.override('numjobs', str(num_cores * 2), nolower=True)
-            job.override('directory', args.directory)
-            job.write(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}')
+    master_server = workers[0]  # use the first server in the list to run the workload
+    try:
+        for num_cores, serverlist in sorted_workers.items():
+            master_server.run('mkdir -p /tmp/fio-jobfiles') # create target directory
+            with open(f'/tmp/fio-jobfiles/{num_cores}', "w") as f:
+                for server in serverlist:
+                    f.write(str(server) + "\n")
+                    server_count += 1
+            master_server.scp(f'/tmp/fio-jobfiles/{num_cores}', '/tmp/fio-jobfiles')
+            for job in jobs:
+                if args.autotune:
+                    job.override('numjobs', str(num_cores * 2), nolower=True)
+                job.override('directory', args.directory)
+                job.write(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}')
+                master_server.scp(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}', '/tmp/fio-jobfiles')
+    except Exception as exc:
+        log.error(f"Error copying jobfiles to {master_server}: {exc}")
+        sys.exit(1)
 
+    """
     # copy the jobfiles to the server that will run the tests
     master_server = workers[0]  # use the first server in the list to run the workload
     try:
+        master_server.run('mkdir -p /tmp/fio-jobfiles')
         master_server.scp('/tmp/fio-jobfiles', '/tmp')
     except Exception as exc:
         log.error(f"Error copying jobfiles to {master_server}: {exc}")
         sys.exit(1)
+    """
 
     fio_results = dict()
     for job in jobs:
@@ -366,14 +389,14 @@ def main():
         # wait a little to make sure the fio servers are ready...
         time.sleep(3)
 
-        log.info(f"starting test run for job {jobname} on {master_server.hostname} with {server_count} workers:")
-        log.debug(f"running on {master_server.hostname}: {cmdline}")
+        log.info(f"starting test run for job {jobname} on {str(master_server)} with {server_count} workers:")
+        log.debug(f"running on {str(master_server)}: {cmdline}")
         master_server.run(cmdline)
         # fio_output[jobname] = master_server.last_response()
 
         # log.debug(master_server.last_response()) # makes logger puke - message too long
-        if master_server.last_error() != "":
-            log.error(f"Error running fio on {master_server.hostname}: {master_server.last_error()}")
+        if master_server.output.status != 0:
+            log.error(f"Error running fio on {str(master_server)}: {master_server.output.stderr}")
             sys.exit(1)
         try:
             fio_results[jobname] = FioResult(job, master_server.last_response())
