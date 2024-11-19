@@ -268,7 +268,14 @@ def main():
     oslist = dict()
     for server in workers:
         #log.debug(f"{server.cpu_info}")
-        cpu_info = f"{server.cpu_info['Model name']} cpus, {server.cpu_info['CPU(s)']} cores"
+        #Some env such as AWS arm do not report Model name (via lscpu) so piece together reasonable arch
+        if server.cpu_info.get('Model name', None) != None:
+            cpu_info = f"{server.cpu_info['Model name']} cpus, {server.cpu_info['CPU(s)']} cores"
+        elif server.cpu_info.get('Vendor ID',None) != None and server.cpu_info.get('Model', None) != None:
+            cpu_info = f"{server.cpu_info['Vendor ID']} - {server.cpu_info['Model']} cpus, {server.cpu_info['CPU(s)']} cores"
+        else:
+            cpu_info = f"Unknown cpus,  {server.cpu_info['CPU(s)']} cores"
+
         if cpu_info not in archcount:
             archcount[cpu_info] = 1
         else:
@@ -344,6 +351,11 @@ def main():
     except:
         pass
 
+    #In the case of --no-weka localhost and/or the host running this is also running fio test,
+    #  we need to avoid scp of files overtop of localhost or else the resulting file is 0 bytes long
+    my_hostname = socket.gethostname()
+    localhost_aliases = {"localhost", "127.0.0.1", "::1", my_hostname}
+
     # copy jobfiles to /tmp, and edit them
     server_count = 0
     master_server = workers[0]  # use the first server in the list to run the workload
@@ -354,13 +366,18 @@ def main():
                 for server in serverlist:
                     f.write(str(server) + "\n")
                     server_count += 1
-            master_server.scp(f'/tmp/fio-jobfiles/{num_cores}', '/tmp/fio-jobfiles')
+            # check self before wreck self
+            if str(master_server._hostname) not in localhost_aliases:
+                master_server.scp(f'/tmp/fio-jobfiles/{num_cores}', '/tmp/fio-jobfiles')
+            
             for job in jobs:
                 if args.autotune:
                     job.override('numjobs', str(num_cores * 2), nolower=True)
                 job.override('directory', args.directory)
                 job.write(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}')
-                master_server.scp(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}', '/tmp/fio-jobfiles')
+                # check self before wreck self
+                if str(master_server._hostname) not in localhost_aliases:               
+                    master_server.scp(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}', '/tmp/fio-jobfiles')
     except Exception as exc:
         log.error(f"Error copying jobfiles to {master_server}: {exc}")
         sys.exit(1)
