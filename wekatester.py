@@ -413,13 +413,15 @@ def main():
 
         # log.debug(master_server.last_response()) # makes logger puke - message too long
         if master_server.output.status != 0:
-            log.error(f"Error running fio on {str(master_server)}: {master_server.output.stderr}")
+            log.error(f"Error running fio on {str(master_server)}:")
+            print(f"{master_server.output.stderr}")
             sys.exit(1)
         try:
             fio_results[jobname] = FioResult(job, master_server.last_response())
             fio_results[jobname].summarize()
-        except:
-            log.error(f"Error parsing fio output")
+        except Exception as exc:
+            log.error(f"Error parsing fio output: {exc}")
+            print(f"{master_server.output.stderr}")
 
     time.sleep(1)
 
