@@ -29,11 +29,15 @@ from workers import start_fio_servers, get_workers
 
 #import threading
 
-VERSION = "2.2.0"
+VERSION = "2025-10-01"
 
 #FIO_BIN="/tmp/fio"
 #FIO_BIN="/usr/bin/fio"
 FIO_BIN=None
+
+STAGING_DIR="/tmp/staging"
+JOBFILE_DIR="fio-jobfiles"
+TARGET_DIR="/tmp/" + JOBFILE_DIR
 
 @contextmanager
 def pushd(new_dir):
@@ -337,7 +341,7 @@ def main():
     start_fio_servers(workers, FIO_BIN)
 
     # get a list of script files
-    fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/fio-jobfiles/{args.workload}/[0-9]*")]
+    fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/{JOBFILE_DIR}/{args.workload}/[0-9]*")]
     fio_scripts.sort()
     log.debug(f"There are {len(fio_scripts)} scripts in the {args.workload} directory")
 
@@ -347,37 +351,39 @@ def main():
         jobs.append(FioJobfile(script))
 
     try:
-        os.mkdir('/tmp/fio-jobfiles', 0o777)
+        os.mkdir(STAGING_DIR, 0o777)
     except:
         pass
 
     #In the case of --no-weka localhost and/or the host running this is also running fio test,
     #  we need to avoid scp of files overtop of localhost or else the resulting file is 0 bytes long
-    my_hostname = socket.gethostname()
-    localhost_aliases = {"localhost", "127.0.0.1", "::1", my_hostname}
+    # my_hostname = socket.gethostname()
+    # localhost_aliases = {"localhost", "127.0.0.1", "::1", my_hostname}
 
     # copy jobfiles to /tmp, and edit them
     server_count = 0
     master_server = workers[0]  # use the first server in the list to run the workload
     try:
         for num_cores, serverlist in sorted_workers.items():
-            master_server.run('mkdir -p /tmp/fio-jobfiles') # create target directory
-            with open(f'/tmp/fio-jobfiles/{num_cores}', "w") as f:
+            master_server.run(f'mkdir -p {TARGET_DIR}')
+            with open(f'{STAGING_DIR}/{num_cores}', "w") as f:
                 for server in serverlist:
                     f.write(str(server) + "\n")
                     server_count += 1
             # check self before wreck self
-            if str(master_server._hostname) not in localhost_aliases:
-                master_server.scp(f'/tmp/fio-jobfiles/{num_cores}', '/tmp/fio-jobfiles')
-            
+            #if str(master_server._hostname) not in localhost_aliases:
+            #    master_server.scp(f'/tmp/fio-jobfiles/{num_cores}', '/tmp/fio-jobfiles')
+            master_server.scp(f'{STAGING_DIR}/{num_cores}', TARGET_DIR)
+
             for job in jobs:
                 if args.autotune:
                     job.override('numjobs', str(num_cores * 2), nolower=True)
                 job.override('directory', args.directory)
-                job.write(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}')
+                job.write(f'{STAGING_DIR}/{num_cores}.{os.path.basename(job.filename)}')
                 # check self before wreck self
-                if str(master_server._hostname) not in localhost_aliases:               
-                    master_server.scp(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}', '/tmp/fio-jobfiles')
+                #if str(master_server._hostname) not in localhost_aliases:
+                #    master_server.scp(f'/tmp/fio-jobfiles/{num_cores}.{os.path.basename(job.filename)}', '/tmp/fio-jobfiles')
+                master_server.scp(f'{STAGING_DIR}/{num_cores}.{os.path.basename(job.filename)}', TARGET_DIR)
     except Exception as exc:
         log.error(f"Error copying jobfiles to {master_server}: {exc}")
         sys.exit(1)
