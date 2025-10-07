@@ -58,7 +58,7 @@ def main():
     # parse arguments
     progname = sys.argv[0]
     parser = argparse.ArgumentParser(description='Basic Performance Test a Network/Parallel Filesystem')
-    parser.add_argument("-d", "--directory", dest='directory', required=True,
+    parser.add_argument("-d", "--directory", dest='directory',
                         help="target directory on the workers for test files")
     parser.add_argument("-w", "--workload", dest='workload', default="default",
                         help="workload definition directory (a subdir of fio-jobfiles)")
@@ -80,6 +80,10 @@ def main():
     register_module("fabric", logging.ERROR)
     register_module("paramiko", logging.ERROR)
     configure_logging(log, args.verbosity)
+
+    if args.directory is None:
+        log.error("You must specify a target directory using '-d'")
+        sys.exit(1)
 
     # Vince - add wekatester.log...
 
