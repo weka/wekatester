@@ -115,6 +115,8 @@ def main():
         if not server.connected:
             log.critical(f"Failed to establish ssh session to {str(server)}")
             errors = True
+        #else:
+        #    log.info(f"We appear to have connected to {str(server)}")
     if errors:
         log.critical("SSH Errors encountered, exiting")
         sys.exit(1)
@@ -138,10 +140,17 @@ def main():
     log.info("starting fio servers")
     start_fio_servers(workers, FIO_BIN)
 
-    # get a list of script files
+    # get a list of script files - start with the directory the wekatester binary is in...
     fio_scripts = [f for f in glob.glob(os.path.dirname(progname) + f"/{JOBFILE_DIR}/{args.workload}/[0-9]*")]
+    # if nothing there, try the current directory
+    if len(fio_scripts) == 0:
+        fio_scripts = [f for f in glob.glob(f"./{JOBFILE_DIR}/{args.workload}/[0-9]*")]
+    # if nothing in the current directory, complain and exit
+    if len(fio_scripts) == 0:
+        log.error(f"Unable to locate the fio-jobfiles directory.")
+        sys.exit(1)
     fio_scripts.sort()
-    log.debug(f"There are {len(fio_scripts)} scripts in the {args.workload} directory")
+    log.info(f"There are {len(fio_scripts)} scripts in the {args.workload} directory")
 
     saved_results = {}  # save the results
     jobs = list()

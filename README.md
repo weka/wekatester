@@ -34,15 +34,15 @@ fio is a benchmark for IO, and is quite popular.  However, running it in a distr
 The idea of wekatester is to bring some order to this chaos.   To make running fio in a distributed environment, wekatester automatically distributes and executes fio commands on remote servers, runs a standard set of benchmark workloads, and summarizes the results.
 
 # Options
-servers - a list of servers to use as workers.
+`servers` - a list of servers to use as workers.
 
 `-d DIRECTORY` sets the directory where the benchmark files will be created.  This is a required argument.
 
 `-w WORKLOAD` get fio jobfile specifications from a subdirectory of fio-jobfiles.   The default is 'default'.  Currently, there are 2 discributed with wekatester, "default" (4-corners tests), and "mixed", a set of 70/30 RW workloads.  You can add your own directories, and use the with -w.
 
-`-v` Sets verbosity.  `-vv`, and `-vvv` are supported to set ever increasing verbosity.
+`--fio-bin` Default is `/usr/bin/fio`.  You can use this argument to set a different location.
 
-`--fio` Default is `/usr/bin/fio`.  You can use this argument to set a different location.
+`-v` Sets verbosity.  `-vv`, and `-vvv` are supported to set ever increasing verbosity.
 
 # Output
 The output will be summarized after each workload run, and all results are writting to a log file.
