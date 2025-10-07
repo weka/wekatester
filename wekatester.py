@@ -59,7 +59,6 @@ def main():
     progname = sys.argv[0]
     parser = argparse.ArgumentParser(description='Basic Performance Test a Network/Parallel Filesystem')
     parser.add_argument("-d", "--directory", dest='directory',
-
                         help="target directory on the workers for test files")
     parser.add_argument("-w", "--workload", dest='workload', default="default",
                         help="workload definition directory (a subdir of fio-jobfiles)")
