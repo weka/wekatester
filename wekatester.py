@@ -85,13 +85,9 @@ def main():
         log.error("You must specify a target directory using '-d'")
         sys.exit(1)
 
-    # Vince - add wekatester.log...
-
-#    root = logging.getLogger()
-#    root.setLevel(logging.DEBUG)
-#    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-#    logging.getLogger("paramiko").setLevel(logging.DEBUG)
-
+    if len(args.serverlist) == 0:
+        log.error("You must specify some servers on the command line")
+        sys.exit(1)
 
     # initialize the list of workers
     workers = list()
