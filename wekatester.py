@@ -29,7 +29,7 @@ from workers import start_fio_servers, get_workers
 
 #import threading
 
-VERSION = "2025-10-07"
+VERSION = "2025-10-16"
 
 FIO_BIN=None
 
@@ -58,7 +58,7 @@ def main():
     # parse arguments
     progname = sys.argv[0]
     parser = argparse.ArgumentParser(description='Basic Performance Test a Network/Parallel Filesystem')
-    parser.add_argument("-d", "--directory", dest='directory',
+    parser.add_argument("-d", "--directory", dest='directory', default="/mnt/weka",
                         help="target directory on the workers for test files")
     parser.add_argument("-w", "--workload", dest='workload', default="default",
                         help="workload definition directory (a subdir of fio-jobfiles)")
@@ -204,14 +204,16 @@ def main():
         # log.debug(master_server.last_response()) # makes logger puke - message too long
         if master_server.output.status != 0:
             log.error(f"Error running fio on {str(master_server)}:")
-            print(f"{master_server.output.stderr}")
+            print(f"stderr:{master_server.output.stderr}")
+            print(f"stdout:{master_server.output.stdout}")
             sys.exit(1)
         try:
             fio_results[jobname] = FioResult(job, master_server.last_response())
             fio_results[jobname].summarize()
         except Exception as exc:
             log.error(f"Error parsing fio output: {exc}")
-            print(f"{master_server.output.stderr}")
+            print(f"stderr:{master_server.output.stderr}")
+            print(f"stdout:{master_server.output.stdout}")
 
     time.sleep(1)
 
