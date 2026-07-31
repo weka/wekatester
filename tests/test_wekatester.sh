@@ -56,5 +56,50 @@ t_assert "core mismatch warns" bash -c '
     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 >/dev/null )
     case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
+# --- tuner: tier rules (Task 6) ---
+t_assert "safe: numjobs = min usable cores" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 6\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^numjobs=3$" "$FIX/jobs/h1/011-bw.job"'   # h2 usable=3 is the min
+t_assert "max: numjobs per host" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 6\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^numjobs=5$" "$FIX/jobs/h1/011-bw.job" && grep -q "^numjobs=3$" "$FIX/jobs/h2/011-bw.job"'
+t_assert "max: bw ioengine upgraded to io_uring" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^ioengine=io_uring$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "safe: engine untouched when available" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "safe: engine fixed when missing on one host" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nioengine=io_uring\nnumjobs=2\nfilesize=1G\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
+    printf "ncpus 8\nweka_allowed 0-2\nengines libaio psync \n" > "$FIX/probe/h2"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "latency: numjobs/iodepth untouched, small files applied at max" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/021-lat.job"
+    grep -q "^numjobs=1$" "$v" && grep -q "^iodepth=1$" "$v" &&
+    grep -q "^filesize=1G$" "$v" && grep -q "wt-small" "$v" &&
+    grep -q "^file_service_type=random$" "$v"'
+t_assert "mixed report treats file as latency" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops latency\n[global]\nnumjobs=4\nioengine=libaio\nfilesize=1G\n[j]\nrw=randwrite\niodepth=8\n" > "$FIX/src/022-mixed.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^numjobs=4$" "$FIX/jobs/h1/022-mixed.job"'
+t_assert "max: iops iodepth and nrfiles derived" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/031-iops.job"
+    grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=5$" "$v"'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
