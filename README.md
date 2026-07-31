@@ -18,7 +18,7 @@ wekatester uses fio's native client/server mode:
 
 # Usage
 ```
-usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-v] [-V] [-h] server [server ...]
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a] [-v] [-V] [-h] server [server ...]
        wekatester -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -26,6 +26,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -d directory   target directory on the workers for test files (default: /mnt/weka)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
   -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
+  -a, --auto [safe|max]   derive system-specific fio options from the workers
+                          (default level when omitted: max)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -60,6 +62,25 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 - The `directory=` line is overridden by `-d` when the jobfiles are staged (and inserted if missing), so the shipped jobfiles work against any mount point.
 - The measured workload should be the **last** job in the jobfile — the shipped files use an initial `create_only` job to lay out the files, then `stonewall` into the real workload, and the summary describes that last job.
 
+# Auto mode
+`-a` / `--auto` derives system-specific fio options from the workers instead
+of trusting the jobfiles' static values. Two levels:
+
+- `-a safe` — uniform and conservative: `numjobs` = the smallest usable core
+  count across workers, ioengine fixed only if a worker lacks the one in the
+  jobfile, and fio pinned away from weka's cores (`cpus_allowed`). Hosts stay
+  directly comparable.
+- `-a max` (default when the level is omitted) — each worker is tuned to its
+  own capability: `numjobs` = that host's usable cores, deeper iodepth,
+  and iops/latency tests move to a shared small-file namespace sized from
+  the cluster's backend RAM (cache-defeat working set). Highest numbers;
+  hosts with different hardware run different settings.
+
+Every staged jobfile records what auto derived for that host in header
+comments. Auto also warns when workers differ (core counts, weka cores),
+when the backend RAM query fails, and when the workload's required capacity
+exceeds what's available at `-d`.
+
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
 
@@ -93,3 +114,4 @@ Any results file can be re-summarized later with `-s`, optionally narrowing the 
 - fio's client/server protocol is version-sensitive. Keep fio versions consistent across the workers and the coordinator host, or connections may fail in confusing ways.
 - TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts, and it refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors).
 - A run needs at least one host; the per-host min/max spread in the summary only appears with 2 or more workers.
+- If `-d` is a wekafs mount it must be mounted with `forcedirect`; wekatester refuses to run otherwise. fio's `direct=1` alone does not keep the wekafs client cache fully out of the IO path.
