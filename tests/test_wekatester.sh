@@ -13,5 +13,15 @@ out=$(source ./wekatester 2>&1)
 t_assert "sourcing produces no output" test -z "$out"
 t_assert "usage function defined after source" bash -c 'source ./wekatester; declare -f usage >/dev/null'
 
+# --- parse_args ---
+p() { (source ./wekatester; parse_args "$@"; echo "$AUTO_LEVEL|$DIRECTORY|${HOSTS[*]-}"); }
+t_assert "no -a: auto off"            test "$(p -d /x h1)" = "|/x|h1"
+t_assert "bare -a defaults to max"    test "$(p -a h1 h2)" = "max|/mnt/weka|h1 h2"
+t_assert "-a safe consumed"           test "$(p -a safe h1)" = "safe|/mnt/weka|h1"
+t_assert "--auto bare is max"         test "$(p --auto h1)" = "max|/mnt/weka|h1"
+t_assert "--auto=safe"                test "$(p --auto=safe h1)" = "safe|/mnt/weka|h1"
+t_assert "-vv still counts" bash -c 'source ./wekatester; parse_args -vv h1; [ "$VERBOSITY" -eq 2 ]'
+t_assert "--auto=bogus errors" bash -c '! (source ./wekatester; parse_args --auto=bogus h1) '
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

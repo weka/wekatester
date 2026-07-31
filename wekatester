@@ -39,6 +39,9 @@ fi
 # ControlMaster opts are appended in main() once the socket dir exists.
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
+# Auto mode: derive system-specific fio options
+AUTO_LEVEL=""    # "", "safe", or "max"
+
 # --- logging -----------------------------------------------------------------
 log()   { echo "$(date '+%H:%M:%S') $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
@@ -46,7 +49,7 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-v] [-V] [-h] server [server ...]
+usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a] [-v] [-V] [-h] server [server ...]
        ${0##*/} -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -54,6 +57,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -d directory   target directory on the workers for test files (default: $DIRECTORY)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
+  -a, --auto [safe|max]   derive system-specific fio options from the workers
+                          (default level when omitted: max)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -63,24 +68,38 @@ EOF
 }
 
 # --- argument parsing ----------------------------------------------------------
-while getopts ":d:w:f:s:r:vVh" opt; do
-    case $opt in
-        d) DIRECTORY=$OPTARG ;;
-        w) WORKLOAD=$OPTARG ;;
-        f) FIO_BIN=$OPTARG ;;
-        s) SUMMARIZE_FILE=$OPTARG ;;
-        r) REPORT_ITEMS=$OPTARG ;;
-        v) VERBOSITY=$((VERBOSITY + 1)) ;;
-        V) echo "${0##*/} version $VERSION"; exit 0 ;;
-        h) usage; exit 0 ;;
-        \?) usage >&2; die "unknown option: -$OPTARG" ;;
-        :)  usage >&2; die "option -$OPTARG requires an argument" ;;
-    esac
-done
-shift $((OPTIND - 1))
+need_arg() { [ "$2" -ge 2 ] || { usage >&2; die "option $1 requires an argument"; }; }
 
-HOSTS=("$@")
-MASTER=${HOSTS[0]:-}
+parse_args() {
+    HOSTS=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d) need_arg "$1" $#; DIRECTORY=$2; shift 2 ;;
+            -w) need_arg "$1" $#; WORKLOAD=$2; shift 2 ;;
+            -f) need_arg "$1" $#; FIO_BIN=$2; shift 2 ;;
+            -s) need_arg "$1" $#; SUMMARIZE_FILE=$2; shift 2 ;;
+            -r) need_arg "$1" $#; REPORT_ITEMS=$2; shift 2 ;;
+            -a|--auto)
+                AUTO_LEVEL="max"
+                case "${2:-}" in safe|max) AUTO_LEVEL=$2; shift ;; esac
+                shift ;;
+            --auto=*)
+                AUTO_LEVEL=${1#--auto=}
+                case "$AUTO_LEVEL" in safe|max) ;; *)
+                    usage >&2; die "unknown auto level: $AUTO_LEVEL (safe|max)" ;;
+                esac
+                shift ;;
+            -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
+            -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
+            -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
+            -V) echo "${0##*/} version $VERSION"; exit 0 ;;
+            -h) usage; exit 0 ;;
+            -*) usage >&2; die "unknown option: $1" ;;
+            *)  HOSTS+=("$1"); shift ;;
+        esac
+    done
+    MASTER=${HOSTS[0]:-}
+}
 
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed.
@@ -416,5 +435,6 @@ main() {
 
 # run only when executed, not when sourced (tests source this file)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    parse_args "$@"
     main
 fi
