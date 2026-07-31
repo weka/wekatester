@@ -117,6 +117,19 @@ t_assert "no capacity warning when it fits" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 >/dev/null )
     case "$err" in *WARNING*available*) false;; *) true;; esac'
+t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) 2>&1 )
+    case "$out" in *"required ~150.0GiB"*) true;; *) false;; esac'
+t_assert "capacity: missing _df file reports 0.0GiB available, no warning" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    rm "$FIX/probe/_df"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 )
+    case "$out" in
+        *"available 0.0GiB"*) grep -q WARNING <<< "$out" && false || true ;;
+        *) false ;;
+    esac'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
