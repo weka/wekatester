@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # wekatester unit tests: source the script (source-guard prevents main), test pure functions.
 cd "$(dirname "$0")/.."
+source ./tests/helpers.sh
 PASS=0; FAIL=0
 
 t_assert() {   # t_assert <description> <command...>
@@ -33,17 +34,27 @@ t_assert "nfs skipped"             test "$(c 'nfs4 rw,noatime')" = "skip"
 t_assert "empty line skipped"      test "$(c '')" = "skip"
 
 # --- probe remote snippet ---
-probe_stub() {
-    stub=$(mktemp -d)   # leaked on purpose; tests are short-lived
-    printf '#!/bin/sh\necho 8\n' > "$stub/getconf"
-    printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
-    printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
-    chmod +x "$stub"/*
-    (source ./wekatester; FIO_BIN=fio; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
-}
-export -f probe_stub
 t_assert "probe snippet emits ncpus"   bash -c 'probe_stub | grep -q "ncpus 8"'
 t_assert "probe snippet emits engines" bash -c 'probe_stub | grep -q "engines.*io_uring"'
+
+# --- tuner: fabricate probe dir + jobfile, run auto_tune ---
+t_assert "tuner writes per-host variants" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null
+    test -f "$FIX/jobs/h1/011-bw.job" && test -f "$FIX/jobs/h2/011-bw.job"'
+t_assert "directory override applied" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null
+    grep -q "^directory=/mnt/weka$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "cpus_allowed excludes weka cores" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null
+    grep -q "^cpus_allowed=3-7$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "core mismatch warns" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 16\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 >/dev/null )
+    case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
