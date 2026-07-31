@@ -1,4 +1,4 @@
-# wekatester auto mode (-a / --auto) — design
+# wekatester auto mode (-a / --auto) and local mode — design
 
 2026-07-31 · branch `shell-rewrite`
 
@@ -18,8 +18,93 @@ hand-tuning jobfiles per site.
   (so `-a host1 host2` works). Unknown level → usage error.
 - New: `--ignore-capacity` (long only, no argument, default off) — overrides
   the auto-mode capacity abort; see Capacity check.
+- The `server ...` positional is now optional (`[server ...]` in the synopsis):
+  with none given the run happens on the local host — see Local mode.
 - All existing options and behavior without `-a` are unchanged, except that
   staging always assembles per-client jobfiles (see Flow).
+
+## Local mode
+
+### Trigger
+
+In the run path only (`-s`, `-V` and `-h` are untouched): `main` calls
+`resolve_local_mode`, which fires when the host list is empty and sets
+`LOCAL_MODE=1`, `HOSTS=(localhost)`, `MASTER=localhost`, then logs the fact.
+The old `die "you must specify at least one server"` is gone — a bare
+invocation is now a valid single-host run, not a usage error. The trigger lives
+in its own function so the decision is testable without running `main`.
+
+### Design: swap the transport, keep the architecture
+
+fio still runs in **client/server mode, over loopback**: `fio --server
+--daemonize` locally, the coordinator as `fio --client=localhost` locally,
+jobfiles staged with `cp`. Every phase — preflight, mount guard, daemon
+lifecycle, port check, probe, tuner, staging, run, summarize, cleanup — runs
+logically unchanged. Only two functions know whether a host is remote:
+
+- `run_host <host> <command>` — `bash -c` locally, `ssh -n $SSH_OPTS` remotely.
+- `copy_to_master <src>... <dst-dir>` — `cp -R` locally, `scp -q -r` remotely
+  (the destination is the last argument in both, so call sites are identical).
+
+All ten previous `ssh`/`scp` call sites go through them. Backgrounded sites
+(`run_host ... &`) keep working — it is a plain function, so `$!`, `wait`, and
+the collect-all failure policy are unaffected.
+
+Rationale for **not** adding a separate no-server fio path (`fio <jobfile>`
+directly): the results JSON would change shape (`jobs[]` instead of
+`client_stats[]`), which would fork the summarizer, the expected-host guard,
+and the create-phase "last entry wins" rule — the three places that are
+hardest to test without a cluster. Loopback client/server keeps one code path
+and one JSON contract, and the port check stays meaningful (fio's listener must
+actually be reachable, even on loopback).
+
+Two consequences worth stating:
+
+- **ControlMaster** options are not appended to `SSH_OPTS` in local mode — no
+  ssh runs, so there is nothing to multiplex. `WORK_DIR` is still created and
+  used (probe files, staged variants), and cleanup's socket-close loop already
+  no-ops on the empty socket directory.
+- **preflight's `rc == 255`** special case ("ssh failed") is gated on remote
+  mode. A local command that happens to exit 255 is reported as what it is in
+  this mode — `fio not found`.
+
+### No-sshd guarantee
+
+Local mode invokes neither `ssh` nor `scp`, so it works with sshd stopped, no
+keys, and no `~/.ssh/config`. The test suite enforces this rather than
+asserting it: `no_ssh_fixture` puts `ssh` and `scp` stubs that exit 99 ahead of
+the real binaries on `PATH`, and the local-mode tests — including the full
+`stage_jobfiles` path — run under them.
+
+### Expected-hostname assumption
+
+The summarizer's missing-host guard is passed `"${HOSTS[*]}"` unchanged, i.e.
+`localhost`. This relies on fio keying each `client_stats` entry by the name
+given to `--client=`, not by the worker's own hostname — lab evidence from a
+multi-host run, where `per_host` was keyed by `backend-N` while `hostname` on
+those machines returned the long FQDN form. Deliberately **not** special-cased:
+if the assumption were wrong, a special case would hide it in local mode while
+leaving the multi-host guard broken. The lab gate below re-verifies it.
+
+### Test plumbing
+
+`TARGET_DIR` is now `${TARGET_DIR:-/dev/shm/fio-jobfiles}`. The only reason is
+testability: the suite points it at a tmp dir so the real `stage_jobfiles` —
+master-side `rm -rf`/`mkdir` plus the jobfile copy, both through the wrappers —
+can run with no worker and no `/dev/shm`. It is not a documented option.
+
+### Lab validation
+
+- Zero-argument smoke run on a backend: `./wekatester -w smoke` — confirm no
+  ssh process appears (`ssh` can even be moved aside), the port check passes on
+  loopback, results parse, and `$TARGET_DIR` is removed on exit.
+- `./wekatester -a max` on a backend — confirm the probe reads that host's own
+  cores/weka pinning and the staged variant under
+  `$TARGET_DIR/localhost/` matches.
+- Confirm fio's `client_stats[].hostname` is literally `localhost` (the
+  expected-host guard above), and that a single-client run still needs no
+  `All clients` aggregate.
+- Confirm it works with `systemctl stop sshd`.
 
 ## Flow changes
 
