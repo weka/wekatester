@@ -131,6 +131,44 @@ preflight() {
     debug "preflight passed on all hosts"
 }
 
+# --- phase 1b: mount mode verification ----------------------------------------
+# Decide whether a "FSTYPE OPTIONS" line from findmnt satisfies the guard.
+# wekafs must be mounted forcedirect: fio's direct=1 asks for O_DIRECT per
+# file, but only the forcedirect mount mode keeps the wekafs client cache
+# out of the IO path entirely. Non-wekafs targets are not our call.
+classify_mount_line() {
+    set -- $1
+    local fstype=${1:-} opts=${2:-} mode
+    [ "$fstype" = "wekafs" ] || { echo "skip"; return; }
+    case ",$opts," in
+        *,forcedirect,*) echo "ok" ;;
+        *,writecache,*)  echo "fail writecache" ;;
+        *,readcache,*)   echo "fail readcache" ;;
+        *)               echo "fail unknown" ;;
+    esac
+}
+
+# All workers: -d must not be a cached-mode wekafs mount.
+verify_mount_mode() {
+    log "checking mount mode of $DIRECTORY on ${#HOSTS[@]} host(s)..."
+    local host line verdict failed=()
+    for host in "${HOSTS[@]}"; do
+        line=$(ssh -n $SSH_OPTS "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
+            || { failed+=("$host: findmnt failed"); continue; }
+        verdict=$(classify_mount_line "$line")
+        case "$verdict" in
+            ok)   ;;
+            skip) debug "$host: $DIRECTORY is not wekafs; guard skipped" ;;
+            fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)") ;;
+        esac
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        for line in "${failed[@]}"; do log "ERROR: $line" >&2; done
+        die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+    fi
+    debug "mount mode ok on all hosts"
+}
+
 # --- phase 2: fio server lifecycle ---------------------------------------------
 # Start 'fio --server' on every host; guarantee teardown on any exit path.
 # Daemons are tracked by pidfile only -- never pkill by name, the host may be
@@ -427,6 +465,7 @@ main() {
 
     trap cleanup EXIT INT TERM
     preflight
+    verify_mount_mode
     start_fio_servers
     verify_fio_ports
     stage_jobfiles

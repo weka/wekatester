@@ -23,5 +23,14 @@ t_assert "--auto=safe"                test "$(p --auto=safe h1)" = "safe|/mnt/we
 t_assert "-vv still counts" bash -c 'source ./wekatester; parse_args -vv h1; [ "$VERBOSITY" -eq 2 ]'
 t_assert "--auto=bogus errors" bash -c '! (source ./wekatester; parse_args --auto=bogus h1) '
 
+# --- mount guard classifier ---
+c() { (source ./wekatester; classify_mount_line "$1"); }
+t_assert "wekafs forcedirect ok"   test "$(c 'wekafs rw,relatime,forcedirect,inode_bits=auto')" = "ok"
+t_assert "wekafs writecache fails" test "$(c 'wekafs rw,relatime,writecache,readahead_kb=32768')" = "fail writecache"
+t_assert "wekafs readcache fails"  test "$(c 'wekafs rw,readcache')" = "fail readcache"
+t_assert "wekafs unknown mode"     test "$(c 'wekafs rw,relatime')" = "fail unknown"
+t_assert "nfs skipped"             test "$(c 'nfs4 rw,noatime')" = "skip"
+t_assert "empty line skipped"      test "$(c '')" = "skip"
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
