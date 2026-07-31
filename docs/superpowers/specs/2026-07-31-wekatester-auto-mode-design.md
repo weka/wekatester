@@ -124,8 +124,8 @@ out of scope here.
 
 ## Capacity warning
 
-`required = Σ over hosts of max over jobfiles(numjobs × filesize × nrfiles)`
-(max, not sum: jobfiles share files within a namespace). Python parses fio
+`required = Σ over hosts of [ Σ over filename_format namespaces of max over that namespace's jobfiles(numjobs × filesize × nrfiles) ]`
+— files are shared within a namespace, so each namespace contributes its largest jobfile's footprint; distinct namespaces (e.g. bandwidth vs small-file) coexist and sum. Python parses fio
 size suffixes. If `required > available` on `-d`: warn loudly with both
 numbers and continue (never abort). Auto mode only, v1.
 

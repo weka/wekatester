@@ -107,5 +107,16 @@ t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
     v="$FIX/jobs/h1/012-mixed-bw.job"
     grep -q "^numjobs=5$" "$v" && grep -q "^filesize=10G$" "$v" && ! grep -q "wt-small" "$v"'
 
+# --- tuner: capacity warning (Task 7) ---
+t_assert "capacity warning fires when oversized" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) 2>&1 >/dev/null )
+    case "$err" in *WARNING*"available"*) true;; *) false;; esac'
+t_assert "no capacity warning when it fits" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 >/dev/null )
+    case "$err" in *WARNING*available*) false;; *) true;; esac'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

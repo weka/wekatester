@@ -456,6 +456,40 @@ for job in jobs:
             fp.write("\n".join(header + out) + "\n")
     kind = "latency" if is_latency else ("bandwidth" if is_bw else "iops" if is_iops else "all")
     print(f"auto[{tier}]: {job} type={kind}")
+
+# Capacity: per host, group staged jobs by filename_format namespace; each
+# namespace's footprint is the max over its jobfiles of numjobs*filesize*nrfiles
+# (files are shared within a namespace); host total = sum over namespaces.
+def job_value(path, key, default):
+    for line in open(path):
+        m = re.match(rf"^{key}=(\S+)", line)
+        if m: return m.group(1)
+    return default
+
+required = 0
+for h in hosts:
+    namespaces = {}
+    for job in jobs:
+        p = os.path.join(work, "jobs", h, job)
+        ns = job_value(p, "filename_format", "$jobname.$jobnum.$filenum")
+        need = (int(job_value(p, "numjobs", "1"))
+                * parse_size(job_value(p, "filesize", "0"))
+                * int(job_value(p, "nrfiles", "1")))
+        namespaces[ns] = max(namespaces.get(ns, 0), need)
+    required += sum(namespaces.values())
+
+avail = 0
+df_path = os.path.join(work, "probe", "_df")
+if os.path.exists(df_path):
+    df_lines = open(df_path).read().splitlines()
+    if len(df_lines) >= 2:
+        avail = int(df_lines[1].split()[3]) * 1024
+
+gib = lambda n: f"{n / 2**30:.1f}"
+print(f"auto: capacity required ~{gib(required)}GiB, available {gib(avail)}GiB")
+if avail and required > avail:
+    warn(f"workload needs ~{gib(required)}GiB but {directory} has "
+         f"{gib(avail)}GiB available")
 PYEOF
 }
 
