@@ -44,6 +44,29 @@ signal_wait_started() {
     [ -e "$SIG/started" ]
 }
 
+# --- local mode: prove the transport never reaches for ssh ---
+# ssh and scp stubs that fail loudly, shadowing the real binaries. Without
+# them, a local-mode test would still pass on any box where ssh-to-localhost
+# happens to work, so the "no sshd required" guarantee would go unverified.
+no_ssh_fixture() {
+    NOSSH=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho "ERROR: %s invoked in local mode" >&2\nexit 99\n' ssh > "$NOSSH/ssh"
+    printf '#!/bin/sh\necho "ERROR: %s invoked in local mode" >&2\nexit 99\n' scp > "$NOSSH/scp"
+    chmod +x "$NOSSH/ssh" "$NOSSH/scp"
+    PATH="$NOSSH:$PATH"
+}
+
+# --- transport: ssh/scp stubs that echo their argv instead of connecting ---
+# Pins the remote command lines the wrappers build, so the local-mode refactor
+# cannot quietly change what a real run sends over the wire.
+echo_transport_fixture() {
+    ECHOT=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho "SSH: $*"\n' > "$ECHOT/ssh"
+    printf '#!/bin/sh\necho "SCP: $*"\n' > "$ECHOT/scp"
+    chmod +x "$ECHOT/ssh" "$ECHOT/scp"
+    PATH="$ECHOT:$PATH"
+}
+
 # --- summarizer: fabricated fio client-mode results ---
 # client_stats is a flat list of (host, job) entries plus "All clients"
 # aggregates. The create/layout phase runs first in every shipped jobfile, so

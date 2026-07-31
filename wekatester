@@ -8,6 +8,10 @@
 # sockets: one TCP+auth handshake per host for the whole run. Result parsing
 # is delegated to embedded python3 (stdlib only). No installable dependencies.
 #
+# With no server on the command line the same orchestration runs against the
+# local host with the transport swapped for direct execution (see run_host):
+# fio still runs client/server, over loopback, so no sshd is needed at all.
+#
 # All transient staging (jobfiles, control sockets, remote jobfile copies,
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
 # written to disk are the results_*.json outputs in the current directory.
@@ -23,8 +27,10 @@ SUMMARIZE_FILE=""               # -s: just summarize an existing results file
 REPORT_ITEMS=""                 # -r: report items for -s (default: all)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# remote hosts are Linux: /dev/shm is guaranteed tmpfs
-TARGET_DIR="/dev/shm/fio-jobfiles"      # jobfile staging dir on the master
+# remote hosts are Linux: /dev/shm is guaranteed tmpfs.
+# TARGET_DIR honours the environment purely as test plumbing -- the suite points
+# it at a tmp dir to exercise the real staging path without a worker.
+TARGET_DIR="${TARGET_DIR:-/dev/shm/fio-jobfiles}"   # jobfile staging dir on the master
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
@@ -39,6 +45,11 @@ fi
 # ControlMaster opts are appended in main() once the socket dir exists.
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
+# Local mode: no server on the command line, so the "cluster" is this host and
+# the transport below executes directly instead of over ssh. Set by
+# resolve_local_mode() in the run path only.
+LOCAL_MODE=0
+
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", or "max"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
@@ -50,10 +61,51 @@ log()   { echo "$(date '+%H:%M:%S') $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
+# --- transport ----------------------------------------------------------------
+# The only two places that know whether a host is remote. Every phase --
+# preflight, the mount guard, the fio daemon lifecycle, the port check, the
+# probe, staging, the run, cleanup -- goes through these, so local mode is a
+# transport swap and nothing else: fio still runs in client/server mode, just
+# over loopback, so every guard applies and the results JSON keeps its shape.
+
+# Run a command on a host. Local mode executes directly -- no sshd needed.
+run_host() {   # run_host <host> <command-string>
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        bash -c "$2"
+    else
+        # -n: stdin from /dev/null, so a backgrounded ssh cannot consume the
+        # script's own stdin
+        ssh -n $SSH_OPTS "$1" "$2"
+    fi
+}
+
+# Copy files to the master's staging area. The destination directory is the
+# last argument, exactly as cp and scp both expect it.
+copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        cp -R "$@"
+    else
+        # ${!#} is the last positional (the destination), ${@:1:$#-1} is
+        # everything before it; both are bash 3.2-safe.
+        scp $SSH_OPTS -q -r "${@:1:$#-1}" "$MASTER:${!#}"
+    fi
+}
+
+# No server on the command line: benchmark this host instead of refusing to run.
+# fio still drives the whole thing in client/server mode, over loopback, so no
+# phase below needs a second code path -- only the transport changes.
+resolve_local_mode() {
+    [ ${#HOSTS[@]} -eq 0 ] || return 0
+    LOCAL_MODE=1
+    HOSTS=(localhost)
+    MASTER=localhost
+    log "no servers given: running on the local host (no ssh required)"
+}
+
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-v] [-V] [-h] server [server ...]
+                  [--ignore-capacity] [-v] [-V] [-h] [server ...]
        ${0##*/} -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -69,6 +121,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -v             increase output verbosity (repeatable)
   -V             display version number and exit
   -h             show this help and exit
+
+With no server given, the test runs on the local host -- no ssh required.
 EOF
 }
 
@@ -108,21 +162,28 @@ parse_args() {
 }
 
 # --- phase 1: preflight --------------------------------------------------------
-# Verify every host is reachable over ssh and has $FIO_BIN installed.
+# Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:
+# just the fio check -- there is no connection to test).
 # Policy: check all hosts in parallel, report every failure, then exit.
 # Side effect: each check opens the host's ControlMaster socket, so every
 # later ssh/scp to that host rides the authenticated connection for free.
 preflight() {
-    log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        log "checking $FIO_BIN on the local host..."
+    else
+        log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
+    fi
     local pids=() failed=() host i rc
     for host in "${HOSTS[@]}"; do
-        ssh -n $SSH_OPTS "$host" "command -v '$FIO_BIN' >/dev/null" &
+        run_host "$host" "command -v '$FIO_BIN' >/dev/null" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}"
         rc=$?
-        if [ "$rc" -eq 255 ]; then
+        # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
+        # a local command that happens to exit 255 is just a missing fio.
+        if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
             failed+=("${HOSTS[$i]}: ssh failed")
         elif [ "$rc" -ne 0 ]; then
             failed+=("${HOSTS[$i]}: $FIO_BIN not found")
@@ -159,7 +220,7 @@ verify_mount_mode() {
     log "checking mount mode of $DIRECTORY on ${#HOSTS[@]} host(s)..."
     local host line verdict failed=()
     for host in "${HOSTS[@]}"; do
-        line=$(ssh -n $SSH_OPTS "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
+        line=$(run_host "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
             || { failed+=("$host: findmnt failed"); continue; }
         verdict=$(classify_mount_line "$line")
         case "$verdict" in
@@ -199,7 +260,7 @@ start_fio_servers() {
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
     local pids=() failed=() host i
     for host in "${HOSTS[@]}"; do
-        ssh -n $SSH_OPTS "$host" \
+        run_host "$host" \
             "$(kill_fio_cmd); '$FIO_BIN' --server --daemonize='$FIO_PIDFILE'" &
         pids+=($!)
     done
@@ -222,7 +283,7 @@ verify_fio_ports() {
     for host in "${HOSTS[@]}"; do
         # single statement on purpose: bash does not exit on a failed exec
         # redirection, so a compound probe would mask the connect failure
-        ssh -n $SSH_OPTS "$MASTER" \
+        run_host "$MASTER" \
             "timeout 3 bash -c ': </dev/tcp/$host/$FIO_PORT'" &
         pids+=($!)
     done
@@ -244,7 +305,7 @@ cleanup() {
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
         for host in "${HOSTS[@]}"; do
-            ssh -n $SSH_OPTS "$host" "$(kill_fio_cmd); rm -rf '$TARGET_DIR'" &
+            run_host "$host" "$(kill_fio_cmd); rm -rf '$TARGET_DIR'" &
         done
         wait
     fi
@@ -281,7 +342,7 @@ probe_workers() {
     mkdir -p "$WORK_DIR/probe"
     local pids=() failed=() host i
     for host in "${HOSTS[@]}"; do
-        ssh -n $SSH_OPTS "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
+        run_host "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
@@ -289,9 +350,9 @@ probe_workers() {
     done
     [ ${#failed[@]} -eq 0 ] || die "probe failed on: ${failed[*]}"
 
-    ssh -n $SSH_OPTS "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
+    run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
-    if ! ssh -n $SSH_OPTS "$MASTER" "weka cluster servers list -J" \
+    if ! run_host "$MASTER" "weka cluster servers list -J" \
             > "$WORK_DIR/probe/_weka_ram.json"; then
         rm -f "$WORK_DIR/probe/_weka_ram.json"
         : > "$WORK_DIR/probe/_weka_ram.err"
@@ -634,9 +695,9 @@ stage_jobfiles() {
 
     stage_variants "$JOBFILE_SRC"
 
-    ssh -n $SSH_OPTS "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
+    run_host "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
         || die "cannot create $TARGET_DIR on $MASTER"
-    scp $SSH_OPTS -q -r "$WORK_DIR"/jobs/* "$MASTER:$TARGET_DIR/" \
+    copy_to_master "$WORK_DIR"/jobs/* "$TARGET_DIR/" \
         || die "failed to copy jobfiles to $MASTER"
 }
 
@@ -664,8 +725,14 @@ run_jobs() {
         outfile="results_${stamp}_${job%.job}.json"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         debug "running on $MASTER: $cmd"
-        ssh -n $SSH_OPTS "$MASTER" "$cmd" > "$outfile" \
+        run_host "$MASTER" "$cmd" > "$outfile" \
             || die "fio run failed for $job (partial output in $outfile)"
+        # Expected-host guard. Assumption: fio keys each client_stats entry by
+        # the name we passed to --client=, not by the worker's own hostname
+        # (lab evidence: a multi-host run keys per_host by backend-N while
+        # `hostname` there returns the long FQDN form). Local mode rides the
+        # same rule -- --client=localhost reports as "localhost" -- so it needs
+        # no special case here. The lab gate re-verifies both.
         summarize "$outfile" "$report" "${HOSTS[*]}"
     done
     log "raw fio results: results_${stamp}_*.json"
@@ -810,7 +877,7 @@ main() {
         exit 0
     fi
 
-    [ ${#HOSTS[@]} -gt 0 ] || { usage >&2; die "you must specify at least one server"; }
+    resolve_local_mode
     command -v python3 >/dev/null || die "python3 is required for result parsing"
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
@@ -819,8 +886,11 @@ main() {
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
     mkdir -p "$WORK_DIR/c" "$WORK_DIR/jobs"
     # multiplex every ssh/scp in this run over one connection per host.
-    # %C hashes host/port/user into a short, safe socket name.
-    SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=60s"
+    # %C hashes host/port/user into a short, safe socket name. Local mode never
+    # runs ssh, so there is nothing to multiplex -- and cleanup's socket loop
+    # already no-ops on the empty socket dir.
+    [ "$LOCAL_MODE" -eq 1 ] || \
+        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=60s"
 
     # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
     # statement, so a Ctrl-C would tear the run down and keep going. Signals

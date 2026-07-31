@@ -389,6 +389,69 @@ t_assert "report directive: prose is not a directive" \
 t_assert "report directive: bare # report means default-all" \
     test -z "$(r '# report\n[global]\n')"
 
+# --- local mode: trigger ---
+# With no server on the command line the run happens here, and the transport
+# wrappers must never reach for ssh/scp (no_ssh_fixture enforces that: the
+# stubs shadow the real binaries and exit 99).
+lm() { (source ./wekatester; parse_args "$@"; resolve_local_mode >/dev/null
+        echo "$LOCAL_MODE|$MASTER|${HOSTS[*]-}"); }
+t_assert "local mode defaults off"          bash -c 'source ./wekatester; [ "$LOCAL_MODE" -eq 0 ]'
+t_assert "no servers: local mode on, host and master are localhost" \
+    test "$(lm -d /x)" = "1|localhost|localhost"
+t_assert "no servers: the run is announced" bash -c '
+    out=$(source ./wekatester; parse_args; resolve_local_mode)
+    case "$out" in *"local host"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "servers given: local mode stays off, host list untouched" \
+    test "$(lm h1 h2)" = "0|h1|h1 h2"
+
+# --- local mode: transport wrappers ---
+t_assert "run_host local: returns the command output" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    source ./wekatester; LOCAL_MODE=1
+    [ "$(run_host localhost "echo hi")" = "hi" ]'
+t_assert "run_host local: nonzero rc propagates" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    source ./wekatester; LOCAL_MODE=1
+    run_host localhost "exit 7"; [ "$?" -eq 7 ]'
+t_assert "copy_to_master local: copies into the destination dir" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d); mkdir "$d/src" "$d/dst"; echo x > "$d/src/f"
+    source ./wekatester; LOCAL_MODE=1
+    copy_to_master "$d/src/f" "$d/dst/" && [ "$(cat "$d/dst/f")" = x ]'
+
+# The remote branch of the wrappers must still build exactly the ssh/scp command
+# lines it built before the refactor -- copy_to_master splits the destination off
+# the end of "$@" (${!#} / ${@:1:$#-1}), which no local-mode test exercises.
+t_assert "run_host remote: builds the ssh command line" bash -c '
+    source ./tests/helpers.sh; echo_transport_fixture
+    out=$(source ./wekatester
+          LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"
+          run_host vega-1 "df -kP /mnt/weka")
+    [ "$out" = "SSH: -n -o BatchMode=yes vega-1 df -kP /mnt/weka" ] ||
+        { echo "$out" >&2; false; }'
+t_assert "copy_to_master remote: last argument becomes the scp destination" bash -c '
+    source ./tests/helpers.sh; echo_transport_fixture
+    out=$(source ./wekatester
+          LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
+          copy_to_master /w/jobs/h1 /w/jobs/h2 /dev/shm/fio-jobfiles/)
+    [ "$out" = "SCP: -o BatchMode=yes -q -r /w/jobs/h1 /w/jobs/h2 vega-1:/dev/shm/fio-jobfiles/" ] ||
+        { echo "$out" >&2; false; }'
+
+# --- local mode: staging end to end (no ssh, no sshd) ---
+# TARGET_DIR is redirected at a tmp dir so the real staging path runs unchanged:
+# the master-side mkdir and the jobfile copy both go through the wrappers.
+t_assert "local staging lands per-host variants under TARGET_DIR" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
+     WORK_DIR="$d/work"; TARGET_DIR="$d/target"; DIRECTORY=/mnt/weka
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles) >/dev/null || exit 1
+    v="$d/target/localhost/011-smoke-readbw.job"
+    test -f "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
+    test -f "$d/target/localhost/022-smoke-writeiops.job"'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh

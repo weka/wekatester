@@ -19,7 +19,7 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-v] [-V] [-h] server [server ...]
+                  [--ignore-capacity] [-v] [-V] [-h] [server ...]
        wekatester -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -35,6 +35,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -v             increase output verbosity (repeatable)
   -V             display version number and exit
   -h             show this help and exit
+
+With no server given, the test runs on the local host -- no ssh required.
 ```
 
 `server ...` — one or more worker hostnames. The first one is the coordinator/master.
