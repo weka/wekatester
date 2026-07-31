@@ -131,5 +131,14 @@ t_assert "capacity: missing _df file reports 0.0GiB available, no warning" bash 
         *) false ;;
     esac'
 
+# --- stage_variants: per-host jobfile staging (Task 8) ---
+t_assert "non-auto staging produces per-host variants" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester
+     WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=""
+     stage_variants "$FIX/src")
+    test -f "$FIX/jobs/h1/011-bw.job" && test -f "$FIX/jobs/h2/011-bw.job" &&
+    grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/011-bw.job"'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -494,10 +494,40 @@ PYEOF
 }
 
 # --- phase 3: stage jobfiles ---------------------------------------------------
-# Discover the workload's jobfiles, override directory=, copy the set to
-# $TARGET_DIR on $MASTER (one scp over the existing master connection).
+# Discover the workload's jobfiles, build $WORK_DIR/jobs/<host>/<job> for
+# every host, copy the whole tree to $TARGET_DIR on $MASTER (one scp over
+# the existing master connection).
 JOBFILES=()      # basenames, in run order
 JOBFILE_SRC=""   # local source directory
+
+# Build $WORK_DIR/jobs/<host>/<job> for every host. Auto mode delegates to
+# the tuner; plain mode copies with the directory override (variants are
+# identical across hosts, but one layout = one code path).
+stage_variants() {
+    local srcdir=$1 job base host
+    if [ -n "$AUTO_LEVEL" ]; then
+        auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" "${HOSTS[@]}" \
+            || die "auto tuning failed"
+        return
+    fi
+    for host in "${HOSTS[@]}"; do
+        mkdir -p "$WORK_DIR/jobs/$host"
+        for job in "$srcdir"/[0-9]*; do
+            base=${job##*/}
+            # override directory= wherever it appears; jobfiles without one
+            # get it inserted right after [global]
+            if grep -q '^directory=' "$job"; then
+                awk -v dir="$DIRECTORY" \
+                    '/^directory=/ { print "directory=" dir; next } { print }' \
+                    "$job" > "$WORK_DIR/jobs/$host/$base"
+            else
+                awk -v dir="$DIRECTORY" \
+                    '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
+                    "$job" > "$WORK_DIR/jobs/$host/$base"
+            fi
+        done
+    done
+}
 
 stage_jobfiles() {
     JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
@@ -508,24 +538,15 @@ stage_jobfiles() {
     for job in "$JOBFILE_SRC"/[0-9]*; do
         [ -f "$job" ] || die "no jobfiles found in $JOBFILE_SRC"
         base=${job##*/}
-        # override directory= wherever it appears; jobfiles without one get
-        # it inserted right after [global]
-        if grep -q '^directory=' "$job"; then
-            awk -v dir="$DIRECTORY" \
-                '/^directory=/ { print "directory=" dir; next } { print }' \
-                "$job" > "$WORK_DIR/jobs/$base"
-        else
-            awk -v dir="$DIRECTORY" \
-                '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
-                "$job" > "$WORK_DIR/jobs/$base"
-        fi
         JOBFILES+=("$base")
     done
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 
+    stage_variants "$JOBFILE_SRC"
+
     ssh -n $SSH_OPTS "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
         || die "cannot create $TARGET_DIR on $MASTER"
-    scp $SSH_OPTS -q "$WORK_DIR"/jobs/*.job "$MASTER:$TARGET_DIR/" \
+    scp $SSH_OPTS -q -r "$WORK_DIR"/jobs/* "$MASTER:$TARGET_DIR/" \
         || die "failed to copy jobfiles to $MASTER"
 }
 
@@ -541,7 +562,7 @@ run_jobs() {
         report=$(sed -n 's/^#[[:space:]]*report[[:space:]]*//p' "$JOBFILE_SRC/$job" | tr '\n' ' ')
         cmd="'$FIO_BIN' --output-format=json"
         for host in "${HOSTS[@]}"; do
-            cmd="$cmd --client=$host '$TARGET_DIR/$job'"
+            cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
         done
         outfile="results_${stamp}_${job%.job}.json"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
