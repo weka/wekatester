@@ -1,80 +1,95 @@
 # wekatester
-Performance test weka clusters with distributed fio
+Performance test weka clusters (or any network/parallel filesystem) with distributed fio.
 
-Includes fio both consistency (versions vary) and convienience. 
-
-
-```
-# ./wekatester --help
-usage: wekatester.py [-h] -d DIRECTORY [-w WORKLOAD] [--fio-bin LOCAL_FIO]
-                     [-V] [-v]
-                     [server ...]
-
-Basic Performance Test a Network/Parallel Filesystem
-
-positional arguments:
-  server                One or more Servers to use a workers
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -d DIRECTORY, --directory DIRECTORY
-                        target directory on the workers for test files
-  -w WORKLOAD, --workload WORKLOAD
-                        workload definition directory (a subdir of fio-
-                        jobfiles)
-  --fio-bin LOCAL_FIO   Specify the fio binary on the target servers (default
-                        /usr/bin/fio)
-  -V, --version         Display version number
-  -v, --verbosity       increase output verbosity
-```                        
+wekatester is a single bash script with an embedded python3 result summarizer. There is nothing to install: it needs only bash, an OpenSSH client, and python3 (stdlib only) on the machine you run it from, plus fio on the workers. The workers are Linux hosts reachable by ssh.
 
 # Basics
-fio is a benchmark for IO, and is quite popular.  However, running it in a distributed fashion across multiple servers can be a bit of a bear to manage, and the output can be quite difficult to read.
+fio is a benchmark for IO, and is quite popular. However, running it in a distributed fashion across multiple servers can be a bit of a bear to manage, and the output can be quite difficult to read.
 
-The idea of wekatester is to bring some order to this chaos.   To make running fio in a distributed environment, wekatester automatically distributes and executes fio commands on remote servers, runs a standard set of benchmark workloads, and summarizes the results.
+The idea of wekatester is to bring some order to this chaos. It starts fio on your workers, runs a standard set of benchmark workloads across all of them at once, and summarizes the results in a few human-readable lines per job.
 
-# Options
-`servers` - a list of servers to use as workers.
+# How it works
+wekatester uses fio's native client/server mode:
 
-`-d DIRECTORY` sets the directory where the benchmark files will be created.  This is a required argument.
+- An `fio --server` daemon is started on every worker (daemonized with a pidfile in `/dev/shm`; on exit it is killed via that pidfile only — never by name, so fio jobs that are not ours are untouched).
+- The **first host on the command line acts as the coordinator**: jobfiles are staged only to that host, and the fio client process runs there, driving all the workers. Aggregation across workers is done by fio itself (the "All clients" totals).
+- ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
+- All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the results files in the current directory.
 
-`-w WORKLOAD` get fio jobfile specifications from a subdirectory of fio-jobfiles.   The default is 'default'.  Currently, there are 2 discributed with wekatester, "default" (4-corners tests), and "mixed", a set of 70/30 RW workloads.  You can add your own directories, and use the with -w.
+# Usage
+```
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-v] [-V] [-h] server [server ...]
+       wekatester -s results.json [-r "bandwidth latency iops"]
 
-`--fio-bin` Default is `/usr/bin/fio`.  You can use this argument to set a different location.
+Basic performance test of a network/parallel filesystem (distributed fio).
 
-`-v` Sets verbosity.  `-vv`, and `-vvv` are supported to set ever increasing verbosity.
+  -d directory   target directory on the workers for test files (default: /mnt/weka)
+  -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
+  -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
+  -s file        summarize an existing fio JSON results file and exit
+  -r items       report items for -s: any of "bandwidth latency iops" (default: all)
+  -v             increase output verbosity (repeatable)
+  -V             display version number and exit
+  -h             show this help and exit
+```
+
+`server ...` — one or more worker hostnames. The first one is the coordinator/master.
+
+`-d directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time.
+
+`-w workload` — pick a workload set, a subdirectory of `fio-jobfiles`. See below.
+
+`-f fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`.
+
+`-s results.json` — offline mode: re-summarize an existing results file and exit, no hosts involved. `-r "bandwidth latency iops"` (any subset) selects which metrics to report; default is all.
+
+`-v` — more verbosity; repeatable (`-vv`).
+
+# Workloads
+A workload is a directory of standard fio jobfiles under `fio-jobfiles/`, run in sorted filename order. Shipped sets:
+
+- `default` — the classic 4-corners tests (read/write bandwidth, latency, iops)
+- `mixed` — 70/30 read/write workloads
+- `2x400Gb` — a heavier bandwidth-oriented variant
+- `wekawithin` — 1M/128k/4k reads, writes, and mixed IO
+
+Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conventions:
+
+- Jobfile names must start with a digit (`011-bandwidthR.job`, ...) — that numeric prefix is both how files are discovered and what sets the run order.
+- A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything.
+- The `directory=` line is overridden by `-d` when the jobfiles are staged (and inserted if missing), so the shipped jobfiles work against any mount point.
+- The measured workload should be the **last** job in the jobfile — the shipped files use an initial `create_only` job to lay out the files, then `stonewall` into the real workload, and the summary describes that last job.
+
+# SSH configuration
+Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
+
+- `aws_ssh_config.example` — `ec2-user` with a support key, host key checking off
+- `on-prem_ssh_config.example` — default key, host key checking off
+
+Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
 
 # Output
-The output will be summarized after each workload run, and all results are writting to a log file.
+Each job prints a summary block as it completes, and the raw fio JSON is kept — one file per job, named `results_<timestamp>_<jobname>.json` in the current directory, so a crashed suite keeps everything already measured.
 
-Typical output will look something like this:
+The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency:
+
 ```
-starting test run for job 011-bandwidthR.job on <hostname> with <n> workers:
-    read bandwidth: 9.37 GiB/s
-    total bandwidth: 9.37 GiB/s
-    average bandwidth: 2.34 GiB/s per host
-
-starting test run for job 012-bandwithW.job on <hostname> with <n> workers:
-    write bandwidth: 7.72 GiB/s
-    total bandwidth: 7.72 GiB/s
-    average bandwidth: 1.93 GiB/s per host
-
-starting test run for job 021-latencyR.job on <hostname> with <n> workers:
-    read latency: 237 us
-
-starting test run for job 022-latencyW.job on <hostname> with <n> workers:
-    write latency: 180 us
-
-starting test run for job 031-iopsR.job on <hostname> with <n> workers:
-    read iops: 376,697/s
-    total iops: 376,697/s
-    average iops: 94,174/s per host
-
-starting test run for job 032-iopsW.job on <hostname> with <n> workers:
-    write iops: 302,132/s
-    total iops: 302,132/s
-    average iops: 75,533/s per host
-
-Writing raw fio results to results_2025-10-07_1112.json
+starting test run for job 011-bandwidthR.job on host-1 with 2 workers:
+    read bandwidth: 4.50 GiB/s
+    write bandwidth: 2.50 GiB/s
+    total bandwidth: 7.00 GiB/s
+    average bandwidth: 3.50 GiB/s per host  (min 3.00 GiB/s vega-1, max 4.00 GiB/s vega-2)
+    read latency: 227.3 us  (min 200.0 us vega-1, max 250.0 us vega-2)
+    average latency: 269.7 us (IO-weighted)
 ```
-The raw output is the actual raw JSON output from the FIO commands.
+
+Any results file can be re-summarized later with `-s`, optionally narrowing the metrics with `-r`:
+
+```
+./wekatester -s results_2026-07-30_1112_011-bandwidthR.json -r "bandwidth latency"
+```
+
+# Caveats
+- fio's client/server protocol is version-sensitive. Keep fio versions consistent across the workers and the coordinator host, or connections may fail in confusing ways.
+- TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts, and it refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors).
+- A run needs at least one host; the per-host min/max spread in the summary only appears with 2 or more workers.

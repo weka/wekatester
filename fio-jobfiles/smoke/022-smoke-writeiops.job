@@ -1,0 +1,32 @@
+# quick harness validation: small files, short run
+# report iops latency
+[global]
+filesize=256M
+time_based=1
+startdelay=2
+exitall_on_error=1
+create_serialize=0
+# flat names (no subdirs): unlink below removes files, leaving nothing behind
+filename_format=wekatester-smoke.$jobnum
+directory=/mnt/weka
+group_reporting=1
+runtime=10
+ioengine=libaio
+disk_util=0
+direct=1
+numjobs=4
+
+[smoke-createfiles]
+blocksize=1Mi
+description='pre-create files'
+create_only=1
+
+[smoke-writeiops]
+stonewall
+description='random write iops smoke test'
+blocksize=4k
+rw=randwrite
+iodepth=8
+# smoke test cleans up after itself; only the last job may unlink,
+# or the measured job would lose the files the create job laid out
+unlink=1

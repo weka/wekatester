@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # remote hosts are Linux: /dev/shm is guaranteed tmpfs
 TARGET_DIR="/dev/shm/fio-jobfiles"      # jobfile staging dir on the master
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
+FIO_PORT=8765                           # fio --server listen port
 
 # local staging: prefer tmpfs; fall back for non-Linux (e.g. macOS) dev boxes
 if [ -d /dev/shm ] && [ -w /dev/shm ]; then
@@ -117,13 +118,26 @@ preflight() {
 # running fio jobs that are not ours.
 FIO_STARTED=0
 
+# remote shell snippet: kill the pidfile daemon and WAIT until every process
+# of ours is actually gone (TERM, up to 3s, then KILL). The pidfile only names
+# the parent -- fio --server forks a child per client connection (same argv),
+# so the drain loop matches the full unique command line instead. The pattern
+# is anchored to the fio binary so the shell running this snippet (whose own
+# cmdline contains the pattern) can never match itself, and the pidfile path
+# makes it ours alone -- fio runs that are not ours can never match.
+kill_fio_cmd() {
+    local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
+    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
+        i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if pgrep -f '$pat' >/dev/null; then pkill -9 -f '$pat' || true; fi"
+}
+
 start_fio_servers() {
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
     local pids=() failed=() host i
     for host in "${HOSTS[@]}"; do
         ssh -n $SSH_OPTS "$host" \
-            "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
-             '$FIO_BIN' --server --daemonize='$FIO_PIDFILE'" &
+            "$(kill_fio_cmd); '$FIO_BIN' --server --daemonize='$FIO_PIDFILE'" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
@@ -135,15 +149,39 @@ start_fio_servers() {
     debug "fio servers running on all hosts"
 }
 
+# The coordinator ($MASTER) must reach every worker on $FIO_PORT -- ssh working
+# does not imply the fio port is open (host firewalls commonly allow only 22).
+# fio itself treats an unreachable client as a warning and silently benchmarks
+# the survivors, so we refuse to run instead.
+verify_fio_ports() {
+    log "verifying fio port $FIO_PORT reachability from $MASTER..."
+    local pids=() failed=() host i
+    for host in "${HOSTS[@]}"; do
+        # single statement on purpose: bash does not exit on a failed exec
+        # redirection, so a compound probe would mask the connect failure
+        ssh -n $SSH_OPTS "$MASTER" \
+            "timeout 3 bash -c ': </dev/tcp/$host/$FIO_PORT'" &
+        pids+=($!)
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        for host in "${failed[@]}"; do
+            log "ERROR: $MASTER cannot reach $host:$FIO_PORT (host firewall?)" >&2
+        done
+        die "fio port check failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
+    fi
+    debug "fio port reachable on all hosts"
+}
+
 cleanup() {
     local host f
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
         for host in "${HOSTS[@]}"; do
-            ssh -n $SSH_OPTS "$host" \
-                "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
-                 rm -rf '$TARGET_DIR'" &
+            ssh -n $SSH_OPTS "$host" "$(kill_fio_cmd); rm -rf '$TARGET_DIR'" &
         done
         wait
     fi
@@ -212,20 +250,22 @@ run_jobs() {
         debug "running on $MASTER: $cmd"
         ssh -n $SSH_OPTS "$MASTER" "$cmd" > "$outfile" \
             || die "fio run failed for $job (partial output in $outfile)"
-        summarize "$outfile" "$report"
+        summarize "$outfile" "$report" "${HOSTS[*]}"
     done
     log "raw fio results: results_${stamp}_*.json"
 }
 
 # Parse a fio JSON results file and print the human summary.
 # $1 = results file, $2 = report items ("bandwidth iops latency"; empty = all)
+# $3 = expected hosts (space-separated; empty = don't check, e.g. -s mode)
 summarize() {
-    python3 - "$1" "$2" <<'PYEOF' || die "failed to summarize $1"
+    python3 - "$1" "$2" "${3:-}" <<'PYEOF' || die "failed to summarize $1"
 import json
 import sys
 
 path = sys.argv[1]
 items = sys.argv[2].split() or ["bandwidth", "latency", "iops"]
+expected = sys.argv[3].split()
 
 raw = open(path).read()
 start = raw.find("{")
@@ -252,6 +292,16 @@ if alls is None:
         alls = next(iter(per_host.values()))  # fio emits no aggregate for one client
     else:
         sys.exit(f"{path}: no 'All clients' aggregate found")
+
+# a worker that dropped out mid-run silently vanishes from fio's output;
+# refuse to summarize a benchmark that is quietly missing hosts
+if expected:
+    missing = [h for h in expected if h not in per_host]
+    if missing:
+        sys.exit(
+            f"{path}: no results from {len(missing)} of {len(expected)} host(s): "
+            + ", ".join(missing)
+        )
 
 
 def fmt_bytes(n):
@@ -359,6 +409,7 @@ main() {
     trap cleanup EXIT INT TERM
     preflight
     start_fio_servers
+    verify_fio_ports
     stage_jobfiles
     run_jobs
 }
