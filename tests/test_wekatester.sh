@@ -204,5 +204,57 @@ t_assert "auto staging with override stages every host" bash -c '
       { echo "coordinator h1 not staged: argument shift?" >&2; false; }; } &&
     test -f "$FIX/jobs/h2/011-bw.job"'
 
+# --- signal handling: INT/TERM must end the run, not just clean up ---
+# Regression: `trap cleanup EXIT INT TERM` ran cleanup and then CONTINUED at the
+# statement after the signal, so a Ctrl-C left later phases running against a
+# torn-down world (misleading errors, or an exit 0 that measured nothing).
+t_assert "SIGTERM during preflight exits 143" bash -c '
+    source ./tests/helpers.sh; signal_fixture
+    ./wekatester h1 > "$SIG/log" 2>&1 &
+    pid=$!
+    signal_wait_started || { echo "stub ssh never started" >&2; exit 1; }
+    kill -TERM "$pid"
+    wait "$pid"; rc=$?
+    [ "$rc" -eq 143 ] || { echo "expected 143, got $rc" >&2; false; }'
+# set -m: a non-interactive shell makes its async commands ignore SIGINT, and a
+# signal ignored on entry cannot be trapped -- job control puts the run in its
+# own process group so the INT trap is reachable at all. Its job-status notice
+# goes to stderr, so keep stderr captured and only surface it on failure.
+t_assert "SIGINT during preflight exits 130" bash -c '
+    source ./tests/helpers.sh; signal_fixture
+    noise=$( (set -m
+              ./wekatester h1 > "$SIG/log" 2>&1 &
+              pid=$!
+              signal_wait_started || { echo "stub ssh never started" >&2; exit 1; }
+              kill -INT "$pid"
+              wait "$pid") 2>&1 )
+    rc=$?
+    [ "$rc" -eq 130 ] || { echo "expected 130, got $rc ($noise)" >&2; false; }'
+
+# --- staging: jobfiles with no [global] section ---
+# Both insert paths (python override(), the awk non-auto branch) used to match
+# nothing here, so the staged variant carried no directory= at all and fio wrote
+# its files into the fio server'"'"'s cwd instead of -d.
+t_assert "non-auto staging creates [global] when the jobfile has none" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[job1]\nrw=read\nfilesize=1G\n" > "$FIX/src/011-bw.job"
+    (source ./wekatester
+     WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=""
+     stage_variants "$FIX/src")
+    v="$FIX/jobs/h2/011-bw.job"
+    [ "$(head -1 "$v")" = "[global]" ] && grep -q "^directory=/mnt/weka$" "$v" &&
+    grep -q "^\[job1\]$" "$v" && grep -q "^rw=read$" "$v"'
+t_assert "auto staging creates [global] when the jobfile has none" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[job1]\nrw=read\nfilesize=1G\n" > "$FIX/src/011-bw.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/011-bw.job"
+    grep -q "^\[global\]$" "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
+    grep -q "^cpus_allowed=3-7$" "$v" && grep -q "^\[job1\]$" "$v"'
+t_assert "an existing [global] is never duplicated" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    [ "$(grep -c "^\[global\]$" "$FIX/jobs/h1/011-bw.job")" -eq 1 ]'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

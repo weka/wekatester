@@ -23,3 +23,23 @@ tuner_fixture() {   # $1 = extra probe content variant
     printf '[{"ram_allocated": 12335448064}, {"ram_allocated": 12335448064}]\n' > "$FIX/probe/_weka_ram.json"
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n' > "$FIX/src/011-bw.job"
 }
+
+# --- signal handling: park a real run in preflight so it can be signalled ---
+# ssh is stubbed with a script that records that it started and then sleeps, so
+# the run blocks in preflight's `wait` -- where a real run spends most of its
+# time -- with no network and no worker involved.
+signal_fixture() {
+    SIG=$(mktemp -d)
+    printf '#!/bin/sh\ntouch "%s/started"\nexec sleep 5\n' "$SIG" > "$SIG/ssh"
+    chmod +x "$SIG/ssh"
+    PATH="$SIG:$PATH"
+}
+
+# Block until the stubbed ssh has run, so a signal cannot race process startup.
+signal_wait_started() {
+    local i=0
+    while [ ! -e "$SIG/started" ] && [ "$i" -lt 500 ]; do
+        sleep 0.01; i=$((i + 1))
+    done
+    [ -e "$SIG/started" ]
+}

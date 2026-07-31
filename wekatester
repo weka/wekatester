@@ -395,21 +395,30 @@ def report_items(path):
     return items or ["bandwidth", "latency", "iops"]
 
 def override(lines, key, value):
-    """Replace key= wherever it appears; else insert after [global]."""
+    """Replace key= wherever it appears; else insert into [global].
+
+    A jobfile with sections but no [global] gets one created at the top of the
+    file: without it the option would be dropped silently, which for
+    directory= means fio writes its files into the server's cwd rather than
+    -d. fio treats the leading '# report' comment as a comment wherever it
+    sits, so prepending is safe.
+    """
     out, found = [], False
     for line in lines:
         if re.match(rf"^{key}=", line):
             out.append(f"{key}={value}"); found = True
         else:
             out.append(line)
-    if not found:
-        ins = []
-        for line in out:
-            ins.append(line)
-            if line.strip() == "[global]":
-                ins.append(f"{key}={value}")
-        out = ins
-    return out
+    if found:
+        return out
+    if not any(l.strip() == "[global]" for l in out):
+        return ["[global]", f"{key}={value}"] + out
+    ins = []
+    for line in out:
+        ins.append(line)
+        if line.strip() == "[global]":
+            ins.append(f"{key}={value}")
+    return ins
 
 # Cache ceiling for small-file working-set sizing, loaded once up front.
 cache_bytes = 0
@@ -553,16 +562,21 @@ stage_variants() {
         mkdir -p "$WORK_DIR/jobs/$host"
         for job in "$srcdir"/[0-9]*; do
             base=${job##*/}
-            # override directory= wherever it appears; jobfiles without one
-            # get it inserted right after [global]
+            # override directory= wherever it appears; jobfiles without one get
+            # it inserted right after [global], and jobfiles with no [global]
+            # at all get the section created at the top -- otherwise the
+            # insert matches nothing and fio silently writes to the server's cwd
             if grep -q '^directory=' "$job"; then
                 awk -v dir="$DIRECTORY" \
                     '/^directory=/ { print "directory=" dir; next } { print }' \
                     "$job" > "$WORK_DIR/jobs/$host/$base"
-            else
+            elif grep -q '^\[global\]' "$job"; then
                 awk -v dir="$DIRECTORY" \
                     '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
                     "$job" > "$WORK_DIR/jobs/$host/$base"
+            else
+                { printf '[global]\ndirectory=%s\n' "$DIRECTORY"; cat "$job"; } \
+                    > "$WORK_DIR/jobs/$host/$base"
             fi
         done
     done
@@ -764,7 +778,13 @@ main() {
     # %C hashes host/port/user into a short, safe socket name.
     SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=60s"
 
-    trap cleanup EXIT INT TERM
+    # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
+    # statement, so a Ctrl-C would tear the run down and keep going. Signals
+    # exit instead, and the single EXIT trap is the only place cleanup runs
+    # (it is idempotent anyway) while preserving the exit status.
+    trap 'rc=$?; cleanup; exit $rc' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     preflight
     verify_mount_mode
     start_fio_servers
