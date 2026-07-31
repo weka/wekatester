@@ -50,21 +50,27 @@ t_assert "cpus_allowed excludes weka cores" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null
     grep -q "^cpus_allowed=3-7$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "wide-only weka_allowed masks are ignored (utility threads)" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null
+    grep -q "^cpus_allowed=0-7$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "core mismatch warns" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 16\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 16\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) 2>&1 >/dev/null )
     case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
 # --- tuner: tier rules (Task 6) ---
 t_assert "safe: numjobs = min usable cores" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 6\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null 2>&1
     grep -q "^numjobs=3$" "$FIX/jobs/h1/011-bw.job"'   # h2 usable=3 is the min
 t_assert "max: numjobs per host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 0-2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 6\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
     grep -q "^numjobs=5$" "$FIX/jobs/h1/011-bw.job" && grep -q "^numjobs=3$" "$FIX/jobs/h2/011-bw.job"'
 t_assert "max: bw ioengine upgraded to io_uring" bash -c '
@@ -78,7 +84,7 @@ t_assert "safe: engine untouched when available" bash -c '
 t_assert "safe: engine fixed when missing on one host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nioengine=io_uring\nnumjobs=2\nfilesize=1G\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
-    printf "ncpus 8\nweka_allowed 0-2\nengines libaio psync \n" > "$FIX/probe/h2"
+    printf "ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines libaio psync \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka h1 h2) >/dev/null 2>&1
     grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "latency: numjobs/iodepth untouched, small files applied at max" bash -c '
@@ -130,6 +136,12 @@ t_assert "capacity: missing _df file reports 0.0GiB available, no warning" bash 
         *"available 0.0GiB"*) grep -q WARNING <<< "$out" && false || true ;;
         *) false ;;
     esac'
+t_assert "weka RAM: memory key fallback (pre-5.1)" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "[{\"memory\": 12335448064}, {\"memory\": 12335448064}]\n" > "$FIX/probe/_weka_ram.json"
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    grep -q "^nrfiles=5$" "$FIX/jobs/h1/031-iops.job"'
 
 # --- stage_variants: per-host jobfile staging (Task 8) ---
 t_assert "non-auto staging produces per-host variants" bash -c '

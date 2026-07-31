@@ -15,9 +15,11 @@ export -f probe_stub
 tuner_fixture() {   # $1 = extra probe content variant
     FIX=$(mktemp -d)
     mkdir -p "$FIX/probe" "$FIX/jobs" "$FIX/src"
-    printf 'ncpus 8\nweka_allowed 0-2\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
-    printf 'ncpus 8\nweka_allowed 0-2\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
+    # weka's dedicated io threads are single-CPU task masks (0, 1, 2 here);
+    # the 0,3-4 line is a wide utility-thread mask and must be ignored.
+    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
+    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
     printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 1073741824 0 1073741824 1%% /mnt/weka\n' > "$FIX/probe/_df"
-    printf '[{"memory": 12335448064}, {"memory": 12335448064}]\n' > "$FIX/probe/_weka_ram.json"
+    printf '[{"ram_allocated": 12335448064}, {"ram_allocated": 12335448064}]\n' > "$FIX/probe/_weka_ram.json"
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n' > "$FIX/src/011-bw.job"
 }

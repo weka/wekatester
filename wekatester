@@ -259,10 +259,14 @@ cleanup() {
 # Remote fact-gathering snippet. Dumb by design: emits raw lines, all
 # interpretation happens locally in the tuner.
 probe_remote_cmd() {
+    # weka pins its dedicated io threads per-thread, not per-process: the
+    # process-level mask (/proc/<pid>/status) is just whatever the main
+    # thread has, so it must be read per-task instead (/proc/<pid>/task/*/status),
+    # deduped remotely -- interpretation of which masks are dedicated vs.
+    # floating utility threads happens locally in the tuner.
     printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
-        for p in \$(pgrep -x wekanode || true); do \
-            awk \"/^Cpus_allowed_list/ {print \\\"weka_allowed\\\", \\\$2}\" \"/proc/\$p/status\"; \
-        done; \
+        for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/task/*/status; done \
+        | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\""
 }
 
@@ -341,7 +345,15 @@ for h in hosts:
         f = line.split()
         if not f: continue
         if f[0] == "ncpus": ncpus = int(f[1])
-        elif f[0] == "weka_allowed": weka |= parse_cpulist(f[1])
+        elif f[0] == "weka_allowed":
+            # weka pins each dedicated io thread to exactly one CPU (a
+            # single-CPU task-level mask); utility threads have wide masks
+            # and float across CPUs. Only single-CPU masks are dedicated
+            # cores -- wide masks must be ignored or the union of every
+            # thread's mask collapses to "all CPUs" and usable cores vanish.
+            cpuset = parse_cpulist(f[1])
+            if len(cpuset) == 1:
+                weka |= cpuset
         elif f[0] == "engines": engines = f[1:]
     usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
     facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable, "engines": engines}
@@ -387,8 +399,11 @@ cache_bytes = 0
 ram_path = os.path.join(work, "probe", "_weka_ram.json")
 if os.path.exists(ram_path):
     try:
-        cache_bytes = sum(s.get("memory", 0) for s in json.load(open(ram_path)))
-    except (ValueError, KeyError) as exc:
+        # 5.1 renamed the field to ram_allocated; fall back to the older
+        # (and any hypothetical newer) "memory" key when absent.
+        cache_bytes = sum((s.get("ram_allocated") or s.get("memory") or 0)
+                           for s in json.load(open(ram_path)))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
         warn(f"could not parse weka RAM listing ({exc}); using working-set floor")
 if cache_bytes == 0:
     warn(f"weka backend RAM unknown; small-file working set floors at {WS_FLOOR // 2**30}GiB/host")

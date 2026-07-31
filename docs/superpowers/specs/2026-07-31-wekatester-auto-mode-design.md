@@ -36,18 +36,22 @@ Per-client staging is unconditional: non-auto variants differ only by the
 Facts per worker, gathered by dumb remote commands and interpreted locally:
 
 - online CPUs: `getconf _NPROCESSORS_ONLN`
-- weka-pinned cores: `Cpus_allowed_list` from `/proc/<pid>/status` of every
-  `wekanode` process (works without cgroups; union computed locally).
-  No wekanode processes → host contributes no weka cores (e.g. pure load
-  generator); usable = all cores.
+- weka-pinned cores: task-level `Cpus_allowed_list` from
+  `/proc/<pid>/task/*/status` of every `wekanode` process (works without
+  cgroups; dedup + union computed locally). Weka pins each dedicated io
+  thread to exactly one CPU, so only single-CPU masks count as dedicated
+  cores; wide masks are floating utility threads and are ignored (a
+  process-level, main-thread-only mask would union to all CPUs and collapse
+  usable cores to nothing). No wekanode processes → host contributes no
+  weka cores (e.g. pure load generator); usable = all cores.
 - available ioengines: `fio --enghelp`
 
 Master-only extras:
 
 - `df -kP <directory>` → available capacity (shared-filesystem assumption)
-- `weka cluster servers list -J` → Σ `memory` over backend entries
-  = conservative DRAM cache ceiling. Query failure → fall back to the
-  working-set floor and warn.
+- `weka cluster servers list -J` → Σ `ram_allocated` (older releases:
+  `memory`) over backend entries = conservative DRAM cache ceiling. Query
+  failure → fall back to the working-set floor and warn.
 
 Any per-host probe failure: collect-all, then die (same policy as preflight).
 
