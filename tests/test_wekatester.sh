@@ -39,10 +39,11 @@ probe_stub() {
     printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
     printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
     chmod +x "$stub"/*
-    (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
+    (source ./wekatester; FIO_BIN=fio; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
 }
-t_assert "probe snippet emits ncpus" bash -c 'stub=$(mktemp -d); printf "#!/bin/sh\necho 8\n" > "$stub/getconf"; printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; printf "#!/bin/sh\necho \" io_uring libaio\"\n" > "$stub/fio"; chmod +x "$stub"/*; (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)" | grep -q "ncpus 8")'
-t_assert "probe snippet emits engines" bash -c 'stub=$(mktemp -d); printf "#!/bin/sh\necho 8\n" > "$stub/getconf"; printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; printf "#!/bin/sh\necho \" io_uring libaio\"\n" > "$stub/fio"; chmod +x "$stub"/*; (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)" | grep -q "engines.*io_uring")'
+export -f probe_stub
+t_assert "probe snippet emits ncpus"   bash -c 'probe_stub | grep -q "ncpus 8"'
+t_assert "probe snippet emits engines" bash -c 'probe_stub | grep -q "engines.*io_uring"'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

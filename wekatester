@@ -259,11 +259,11 @@ cleanup() {
 # Remote fact-gathering snippet. Dumb by design: emits raw lines, all
 # interpretation happens locally in the tuner.
 probe_remote_cmd() {
-    printf '%s' 'echo "ncpus $(getconf _NPROCESSORS_ONLN)"; \
-        for p in $(pgrep -x wekanode || true); do \
-            awk "/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}" "/proc/$p/status"; \
+    printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
+        for p in \$(pgrep -x wekanode || true); do \
+            awk \"/^Cpus_allowed_list/ {print \\\"weka_allowed\\\", \\\$2}\" \"/proc/\$p/status\"; \
         done; \
-        echo "engines $(fio --enghelp | tr "\n" " ")"'
+        echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\""
 }
 
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
