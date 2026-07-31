@@ -32,5 +32,17 @@ t_assert "wekafs unknown mode"     test "$(c 'wekafs rw,relatime')" = "fail unkn
 t_assert "nfs skipped"             test "$(c 'nfs4 rw,noatime')" = "skip"
 t_assert "empty line skipped"      test "$(c '')" = "skip"
 
+# --- probe remote snippet ---
+probe_stub() {
+    stub=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho 8\n' > "$stub/getconf"
+    printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
+    printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
+    chmod +x "$stub"/*
+    (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
+}
+t_assert "probe snippet emits ncpus" bash -c 'stub=$(mktemp -d); printf "#!/bin/sh\necho 8\n" > "$stub/getconf"; printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; printf "#!/bin/sh\necho \" io_uring libaio\"\n" > "$stub/fio"; chmod +x "$stub"/*; (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)" | grep -q "ncpus 8")'
+t_assert "probe snippet emits engines" bash -c 'stub=$(mktemp -d); printf "#!/bin/sh\necho 8\n" > "$stub/getconf"; printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; printf "#!/bin/sh\necho \" io_uring libaio\"\n" > "$stub/fio"; chmod +x "$stub"/*; (source ./wekatester; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)" | grep -q "engines.*io_uring")'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

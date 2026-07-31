@@ -42,6 +42,9 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", or "max"
 
+# Auto-mode probe defaults
+WS_FLOOR_GIB=8   # minimum working-set (RAM) assumption in GiB per host
+
 # --- logging -----------------------------------------------------------------
 log()   { echo "$(date '+%H:%M:%S') $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
@@ -249,6 +252,41 @@ cleanup() {
             [ -S "$f" ] && ssh -O exit -o ControlPath="$f" unused-host-arg
         done
         rm -rf "$WORK_DIR"
+    fi
+}
+
+# --- phase 2b: probe workers for auto-mode system info -----------------------
+# Remote fact-gathering snippet. Dumb by design: emits raw lines, all
+# interpretation happens locally in the tuner.
+probe_remote_cmd() {
+    printf '%s' 'echo "ncpus $(getconf _NPROCESSORS_ONLN)"; \
+        for p in $(pgrep -x wekanode || true); do \
+            awk "/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}" "/proc/$p/status"; \
+        done; \
+        echo "engines $(fio --enghelp | tr "\n" " ")"'
+}
+
+# Gather per-host facts + master-side extras into $WORK_DIR/probe/.
+probe_workers() {
+    log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
+    mkdir -p "$WORK_DIR/probe"
+    local pids=() failed=() host i
+    for host in "${HOSTS[@]}"; do
+        ssh -n $SSH_OPTS "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
+        pids+=($!)
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
+    done
+    [ ${#failed[@]} -eq 0 ] || die "probe failed on: ${failed[*]}"
+
+    ssh -n $SSH_OPTS "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
+        || die "cannot df $DIRECTORY on $MASTER"
+    if ! ssh -n $SSH_OPTS "$MASTER" "weka cluster servers list -J" \
+            > "$WORK_DIR/probe/_weka_ram.json"; then
+        rm -f "$WORK_DIR/probe/_weka_ram.json"
+        : > "$WORK_DIR/probe/_weka_ram.err"
+        log "WARNING: could not query weka backend RAM; using ${WS_FLOOR_GIB}GiB/host working-set floor" >&2
     fi
 }
 
@@ -468,6 +506,7 @@ main() {
     verify_mount_mode
     start_fio_servers
     verify_fio_ports
+    [ -n "$AUTO_LEVEL" ] && probe_workers
     stage_jobfiles
     run_jobs
 }
