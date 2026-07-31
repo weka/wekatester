@@ -393,16 +393,35 @@ t_assert "report directive: bare # report means default-all" \
 # With no server on the command line the run happens here, and the transport
 # wrappers must never reach for ssh/scp (no_ssh_fixture enforces that: the
 # stubs shadow the real binaries and exit 99).
-lm() { (source ./wekatester; parse_args "$@"; resolve_local_mode >/dev/null
+lm() { (uname_fixture Linux   # local mode is Linux-only; the suite also runs on macOS
+        source ./wekatester; parse_args "$@"; resolve_local_mode >/dev/null
         echo "$LOCAL_MODE|$MASTER|${HOSTS[*]-}"); }
 t_assert "local mode defaults off"          bash -c 'source ./wekatester; [ "$LOCAL_MODE" -eq 0 ]'
 t_assert "no servers: local mode on, host and master are localhost" \
     test "$(lm -d /x)" = "1|localhost|localhost"
 t_assert "no servers: the run is announced" bash -c '
+    source ./tests/helpers.sh; uname_fixture Linux
     out=$(source ./wekatester; parse_args; resolve_local_mode)
     case "$out" in *"local host"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "servers given: local mode stays off, host list untouched" \
     test "$(lm h1 h2)" = "0|h1|h1 h2"
+# Local mode needs findmnt and /dev/shm. A remote run from the same machine is
+# still fine -- that plumbing lives on the workers -- so the guard must sit
+# inside the no-hosts branch, not at the top of the function.
+t_assert "local mode refuses to run on a non-Linux host" bash -c '
+    source ./tests/helpers.sh; uname_fixture Darwin
+    err=$( (source ./wekatester; parse_args; resolve_local_mode) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in
+        *"local mode is Linux-only"*"name a server instead"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "a non-Linux host with servers named is unaffected" bash -c '
+    source ./tests/helpers.sh; uname_fixture Darwin
+    out=$(source ./wekatester; parse_args h1 h2; resolve_local_mode
+          echo "$LOCAL_MODE|$MASTER")
+    [ "$out" = "0|h1" ] || { echo "$out" >&2; false; }'
 
 # --- local mode: transport wrappers ---
 t_assert "run_host local: returns the command output" bash -c '
@@ -422,19 +441,22 @@ t_assert "copy_to_master local: copies into the destination dir" bash -c '
 # The remote branch of the wrappers must still build exactly the ssh/scp command
 # lines it built before the refactor -- copy_to_master splits the destination off
 # the end of "$@" (${!#} / ${@:1:$#-1}), which no local-mode test exercises.
-t_assert "run_host remote: builds the ssh command line" bash -c '
+# The stub brackets every argument, so these assert argv BOUNDARIES, not just
+# the concatenated text: the command string must arrive as one argument however
+# many spaces it contains, and multiple sources must arrive as separate ones.
+t_assert "run_host remote: the command string stays a single argument" bash -c '
     source ./tests/helpers.sh; echo_transport_fixture
     out=$(source ./wekatester
           LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"
           run_host vega-1 "df -kP /mnt/weka")
-    [ "$out" = "SSH: -n -o BatchMode=yes vega-1 df -kP /mnt/weka" ] ||
+    [ "$out" = "SSH[-n][-o][BatchMode=yes][vega-1][df -kP /mnt/weka]" ] ||
         { echo "$out" >&2; false; }'
-t_assert "copy_to_master remote: last argument becomes the scp destination" bash -c '
+t_assert "copy_to_master remote: sources stay separate, last arg is the destination" bash -c '
     source ./tests/helpers.sh; echo_transport_fixture
     out=$(source ./wekatester
           LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
-          copy_to_master /w/jobs/h1 /w/jobs/h2 /dev/shm/fio-jobfiles/)
-    [ "$out" = "SCP: -o BatchMode=yes -q -r /w/jobs/h1 /w/jobs/h2 vega-1:/dev/shm/fio-jobfiles/" ] ||
+          copy_to_master /w/jobs/h1 /w/jobs/h2 /w/jobs/h3 /dev/shm/fio-jobfiles/)
+    [ "$out" = "SCP[-o][BatchMode=yes][-q][-r][/w/jobs/h1][/w/jobs/h2][/w/jobs/h3][vega-1:/dev/shm/fio-jobfiles/]" ] ||
         { echo "$out" >&2; false; }'
 
 # preflight reads 255 as ssh'"'"'s "could not connect" status, which only means that
@@ -456,6 +478,38 @@ t_assert "preflight: rc 255 in remote mode is still a dead ssh" bash -c '
             preflight) 2>&1 >/dev/null )
     case "$err" in
         *"vega-1: ssh failed"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
+# A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
+# operator to remount forcedirect then points away from the real fault, which
+# for a bare run is usually that -d defaults to a /mnt/weka that does not exist.
+t_assert "mount guard: findmnt failure blames the directory, not the mount mode" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
+            run_host() { return 1; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in *forcedirect*) echo "leaked remount advice: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"findmnt failed for /mnt/weka -- does it exist? (wrong -d?)"*"-d names the right directory"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: a genuine cached-mode mount still says remount forcedirect" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
+            run_host() { echo "wekafs rw,relatime,writecache"; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in
+        *"wekafs mounted writecache (need forcedirect)"*"must be mounted with forcedirect; remount"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: one real mode failure outweighs a findmnt failure" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(h1 h2); DIRECTORY=/mnt/weka
+            run_host() { [ "$1" = h1 ] && return 1; echo "wekafs rw,readcache"; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in
+        *"h1: findmnt failed"*"h2: wekafs mounted readcache"*"must be mounted with forcedirect; remount"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 

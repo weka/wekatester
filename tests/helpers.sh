@@ -59,12 +59,26 @@ no_ssh_fixture() {
 # --- transport: ssh/scp stubs that echo their argv instead of connecting ---
 # Pins the remote command lines the wrappers build, so the local-mode refactor
 # cannot quietly change what a real run sends over the wire.
+#
+# Each argument is bracketed rather than flattened with "$*": argv boundaries
+# are the whole point here. "$*" would render `a b` and `a` `b` identically, so
+# it could not tell a correctly quoted expansion from one that word-splits --
+# exactly the regression these tests exist to catch.
 echo_transport_fixture() {
     ECHOT=$(mktemp -d)   # leaked on purpose; tests are short-lived
-    printf '#!/bin/sh\necho "SSH: $*"\n' > "$ECHOT/ssh"
-    printf '#!/bin/sh\necho "SCP: $*"\n' > "$ECHOT/scp"
+    printf '#!/bin/sh\nprintf SSH\nprintf "[%%s]" "$@"\nprintf "\\n"\n' > "$ECHOT/ssh"
+    printf '#!/bin/sh\nprintf SCP\nprintf "[%%s]" "$@"\nprintf "\\n"\n' > "$ECHOT/scp"
     chmod +x "$ECHOT/ssh" "$ECHOT/scp"
     PATH="$ECHOT:$PATH"
+}
+
+# --- local mode is Linux-only: drive the guard both ways ---
+# resolve_local_mode calls plain `uname` so it resolves through PATH.
+uname_fixture() {   # $1 = kernel name to report
+    UNAMED=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho %s\n' "$1" > "$UNAMED/uname"
+    chmod +x "$UNAMED/uname"
+    PATH="$UNAMED:$PATH"
 }
 
 # --- summarizer: fabricated fio client-mode results ---

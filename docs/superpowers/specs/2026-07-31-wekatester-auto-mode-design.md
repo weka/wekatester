@@ -65,8 +65,18 @@ hardest to test without a cluster. Loopback client/server keeps one code path
 and one JSON contract, and the port check stays meaningful (fio's listener must
 actually be reachable, even on loopback).
 
-Two consequences worth stating:
+Consequences worth stating:
 
+- **Local mode is Linux-only** and says so up front. The mount guard shells out
+  to `findmnt` and staging plus the fio pidfile live in `/dev/shm`, so
+  `resolve_local_mode` refuses to run on a non-Linux kernel rather than letting
+  the fault surface two phases later as an opaque findmnt failure. The check
+  sits *inside* the no-hosts branch: driving remote workers from a macOS laptop
+  stays supported, because that plumbing is on the workers.
+- **Command strings must be POSIX sh, or wrap themselves in `bash -c`.** The
+  local branch runs them under bash, the remote branch under the worker's login
+  shell, which need not be bash. `verify_fio_ports` is the exemplar — it needs
+  `/dev/tcp`, so it carries its own `bash -c`.
 - **ControlMaster** options are not appended to `SSH_OPTS` in local mode — no
   ssh runs, so there is nothing to multiplex. `WORK_DIR` is still created and
   used (probe files, staged variants), and cleanup's socket-close loop already
@@ -77,7 +87,16 @@ Two consequences worth stating:
 - **The port-check failure hint** is mode-dependent. Between two machines a
   host firewall is the overwhelmingly likely cause; on loopback it never is, so
   local mode points at the actual suspect instead — the name resolving to `::1`
-  while fio's listener is on IPv4.
+  while fio's listener is on IPv4. Grep for `loopback resolution? fio binds
+  IPv4` to find it.
+- **The port check and fio can disagree about loopback**, and the failure that
+  results does not look like a port problem. Bash's `/dev/tcp` walks every
+  address `getaddrinfo` returns, so the probe falls through a refused `::1` to
+  `127.0.0.1` and reports success, while fio's client resolves once and may sit
+  on the address that fails — surfacing as the generic
+  `fio run failed for <job>` from `run_jobs`, with a clean port check just above
+  it in the log. If that combination appears, suspect loopback resolution before
+  anything else and check that `localhost` resolves to `127.0.0.1` first.
 
 ### No-sshd guarantee
 
@@ -104,6 +123,12 @@ reason is testability: the suite points it at a tmp dir so the real
 `stage_jobfiles` — master-side `rm -rf`/`mkdir` plus the jobfile copy, both
 through the wrappers — can run with no worker and no `/dev/shm`. It is not a
 documented option.
+
+The remote-transport stubs bracket each argument (`SSH[-n][-o][…]`) rather than
+echoing `"$*"`. Argv boundaries are the point of those tests: `"$*"` renders a
+correctly quoted expansion and a word-splitting one identically, so it cannot
+tell `"${@:1:$#-1}"` from `"${*:1:$#-1}"` — verified, both printed the same
+line — and the regression the tests exist to catch would pass unnoticed.
 
 The override **must** stay namespaced. This path is what cleanup passes to
 `rm -rf` on the master and on every worker, so honouring a bare `$TARGET_DIR` —

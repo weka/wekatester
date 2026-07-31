@@ -70,6 +70,11 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 # probe, staging, the run, cleanup -- goes through these, so local mode is a
 # transport swap and nothing else: fio still runs in client/server mode, just
 # over loopback, so every guard applies and the results JSON keeps its shape.
+#
+# Invariant for callers: a command string must be POSIX sh, or wrap itself in
+# `bash -c`. Locally it runs under bash; remotely it runs under the worker's
+# login shell, which is not necessarily bash. verify_fio_ports is the exemplar
+# -- it needs /dev/tcp, a bash feature, so it carries its own `bash -c`.
 
 # Run a command on a host. Local mode executes directly -- no sshd needed.
 # Both branches take stdin from /dev/null (ssh -n, and an explicit redirect
@@ -102,6 +107,13 @@ copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
 # phase below needs a second code path -- only the transport changes.
 resolve_local_mode() {
     [ ${#HOSTS[@]} -eq 0 ] || return 0
+    # Local mode leans on Linux-only plumbing: findmnt for the mount guard,
+    # /dev/shm for staging and the fio pidfile. Say so here rather than letting
+    # it surface two phases later as a confusing findmnt failure. Remote runs
+    # from a non-Linux box stay supported -- that plumbing is on the workers.
+    # Plain `uname`, PATH-resolved on purpose, so the suite can stub it.
+    [ "$(uname -s)" = Linux ] || \
+        die "local mode is Linux-only (findmnt, /dev/shm); name a server instead"
     LOCAL_MODE=1
     HOSTS=(localhost)
     MASTER=localhost
@@ -224,20 +236,29 @@ classify_mount_line() {
 # All workers: -d must not be a cached-mode wekafs mount.
 verify_mount_mode() {
     log "checking mount mode of $DIRECTORY on ${#HOSTS[@]} host(s)..."
-    local host line verdict failed=()
+    local host line verdict failed=() mode_fail=0
     for host in "${HOSTS[@]}"; do
         line=$(run_host "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
-            || { failed+=("$host: findmnt failed"); continue; }
+            || { failed+=("$host: findmnt failed for $DIRECTORY -- does it exist? (wrong -d?)")
+                 continue; }
         verdict=$(classify_mount_line "$line")
         case "$verdict" in
             ok)   ;;
             skip) debug "$host: $DIRECTORY is not wekafs; guard skipped" ;;
-            fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)") ;;
+            fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
+                   mode_fail=1 ;;
         esac
     done
     if [ ${#failed[@]} -gt 0 ]; then
         for line in "${failed[@]}"; do log "ERROR: $line" >&2; done
-        die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+        # Only advise a remount when a mount mode was actually the problem. When
+        # every failure came from findmnt, the mode is unknown rather than
+        # wrong -- most often -d simply names a directory that does not exist
+        # (a bare run defaults to /mnt/weka), and "remount forcedirect" would be
+        # confidently wrong advice pointing away from the real fault.
+        [ "$mode_fail" -eq 0 ] || \
+            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+        die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
     fi
     debug "mount mode ok on all hosts"
 }
