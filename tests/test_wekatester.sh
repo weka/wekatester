@@ -256,5 +256,52 @@ t_assert "an existing [global] is never duplicated" bash -c '
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) >/dev/null 2>&1
     [ "$(grep -c "^\[global\]$" "$FIX/jobs/h1/011-bw.job")" -eq 1 ]'
 
+# --- capacity model: namespaces, size=, small-file size rewrite ---
+# fio expands the default filename_format ($jobname...) per section, so two
+# jobfiles that set no filename_format own separate files and must SUM. They
+# used to share one literal default key and collapse to a max, under-counting
+# the footprint -- the one direction the guard must never fail in.
+t_assert "capacity: jobfiles without filename_format sum, not max" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/012-bw2.job"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1) 2>&1 )
+    case "$out" in *"required ~100.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "capacity: jobfiles sharing one filename_format take the max" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    j="# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nfilename_format=shared.\$jobnum.\$filenum\nioengine=libaio\n[j]\nrw=read\n"
+    printf "$j" > "$FIX/src/011-bw.job"
+    printf "$j" > "$FIX/src/012-bw2.job"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1) 2>&1 )
+    case "$out" in *"required ~50.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "capacity: size= without filesize counts numjobs x size" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nsize=4G\nnrfiles=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1) 2>&1 )
+    case "$out" in *"required ~20.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "capacity: a percentage size= contributes 0 instead of crashing" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nsize=50%%\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1) 2>&1 )
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc: $out" >&2; false; } &&
+    case "$out" in *"required ~0.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "max: small-file redirect rewrites size= to nrfiles x 1G" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nsize=40G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/031-iops.job"
+    grep -q "^nrfiles=5$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^size=5G$" "$v"'
+t_assert "max: latency size= follows the capped nrfiles" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report latency\n[global]\nfilesize=10G\nsize=40G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/021-lat.job"
+    grep -q "^nrfiles=8$" "$v" && grep -q "^size=8G$" "$v"'
+t_assert "size= is never inserted where the jobfile had none" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    ! grep -q "^size=" "$FIX/jobs/h1/031-iops.job"'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
