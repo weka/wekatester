@@ -41,6 +41,7 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", or "max"
+IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 
 # Auto-mode probe defaults
 WS_FLOOR_GIB=8   # minimum working-set (RAM) assumption in GiB per host
@@ -52,7 +53,7 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a] [-v] [-V] [-h] server [server ...]
+usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a] [--ignore-capacity] [-v] [-V] [-h] server [server ...]
        ${0##*/} -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -62,6 +63,7 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
+  --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -92,6 +94,7 @@ parse_args() {
                     usage >&2; die "unknown auto level: $AUTO_LEVEL (safe|max)" ;;
                 esac
                 shift ;;
+            --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
@@ -297,12 +300,18 @@ probe_workers() {
 # One-shot tuner: reads all probe facts and all jobfiles, writes every
 # per-host variant. Python because the rules are per-section, per-type,
 # per-tier -- data transformation, not orchestration.
+#
+# usage: auto_tune <src> <work> <tier> <directory> <ignore_capacity> <host>...
+# where <ignore_capacity> is 1 to downgrade the over-capacity abort to a
+# warning (--ignore-capacity), 0 to abort. Returns nonzero on any failure,
+# including the capacity check, so the caller aborts before fio starts.
 auto_tune() {
     python3 - "$@" <<'PYEOF' || return 1
 import json, math, os, re, sys
 
 src, work, tier, directory = sys.argv[1:5]
-hosts = sys.argv[5:]
+ignore_capacity = sys.argv[5] == "1"
+hosts = sys.argv[6:]
 
 SMALL_FILESIZE = "1G"; SMALL_BYTES = 2**30
 CACHE_MULT = 2; WS_FLOOR = 8 * 2**30
@@ -502,9 +511,16 @@ if os.path.exists(df_path):
 
 gib = lambda n: f"{n / 2**30:.1f}"
 print(f"auto: capacity required ~{gib(required)}GiB, available {gib(avail)}GiB")
+# avail == 0 means df was unavailable/unparsable, not a full filesystem: with
+# no ground truth there is nothing to check, so stay silent either way.
 if avail and required > avail:
-    warn(f"workload needs ~{gib(required)}GiB but {directory} has "
-         f"{gib(avail)}GiB available")
+    short = (f"workload needs ~{gib(required)}GiB but {directory} has only "
+             f"{gib(avail)}GiB available")
+    if ignore_capacity:
+        warn(f"{short} (--ignore-capacity: running anyway)")
+    else:
+        # fio would march into ENOSPC mid-run; abort during staging instead.
+        sys.exit(f"ERROR: {short} (use --ignore-capacity to run anyway)")
 PYEOF
 }
 
@@ -521,8 +537,8 @@ JOBFILE_SRC=""   # local source directory
 stage_variants() {
     local srcdir=$1 job base host
     if [ -n "$AUTO_LEVEL" ]; then
-        auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" "${HOSTS[@]}" \
-            || die "auto tuning failed"
+        auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" \
+            "$IGNORE_CAPACITY" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi
     for host in "${HOSTS[@]}"; do

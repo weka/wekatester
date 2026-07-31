@@ -16,6 +16,8 @@ hand-tuning jobfiles per site.
 - New: `-a [safe|max]` / `--auto[=safe|max]`. Bare `-a` or `--auto` means
   `max`. A token following `-a` that is not a recognized level is not consumed
   (so `-a host1 host2` works). Unknown level → usage error.
+- New: `--ignore-capacity` (long only, no argument, default off) — overrides
+  the auto-mode capacity abort; see Capacity check.
 - All existing options and behavior without `-a` are unchanged, except that
   staging always assembles per-client jobfiles (see Flow).
 
@@ -126,12 +128,27 @@ Non-wekafs targets skip the guard (the tool supports generic filesystems;
 mounted at all fails preflight naturally when fio tries to create files —
 out of scope here.
 
-## Capacity warning
+## Capacity check
 
 `required = Σ over hosts of [ Σ over filename_format namespaces of max over that namespace's jobfiles(numjobs × filesize × nrfiles) ]`
 — files are shared within a namespace, so each namespace contributes its largest jobfile's footprint; distinct namespaces (e.g. bandwidth vs small-file) coexist and sum. Python parses fio
-size suffixes. If `required > available` on `-d`: warn loudly with both
-numbers and continue (never abort). Auto mode only, v1.
+size suffixes.
+
+If `required > available` on `-d`: print both numbers and **die**, inside the
+tuner, i.e. during staging and before any fio job starts. Rationale (lab
+evidence): continuing does not degrade gracefully — fio hits `ENOSPC` partway
+through and the run is lost anyway, so the useful failure is the early,
+explanatory one.
+
+`--ignore-capacity` (new long option, no short form; default off) downgrades
+the abort to the old loud warning and continues, for the case where `df`
+under-reports the usable space (thin provisioning, rebalance in flight).
+
+Unknown capacity is not a failure: when the `df` probe is missing or
+unparsable, `available` is 0, and 0 disables the comparison entirely — no
+error, no warning, only the informational `auto: capacity required ...` line.
+Auto mode only (non-auto never computes a footprint, so `--ignore-capacity`
+is accepted and inert there).
 
 ## Non-goals (v1)
 
@@ -148,8 +165,9 @@ numbers and continue (never abort). Auto mode only, v1.
   query failure fallback, capacity math with unit suffixes.
 - Lab: `-a safe` and `-a max` smoke runs; inspect staged variants on the
   master; confirm fio JSON echoes the derived options; confirm fio threads
-  avoid weka cores; oversized test workload to prove the capacity warning
-  fires; heterogeneity warning via an artificial single-host cpus_allowed
+  avoid weka cores; oversized test workload to prove the capacity check
+  aborts the run, and that `--ignore-capacity` runs it anyway;
+  heterogeneity warning via an artificial single-host cpus_allowed
   restriction if practical.
 - Mount-mode guard: the lab currently mounts `/mnt/weka` in `writecache`
   mode — run once to confirm the guard dies naming all hosts (negative

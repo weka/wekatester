@@ -18,7 +18,7 @@ wekatester uses fio's native client/server mode:
 
 # Usage
 ```
-usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a] [-v] [-V] [-h] server [server ...]
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a] [--ignore-capacity] [-v] [-V] [-h] server [server ...]
        wekatester -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -28,6 +28,7 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
+  --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -77,9 +78,17 @@ of trusting the jobfiles' static values. Two levels:
   hosts with different hardware run different settings.
 
 Every staged jobfile records what auto derived for that host in header
-comments. Auto also warns when workers differ (core counts, weka cores),
-when the backend RAM query fails, and when the workload's required capacity
-exceeds what's available at `-d`.
+comments. Auto also warns when workers differ (core counts, weka cores) and
+when the backend RAM query fails.
+
+Auto sizes the workload's file footprint, so it also knows whether the test
+can fit. If the derived workload needs more space than `-d` has available,
+the run **fails during staging**, before any fio job starts, naming both
+numbers — continuing would only march fio into `ENOSPC` partway through and
+throw away the run. Pass `--ignore-capacity` to downgrade that to a warning
+and run anyway (useful when `df` under-reports, e.g. a filesystem that is
+thin-provisioned or still rebalancing). Capacity is only known in auto mode;
+if the `df` probe returns nothing usable, no check is made.
 
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
