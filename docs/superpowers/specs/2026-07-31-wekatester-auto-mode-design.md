@@ -108,6 +108,20 @@ Constants (documented in the script, single place):
 `SMALL_FILESIZE=1G`, `CACHE_MULT=2`, `WS_FLOOR=8G`,
 `IOPS_OUTSTANDING=64×cores`, `IODEPTH_CAP=128`, `LAT_NRFILES_CAP=8`.
 
+## Mount-mode guard (all runs, auto or not)
+
+After preflight, in parallel per worker: `findmnt -T <directory> -n -o
+FSTYPE,OPTIONS` (resolves the containing mount even for subdirectories).
+If FSTYPE is `wekafs` and the options lack `forcedirect`: collect-all across
+hosts, then die, naming each offending host and its actual mode (e.g.
+`writecache`). Rationale: fio's `direct=1` requests O_DIRECT per file, but
+only the `forcedirect` mount mode guarantees the wekafs client stays out of
+the IO path entirely — without it, client-side caching can flatter results.
+Non-wekafs targets skip the guard (the tool supports generic filesystems;
+`direct=1` remains the only control there). A worker where `-d` is not
+mounted at all fails preflight naturally when fio tries to create files —
+out of scope here.
+
 ## Capacity warning
 
 `required = Σ over hosts of max over jobfiles(numjobs × filesize × nrfiles)`
@@ -133,3 +147,6 @@ numbers and continue (never abort). Auto mode only, v1.
   avoid weka cores; oversized test workload to prove the capacity warning
   fires; heterogeneity warning via an artificial single-host cpus_allowed
   restriction if practical.
+- Mount-mode guard: the lab currently mounts `/mnt/weka` in `writecache`
+  mode — run once to confirm the guard dies naming all hosts (negative
+  test), remount `forcedirect`, confirm the run proceeds (positive test).
