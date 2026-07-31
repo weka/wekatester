@@ -18,7 +18,8 @@ wekatester uses fio's native client/server mode:
 
 # Usage
 ```
-usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a] [--ignore-capacity] [-v] [-V] [-h] server [server ...]
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
+                  [--ignore-capacity] [-v] [-V] [-h] server [server ...]
        wekatester -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -55,12 +56,13 @@ A workload is a directory of standard fio jobfiles under `fio-jobfiles/`, run in
 - `mixed` — 70/30 read/write workloads
 - `2x400Gb` — a heavier bandwidth-oriented variant
 - `wekawithin` — 1M/128k/4k reads, writes, and mixed IO
+- `smoke` — a fast validation set for the harness itself: 256M files, 10s runs, and it removes its own files afterwards (`-w smoke`)
 
 Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conventions:
 
 - Jobfile names must start with a digit (`011-bandwidthR.job`, ...) — that numeric prefix is both how files are discovered and what sets the run order.
 - A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything.
-- The `directory=` line is overridden by `-d` when the jobfiles are staged (and inserted if missing), so the shipped jobfiles work against any mount point.
+- The `directory=` line is overridden by `-d` when the jobfiles are staged — inserted into `[global]` if missing, and if the jobfile has no `[global]` section at all one is created — so the shipped jobfiles work against any mount point.
 - The measured workload should be the **last** job in the jobfile — the shipped files use an initial `create_only` job to lay out the files, then `stonewall` into the real workload, and the summary describes that last job.
 
 # Auto mode

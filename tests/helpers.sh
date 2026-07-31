@@ -43,3 +43,67 @@ signal_wait_started() {
     done
     [ -e "$SIG/started" ]
 }
+
+# --- summarizer: fabricated fio client-mode results ---
+# client_stats is a flat list of (host, job) entries plus "All clients"
+# aggregates. The create/layout phase runs first in every shipped jobfile, so
+# its entries -- including its own "All clients" -- come first here: the
+# summarizer must report the LAST entry per host and the last aggregate. The
+# create-phase numbers are absurd on purpose, so picking one up is obvious.
+#
+# Figures chosen so every printed number is exact:
+#   bandwidth  vega-1 3.00 + vega-2 4.00 GiB/s -> total 7.00, average 3.50
+#   iops       vega-1 3,000 + vega-2 4,000     -> total 7,000, average 3,500
+#   latency    200us over 3000 read IOs, 400us over 1000 write IOs
+#              -> IO-weighted 250.0us
+fio_json_fixture() {   # $1 = file to write
+    cat > "$1" <<'JSON'
+{
+  "fio version": "fio-3.35",
+  "client_stats": [
+    { "jobname": "create", "hostname": "vega-1",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "create", "hostname": "vega-2",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "All clients",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 214748364800, "iops": 1800000.0, "total_ios": 1800000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "bw", "hostname": "vega-1",
+      "read":  { "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 1400, "lat_ns": { "mean": 150000.0 } },
+      "write": { "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 400,  "lat_ns": { "mean": 350000.0 } } },
+    { "jobname": "bw", "hostname": "vega-2",
+      "read":  { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1600, "lat_ns": { "mean": 250000.0 } },
+      "write": { "bw_bytes": 1610612736, "iops": 1500.0, "total_ios": 600,  "lat_ns": { "mean": 450000.0 } } },
+    { "jobname": "All clients",
+      "read":  { "bw_bytes": 4831838208, "iops": 4500.0, "total_ios": 3000, "lat_ns": { "mean": 200000.0 } },
+      "write": { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1000, "lat_ns": { "mean": 400000.0 } } }
+  ]
+}
+JSON
+}
+
+# Single-client run: fio emits no "All clients" aggregate at all, so the lone
+# host entry has to serve as the aggregate. Same latency figures -> 250.0us.
+fio_json_single_fixture() {   # $1 = file to write
+    cat > "$1" <<'JSON'
+{
+  "fio version": "fio-3.35",
+  "client_stats": [
+    { "jobname": "bw", "hostname": "vega-1",
+      "read":  { "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 3000, "lat_ns": { "mean": 200000.0 } },
+      "write": { "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 1000, "lat_ns": { "mean": 400000.0 } } }
+  ]
+}
+JSON
+}
+
+# --- README: the fenced block under "# Usage" must equal ./wekatester -h ---
+readme_usage_block() {   # $1 = README path (default README.md)
+    awk '/^# Usage$/ { in_usage = 1; next }
+         in_usage && /^```$/ { fence++; next }
+         in_usage && fence == 1 { print }
+         fence == 2 { exit }' "${1:-README.md}"
+}
+

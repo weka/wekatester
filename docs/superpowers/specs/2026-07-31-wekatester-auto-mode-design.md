@@ -57,8 +57,8 @@ Master-only extras:
 
 Any per-host probe failure: collect-all, then die (same policy as preflight).
 
-Warnings (once, with a per-host table): system core counts differ across
-hosts; weka core counts differ across hosts.
+Warnings (once each, printed as a one-line `host=value` list — not a table):
+system core counts differ across hosts; weka core counts differ across hosts.
 
 ## Tuner (embedded python3; pure function: jobfile + facts → per-host variant)
 
@@ -83,21 +83,33 @@ Tier rules for non-latency files:
 | filesize  | untouched                               | bw: untouched; iops: 1G (small-file namespace)     |
 
 Latency files at max tier: corrections plus small-file redirection only —
-`numjobs`/`iodepth` NEVER touched; `filesize=1G`; `nrfiles=min(8,
-nrfiles_iops)`; `file_service_type=random`.
+`numjobs`/`iodepth` NEVER touched; `filesize=1G`;
+`nrfiles=min(8, max(2, ceil(ws / 1 GiB)))`; `file_service_type=random`.
+Note the effective job count in that formula is 1, not the host's cores: a
+latency job runs QD1 with an untuned `numjobs` (typically 1), so that single
+job has to traverse the whole per-host working set by itself to defeat cache.
+Dividing `ws` by cores the job never uses would size the files from
+concurrency that does not exist. See Working-set sizing.
 
 Small-file namespace: at max tier, iops and latency files share one
 `filename_format` (exactly `wt-small.$jobnum.$filenum`), so latency reuses the
 iops files; create sections are idempotent, whichever runs first lays out
-what it needs. Bandwidth files keep their original (large) namespace.
+what it needs. Bandwidth files keep their original (large) namespace. A jobfile
+that sizes with `size=` has it rewritten to `nrfiles × 1G` at the same time:
+fio divides `size` across `nrfiles`, so a `size=` left over from the large-file
+layout would shrink the 1G files straight back down. `size=` is never inserted
+where the jobfile had none — that would cap a job that had no cap.
 
 Every staged variant gets header comments recording tier, derived values, and
 the probe facts used — the support artifact for "what did auto actually run?"
 
 Override semantics (same as the old Python `override()`): replace the option
-wherever it appears in any section; insert into `[global]` when absent.
-Create-phase sections inherit the tuned global `numjobs`, keeping file
-coverage consistent.
+wherever it appears in any section; insert into `[global]` when absent, and
+create `[global]` at the top of the file when the jobfile has none — a jobfile
+with sections but no `[global]` would otherwise lose the option silently, and
+for `directory=` that means fio writing its files into the fio server's cwd.
+(The non-auto awk staging path does the same.) Create-phase sections inherit
+the tuned global `numjobs`, keeping file coverage consistent.
 
 ## Working-set sizing (max tier)
 
@@ -108,7 +120,11 @@ DRAM read cache or iops/latency numbers measure RAM.
 - cache ceiling `C` = Σ backend container RAM (conservative: true data cache
   is a fraction of this)
 - per-host working set `ws = max(8 GiB, 2 × C / n_workers)`
-- `nrfiles(iops) = max(2, ceil(ws / (numjobs × 1 GiB)))`
+- `nrfiles(iops) = max(2, ceil(ws / (numjobs × 1 GiB)))` — an iops job spreads
+  its IO over `numjobs` jobs, so each job only needs `ws / numjobs`
+- `nrfiles(latency) = min(8, max(2, ceil(ws / 1 GiB)))` — effective job count 1
+  (see Tuner): one QD1 job must cover `ws` alone. The cap keeps file-open and
+  layout cost bounded.
 
 Constants (documented in the script, single place):
 `SMALL_FILESIZE=1G`, `CACHE_MULT=2`, `WS_FLOOR=8G`,
@@ -116,8 +132,11 @@ Constants (documented in the script, single place):
 
 ## Mount-mode guard (all runs, auto or not)
 
-After preflight, in parallel per worker: `findmnt -T <directory> -n -o
+After preflight, sequentially per worker: `findmnt -T <directory> -n -o
 FSTYPE,OPTIONS` (resolves the containing mount even for subdirectories).
+Sequential is deliberate — preflight has already opened each host's
+ControlMaster, so a check costs about one round trip (~30ms) and a parallel
+fan-out would only add bookkeeping.
 If FSTYPE is `wekafs` and the options lack `forcedirect`: collect-all across
 hosts, then die, naming each offending host and its actual mode (e.g.
 `writecache`). Rationale: fio's `direct=1` requests O_DIRECT per file, but
@@ -130,9 +149,24 @@ out of scope here.
 
 ## Capacity check
 
-`required = Σ over hosts of [ Σ over filename_format namespaces of max over that namespace's jobfiles(numjobs × filesize × nrfiles) ]`
-— files are shared within a namespace, so each namespace contributes its largest jobfile's footprint; distinct namespaces (e.g. bandwidth vs small-file) coexist and sum. Python parses fio
-size suffixes.
+`required = Σ over hosts of [ Σ over namespaces of max over that namespace's jobfiles(footprint) ]`
+
+- A namespace is the staged jobfile's `filename_format`. Files are shared within
+  a namespace, so each namespace contributes only its largest jobfile's
+  footprint; distinct namespaces (e.g. bandwidth vs small-file) coexist and sum.
+- A jobfile that sets **no** `filename_format` gets a namespace of its own: fio
+  expands the default format's `$jobname` per section, so two such jobfiles own
+  different files and must sum. (Treating the absent format as one shared
+  literal key collapsed them onto a single max and under-counted.)
+- `footprint = numjobs × filesize × nrfiles`, or `numjobs × size` when the
+  jobfile sizes with `size=` and no `filesize=` — fio's `size=` is the per-job
+  total *across* that job's files, so `nrfiles` must not multiply it again.
+  With neither, or with a `size=` that is not a byte count (`size=50%`, warned
+  once), the jobfile contributes 0.
+- The estimate deliberately rounds up: over-counting is recoverable with
+  `--ignore-capacity`, under-counting silently defeats the guard.
+
+Python parses fio size suffixes.
 
 If `required > available` on `-d`: print both numbers and **die**, inside the
 tuner, i.e. during staging and before any fio job starts. Rationale (lab

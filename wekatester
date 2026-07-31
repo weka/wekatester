@@ -12,7 +12,7 @@
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
 # written to disk are the results_*.json outputs in the current directory.
 
-VERSION="2026-07-30"
+VERSION="2026-07-31"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -42,9 +42,8 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", or "max"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
-
-# Auto-mode probe defaults
-WS_FLOOR_GIB=8   # minimum working-set (RAM) assumption in GiB per host
+# The working-set floor itself lives in the tuner (WS_FLOOR) and is quoted only
+# from there, so bash and python cannot drift apart on the number.
 
 # --- logging -----------------------------------------------------------------
 log()   { echo "$(date '+%H:%M:%S') $*"; }
@@ -53,7 +52,8 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a] [--ignore-capacity] [-v] [-V] [-h] server [server ...]
+usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
+                  [--ignore-capacity] [-v] [-V] [-h] server [server ...]
        ${0##*/} -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -144,7 +144,7 @@ preflight() {
 # out of the IO path entirely. Non-wekafs targets are not our call.
 classify_mount_line() {
     set -- $1
-    local fstype=${1:-} opts=${2:-} mode
+    local fstype=${1:-} opts=${2:-}
     [ "$fstype" = "wekafs" ] || { echo "skip"; return; }
     case ",$opts," in
         *,forcedirect,*) echo "ok" ;;
@@ -251,8 +251,10 @@ cleanup() {
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         # close any ControlMaster still running, then drop the whole work dir.
         # -O exit talks only to the socket; the trailing hostname is unused.
+        # -q silences ssh's "Exit request sent." banner -- a status line, not a
+        # result: a failed -O exit still reports its failure on stderr.
         for f in "$WORK_DIR"/c/*; do
-            [ -S "$f" ] && ssh -O exit -o ControlPath="$f" unused-host-arg
+            [ -S "$f" ] && ssh -q -O exit -o ControlPath="$f" unused-host-arg
         done
         rm -rf "$WORK_DIR"
     fi
@@ -293,7 +295,9 @@ probe_workers() {
             > "$WORK_DIR/probe/_weka_ram.json"; then
         rm -f "$WORK_DIR/probe/_weka_ram.json"
         : > "$WORK_DIR/probe/_weka_ram.err"
-        log "WARNING: could not query weka backend RAM; using ${WS_FLOOR_GIB}GiB/host working-set floor" >&2
+        # the tuner prints the floor it actually used; no number here, so the
+        # two cannot disagree
+        log "WARNING: could not query weka backend RAM; using the working-set floor" >&2
     fi
 }
 
@@ -637,6 +641,14 @@ stage_jobfiles() {
 }
 
 # --- phase 4: run + summarize --------------------------------------------------
+# '# report <items>' / '#report <items>' comment lines pick the metrics for a
+# jobfile. At least one space after 'report' is required, so a prose comment
+# ('# reporting notes...') is not mistaken for a directive; a bare '# report'
+# matches nothing and the summarizer falls back to reporting everything.
+report_directive() {
+    sed -n 's/^#[[:space:]]*report[[:space:]]\{1,\}//p' "$1" | tr '\n' ' '
+}
+
 # For each jobfile: run the fio coordinator on $MASTER against all hosts,
 # capture JSON locally, hand it to the summarizer. One results file per job
 # so a crashed suite keeps everything already measured.
@@ -644,8 +656,7 @@ run_jobs() {
     local stamp job outfile report cmd host
     stamp=$(date '+%Y-%m-%d_%H%M')
     for job in "${JOBFILES[@]}"; do
-        # '# report <items>' / '#report <items>' comment lines pick the metrics
-        report=$(sed -n 's/^#[[:space:]]*report[[:space:]]*//p' "$JOBFILE_SRC/$job" | tr '\n' ' ')
+        report=$(report_directive "$JOBFILE_SRC/$job")
         cmd="'$FIO_BIN' --output-format=json"
         for host in "${HOSTS[@]}"; do
             cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"

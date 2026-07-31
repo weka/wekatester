@@ -303,5 +303,96 @@ t_assert "size= is never inserted where the jobfile had none" bash -c '
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) >/dev/null 2>&1
     ! grep -q "^size=" "$FIX/jobs/h1/031-iops.job"'
 
+# --- summarizer ---
+# Fixture figures are exact by construction (see tests/helpers.sh), so these pin
+# the printed numbers, not just their shape.
+t_assert "summarize: bandwidth totals are exact" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in
+        *"read bandwidth: 4.50 GiB/s"*"write bandwidth: 2.50 GiB/s"*"total bandwidth: 7.00 GiB/s"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: per-host spread names the min and max hosts" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in
+        *"average bandwidth: 3.50 GiB/s per host  (min 3.00 GiB/s vega-1, max 4.00 GiB/s vega-2)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: iops totals and spread are exact" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in
+        *"total iops: 7,000/s"*"average iops: 3,500/s per host  (min 3,000/s vega-1, max 4,000/s vega-2)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: average latency is IO-weighted, not a bare mean" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    # bare mean of 200us and 400us would be 300.0us
+    case "$out" in
+        *"read latency: 200.0 us  (min 150.0 us vega-1, max 250.0 us vega-2)"*"average latency: 250.0 us (IO-weighted)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: the create phase is not what gets reported" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in *"100.00 GiB/s"*|*"200.00 GiB/s"*|*" 9.0 ms"*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "summarize: -r narrows the report" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" -r latency 2>&1)
+    case "$out" in *"average latency: 250.0 us"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *bandwidth*|*iops*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "summarize: refuses results that are missing a host, by name" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    err=$( (source ./wekatester; summarize "$d/r.json" "" "vega-1 vega-2 vega-3") 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in
+        *"no results from 1 of 3 host(s): vega-3"*) true;;
+        *) echo "unexpected stderr: $err" >&2; false;;
+    esac'
+t_assert "summarize: passes when every expected host reported" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    (source ./wekatester; summarize "$d/r.json" "bandwidth" "vega-1 vega-2") >/dev/null'
+t_assert "summarize: a single-client run needs no All clients aggregate" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_single_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc: $out" >&2; false; } &&
+    case "$out" in
+        *"total bandwidth: 3.00 GiB/s"*"average latency: 250.0 us (IO-weighted)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+
+# --- report directive parsing ---
+# The metric selector needs whitespace after "report", or prose comments get
+# parsed as report items.
+r() { f=$(mktemp); printf '%b' "$1" > "$f"; (source ./wekatester; report_directive "$f"); }
+# the items are newline-joined with tr, so one trailing space is expected
+t_assert "report directive: items are parsed" \
+    test "$(r '# report bandwidth latency\n[global]\n')" = "bandwidth latency "
+t_assert "report directive: no space after # is fine" \
+    test "$(r '#report iops\n[global]\n')" = "iops "
+t_assert "report directive: prose is not a directive" \
+    test -z "$(r '# reporting notes for the field\n[global]\n')"
+t_assert "report directive: bare # report means default-all" \
+    test -z "$(r '# report\n[global]\n')"
+
+# --- README stays in sync with the real help output ---
+t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
+    source ./tests/helpers.sh
+    diff <(./wekatester -h) <(readme_usage_block README.md)'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
