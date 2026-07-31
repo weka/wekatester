@@ -437,20 +437,69 @@ t_assert "copy_to_master remote: last argument becomes the scp destination" bash
     [ "$out" = "SCP: -o BatchMode=yes -q -r /w/jobs/h1 /w/jobs/h2 vega-1:/dev/shm/fio-jobfiles/" ] ||
         { echo "$out" >&2; false; }'
 
+# preflight reads 255 as ssh'"'"'s "could not connect" status, which only means that
+# remotely. run_host is stubbed to hand preflight the rc directly: no local
+# command exits 255 for the reason preflight would be classifying.
+t_assert "preflight: rc 255 in local mode is a missing fio, not a dead ssh" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=/usr/bin/fio
+            run_host() { return 255; }
+            preflight) 2>&1 >/dev/null )
+    case "$err" in
+        *"localhost: /usr/bin/fio not found"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "preflight: rc 255 in remote mode is still a dead ssh" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(vega-1); FIO_BIN=/usr/bin/fio
+            run_host() { return 255; }
+            preflight) 2>&1 >/dev/null )
+    case "$err" in
+        *"vega-1: ssh failed"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
+# On loopback a firewall is not the plausible cause; ::1-vs-IPv4 is.
+t_assert "port check: local mode blames loopback resolution, not a firewall" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+            run_host() { return 1; }
+            verify_fio_ports) 2>&1 >/dev/null )
+    case "$err" in
+        *"cannot reach localhost:8765 (loopback resolution?"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "port check: remote mode still blames the firewall" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(vega-2); MASTER=vega-1
+            run_host() { return 1; }
+            verify_fio_ports) 2>&1 >/dev/null )
+    case "$err" in
+        *"vega-1 cannot reach vega-2:8765 (host firewall?)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
 # --- local mode: staging end to end (no ssh, no sshd) ---
-# TARGET_DIR is redirected at a tmp dir so the real staging path runs unchanged:
-# the master-side mkdir and the jobfile copy both go through the wrappers.
-t_assert "local staging lands per-host variants under TARGET_DIR" bash -c '
+# The staging dir is redirected at a tmp dir through the real environment
+# override, so both the override and the staging path are exercised: the
+# master-side mkdir and the jobfile copy each go through a wrapper. The variable
+# is namespaced (WEKATESTER_TARGET_DIR) because a bare TARGET_DIR is common
+# enough in build environments to hijack cleanup'"'"'s rm -rf by accident.
+t_assert "local staging lands per-host variants under the staging dir" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)
-    (source ./wekatester
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
-     WORK_DIR="$d/work"; TARGET_DIR="$d/target"; DIRECTORY=/mnt/weka
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
      stage_jobfiles) >/dev/null || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     test -f "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
     test -f "$d/target/localhost/022-smoke-writeiops.job"'
+t_assert "a bare TARGET_DIR in the environment is ignored" bash -c '
+    out=$(TARGET_DIR=/tmp/hijacked bash -c "source ./wekatester; echo \$TARGET_DIR")
+    [ "$out" = "/dev/shm/fio-jobfiles" ] || { echo "$out" >&2; false; }'
 
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '

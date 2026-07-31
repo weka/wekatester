@@ -28,9 +28,12 @@ REPORT_ITEMS=""                 # -r: report items for -s (default: all)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # remote hosts are Linux: /dev/shm is guaranteed tmpfs.
-# TARGET_DIR honours the environment purely as test plumbing -- the suite points
-# it at a tmp dir to exercise the real staging path without a worker.
-TARGET_DIR="${TARGET_DIR:-/dev/shm/fio-jobfiles}"   # jobfile staging dir on the master
+# The override is namespaced on purpose. This path is what cleanup feeds to
+# `rm -rf` on the master and on every worker, so honouring a bare $TARGET_DIR --
+# a common variable in build and CI environments -- would let a stray export
+# silently point those deletions somewhere else. Test plumbing only: the suite
+# sets it to exercise the real staging path without a worker.
+TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
@@ -69,12 +72,15 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 # over loopback, so every guard applies and the results JSON keeps its shape.
 
 # Run a command on a host. Local mode executes directly -- no sshd needed.
+# Both branches take stdin from /dev/null (ssh -n, and an explicit redirect
+# locally). Without it a foreground call inherits and can consume the script's
+# own stdin, and so can a backgrounded one whenever job control is in effect
+# (bash only auto-redirects async commands to /dev/null when it is not). The
+# invariant has to hold on both sides of the branch or it is not an invariant.
 run_host() {   # run_host <host> <command-string>
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        bash -c "$2"
+        bash -c "$2" </dev/null
     else
-        # -n: stdin from /dev/null, so a backgrounded ssh cannot consume the
-        # script's own stdin
         ssh -n $SSH_OPTS "$1" "$2"
     fi
 }
@@ -279,7 +285,7 @@ start_fio_servers() {
 # the survivors, so we refuse to run instead.
 verify_fio_ports() {
     log "verifying fio port $FIO_PORT reachability from $MASTER..."
-    local pids=() failed=() host i
+    local pids=() failed=() host i hint
     for host in "${HOSTS[@]}"; do
         # single statement on purpose: bash does not exit on a failed exec
         # redirection, so a compound probe would mask the connect failure
@@ -291,8 +297,14 @@ verify_fio_ports() {
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
     done
     if [ ${#failed[@]} -gt 0 ]; then
+        # A firewall is the overwhelmingly likely cause between two machines,
+        # but never on loopback: there the usual culprit is the name resolving
+        # to ::1 while fio's listener is on IPv4.
+        hint="(host firewall?)"
+        [ "$LOCAL_MODE" -eq 0 ] || \
+            hint="(loopback resolution? fio binds IPv4 -- check that localhost resolves to 127.0.0.1)"
         for host in "${failed[@]}"; do
-            log "ERROR: $MASTER cannot reach $host:$FIO_PORT (host firewall?)" >&2
+            log "ERROR: $MASTER cannot reach $host:$FIO_PORT $hint" >&2
         done
         die "fio port check failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
@@ -641,8 +653,8 @@ PYEOF
 
 # --- phase 3: stage jobfiles ---------------------------------------------------
 # Discover the workload's jobfiles, build $WORK_DIR/jobs/<host>/<job> for
-# every host, copy the whole tree to $TARGET_DIR on $MASTER (one scp over
-# the existing master connection).
+# every host, copy the whole tree to $TARGET_DIR on $MASTER -- one scp over the
+# existing master connection, or a plain cp when the master is this host.
 JOBFILES=()      # basenames, in run order
 JOBFILE_SRC=""   # local source directory
 

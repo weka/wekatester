@@ -46,9 +46,16 @@ logically unchanged. Only two functions know whether a host is remote:
 - `copy_to_master <src>... <dst-dir>` — `cp -R` locally, `scp -q -r` remotely
   (the destination is the last argument in both, so call sites are identical).
 
-All ten previous `ssh`/`scp` call sites go through them. Backgrounded sites
-(`run_host ... &`) keep working — it is a plain function, so `$!`, `wait`, and
-the collect-all failure policy are unaffected.
+Eleven of the twelve previous transport call sites go through them: ten `ssh`
+invocations plus the one `scp`. The twelfth, cleanup's `ssh -O exit`, is a
+ControlMaster socket operation with no local equivalent and is left alone — its
+loop no-ops in local mode because no sockets were ever created.
+
+Backgrounded sites (`run_host ... &`) keep working — it is a plain function, so
+`$!`, `wait`, and the collect-all failure policy are unaffected. Both branches
+take stdin from `/dev/null` (`ssh -n`, and an explicit redirect locally): a
+foreground call would otherwise inherit and consume the script's own stdin, as
+would a backgrounded one whenever job control is in effect.
 
 Rationale for **not** adding a separate no-server fio path (`fio <jobfile>`
 directly): the results JSON would change shape (`jobs[]` instead of
@@ -67,6 +74,10 @@ Two consequences worth stating:
 - **preflight's `rc == 255`** special case ("ssh failed") is gated on remote
   mode. A local command that happens to exit 255 is reported as what it is in
   this mode — `fio not found`.
+- **The port-check failure hint** is mode-dependent. Between two machines a
+  host firewall is the overwhelmingly likely cause; on loopback it never is, so
+  local mode points at the actual suspect instead — the name resolving to `::1`
+  while fio's listener is on IPv4.
 
 ### No-sshd guarantee
 
@@ -88,10 +99,18 @@ leaving the multi-host guard broken. The lab gate below re-verifies it.
 
 ### Test plumbing
 
-`TARGET_DIR` is now `${TARGET_DIR:-/dev/shm/fio-jobfiles}`. The only reason is
-testability: the suite points it at a tmp dir so the real `stage_jobfiles` —
-master-side `rm -rf`/`mkdir` plus the jobfile copy, both through the wrappers —
-can run with no worker and no `/dev/shm`. It is not a documented option.
+`TARGET_DIR` is now `${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}`. The only
+reason is testability: the suite points it at a tmp dir so the real
+`stage_jobfiles` — master-side `rm -rf`/`mkdir` plus the jobfile copy, both
+through the wrappers — can run with no worker and no `/dev/shm`. It is not a
+documented option.
+
+The override **must** stay namespaced. This path is what cleanup passes to
+`rm -rf` on the master and on every worker, so honouring a bare `$TARGET_DIR` —
+a variable common enough in build and CI environments to be exported by
+accident — would let unrelated tooling silently redirect those deletions at an
+arbitrary path. A test asserts that a bare `TARGET_DIR` in the environment is
+ignored.
 
 ### Lab validation
 
