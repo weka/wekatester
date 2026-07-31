@@ -406,7 +406,11 @@ for job in jobs:
 
         is_latency = "latency" in items
         is_bw = "bandwidth" in items and not is_latency
-        is_iops = "iops" in items and not is_latency
+        # Precedence latency > bandwidth > iops: a mixed bandwidth+iops file
+        # is measuring bandwidth, and per spec bandwidth-file layout
+        # (filesize/nrfiles) is part of the measurement and must stay
+        # untouched, so it must not also take the iops small-file path.
+        is_iops = "iops" in items and not is_latency and not is_bw
         usable_n = len(facts[h]["usable"])
         best = common_engines[0] if common_engines else None
 

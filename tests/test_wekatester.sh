@@ -100,6 +100,12 @@ t_assert "max: iops iodepth and nrfiles derived" bash -c '
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
     grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=5$" "$v"'
+t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/012-mixed-bw.job"
+    grep -q "^numjobs=5$" "$v" && grep -q "^filesize=10G$" "$v" && ! grep -q "wt-small" "$v"'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
