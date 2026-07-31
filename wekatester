@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+#
+# wekatester - performance test a network/parallel filesystem with distributed fio
+#
+# Shell rewrite. Orchestration uses the system OpenSSH binary, so agent
+# forwarding, certificates, ProxyJump, and ~/.ssh/config behave exactly as
+# they do for interactive ssh. Connections are multiplexed over ControlMaster
+# sockets: one TCP+auth handshake per host for the whole run. Result parsing
+# is delegated to embedded python3 (stdlib only). No installable dependencies.
+#
+# All transient staging (jobfiles, control sockets, remote jobfile copies,
+# fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
+# written to disk are the results_*.json outputs in the current directory.
+
+VERSION="2026-07-30"
+
+# --- defaults ----------------------------------------------------------------
+DIRECTORY="/mnt/weka"           # target directory on the workers for test files
+WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
+FIO_BIN="/usr/bin/fio"          # fio binary on the workers
+VERBOSITY=0
+SUMMARIZE_FILE=""               # -s: just summarize an existing results file
+REPORT_ITEMS=""                 # -r: report items for -s (default: all)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# remote hosts are Linux: /dev/shm is guaranteed tmpfs
+TARGET_DIR="/dev/shm/fio-jobfiles"      # jobfile staging dir on the master
+FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
+
+# local staging: prefer tmpfs; fall back for non-Linux (e.g. macOS) dev boxes
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    STAGE_BASE=/dev/shm
+else
+    STAGE_BASE=${TMPDIR:-/tmp}
+fi
+
+# BatchMode: fail cleanly instead of hanging on an interactive prompt.
+# ControlMaster opts are appended in main() once the socket dir exists.
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+
+# --- logging -----------------------------------------------------------------
+log()   { echo "$(date '+%H:%M:%S') $*"; }
+debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
+die()   { log "ERROR: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-v] [-V] [-h] server [server ...]
+       ${0##*/} -s results.json [-r "bandwidth latency iops"]
+
+Basic performance test of a network/parallel filesystem (distributed fio).
+
+  -d directory   target directory on the workers for test files (default: $DIRECTORY)
+  -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
+  -f fio_bin     fio binary on the workers (default: $FIO_BIN)
+  -s file        summarize an existing fio JSON results file and exit
+  -r items       report items for -s: any of "bandwidth latency iops" (default: all)
+  -v             increase output verbosity (repeatable)
+  -V             display version number and exit
+  -h             show this help and exit
+EOF
+}
+
+# --- argument parsing ----------------------------------------------------------
+while getopts ":d:w:f:s:r:vVh" opt; do
+    case $opt in
+        d) DIRECTORY=$OPTARG ;;
+        w) WORKLOAD=$OPTARG ;;
+        f) FIO_BIN=$OPTARG ;;
+        s) SUMMARIZE_FILE=$OPTARG ;;
+        r) REPORT_ITEMS=$OPTARG ;;
+        v) VERBOSITY=$((VERBOSITY + 1)) ;;
+        V) echo "${0##*/} version $VERSION"; exit 0 ;;
+        h) usage; exit 0 ;;
+        \?) usage >&2; die "unknown option: -$OPTARG" ;;
+        :)  usage >&2; die "option -$OPTARG requires an argument" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+HOSTS=("$@")
+MASTER=${HOSTS[0]:-}
+
+# --- phase 1: preflight --------------------------------------------------------
+# Verify every host is reachable over ssh and has $FIO_BIN installed.
+# Policy: check all hosts in parallel, report every failure, then exit.
+# Side effect: each check opens the host's ControlMaster socket, so every
+# later ssh/scp to that host rides the authenticated connection for free.
+preflight() {
+    log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
+    local pids=() failed=() host i rc
+    for host in "${HOSTS[@]}"; do
+        ssh -n $SSH_OPTS "$host" "command -v '$FIO_BIN' >/dev/null" &
+        pids+=($!)
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}"
+        rc=$?
+        if [ "$rc" -eq 255 ]; then
+            failed+=("${HOSTS[$i]}: ssh failed")
+        elif [ "$rc" -ne 0 ]; then
+            failed+=("${HOSTS[$i]}: $FIO_BIN not found")
+        fi
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        for host in "${failed[@]}"; do
+            log "ERROR: $host" >&2
+        done
+        die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
+    fi
+    debug "preflight passed on all hosts"
+}
+
+# --- phase 2: fio server lifecycle ---------------------------------------------
+# Start 'fio --server' on every host; guarantee teardown on any exit path.
+# Daemons are tracked by pidfile only -- never pkill by name, the host may be
+# running fio jobs that are not ours.
+FIO_STARTED=0
+
+start_fio_servers() {
+    log "starting fio servers on ${#HOSTS[@]} host(s)..."
+    local pids=() failed=() host i
+    for host in "${HOSTS[@]}"; do
+        ssh -n $SSH_OPTS "$host" \
+            "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
+             '$FIO_BIN' --server --daemonize='$FIO_PIDFILE'" &
+        pids+=($!)
+    done
+    FIO_STARTED=1   # set before checking: partial starts must still be torn down
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
+    done
+    [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
+    sleep 2   # let the listeners settle before the first coordinator connect
+    debug "fio servers running on all hosts"
+}
+
+cleanup() {
+    local host f
+    if [ "$FIO_STARTED" -eq 1 ]; then
+        FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
+        log "stopping fio servers..."
+        for host in "${HOSTS[@]}"; do
+            ssh -n $SSH_OPTS "$host" \
+                "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
+                 rm -rf '$TARGET_DIR'" &
+        done
+        wait
+    fi
+    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+        # close any ControlMaster still running, then drop the whole work dir.
+        # -O exit talks only to the socket; the trailing hostname is unused.
+        for f in "$WORK_DIR"/c/*; do
+            [ -S "$f" ] && ssh -O exit -o ControlPath="$f" unused-host-arg
+        done
+        rm -rf "$WORK_DIR"
+    fi
+}
+
+# --- phase 3: stage jobfiles ---------------------------------------------------
+# Discover the workload's jobfiles, override directory=, copy the set to
+# $TARGET_DIR on $MASTER (one scp over the existing master connection).
+JOBFILES=()      # basenames, in run order
+JOBFILE_SRC=""   # local source directory
+
+stage_jobfiles() {
+    JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    [ -d "$JOBFILE_SRC" ] || JOBFILE_SRC="./fio-jobfiles/$WORKLOAD"
+    [ -d "$JOBFILE_SRC" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+
+    local job base
+    for job in "$JOBFILE_SRC"/[0-9]*; do
+        [ -f "$job" ] || die "no jobfiles found in $JOBFILE_SRC"
+        base=${job##*/}
+        # override directory= wherever it appears; jobfiles without one get
+        # it inserted right after [global]
+        if grep -q '^directory=' "$job"; then
+            awk -v dir="$DIRECTORY" \
+                '/^directory=/ { print "directory=" dir; next } { print }' \
+                "$job" > "$WORK_DIR/jobs/$base"
+        else
+            awk -v dir="$DIRECTORY" \
+                '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
+                "$job" > "$WORK_DIR/jobs/$base"
+        fi
+        JOBFILES+=("$base")
+    done
+    log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
+
+    ssh -n $SSH_OPTS "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
+        || die "cannot create $TARGET_DIR on $MASTER"
+    scp $SSH_OPTS -q "$WORK_DIR"/jobs/*.job "$MASTER:$TARGET_DIR/" \
+        || die "failed to copy jobfiles to $MASTER"
+}
+
+# --- phase 4: run + summarize --------------------------------------------------
+# For each jobfile: run the fio coordinator on $MASTER against all hosts,
+# capture JSON locally, hand it to the summarizer. One results file per job
+# so a crashed suite keeps everything already measured.
+run_jobs() {
+    local stamp job outfile report cmd host
+    stamp=$(date '+%Y-%m-%d_%H%M')
+    for job in "${JOBFILES[@]}"; do
+        # '# report <items>' / '#report <items>' comment lines pick the metrics
+        report=$(sed -n 's/^#[[:space:]]*report[[:space:]]*//p' "$JOBFILE_SRC/$job" | tr '\n' ' ')
+        cmd="'$FIO_BIN' --output-format=json"
+        for host in "${HOSTS[@]}"; do
+            cmd="$cmd --client=$host '$TARGET_DIR/$job'"
+        done
+        outfile="results_${stamp}_${job%.job}.json"
+        log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
+        debug "running on $MASTER: $cmd"
+        ssh -n $SSH_OPTS "$MASTER" "$cmd" > "$outfile" \
+            || die "fio run failed for $job (partial output in $outfile)"
+        summarize "$outfile" "$report"
+    done
+    log "raw fio results: results_${stamp}_*.json"
+}
+
+# Parse a fio JSON results file and print the human summary.
+# $1 = results file, $2 = report items ("bandwidth iops latency"; empty = all)
+summarize() {
+    python3 - "$1" "$2" <<'PYEOF' || die "failed to summarize $1"
+import json
+import sys
+
+path = sys.argv[1]
+items = sys.argv[2].split() or ["bandwidth", "latency", "iops"]
+
+raw = open(path).read()
+start = raw.find("{")
+if start < 0:
+    sys.exit(f"{path}: no JSON in fio output")
+try:
+    data = json.loads(raw[start:])
+except ValueError as exc:
+    sys.exit(f"{path}: cannot parse fio JSON: {exc}")
+
+# client_stats is a flat list: one entry per (host, job) plus "All clients"
+# aggregates. The measured workload runs last in every jobfile, so the last
+# entry per host -- and the last aggregate -- describe the workload, not the
+# create/layout phase.
+per_host = {}
+alls = None
+for s in data.get("client_stats", []):
+    if s["jobname"] == "All clients":
+        alls = s
+    else:
+        per_host[s.get("hostname", s["jobname"])] = s
+if alls is None:
+    if len(per_host) == 1:
+        alls = next(iter(per_host.values()))  # fio emits no aggregate for one client
+    else:
+        sys.exit(f"{path}: no 'All clients' aggregate found")
+
+
+def fmt_bytes(n):
+    for unit, val in (("TiB", 2**40), ("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)):
+        if n >= val:
+            return f"{n / val:.2f} {unit}/s"
+    return f"{n:.0f} bytes/s"
+
+
+def fmt_lat(ns):
+    for unit, val in (("s", 1e9), ("ms", 1e6), ("us", 1e3)):
+        if ns >= val:
+            return f"{ns / val:.1f} {unit}"
+    return f"{ns:.0f} ns"
+
+
+def fmt_iops(n):
+    return f"{n:,.0f}/s"
+
+
+def spread(metric, fmt):
+    """Straggler visibility: per-host min/max of a metric, when it varies."""
+    if len(per_host) < 2:
+        return ""
+    vals = sorted((metric(s), h) for h, s in per_host.items())
+    (lo, lo_h), (hi, hi_h) = vals[0], vals[-1]
+    if lo == hi:
+        return ""
+    return f"  (min {fmt(lo)} {lo_h}, max {fmt(hi)} {hi_h})"
+
+
+lines = []
+if "bandwidth" in items:
+    r, w = alls["read"]["bw_bytes"], alls["write"]["bw_bytes"]
+    if r:
+        lines.append(f"read bandwidth: {fmt_bytes(r)}")
+    if w:
+        lines.append(f"write bandwidth: {fmt_bytes(w)}")
+    if r and w:
+        lines.append(f"total bandwidth: {fmt_bytes(r + w)}")
+    if r or w:
+        lines.append(
+            f"average bandwidth: {fmt_bytes((r + w) / len(per_host))} per host"
+            + spread(lambda s: s["read"]["bw_bytes"] + s["write"]["bw_bytes"], fmt_bytes)
+        )
+
+if "iops" in items:
+    r, w = alls["read"]["iops"], alls["write"]["iops"]
+    if r:
+        lines.append(f"read iops: {fmt_iops(r)}")
+    if w:
+        lines.append(f"write iops: {fmt_iops(w)}")
+    if r and w:
+        lines.append(f"total iops: {fmt_iops(r + w)}")
+    if r or w:
+        lines.append(
+            f"average iops: {fmt_iops((r + w) / len(per_host))} per host"
+            + spread(lambda s: s["read"]["iops"] + s["write"]["iops"], fmt_iops)
+        )
+
+if "latency" in items:
+    for d in ("read", "write"):
+        mean = alls[d]["lat_ns"]["mean"]
+        if mean:
+            lines.append(
+                f"{d} latency: {fmt_lat(mean)}"
+                + spread(lambda s, d=d: s[d]["lat_ns"]["mean"], fmt_lat)
+            )
+    r_lat, w_lat = alls["read"]["lat_ns"]["mean"], alls["write"]["lat_ns"]["mean"]
+    r_ios, w_ios = alls["read"]["total_ios"], alls["write"]["total_ios"]
+    if r_lat and w_lat and (r_ios + w_ios):
+        # weighted by IO count, not a bare mean of the two directions
+        weighted = (r_lat * r_ios + w_lat * w_ios) / (r_ios + w_ios)
+        lines.append(f"average latency: {fmt_lat(weighted)} (IO-weighted)")
+
+if not lines:
+    lines.append("(no non-zero metrics to report)")
+for line in lines:
+    print(f"    {line}")
+print()
+PYEOF
+}
+
+# --- main ----------------------------------------------------------------------
+main() {
+    # -s: offline re-summarize of an existing results file, no hosts involved
+    if [ -n "$SUMMARIZE_FILE" ]; then
+        [ -f "$SUMMARIZE_FILE" ] || die "no such file: $SUMMARIZE_FILE"
+        summarize "$SUMMARIZE_FILE" "$REPORT_ITEMS"
+        exit 0
+    fi
+
+    [ ${#HOSTS[@]} -gt 0 ] || { usage >&2; die "you must specify at least one server"; }
+    command -v python3 >/dev/null || die "python3 is required for result parsing"
+
+    log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
+    [ "$STAGE_BASE" = /dev/shm ] || debug "no /dev/shm here; local staging in $STAGE_BASE"
+
+    WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
+    mkdir -p "$WORK_DIR/c" "$WORK_DIR/jobs"
+    # multiplex every ssh/scp in this run over one connection per host.
+    # %C hashes host/port/user into a short, safe socket name.
+    SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=60s"
+
+    trap cleanup EXIT INT TERM
+    preflight
+    start_fio_servers
+    stage_jobfiles
+    run_jobs
+}
+
+main
