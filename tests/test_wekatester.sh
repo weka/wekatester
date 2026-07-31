@@ -174,5 +174,35 @@ t_assert "non-auto staging produces per-host variants" bash -c '
     test -f "$FIX/jobs/h1/011-bw.job" && test -f "$FIX/jobs/h2/011-bw.job" &&
     grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/011-bw.job"'
 
+# Auto staging at the real call site (wekatester:540). These exercise the
+# argument order that stage_variants passes to auto_tune: a dropped or
+# reordered positional there shifts the host list, which no direct auto_tune
+# test can catch (they build their own argv).
+t_assert "auto staging aborts when the workload does not fit" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
+    err=$( (source ./wekatester
+            WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
+            AUTO_LEVEL=max; IGNORE_CAPACITY=0
+            stage_variants "$FIX/src") 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in
+        *ERROR*"only"*"available (use --ignore-capacity to run anyway)"*"auto tuning failed"*) true;;
+        *) echo "unexpected stderr: $err" >&2; false;;
+    esac'
+t_assert "auto staging with override stages every host" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
+    err=$( (source ./wekatester
+            WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
+            AUTO_LEVEL=max; IGNORE_CAPACITY=1
+            stage_variants "$FIX/src") 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc ($err)" >&2; false; } &&
+    { test -f "$FIX/jobs/h1/011-bw.job" ||
+      { echo "coordinator h1 not staged: argument shift?" >&2; false; }; } &&
+    test -f "$FIX/jobs/h2/011-bw.job"'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

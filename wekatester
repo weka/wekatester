@@ -309,6 +309,14 @@ auto_tune() {
     python3 - "$@" <<'PYEOF' || return 1
 import json, math, os, re, sys
 
+# Validate the flag slot before unpacking: without this, an old-style 5-arg
+# call (no ignore_capacity) silently succeeds -- argv[5] becomes the first
+# hostname, which reads as "not 1", drops that host from both the tuning loop
+# and the capacity total, and exits 0. Wrong quietly is worse than not running.
+if len(sys.argv) < 7 or sys.argv[5] not in ("0", "1"):
+    sys.exit("ERROR: auto_tune: usage: <src> <work> <tier> <directory> "
+             "<ignore_capacity 0|1> <host>...")
+
 src, work, tier, directory = sys.argv[1:5]
 ignore_capacity = sys.argv[5] == "1"
 hosts = sys.argv[6:]
