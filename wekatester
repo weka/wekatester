@@ -156,12 +156,15 @@ apply_ssh_auth_opts() {
     if [ -n "$SSH_IDENTITY" ]; then
         # Name a bad key path now. Left to ssh it surfaces as a BatchMode
         # authentication failure on every host at once, which reads like a
-        # cluster problem instead of a typo.
-        [ -r "$SSH_IDENTITY" ] || die "identity file not readable: $SSH_IDENTITY"
+        # cluster problem instead of a typo. -f as well as -r: a directory is
+        # readable, and `-i ~/.ssh` is the likeliest way to mistype a key path.
+        { [ -f "$SSH_IDENTITY" ] && [ -r "$SSH_IDENTITY" ]; } || \
+            die "identity file not readable: $SSH_IDENTITY"
         # IdentitiesOnly is deliberate: with an explicit key, do not also let a
         # running agent offer its whole keyring. Those attempts are counted by
         # sshd's MaxAuthTries and can lock the run out before the right key is
-        # ever tried.
+        # ever tried. It bounds the agent, not ssh_config -- IdentityFile
+        # entries from the config are still eligible.
         SSH_OPTS="$SSH_OPTS -o IdentityFile=$SSH_IDENTITY -o IdentitiesOnly=yes"
     fi
 }
@@ -182,7 +185,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -l, --login user        ssh login user for the workers (remote runs only)
-  -i, --identity keyfile  ssh private key to use, and only it (remote runs only)
+  -i, --identity keyfile  ssh private key for the workers (remote runs only);
+                          keeps the agent's other keys from being offered
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -217,9 +221,16 @@ parse_args() {
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             -l|--login)    need_arg "$1" $#; SSH_LOGIN=$2; shift 2 ;;
-            --login=*)     SSH_LOGIN=${1#--login=}; shift ;;
+            # An =-form carries an argument that is merely empty, so need_arg
+            # cannot catch it. Reject it here: silently ignoring --login= would
+            # make the one spelling that looks most deliberate do nothing.
+            --login=*)     SSH_LOGIN=${1#--login=}
+                           [ -n "$SSH_LOGIN" ] || { usage >&2; die "option --login requires a value"; }
+                           shift ;;
             -i|--identity) need_arg "$1" $#; SSH_IDENTITY=$2; shift 2 ;;
-            --identity=*)  SSH_IDENTITY=${1#--identity=}; shift ;;
+            --identity=*)  SSH_IDENTITY=${1#--identity=}
+                           [ -n "$SSH_IDENTITY" ] || { usage >&2; die "option --identity requires a value"; }
+                           shift ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;

@@ -28,14 +28,19 @@ hand-tuning jobfiles per site.
   call-site change. `IdentitiesOnly=yes` is deliberate: once a key is named
   explicitly, a running agent must not also offer its whole keyring, because
   those attempts count against sshd's `MaxAuthTries` and can exhaust it before
-  the right key is tried.
+  the right key is tried. It bounds the agent only — `IdentityFile` entries
+  from `ssh_config` remain eligible.
 - `parse_args` only records the two values (`SSH_LOGIN`, `SSH_IDENTITY`);
   `apply_ssh_auth_opts`, called from `main` after `resolve_local_mode` and
   before any host contact, validates them and appends to `SSH_OPTS`. Guards
-  there: an unreadable `-i` path dies naming the path (left to ssh it looks
-  like a cluster-wide auth failure rather than a typo), and neither value may
-  contain whitespace, since `SSH_OPTS` is expanded unquoted by design. In local
-  mode both are accepted no-ops — there is no ssh to configure.
+  there: a `-i` path that is not a readable regular file dies naming the path
+  (left to ssh it looks like a cluster-wide auth failure rather than a typo,
+  and `-f` as well as `-r` because a directory passes `-r` and `-i ~/.ssh` is
+  the likeliest mistype), and neither value may contain whitespace, since
+  `SSH_OPTS` is expanded unquoted by design. In local mode both are accepted
+  no-ops — there is no ssh to configure. Empty `=`-forms (`--login=`) are a
+  usage error: `need_arg` cannot see them, and ignoring them silently would
+  make the most deliberate-looking spelling do nothing.
 - The `server ...` positional is now optional (`[server ...]` in the synopsis):
   with none given the run happens on the local host — see Local mode.
 - All existing options and behavior without `-a` are unchanged, except that

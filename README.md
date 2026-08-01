@@ -33,7 +33,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -l, --login user        ssh login user for the workers (remote runs only)
-  -i, --identity keyfile  ssh private key to use, and only it (remote runs only)
+  -i, --identity keyfile  ssh private key for the workers (remote runs only);
+                          keeps the agent's other keys from being offered
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -106,7 +107,7 @@ Because wekatester uses the real ssh client, anything you can express in `~/.ssh
 
 Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
 
-When the workers want a different login or a specific key and editing `~/.ssh/config` isn't practical — you're root on the coordinator driving `ubuntu@` client nodes, say — use `-l login` and `-i keyfile`. They become `-o User=` and `-o IdentityFile=` internally, so ssh and scp both honour them. `-i` also sets `IdentitiesOnly=yes`: if you name a key, only that key is offered, and a loaded agent can't burn through sshd's `MaxAuthTries` with the rest of your keyring before the right one is reached. An unreadable key path is reported before the first connection, and neither option may contain whitespace (`SSH_OPTS` is a whitespace-split option list). In local mode both are accepted and ignored — there is no ssh to configure.
+When the workers want a different login or a specific key and editing `~/.ssh/config` isn't practical — you're root on the coordinator driving `ubuntu@` client nodes, say — use `-l login` and `-i keyfile`. They become `-o User=` and `-o IdentityFile=` internally, so ssh and scp both honour them. `-i` also sets `IdentitiesOnly=yes`, which keeps the ssh agent's other keys from being offered — those attempts count against sshd's `MaxAuthTries` and can exhaust it before the key you named is reached. It bounds the agent, not your config: `IdentityFile` entries in `~/.ssh/config` still apply. A key path that is missing, unreadable, or not a regular file (`-i ~/.ssh` instead of `-i ~/.ssh/id_ed25519`) is reported before the first connection, and neither option may contain whitespace (`SSH_OPTS` is a whitespace-split option list). In local mode both are accepted and ignored — there is no ssh to configure.
 
 # Output
 Each job prints a summary block as it completes, and the raw fio JSON is kept — one file per job, named `results_<timestamp>_<jobname>.json` in the current directory, so a crashed suite keeps everything already measured.

@@ -571,6 +571,13 @@ t_assert "-l/-i do not swallow the host list" bash -c '
     [ "${HOSTS[*]}" = "h1 h2" ]'
 t_assert "-l with no value errors" bash -c '! (source ./wekatester; parse_args -l)'
 t_assert "-i with no value errors" bash -c '! (source ./wekatester; parse_args -i)'
+# The =-forms carry an argument that happens to be empty, so need_arg cannot see
+# them. Left alone they were silent no-ops -- the one spelling of "I gave you a
+# login" that quietly did nothing.
+t_assert "--login= with an empty value errors" bash -c '
+    ! (source ./wekatester; parse_args --login= h1)'
+t_assert "--identity= with an empty value errors" bash -c '
+    ! (source ./wekatester; parse_args --identity= h1)'
 # parse_args stays pure: SSH_OPTS is only touched by the apply step.
 t_assert "parse_args leaves SSH_OPTS alone" bash -c '
     out=$(source ./wekatester; parse_args -l ubuntu -i /tmp/k h1; echo "$SSH_OPTS")
@@ -616,6 +623,17 @@ t_assert "an unreadable identity file dies, naming the path" bash -c '
         *"identity file not readable: /no/such/key"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+# `-i ~/.ssh` is the likeliest typo of `-i ~/.ssh/id_ed25519`, and a directory
+# passes a bare -r test, so the guard has to demand a regular file.
+t_assert "an identity path that is a directory is refused" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; SSH_IDENTITY="$d"
+            apply_ssh_auth_opts) 2>&1 >/dev/null )
+    case "$err" in
+        *"identity file not readable: $d"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
 # SSH_OPTS is expanded unquoted on purpose (it is an option list), so a value
 # with whitespace in it would split into extra ssh options rather than travel
 # as one. Refuse it instead of building a command line nobody asked for.
@@ -653,6 +671,17 @@ t_assert "-s is unaffected by -l/-i" bash -c '
     out=$(./wekatester -s "$d/r.json" -r bandwidth -l ubuntu -i /no/such/key 2>&1)
     case "$out" in
         *"total bandwidth: 7.00 GiB/s"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+# Every assertion above calls apply_ssh_auth_opts directly, so none of them
+# would notice the call going missing from main. This one drives the real
+# binary end to end -- parse_args, main, apply -- and a named host means it can
+# only be reporting the key before preflight, since nothing here can reach h1.
+t_assert "the real binary applies -l/-i before it contacts a host" bash -c '
+    out=$(./wekatester -i /no/such/key h1 2>&1); rc=$?
+    [ "$rc" -eq 1 ] || { echo "rc=$rc: $out" >&2; exit 1; }
+    case "$out" in
+        *"identity file not readable: /no/such/key"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 
