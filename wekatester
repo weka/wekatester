@@ -48,6 +48,13 @@ fi
 # ControlMaster opts are appended in main() once the socket dir exists.
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
+# -l / -i: login user and identity file for the workers, for the case where the
+# host you drive the run from is not the user the workers expect (root on the
+# coordinator, ubuntu@ on the clients) and ~/.ssh/config cannot say so. Recorded
+# here by parse_args; apply_ssh_auth_opts folds them into SSH_OPTS in main.
+SSH_LOGIN=""
+SSH_IDENTITY=""
+
 # Local mode: no server on the command line, so the "cluster" is this host and
 # the transport below executes directly instead of over ssh. Set by
 # resolve_local_mode() in the run path only.
@@ -120,10 +127,50 @@ resolve_local_mode() {
     log "no servers given: running on the local host (no ssh required)"
 }
 
+# Fold -l/-i into SSH_OPTS. Both become `-o` forms rather than ssh's own -l/-i
+# flags, because `-o` is the one spelling BOTH ssh and scp accept (scp's -l is a
+# bandwidth limit) -- so the two transport wrappers pick them up with no change
+# at any call site, including the `$MASTER:` scp destination.
+#
+# Called from main in the run path only, after resolve_local_mode has decided
+# whether ssh is involved at all and before anything can touch a host.
+apply_ssh_auth_opts() {
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        # No ssh in local mode, so the flags are accepted and ignored rather
+        # than treated as a usage error -- same shape as --ignore-capacity
+        # outside auto mode.
+        [ -z "$SSH_LOGIN$SSH_IDENTITY" ] || debug "local mode: ignoring -l/-i (no ssh involved)"
+        return 0
+    fi
+    # SSH_OPTS is expanded unquoted on purpose -- it is an option list, and the
+    # shell splitting it is what turns it into argv. A value with whitespace in
+    # it would therefore arrive as several options instead of one, so refuse it
+    # here rather than hand ssh a command line nobody wrote.
+    case "$SSH_LOGIN" in
+        *[[:space:]]*) die "login must not contain whitespace (SSH_OPTS is whitespace-split)" ;;
+    esac
+    case "$SSH_IDENTITY" in
+        *[[:space:]]*) die "identity file must not contain whitespace (SSH_OPTS is whitespace-split)" ;;
+    esac
+    [ -z "$SSH_LOGIN" ] || SSH_OPTS="$SSH_OPTS -o User=$SSH_LOGIN"
+    if [ -n "$SSH_IDENTITY" ]; then
+        # Name a bad key path now. Left to ssh it surfaces as a BatchMode
+        # authentication failure on every host at once, which reads like a
+        # cluster problem instead of a typo.
+        [ -r "$SSH_IDENTITY" ] || die "identity file not readable: $SSH_IDENTITY"
+        # IdentitiesOnly is deliberate: with an explicit key, do not also let a
+        # running agent offer its whole keyring. Those attempts are counted by
+        # sshd's MaxAuthTries and can lock the run out before the right key is
+        # ever tried.
+        SSH_OPTS="$SSH_OPTS -o IdentityFile=$SSH_IDENTITY -o IdentitiesOnly=yes"
+    fi
+}
+
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-v] [-V] [-h] [server ...]
+                  [--ignore-capacity] [-l login] [-i keyfile]
+                  [-v] [-V] [-h] [server ...]
        ${0##*/} -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -134,6 +181,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
+  -l, --login user        ssh login user for the workers (remote runs only)
+  -i, --identity keyfile  ssh private key to use, and only it (remote runs only)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -167,6 +216,10 @@ parse_args() {
                 esac
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
+            -l|--login)    need_arg "$1" $#; SSH_LOGIN=$2; shift 2 ;;
+            --login=*)     SSH_LOGIN=${1#--login=}; shift ;;
+            -i|--identity) need_arg "$1" $#; SSH_IDENTITY=$2; shift 2 ;;
+            --identity=*)  SSH_IDENTITY=${1#--identity=}; shift ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
@@ -911,6 +964,10 @@ main() {
     fi
 
     resolve_local_mode
+    # -l/-i land in SSH_OPTS here, before the staging dir exists and long before
+    # preflight opens the first connection: a bad key path costs nothing to
+    # report and leaves nothing behind. ControlMaster opts are appended below.
+    apply_ssh_auth_opts
     command -v python3 >/dev/null || die "python3 is required for result parsing"
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"

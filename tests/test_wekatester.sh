@@ -555,6 +555,107 @@ t_assert "a bare TARGET_DIR in the environment is ignored" bash -c '
     out=$(TARGET_DIR=/tmp/hijacked bash -c "source ./wekatester; echo \$TARGET_DIR")
     [ "$out" = "/dev/shm/fio-jobfiles" ] || { echo "$out" >&2; false; }'
 
+# --- ssh login and identity (-l / -i) ---
+# The letters mirror ssh's own. parse_args only records them; apply_ssh_auth_opts
+# validates and folds them into SSH_OPTS, so the parse stays pure.
+a() { (source ./wekatester; parse_args "$@"; echo "$SSH_LOGIN|$SSH_IDENTITY"); }
+t_assert "login and identity default to empty" test "$(a h1)" = "|"
+t_assert "-l sets the login"           test "$(a -l ubuntu h1)" = "ubuntu|"
+t_assert "--login value sets the login" test "$(a --login ubuntu h1)" = "ubuntu|"
+t_assert "--login=value sets the login" test "$(a --login=ubuntu h1)" = "ubuntu|"
+t_assert "-i sets the identity"        test "$(a -i /tmp/k h1)" = "|/tmp/k"
+t_assert "--identity value sets the identity" test "$(a --identity /tmp/k h1)" = "|/tmp/k"
+t_assert "--identity=value sets the identity" test "$(a --identity=/tmp/k h1)" = "|/tmp/k"
+t_assert "-l/-i do not swallow the host list" bash -c '
+    source ./wekatester; parse_args -l ubuntu -i /tmp/k h1 h2
+    [ "${HOSTS[*]}" = "h1 h2" ]'
+t_assert "-l with no value errors" bash -c '! (source ./wekatester; parse_args -l)'
+t_assert "-i with no value errors" bash -c '! (source ./wekatester; parse_args -i)'
+# parse_args stays pure: SSH_OPTS is only touched by the apply step.
+t_assert "parse_args leaves SSH_OPTS alone" bash -c '
+    out=$(source ./wekatester; parse_args -l ubuntu -i /tmp/k h1; echo "$SSH_OPTS")
+    case "$out" in *User=*|*IdentityFile=*) echo "$out" >&2; false;; *) true;; esac'
+
+# Both are translated to `-o` forms because those are valid for ssh AND scp
+# (scp has no -l, and -i differs in nothing but luck), so both transport
+# wrappers inherit them with no change at the call sites. The bracketing stub
+# proves each lands as its own argv entry rather than one glued string.
+t_assert "-l/-i reach the ssh command line as separate -o options" bash -c '
+    source ./tests/helpers.sh; echo_transport_fixture
+    k=$(mktemp)
+    out=$(source ./wekatester
+          LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"
+          SSH_LOGIN=ubuntu; SSH_IDENTITY="$k"
+          apply_ssh_auth_opts
+          run_host vega-1 "df -kP /mnt/weka")
+    [ "$out" = "SSH[-n][-o][BatchMode=yes][-o][User=ubuntu][-o][IdentityFile=$k][-o][IdentitiesOnly=yes][vega-1][df -kP /mnt/weka]" ] ||
+        { echo "$out" >&2; false; }'
+t_assert "-l/-i reach the scp command line too" bash -c '
+    source ./tests/helpers.sh; echo_transport_fixture
+    k=$(mktemp)
+    out=$(source ./wekatester
+          LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
+          SSH_LOGIN=ubuntu; SSH_IDENTITY="$k"
+          apply_ssh_auth_opts
+          copy_to_master /w/jobs/h1 /dev/shm/fio-jobfiles/)
+    [ "$out" = "SCP[-o][BatchMode=yes][-o][User=ubuntu][-o][IdentityFile=$k][-o][IdentitiesOnly=yes][-q][-r][/w/jobs/h1][vega-1:/dev/shm/fio-jobfiles/]" ] ||
+        { echo "$out" >&2; false; }'
+t_assert "-l alone adds only User" bash -c '
+    out=$(source ./wekatester
+          LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"; SSH_LOGIN=ubuntu
+          apply_ssh_auth_opts; echo "$SSH_OPTS")
+    [ "$out" = "-o BatchMode=yes -o User=ubuntu" ] || { echo "$out" >&2; false; }'
+
+# A bad key path must be named before the first ssh, not after ssh has already
+# failed for a reason the operator has to reverse-engineer from BatchMode noise.
+t_assert "an unreadable identity file dies, naming the path" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; SSH_IDENTITY=/no/such/key
+            apply_ssh_auth_opts) 2>&1 >/dev/null )
+    case "$err" in
+        *"identity file not readable: /no/such/key"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+# SSH_OPTS is expanded unquoted on purpose (it is an option list), so a value
+# with whitespace in it would split into extra ssh options rather than travel
+# as one. Refuse it instead of building a command line nobody asked for.
+t_assert "a login containing whitespace is refused" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; SSH_LOGIN="ubuntu -o ProxyCommand=nc"
+            apply_ssh_auth_opts) 2>&1 >/dev/null )
+    case "$err" in
+        *"must not contain whitespace"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+# The file here exists and is readable: only the space in its name is wrong, so
+# this pins that the whitespace guard runs before (not instead of) the -r check.
+t_assert "an identity path containing whitespace is refused" bash -c '
+    d=$(mktemp -d); k="$d/my key"; : > "$k"
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; SSH_IDENTITY="$k"
+            apply_ssh_auth_opts) 2>&1 >/dev/null )
+    case "$err" in
+        *"must not contain whitespace"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+# Local mode never runs ssh, so the flags are accepted and ignored -- including
+# a key path that would be fatal on a remote run.
+t_assert "local mode accepts -l/-i as no-ops" bash -c '
+    out=$(source ./wekatester
+          LOCAL_MODE=1; SSH_LOGIN=ubuntu; SSH_IDENTITY=/no/such/key
+          apply_ssh_auth_opts && echo "OPTS:$SSH_OPTS")
+    case "$out" in OPTS:*) ;; *) echo "expected a clean return, got: $out" >&2; exit 1;; esac
+    case "$out" in *User=*|*IdentityFile=*) echo "$out" >&2; false;; *) true;; esac'
+# -s exits before the apply step, so an unusable key cannot break offline mode.
+t_assert "-s is unaffected by -l/-i" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" -r bandwidth -l ubuntu -i /no/such/key 2>&1)
+    case "$out" in
+        *"total bandwidth: 7.00 GiB/s"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh

@@ -20,7 +20,8 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-v] [-V] [-h] [server ...]
+                  [--ignore-capacity] [-l login] [-i keyfile]
+                  [-v] [-V] [-h] [server ...]
        wekatester -s results.json [-r "bandwidth latency iops"]
 
 Basic performance test of a network/parallel filesystem (distributed fio).
@@ -31,6 +32,8 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
+  -l, --login user        ssh login user for the workers (remote runs only)
+  -i, --identity keyfile  ssh private key to use, and only it (remote runs only)
   -s file        summarize an existing fio JSON results file and exit
   -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
@@ -102,6 +105,8 @@ Because wekatester uses the real ssh client, anything you can express in `~/.ssh
 - `on-prem_ssh_config.example` — default key, host key checking off
 
 Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
+
+When the workers want a different login or a specific key and editing `~/.ssh/config` isn't practical — you're root on the coordinator driving `ubuntu@` client nodes, say — use `-l login` and `-i keyfile`. They become `-o User=` and `-o IdentityFile=` internally, so ssh and scp both honour them. `-i` also sets `IdentitiesOnly=yes`: if you name a key, only that key is offered, and a loaded agent can't burn through sshd's `MaxAuthTries` with the rest of your keyring before the right one is reached. An unreadable key path is reported before the first connection, and neither option may contain whitespace (`SSH_OPTS` is a whitespace-split option list). In local mode both are accepted and ignored — there is no ssh to configure.
 
 # Output
 Each job prints a summary block as it completes, and the raw fio JSON is kept — one file per job, named `results_<timestamp>_<jobname>.json` in the current directory, so a crashed suite keeps everything already measured.

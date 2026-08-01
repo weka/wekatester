@@ -18,6 +18,24 @@ hand-tuning jobfiles per site.
   (so `-a host1 host2` works). Unknown level → usage error.
 - New: `--ignore-capacity` (long only, no argument, default off) — overrides
   the auto-mode capacity abort; see Capacity check.
+- New: `-l login` / `--login[=]login` and `-i keyfile` / `--identity[=]keyfile`,
+  for workers that want a login or a key that `~/.ssh/config` cannot supply
+  (root on the coordinator driving `ubuntu@` clients). They are translated,
+  not passed through: `-l` becomes `-o User=<login>` and `-i` becomes
+  `-o IdentityFile=<path> -o IdentitiesOnly=yes`. The `-o` spelling is the
+  point — it is accepted by **both** ssh and scp (scp's own `-l` is a bandwidth
+  limit), so appending to `SSH_OPTS` reaches both transport wrappers with no
+  call-site change. `IdentitiesOnly=yes` is deliberate: once a key is named
+  explicitly, a running agent must not also offer its whole keyring, because
+  those attempts count against sshd's `MaxAuthTries` and can exhaust it before
+  the right key is tried.
+- `parse_args` only records the two values (`SSH_LOGIN`, `SSH_IDENTITY`);
+  `apply_ssh_auth_opts`, called from `main` after `resolve_local_mode` and
+  before any host contact, validates them and appends to `SSH_OPTS`. Guards
+  there: an unreadable `-i` path dies naming the path (left to ssh it looks
+  like a cluster-wide auth failure rather than a typo), and neither value may
+  contain whitespace, since `SSH_OPTS` is expanded unquoted by design. In local
+  mode both are accepted no-ops — there is no ssh to configure.
 - The `server ...` positional is now optional (`[server ...]` in the synopsis):
   with none given the run happens on the local host — see Local mode.
 - All existing options and behavior without `-a` are unchanged, except that
