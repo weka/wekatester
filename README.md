@@ -65,9 +65,9 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-f fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`.
 
-`-s results.json` — offline mode: re-summarize an existing results file and exit, no hosts involved. `-r "bandwidth latency iops"` (any subset) selects which metrics to report; default is all.
+`-s results.json` — offline mode: re-summarize an existing results file and exit, no hosts involved. The full summary (all metric groups) is always printed.
 
-`-v` — more verbosity; repeatable (`-vv`).
+`-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
 # Workloads
 A workload is a directory of standard fio jobfiles under `fio-jobfiles/`, run in sorted filename order. Shipped sets:
@@ -83,7 +83,32 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 - Jobfile names must start with a digit (`011-bandwidthR.job`, ...) — that numeric prefix is both how files are discovered and what sets the run order.
 - A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything.
 - The `directory=` line is overridden by `-d` when the jobfiles are staged — inserted into `[global]` if missing, and if the jobfile has no `[global]` section at all one is created — so the shipped jobfiles work against any mount point.
-- The measured workload should be the **last** job in the jobfile — the shipped files use an initial `create_only` job to lay out the files, then `stonewall` into the real workload, and the summary describes that last job.
+- The measured workload should be the **last** job in the jobfile, and the summary describes that last job.
+
+**File layout is a separate, generated job.** Every run puts a `000-wekatester-layout.job` first: it derives one `create_only` section per file namespace from the set's own jobfiles (taking each namespace's largest `numjobs`/`nrfiles`/`filesize`), so **all files exist on all machines before any measured test starts** — wekatester runs jobfiles serially and fio's coordinator waits for every client, so that first job is a true cross-client barrier. A workload directory that carries its own layout job keeps it (it is never regenerated unless you ask with `-g`); every other set gets one generated on the fly, without touching the source directory. The shipped jobfiles still contain their original `create_only` sections — they are harmless no-ops after the layout job has run, and they keep each file usable standalone with plain fio. The layout job prints a duration instead of a summary.
+
+# Customizing workloads (-C)
+Jobfiles get edited in the field — `-C` makes that a guided flow instead of `cp -r` and hope:
+
+```
+./wekatester -C -l ubuntu -i key.pem 10.30.0.1 10.30.0.2      # temp set from -w's workload
+./wekatester -Cmyset host1 host2                              # named: ./fio-jobfiles/myset
+./wekatester -C ./path/to/set -- host1 host2                  # explicit path; hosts after --
+```
+
+The flow: the workload set is copied (shipped sets are never edited in place), each jobfile opens in your editor (`$VISUAL`, then `$EDITOR`, then `vi`) in run order, the layout job is generated, and you are offered a chance to edit it (5s prompt, default no). A set created without a name lands in `./fio-jobfiles/<date>-<time>/` and you choose whether to keep it for reuse (5s prompt, default keep); a set you chose not to keep is removed **only after a fully successful run** — any failure preserves your edits. Naming an existing set edits it as-is; adding an explicit `-w` on top of an existing set asks (a real y/N, no timeout) before re-copying that workload over it.
+
+With no attached set name, the token after `-C` is assumed to be a client; if it turns out unreachable over ssh, wekatester asks (5s, default yes) whether it was actually the set name. Put hosts after `--` to make it unambiguous.
+
+Unattended forms:
+
+- `-r` — fast track: no prompts, no editors; whatever is needed (set copy, layout) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). Temp sets are kept.
+- `-n` — dry run: everything is resolved, generated and staged, then the full paths of the created files, every staged jobfile's contents, and the would-be run details are printed — and nothing executes. Combine with `-C` to prepare a set for manual editing.
+- `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too).
+
+A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it. A pristine layout job under `-a max` is re-derived per host so it lays out the tuned namespaces (including the small-file working set).
+
+`-C` needs a terminal for its editors and prompts; without one it refuses to run unless `-r` or `-n` is given. Prompts read the terminal directly, so they work fine under `... | tee run.log`.
 
 # Auto mode
 `-a` / `--auto` derives system-specific fio options from the workers instead
@@ -137,10 +162,17 @@ starting test run for job 011-bandwidthR.job on host-1 with 2 workers:
     average latency: 269.7 us (IO-weighted)
 ```
 
-Any results file can be re-summarized later with `-s`, optionally narrowing the metrics with `-r`:
+The layout job that runs first reports a duration instead of a summary:
 
 ```
-./wekatester -s results_2026-07-30_1112_011-bandwidthR.json -r "bandwidth latency"
+laying out files (000-wekatester-layout.job) on 2 host(s)...
+layout: complete in 41s across 2 host(s)
+```
+
+Any results file can be re-summarized later with `-s`:
+
+```
+./wekatester -s results_2026-07-30_1112_011-bandwidthR.json
 ```
 
 # Caveats
