@@ -144,3 +144,31 @@ readme_usage_block() {   # $1 = README path (default README.md)
          fence == 2 { exit }' "${1:-README.md}"
 }
 
+
+# --- interactive prompts: drive prompt_key over a pipe, capture UI on stdout ---
+# The prompt fds are variables precisely so the suite can point them at a pipe
+# and fd 1 -- no pty involved, nothing blocks waiting for a keystroke.
+key_probe() {   # key_probe <timeout>; keystrokes arrive on stdin
+    (source ./wekatester
+     PROMPT_IN_FD=0
+     PROMPT_OUT_FD=1
+     prompt_key "$1"
+     echo "rc=$? key=$PROMPT_KEY")
+}
+export -f key_probe
+
+# --- editor stub: records each file it was handed, in order ---
+editor_fixture() {   # $1 = exit status for the stub (default 0)
+    ED=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\nbasename "$1" >> "%s/order"\nexit %s\n' "$ED" "${1:-0}" > "$ED/stub-ed"
+    printf '#!/bin/sh\necho VISUAL >> "%s/order"\nexit 0\n' "$ED" > "$ED/stub-visual"
+    chmod +x "$ED/stub-ed" "$ED/stub-visual"
+    EDITOR="$ED/stub-ed"; unset VISUAL
+}
+
+# --- a small on-disk workload set for generator/customize tests ---
+set_fixture() {   # creates $SETFIX with two jobfiles in distinct namespaces
+    SETFIX=$(mktemp -d)
+    printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=big/$jobnum\n[create]\ncreate_only=1\n[bw]\nrw=read\niodepth=1\n' > "$SETFIX/011-bw.job"
+    printf '# report iops\n[global]\nfilesize=2G\nnumjobs=8\ndirectory=/orig\nioengine=libaio\nfilename_format=small.$jobnum\nnrfiles=3\n[create]\ncreate_only=1\n[io]\nbs=4k\nrw=randread\niodepth=8\n' > "$SETFIX/031-iops.job"
+}

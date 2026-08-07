@@ -43,6 +43,9 @@ CUSTOM_SET=""       # the set named by an attached value or a consumed bare toke
 # A bare -C leaves its following bare token in HOSTS and only remembers it here:
 # it could be a client or a set name, and preflight is what tells them apart.
 C_CANDIDATE=""
+SET_DIR_OVERRIDE="" # the resolved custom set dir; stage_jobfiles runs it instead of -w
+TEMP_SET=0          # 1 = the set is a <date>-<time> temp dir
+TEMP_REMOVE=0       # 1 = operator chose not to keep it; removed after a clean run
 
 # remote hosts are Linux: /dev/shm is guaranteed tmpfs.
 # The override is namespaced on purpose. This path is what cleanup feeds to
@@ -184,6 +187,136 @@ apply_ssh_auth_opts() {
         # entries from the config are still eligible.
         SSH_OPTS="$SSH_OPTS -o IdentityFile=$SSH_IDENTITY -o IdentitiesOnly=yes"
     fi
+}
+
+# --- interactive prompting (-C) --------------------------------------------------
+# The transport /dev/null's stdin for every child (see run_host), and a run is
+# commonly piped ('wekatester ... | tee run.log'), so neither fd 0 nor fd 1 is a
+# reliable answer to "is a human here". The controlling terminal is: /dev/tty is
+# the same device whether or not stdin/stdout were redirected. One rw fd carries
+# both directions, so the prompt stays visible under a pipe and the run log on
+# stdout is never polluted with UI. Every behavior below was probe-verified on
+# bash 3.2.57: timeouts are whole seconds only; read -s must consume via fd
+# redirection (read -u echoes); partial -n input is DISCARDED on timeout, so the
+# escape drain reads one byte at a time.
+PROMPT_TTY="${WEKATESTER_PROMPT_TTY:-/dev/tty}"   # test plumbing only, namespaced
+PROMPT_OPENED=0      # 1 = we own fd 3 and must close it
+PROMPT_IN_FD=""      # read side  -- the suite presets these two and then
+PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
+PROMPT_DRAIN_SECS=1  # bash 3.2 read -t takes whole seconds; 1 is the floor
+
+require_interactive() {   # require_interactive <what-needs-it>
+    if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
+    # exec with only redirections reports failure without killing the shell
+    # (non-posix bash), so the open is testable. Its own stderr line names the
+    # device and reason; leaving it visible is the point.
+    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
+        PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
+        return 0
+    fi
+    die "$1 needs a terminal; use -r for unattended runs"
+}
+
+# Hand the run phase back exactly the world it has today: no child inherits a
+# readable terminal fd behind the transport's /dev/null-ed stdin.
+close_interactive() {
+    [ "$PROMPT_OPENED" -eq 1 ] || return 0
+    exec 3<&-
+    PROMPT_OPENED=0; PROMPT_IN_FD=""; PROMPT_OUT_FD=""
+}
+
+prompt_say()  { printf '%s'   "$*" >&"$PROMPT_OUT_FD"; }
+prompt_line() { printf '%s\n' "$*" >&"$PROMPT_OUT_FD"; }
+
+# ESC arrived. Arrow/function keys send ESC plus more bytes; a bare Esc sends
+# ESC alone. Returns 0 (it was a sequence) when another byte follows within
+# PROMPT_DRAIN_SECS, and swallows the remainder either way -- leftover bytes
+# would otherwise be delivered as keypresses at the NEXT prompt.
+prompt_drain_escape() {
+    local c rc=1
+    if IFS= read -r -s -n 1 -t "$PROMPT_DRAIN_SECS" c <&"$PROMPT_IN_FD"; then
+        rc=0
+        while IFS= read -r -s -n 1 -t "$PROMPT_DRAIN_SECS" c <&"$PROMPT_IN_FD"; do :; done
+    fi
+    return $rc
+}
+
+# Read exactly one keypress. $1 = whole-second timeout, 0 = wait forever
+# (which means: omit -t entirely -- `read -t 0` means something else and
+# something different again across bash versions). Sets PROMPT_KEY to
+# enter|space|esc|escseq|none|<char>. Returns 0 when a key was read.
+# IFS= and -r are load-bearing: without IFS= a space reads as the empty string
+# (indistinguishable from Enter); without -r a backslash swallows the next key.
+prompt_key() {   # prompt_key <timeout-seconds|0>
+    local key rc
+    if [ "$1" -gt 0 ]; then
+        IFS= read -r -s -n 1 -t "$1" key <&"$PROMPT_IN_FD"; rc=$?
+    else
+        IFS= read -r -s -n 1 key <&"$PROMPT_IN_FD"; rc=$?
+    fi
+    # 3.2 returns 1 for both timeout and EOF; 4+ returns >128 for timeout.
+    # Only zero/nonzero is branched on, so the contract holds on both.
+    if [ "$rc" -ne 0 ]; then PROMPT_KEY=none; return 1; fi
+    case $key in
+        '')      PROMPT_KEY=enter ;;
+        ' ')     PROMPT_KEY=space ;;
+        $'\033') if prompt_drain_escape; then PROMPT_KEY=escseq
+                 else PROMPT_KEY=esc; fi ;;
+        *)       PROMPT_KEY=$key ;;
+    esac
+    return 0
+}
+
+# Enter / y / space = yes; Esc / n = no; anything else, or no key at all, takes
+# the default -- an unrecognized key resolving like the timeout means there is
+# no re-prompt loop to get stuck in. The resolved answer is echoed on the tty
+# (the operator sees what registered) and logged on stdout (the run record
+# shows what was chosen). Returns 0 for yes, 1 for no.
+confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
+    local secs=$1 default=$2 msg=$3 answer
+    prompt_say "$msg [Enter/y = yes, Esc/n = no] (${secs}s -> $default) "
+    prompt_key "$secs"
+    case "$PROMPT_KEY" in
+        enter|space|y|Y) answer=yes ;;
+        esc|n|N)         answer=no  ;;
+        *)               answer=$default ;;
+    esac
+    prompt_line "$answer"
+    log "$msg $answer"
+    [ "$answer" = yes ]
+}
+
+# The recopy that throws away existing edits gets no timeout and no forgiving
+# default: only 'y' means yes, Enter takes the [y/N] default. Without -t a
+# failed read means EOF -- the terminal went away mid-flow; die rather than
+# answer for the operator.
+confirm_destructive() {   # confirm_destructive <message>
+    prompt_say "$1 [y/N] "
+    prompt_key 0 || { prompt_line ""; die "prompt input closed while waiting for an answer"; }
+    case "$PROMPT_KEY" in
+        y|Y) prompt_line yes; log "$1 yes"; return 0 ;;
+        *)   prompt_line no;  log "$1 no";  return 1 ;;
+    esac
+}
+
+# $VISUAL, then $EDITOR, then vi -- the order every editor-delegating tool
+# uses. The value is a command, not a path ('code -w', 'emacs -nw'), so it is
+# deliberately word-split and only the first word is checked for existence.
+resolve_editor() {
+    EDITOR_CMD=${VISUAL:-${EDITOR:-vi}}
+    set -- $EDITOR_CMD
+    [ $# -gt 0 ] || die "\$VISUAL/\$EDITOR is set but empty"
+    command -v "$1" >/dev/null || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
+}
+
+# Give the editor the terminal on all three fds: the script's own stdin may be
+# closed and stdout piped, and a full-screen editor on a pipe either refuses to
+# start or scribbles control codes into the log. This is a handoff, not a
+# suppression -- the editor's stderr lands on the operator's screen.
+edit_jobfile() {   # edit_jobfile <path>
+    log "editing $1 with $EDITOR_CMD"
+    $EDITOR_CMD "$1" <&"$PROMPT_IN_FD" >&"$PROMPT_OUT_FD" 2>&"$PROMPT_OUT_FD" \
+        || die "editor exited $? on $1 -- nothing has been run"
 }
 
 usage() {
@@ -381,6 +514,46 @@ preflight() {
             failed+=("${HOSTS[$i]}: $FIO_BIN not found")
         fi
     done
+    # A bare -C left its following token in HOSTS as a mere candidate. If that
+    # exact token failed the ssh phase it is almost certainly the custom set's
+    # name rather than a client -- confirm (5s, default yes), or assume so
+    # outright on unattended runs. Everything else that failed still fails.
+    if [ ${#failed[@]} -gt 0 ] && [ "$CUSTOMIZE" -eq 1 ] && [ -z "$CUSTOM_SET" ] \
+            && [ -n "$C_CANDIDATE" ] && [ "${PREFLIGHT_RETRY:-0}" -eq 0 ]; then
+        local cand_failed=0 rest=() as_set=0 h2 new=()
+        for host in "${failed[@]}"; do
+            case "$host" in
+                "$C_CANDIDATE: ssh failed") cand_failed=1 ;;
+                *) rest+=("$host") ;;
+            esac
+        done
+        if [ "$cand_failed" -eq 1 ]; then
+            if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+                as_set=1
+                log "'$C_CANDIDATE' is not reachable over ssh; treating it as the custom set name"
+            elif confirm_timed 5 yes "'$C_CANDIDATE' is not reachable over ssh; treat it as the custom set name?"; then
+                as_set=1
+            fi
+        fi
+        if [ "$as_set" -eq 1 ]; then
+            CUSTOM_SET=$C_CANDIDATE
+            C_CANDIDATE=""
+            for h2 in "${HOSTS[@]}"; do
+                [ "$h2" = "$CUSTOM_SET" ] || new+=("$h2")
+            done
+            HOSTS=()
+            [ ${#new[@]} -eq 0 ] || HOSTS=("${new[@]}")
+            MASTER=${HOSTS[0]:-}
+            failed=()
+            [ ${#rest[@]} -eq 0 ] || failed=("${rest[@]}")
+            if [ ${#HOSTS[@]} -eq 0 ]; then
+                # The candidate was the only "host": this is a local run now.
+                resolve_local_mode
+                PREFLIGHT_RETRY=1 preflight
+                return
+            fi
+        fi
+    fi
     if [ ${#failed[@]} -gt 0 ]; then
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
@@ -711,11 +884,94 @@ if os.path.exists(ram_path):
 if cache_bytes == 0:
     warn(f"weka backend RAM unknown; small-file working set floors at {WS_FLOOR // 2**30}GiB/host")
 
+LAYOUT_MARKER = "# wekatester-layout: generated"
+
+def is_layout(path):
+    with open(path) as fp:
+        return any(next(fp, "").startswith(LAYOUT_MARKER) for _ in range(3))
+
+def layout_pristine(lines):
+    """True when the sha256 in the marker still matches the body -- i.e. the
+    operator never edited the generated file, so re-deriving it loses nothing."""
+    import hashlib
+    for l in lines[:3]:
+        m = re.match(re.escape(LAYOUT_MARKER) + r" sha256=([0-9a-f]{64})\s*$", l)
+        if m:
+            body = [x for x in lines if not x.startswith(LAYOUT_MARKER)]
+            digest = hashlib.sha256("\n".join(x.rstrip() for x in body).encode()).hexdigest()
+            return digest == m.group(1)
+    return False
+
+def first_value(lines, key):
+    for l in lines:
+        m = re.match(rf"^{key}=(\S+)", l)
+        if m: return m.group(1)
+    return ""
+
+def last_section(lines):
+    name = ""
+    for l in lines:
+        m = re.match(r"^\[(.+)\]\s*$", l)
+        if m: name = m.group(1)
+    return name
+
 jobs = sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f))
+layout_set = {j for j in jobs if is_layout(os.path.join(src, j))}
 for h in hosts:
     os.makedirs(os.path.join(work, "jobs", h), exist_ok=True)
 
+def derive_layout_variant(h):
+    """Re-derive layout sections from this host's already-tuned variants, so
+    the layout covers what will actually run (e.g. the wt-small namespace the
+    max tier redirects iops/latency files into). Twin of generate_layout in
+    the bash layer -- keep the grouping rules in sync."""
+    namespaces, engines = {}, {}
+    for j in jobs:
+        if j in layout_set: continue
+        vlines = open(os.path.join(work, "jobs", h, j)).read().splitlines()
+        fmt = first_value(vlines, "filename_format")
+        if fmt:
+            key, section, out_fmt = fmt, None, fmt
+        else:
+            sec = last_section(vlines) or j
+            key, section, out_fmt = f"__jobname__:{sec}", sec, ""
+        eng = first_value(vlines, "ioengine")
+        if eng: engines[eng] = engines.get(eng, 0) + 1
+        ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt,
+                                         "numjobs": 0, "nrfiles": 0,
+                                         "filesize": "", "filesize_b": -1,
+                                         "size": "", "size_b": -1})
+        ns["numjobs"] = max(ns["numjobs"], int(first_value(vlines, "numjobs") or 1))
+        ns["nrfiles"] = max(ns["nrfiles"], int(first_value(vlines, "nrfiles") or 1))
+        for k in ("filesize", "size"):
+            v = first_value(vlines, k)
+            if v:
+                try: b = parse_size(v)
+                except ValueError: continue
+                if b > ns[k + "_b"]:
+                    ns[k + "_b"], ns[k] = b, v
+    best = max(engines, key=lambda e: engines[e]) if engines else "libaio"
+    out = ["# re-derived by wekatester auto[max] from this host's tuned variants",
+           "[global]", f"directory={directory}",
+           f"cpus_allowed={fmt_cpulist(facts[h]['usable'])}",
+           "create_serialize=0", f"ioengine={best}"]
+    n = 0
+    for key in sorted(namespaces):
+        ns = namespaces[key]; n += 1
+        out.append("")
+        out.append(f"[{ns['section'] or 'layout-%d' % n}]")
+        out.append("create_only=1")
+        out.append("blocksize=1Mi")
+        if ns["fmt"]: out.append(f"filename_format={ns['fmt']}")
+        if ns["filesize"]: out.append(f"filesize={ns['filesize']}")
+        elif ns["size"]: out.append(f"size={ns['size']}")
+        if ns["nrfiles"] > 1: out.append(f"nrfiles={ns['nrfiles']}")
+        out.append(f"numjobs={ns['numjobs']}")
+    return out
+
 for job in jobs:
+    if job in layout_set:
+        continue   # layout jobs are handled after every variant exists
     lines = open(os.path.join(src, job)).read().splitlines()
     items = report_items(os.path.join(src, job))
     for h in hosts:
@@ -782,6 +1038,26 @@ for job in jobs:
     kind = "latency" if is_latency else ("bandwidth" if is_bw else "iops" if is_iops else "all")
     print(f"auto[{tier}]: {job} type={kind}")
 
+# Layout jobs last: at max tier the tuned variants above are their ground
+# truth. A pristine (never-edited) layout is re-derived per host so it covers
+# the redirected namespaces; an edited one is the operator's word -- stage it
+# with corrections only and say so once.
+for job in sorted(layout_set):
+    lines = open(os.path.join(src, job)).read().splitlines()
+    pristine = layout_pristine(lines)
+    if not pristine and tier == "max":
+        warn_once(f"{job}: user-edited layout staged as-is; it may not cover "
+                  "auto-tuned namespaces (regenerate with -g)")
+    for h in hosts:
+        if tier == "max" and pristine:
+            out = derive_layout_variant(h)
+        else:
+            out = override(lines, "directory", directory)
+            out = override(out, "cpus_allowed", fmt_cpulist(facts[h]["usable"]))
+        with open(os.path.join(work, "jobs", h, job), "w") as fp:
+            fp.write("\n".join(out) + "\n")
+    print(f"auto[{tier}]: {job} type=layout")
+
 # Capacity: per host, group staged jobs by filename_format namespace; each
 # namespace's footprint is the max over its jobfiles of that jobfile's
 # footprint (files are shared within a namespace); host total = sum over
@@ -815,6 +1091,8 @@ required = 0
 for h in hosts:
     namespaces = {}
     for job in jobs:
+        if job in layout_set:
+            continue   # a layout job's footprint IS the other files' namespaces
         p = os.path.join(work, "jobs", h, job)
         # No filename_format means fio expands its default ($jobname...) per
         # section, so each jobfile owns its own files: give it a private key so
@@ -846,12 +1124,306 @@ if avail and required > avail:
 PYEOF
 }
 
+# --- layout jobs -----------------------------------------------------------------
+# File layout is its own jobfile that always runs first. The run loop executes
+# jobfiles serially and the fio coordinator does not exit until every client
+# finishes, so jobfile boundaries are hard cross-client barriers: a layout job
+# as JOBFILES[0] guarantees all files exist on all machines before any measured
+# test starts -- no create-phase skew, no mid-suite re-layout when one job needs
+# more files than the previous one created.
+LAYOUT_JOB="000-wekatester-layout.job"
+LAYOUT_MARKER="# wekatester-layout: generated"
+
+# A layout job is recognized by its reserved name or its marker line, so a
+# renamed copy in a custom set is still treated as layout.
+is_layout_file() {   # is_layout_file <path>
+    [ -f "$1" ] || return 1
+    case "${1##*/}" in "$LAYOUT_JOB") return 0 ;; esac
+    head -3 "$1" | grep -q "^${LAYOUT_MARKER}" 2>&1
+}
+
+# Derive the layout job for a set: group its jobfiles by filename_format
+# namespace, take each namespace's superset geometry, and emit one create_only
+# section per namespace. Generated deterministically so the embedded sha256 of
+# the body identifies a pristine (never hand-edited) file -- the tuner uses
+# that to decide whether it may re-derive the staged variant at -a max.
+generate_layout() {   # generate_layout <setdir> <outdir>
+    python3 - "$1" "$2" <<'PYEOF' || return 1
+import hashlib, os, re, sys
+
+src, outdir = sys.argv[1], sys.argv[2]
+MARKER = "# wekatester-layout: generated"
+NAME = "000-wekatester-layout.job"
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
+    if not m: raise ValueError(f"bad size: {s}")
+    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
+    return int(float(m.group(1)) * mult)
+
+def first_value(lines, key):
+    for l in lines:
+        m = re.match(rf"^{key}=(\S+)", l)
+        if m: return m.group(1)
+    return ""
+
+def last_section(lines):
+    name = ""
+    for l in lines:
+        m = re.match(r"^\[(.+)\]\s*$", l)
+        if m: name = m.group(1)
+    return name
+
+namespaces = {}   # key -> dict(section, fmt, numjobs, nrfiles, filesize_str, filesize_b, size_str, size_b)
+engines = {}
+directory = ""
+for f in sorted(os.listdir(src)):
+    if not re.match(r"^[0-9]", f): continue
+    path = os.path.join(src, f)
+    if not os.path.isfile(path): continue
+    lines = open(path).read().splitlines()
+    if f == NAME or any(l.startswith(MARKER) for l in lines[:3]):
+        continue   # never derive layout from layout
+    fmt = first_value(lines, "filename_format")
+    if fmt:
+        key, section, out_fmt = fmt, None, fmt
+    else:
+        # No filename_format: fio's default naming embeds the job section
+        # name, so the layout section must carry the SAME name as the file's
+        # measured (last) section or it would create differently-named files.
+        sec = last_section(lines) or f
+        key, section, out_fmt = f"__jobname__:{sec}", sec, ""
+    eng = first_value(lines, "ioengine")
+    if eng: engines[eng] = engines.get(eng, 0) + 1
+    directory = directory or first_value(lines, "directory")
+    numjobs = int(first_value(lines, "numjobs") or 1)
+    nrfiles = int(first_value(lines, "nrfiles") or 1)
+    fs, size = first_value(lines, "filesize"), first_value(lines, "size")
+    ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt,
+                                     "numjobs": 0, "nrfiles": 0,
+                                     "filesize": "", "filesize_b": -1,
+                                     "size": "", "size_b": -1})
+    ns["numjobs"] = max(ns["numjobs"], numjobs)
+    ns["nrfiles"] = max(ns["nrfiles"], nrfiles)
+    for k, v in (("filesize", fs), ("size", size)):
+        if v:
+            try: b = parse_size(v)
+            except ValueError: continue   # e.g. size=50%: not derivable
+            if b > ns[k + "_b"]:
+                ns[k + "_b"], ns[k] = b, v
+
+if not namespaces:
+    sys.exit(f"ERROR: no jobfiles to derive a layout from in {src}")
+
+body = []
+body.append("# Auto-generated by wekatester: lays out every file the set's jobs")
+body.append("# will use, as the first job of the run -- a cross-client barrier, so")
+body.append("# all files exist on all machines before any measured test starts.")
+body.append("# Edit freely: an edited layout job is preserved (regenerate with -g).")
+body.append("[global]")
+body.append(f"directory={directory or '/mnt/weka'}")
+body.append("create_serialize=0")
+best_engine = max(engines, key=lambda e: engines[e]) if engines else "libaio"
+body.append(f"ioengine={best_engine}")
+n = 0
+for key in sorted(namespaces):
+    ns = namespaces[key]; n += 1
+    body.append("")
+    body.append(f"[{ns['section'] or 'layout-%d' % n}]")
+    body.append("create_only=1")
+    body.append("blocksize=1Mi")
+    if ns["fmt"]: body.append(f"filename_format={ns['fmt']}")
+    if ns["filesize"]: body.append(f"filesize={ns['filesize']}")
+    elif ns["size"]: body.append(f"size={ns['size']}")
+    else: body.append(f"# WARNING: no derivable file size in this namespace ({key})")
+    if ns["nrfiles"] > 1: body.append(f"nrfiles={ns['nrfiles']}")
+    body.append(f"numjobs={ns['numjobs']}")
+
+normalized = "\n".join(l.rstrip() for l in body)
+digest = hashlib.sha256(normalized.encode()).hexdigest()
+os.makedirs(outdir, exist_ok=True)
+with open(os.path.join(outdir, NAME), "w") as fp:
+    fp.write(f"{MARKER} sha256={digest}\n" + normalized + "\n")
+print(f"layout: generated {os.path.join(outdir, NAME)} ({len(namespaces)} namespace(s))")
+PYEOF
+}
+
+# --- customize workflow (-C) ------------------------------------------------------
+copy_set_into() {   # copy_set_into <srcdir> <dstdir>
+    local f
+    for f in "$1"/[0-9]*; do
+        [ -f "$f" ] || die "no jobfiles to copy from $1"
+        cp "$f" "$2/" || die "cannot copy ${f##*/} into $2"
+    done
+}
+
+# The -w set's directory, resolved exactly the way stage_jobfiles does.
+workload_src_dir() {
+    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+    printf '%s' "$d"
+}
+
+# Turn CUSTOM_SET (or its absence) into a directory of jobfiles to edit and
+# run. Every branch checks writability before touching anything, because the
+# next step is an editor session the operator should not invest in twice.
+resolve_custom_set() {
+    local src dst created=0
+    src=$(workload_src_dir) || exit 1
+    case "$CUSTOM_SET" in
+        "")
+            # No name: a <date>-<time> set under ./fio-jobfiles, reusable later
+            # by that name with -w or -C.
+            [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
+                die "cannot create a custom set: ./fio-jobfiles is not writable here"
+            dst="./fio-jobfiles/$(date +%Y%m%d-%H%M%S)"
+            mkdir -p "$dst" || die "cannot create $dst"
+            copy_set_into "$src" "$dst"
+            created=1; TEMP_SET=1
+            ;;
+        /*|./*)
+            dst=$CUSTOM_SET
+            if [ -d "$dst" ]; then
+                [ -w "$dst" ] || die "custom set $dst is not writable"
+            else
+                mkdir -p "$dst" || die "cannot create $dst (missing write permission on its parent?)"
+                copy_set_into "$src" "$dst"
+                created=1
+            fi
+            ;;
+        *)
+            # Bare name: same lookup as -w; created under ./fio-jobfiles when new.
+            if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
+                dst="$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
+                [ -w "$dst" ] || die "custom set $dst is not writable"
+            elif [ -d "./fio-jobfiles/$CUSTOM_SET" ]; then
+                dst="./fio-jobfiles/$CUSTOM_SET"
+                [ -w "$dst" ] || die "custom set $dst is not writable"
+            else
+                [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
+                    die "cannot create a custom set: ./fio-jobfiles is not writable here"
+                dst="./fio-jobfiles/$CUSTOM_SET"
+                mkdir -p "$dst" || die "cannot create $dst"
+                copy_set_into "$src" "$dst"
+                created=1
+            fi
+            ;;
+    esac
+    # An existing set plus an explicit -w is a request to refresh it from that
+    # workload -- destructive to its edits, so it needs a real yes with no
+    # timeout, and it never happens on an unattended run.
+    if [ "$created" -eq 0 ] && [ "$WORKLOAD_EXPLICIT" -eq 1 ] \
+            && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        if confirm_destructive "re-copy $WORKLOAD over $dst, overwriting its jobfiles?"; then
+            copy_set_into "$src" "$dst"
+        fi
+    fi
+    SET_DIR_OVERRIDE=$dst
+    log "custom set: $dst"
+}
+
+# The guided flow: edit each jobfile, sort out layout per the flag matrix,
+# decide the temp set's fate. Interactive parts are skipped wholesale by
+# -r (fast track) and -n (dry run).
+customize_jobfiles() {
+    resolve_custom_set
+    local dst=$SET_DIR_OVERRIDE job f interactive=1 had_layout=0
+    if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then interactive=0; fi
+
+    for f in "$dst"/[0-9]*; do
+        if is_layout_file "$f"; then had_layout=1; break; fi
+    done
+
+    if [ "$interactive" -eq 1 ]; then
+        [ -z "$AUTO_LEVEL" ] || log "note: -a $AUTO_LEVEL will override numjobs/iodepth/ioengine (and filesize/nrfiles/filename_format on iops/latency files) in the staged copies of these jobfiles"
+        discover_jobfiles "$dst"
+        for job in "${JOBFILES[@]}"; do
+            is_layout_file "$dst/$job" && continue   # layout editing is prompted below
+            edit_jobfile "$dst/$job"
+        done
+    fi
+
+    # Layout, per the flag matrix: -g always regenerates; existing layout is
+    # otherwise never touched on unattended runs, and prompted (default: keep)
+    # on interactive ones; a set without layout gets one generated silently.
+    if [ "$had_layout" -eq 1 ]; then
+        if [ "$REGEN_LAYOUT" -eq 1 ]; then
+            generate_layout "$dst" "$dst" || die "layout generation failed"
+        elif [ "$interactive" -eq 1 ] \
+                && confirm_timed 5 no "regenerate the existing layout job(s)?"; then
+            generate_layout "$dst" "$dst" || die "layout generation failed"
+        fi
+    else
+        generate_layout "$dst" "$dst" || die "layout generation failed"
+    fi
+
+    if [ "$interactive" -eq 1 ]; then
+        if confirm_timed 5 no "edit the layout job(s)?"; then
+            for f in "$dst"/[0-9]*; do
+                is_layout_file "$f" && edit_jobfile "$f"
+            done
+        fi
+        if [ "$TEMP_SET" -eq 1 ]; then
+            confirm_timed 5 yes "keep $dst for reuse after the run?" || TEMP_REMOVE=1
+        fi
+    fi
+    return 0
+}
+
+# Remove a temp custom set only after a fully successful run: every die() path
+# exits before reaching this call, so failed or partial runs always keep the
+# files -- the operator's edits survive anything that goes wrong.
+finish_temp_set() {
+    [ "$TEMP_REMOVE" -eq 1 ] || return 0
+    log "removing temporary custom set $SET_DIR_OVERRIDE (not kept for reuse)"
+    rm -rf "$SET_DIR_OVERRIDE"
+}
+
+# -n: everything is resolved, generated and staged -- print what a real run
+# would do and stop. Contents are shown from the master's staged variants,
+# which is what fio would actually read.
+dry_run_report() {
+    local job f
+    echo
+    log "dry run: nothing was executed; details of what would have run:"
+    if [ -n "$SET_DIR_OVERRIDE" ]; then
+        log "custom set files (edit these, then re-run without -n):"
+        for f in "$SET_DIR_OVERRIDE"/[0-9]*; do
+            [ -f "$f" ] && echo "  $(cd "$(dirname "$f")" && pwd)/${f##*/}"
+        done
+    fi
+    log "workload source: $JOBFILE_SRC"
+    log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
+    for job in "${JOBFILES[@]}"; do
+        echo
+        echo "==== $job (staged variant for $MASTER) ===="
+        cat "$WORK_DIR/jobs/$MASTER/$job"
+    done
+    echo
+    [ ${#HOSTS[@]} -le 1 ] || \
+        log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
+    log "would run, per job in the order above: fio --output-format=json --client=<host> $TARGET_DIR/<host>/<job>"
+}
+
 # --- phase 3: stage jobfiles ---------------------------------------------------
 # Discover the workload's jobfiles, build $WORK_DIR/jobs/<host>/<job> for
 # every host, copy the whole tree to $TARGET_DIR on $MASTER -- one scp over the
 # existing master connection, or a plain cp when the master is this host.
 JOBFILES=()      # basenames, in run order
 JOBFILE_SRC=""   # local source directory
+SET_DIR=""       # merged view actually staged: source files + generated layout
+
+# Single source of truth for what runs and in what order -- the editor loop
+# and the runner must never disagree on either.
+discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
+    local job
+    JOBFILES=()
+    for job in "$1"/[0-9]*; do
+        [ -f "$job" ] || die "no jobfiles found in $1"
+        JOBFILES+=("${job##*/}")
+    done
+}
 
 # Build $WORK_DIR/jobs/<host>/<job> for every host. Auto mode delegates to
 # the tuner; plain mode copies with the directory override (variants are
@@ -888,20 +1460,37 @@ stage_variants() {
 }
 
 stage_jobfiles() {
-    JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
-    [ -d "$JOBFILE_SRC" ] || JOBFILE_SRC="./fio-jobfiles/$WORKLOAD"
-    [ -d "$JOBFILE_SRC" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+    # -C already resolved a set to run; otherwise -w names one.
+    if [ -n "$SET_DIR_OVERRIDE" ]; then
+        JOBFILE_SRC=$SET_DIR_OVERRIDE
+    else
+        JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+        [ -d "$JOBFILE_SRC" ] || JOBFILE_SRC="./fio-jobfiles/$WORKLOAD"
+        [ -d "$JOBFILE_SRC" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+    fi
 
-    local job base
-    for job in "$JOBFILE_SRC"/[0-9]*; do
-        [ -f "$job" ] || die "no jobfiles found in $JOBFILE_SRC"
-        base=${job##*/}
-        JOBFILES+=("$base")
+    discover_jobfiles "$JOBFILE_SRC"
+
+    # The staged view is source files plus a layout job. A set that carries its
+    # own layout file keeps it (it sorts first by its 000- prefix); every other
+    # set gets one generated transiently -- it never touches the source dir.
+    SET_DIR="$WORK_DIR/set"
+    mkdir -p "$SET_DIR"
+    local job has_layout=0
+    for job in "${JOBFILES[@]}"; do
+        cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
+        is_layout_file "$JOBFILE_SRC/$job" && has_layout=1
     done
+    if [ "$has_layout" -eq 0 ]; then
+        generate_layout "$JOBFILE_SRC" "$SET_DIR" || die "layout generation failed"
+        discover_jobfiles "$SET_DIR"
+    fi
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 
-    stage_variants "$JOBFILE_SRC"
+    stage_variants "$SET_DIR"
 
+    # A dry run inspects the staged variants without touching the master.
+    [ "$DRY_RUN" -eq 1 ] && return 0
     run_host "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
         || die "cannot create $TARGET_DIR on $MASTER"
     copy_to_master "$WORK_DIR"/jobs/* "$TARGET_DIR/" \
@@ -921,15 +1510,26 @@ report_directive() {
 # capture JSON locally, hand it to the summarizer. One results file per job
 # so a crashed suite keeps everything already measured.
 run_jobs() {
-    local stamp job outfile report cmd host
+    local stamp job outfile report cmd host t0 t1
     stamp=$(date '+%Y-%m-%d_%H%M')
     for job in "${JOBFILES[@]}"; do
-        report=$(report_directive "$JOBFILE_SRC/$job")
         cmd="'$FIO_BIN' --output-format=json"
         for host in "${HOSTS[@]}"; do
             cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
         done
         outfile="results_${stamp}_${job%.job}.json"
+        if is_layout_file "$SET_DIR/$job"; then
+            # The layout job is a barrier, not a measurement: its stats are
+            # create-phase zeros, so it gets a duration instead of a summary.
+            log "laying out files ($job) on ${#HOSTS[@]} host(s)..."
+            t0=$(date +%s)
+            run_host "$MASTER" "$cmd" > "$outfile" \
+                || die "layout failed for $job (partial output in $outfile)"
+            t1=$(date +%s)
+            log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            continue
+        fi
+        report=$(report_directive "$SET_DIR/$job")
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         debug "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
@@ -1090,6 +1690,13 @@ main() {
     # report and leaves nothing behind. ControlMaster opts are appended below.
     apply_ssh_auth_opts
     command -v python3 >/dev/null || die "python3 is required for result parsing"
+    # -C's editors and prompts need a terminal; a missing one (or a bogus
+    # $EDITOR) costs nothing to report now and everything to discover after
+    # ten minutes of setup. Unattended forms (-r, -n) skip the terminal.
+    if [ "$CUSTOMIZE" -eq 1 ] && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        require_interactive "-C"
+        resolve_editor
+    fi
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     [ "$STAGE_BASE" = /dev/shm ] || debug "no /dev/shm here; local staging in $STAGE_BASE"
@@ -1112,11 +1719,26 @@ main() {
     trap 'exit 143' TERM
     preflight
     verify_mount_mode
+    # The customize flow sits after host validation (no editing time invested
+    # against a broken cluster) and before any daemon exists (nothing to tear
+    # down while an editor sits open). The prompt fd closes before the run so
+    # no child inherits a readable terminal.
+    if [ "$CUSTOMIZE" -eq 1 ]; then
+        customize_jobfiles
+        close_interactive
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        [ -n "$AUTO_LEVEL" ] && probe_workers
+        stage_jobfiles
+        dry_run_report
+        exit 0
+    fi
     start_fio_servers
     verify_fio_ports
     [ -n "$AUTO_LEVEL" ] && probe_workers
     stage_jobfiles
     run_jobs
+    finish_temp_set
 }
 
 # run only when executed, not when sourced (tests source this file)

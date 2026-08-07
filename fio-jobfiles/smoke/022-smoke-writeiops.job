@@ -1,5 +1,6 @@
 # quick harness validation: small files, short run
 # report iops latency
+# NOTE: file layout is normally handled by the auto-generated 000-wekatester-layout job; the create section below remains for standalone fio use.
 [global]
 filesize=256M
 time_based=1

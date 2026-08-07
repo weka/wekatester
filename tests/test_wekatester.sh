@@ -780,6 +780,207 @@ t_assert "the real binary applies -l/-i before it contacts a host" bash -c '
         *) echo "$out" >&2; false;;
     esac'
 
+# --- interactive prompt primitive (fd seam; no pty anywhere) ---
+t_assert "prompt: timeout takes the default" bash -c '
+    source ./tests/helpers.sh
+    out=$(key_probe 1 < <(sleep 2)); [ "$out" = "rc=1 key=none" ]'
+t_assert "prompt: y is read as y" bash -c '
+    source ./tests/helpers.sh
+    out=$(printf y | key_probe 5); [ "$out" = "rc=0 key=y" ]'
+t_assert "prompt: enter and space are distinct (IFS= regression)" bash -c '
+    source ./tests/helpers.sh
+    [ "$(printf "\n" | key_probe 5)" = "rc=0 key=enter" ] &&
+    [ "$(printf " "  | key_probe 5)" = "rc=0 key=space" ]'
+t_assert "prompt: bare Esc is esc" bash -c '
+    source ./tests/helpers.sh
+    [ "$(printf "\033" | key_probe 5)" = "rc=0 key=esc" ]'
+t_assert "prompt: arrow key is escseq and leaves no residue" bash -c '
+    source ./tests/helpers.sh
+    out=$(printf "\033[A" | (source ./wekatester
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        prompt_key 5; k1=$PROMPT_KEY
+        prompt_key 1; k2=$PROMPT_KEY
+        echo "$k1 $k2"))
+    [ "$out" = "escseq none" ]'
+t_assert "confirm_timed: esc beats a yes default" bash -c '
+    source ./tests/helpers.sh
+    ! (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+       printf "\033" | { confirm_timed 5 yes "q?" >/dev/null; }) '
+t_assert "confirm_timed: timeout yields the stated default" bash -c '
+    (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+     confirm_timed 1 yes "q?" < <(sleep 2) >/dev/null)'
+t_assert "confirm_destructive: enter is NOT yes, y is, EOF dies" bash -c '
+    source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+    ! (printf "\n" | { confirm_destructive "sure?" >/dev/null; }) &&
+    (printf "y" | { confirm_destructive "sure?" >/dev/null; }) &&
+    ! ( { confirm_destructive "sure?" >/dev/null; } </dev/null )'
+t_assert "require_interactive dies without a terminal" bash -c '
+    out=$( (source ./wekatester; WEKATESTER_PROMPT_TTY=/dev/null PROMPT_TTY=/dev/null
+            require_interactive "-C") 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$out" in *"-C needs a terminal"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "editor: files edited in run order, VISUAL beats EDITOR" bash -c '
+    source ./tests/helpers.sh; set_fixture; editor_fixture
+    (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+     EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
+     discover_jobfiles "$SETFIX"
+     for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >/dev/null
+    [ "$(cat "$ED/order")" = "011-bw.job
+031-iops.job" ]'
+t_assert "editor: nonzero exit aborts after exactly one file" bash -c '
+    source ./tests/helpers.sh; set_fixture; editor_fixture 3
+    ! (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+       EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
+       discover_jobfiles "$SETFIX"
+       for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >/dev/null 2>&1
+    [ "$(wc -l < "$ED/order")" -eq 1 ]'
+
+# --- layout generator ---
+t_assert "generator: one section per namespace with superset geometry" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    f="$SETFIX/000-wekatester-layout.job"
+    grep -q "^# wekatester-layout: generated sha256=" "$f" &&
+    grep -q "^filename_format=big/\$jobnum$" "$f" &&
+    grep -q "^filename_format=small.\$jobnum$" "$f" &&
+    grep -q "^nrfiles=3$" "$f" && grep -q "^numjobs=8$" "$f" && grep -q "^numjobs=4$" "$f" &&
+    [ "$(grep -c "^create_only=1$" "$f")" -eq 2 ]'
+t_assert "generator: deterministic (regeneration is byte-identical)" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    (source ./wekatester
+     generate_layout "$SETFIX" "$SETFIX" >/dev/null
+     cp "$SETFIX/000-wekatester-layout.job" /tmp/gen1.$$
+     generate_layout "$SETFIX" "$SETFIX" >/dev/null)
+    diff -q /tmp/gen1.$$ "$SETFIX/000-wekatester-layout.job" >/dev/null; rc=$?
+    rm -f /tmp/gen1.$$; [ "$rc" -eq 0 ]'
+t_assert "generator: pristine hash verifies and an edit breaks it" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    f="$SETFIX/000-wekatester-layout.job"
+    want=$(sed -n "s/^# wekatester-layout: generated sha256=//p" "$f")
+    got=$(grep -v "^# wekatester-layout: generated" "$f" | sed "s/[[:space:]]*$//" |
+          python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.read().rstrip(chr(10)).encode()).hexdigest())")
+    [ "$want" = "$got" ]'
+t_assert "shipped jobfiles all carry the layout note" bash -c '
+    n=$(grep -l "auto-generated 000-wekatester-layout" fio-jobfiles/*/[0-9]*.job | wc -l)
+    m=$(ls fio-jobfiles/*/[0-9]*.job | wc -l)
+    [ "$n" -eq "$m" ]'
+
+# --- layout runtime integration ---
+t_assert "staging: layout job is generated and runs first" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+     WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
+     WEKATESTER_TARGET_DIR="$d/target" TARGET_DIR="$d/target"
+     DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+     stage_jobfiles >/dev/null
+     [ "${JOBFILES[0]}" = "000-wekatester-layout.job" ] &&
+     [ -f "$WORK_DIR/jobs/localhost/000-wekatester-layout.job" ] &&
+     grep -q "^directory=/mnt/x$" "$WORK_DIR/jobs/localhost/000-wekatester-layout.job")'
+t_assert "staging: a set with its own layout file is not regenerated" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    printf "# wekatester-layout: generated sha256=0000\n[global]\ndirectory=/orig\n[lay]\ncreate_only=1\nfilesize=1G\n" \
+        > "$SETFIX/000-wekatester-layout.job"
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+     WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
+     TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+     stage_jobfiles >/dev/null
+     grep -q "sha256=0000" "$WORK_DIR/set/000-wekatester-layout.job")'
+t_assert "tuner: pristine layout at max is re-derived per host (covers wt-small)" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/000-wekatester-layout.job"
+    grep -q "re-derived by wekatester auto\[max\]" "$v" &&
+    grep -q "^filename_format=wt-small.\$jobnum.\$filenum$" "$v" &&
+    grep -q "^cpus_allowed=3-7$" "$v"'
+t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 h1 h2) 2>&1 >/dev/null )
+    v="$FIX/jobs/h1/000-wekatester-layout.job"
+    grep -q "# operator note" "$v" && ! grep -q "re-derived" "$v" &&
+    case "$err" in *"user-edited layout staged as-is"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "tuner capacity: layout job does not double the required total" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) 2>/dev/null )
+    case "$out" in *"required ~100.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+
+# --- customize workflow ---
+t_assert "resolve: bare name creates under ./fio-jobfiles and copies" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); cd "$tmp"
+    mkdir -p fio-jobfiles/default
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[j]\nrw=read\n" > fio-jobfiles/default/011-x.job
+    (source "$OLDPWD/wekatester"
+     SCRIPT_DIR=$tmp; WORKLOAD=default; CUSTOM_SET=mynew
+     resolve_custom_set >/dev/null
+     [ "$SET_DIR_OVERRIDE" = "./fio-jobfiles/mynew" ] && [ -f ./fio-jobfiles/mynew/011-x.job ])'
+t_assert "resolve: unwritable fio-jobfiles dies for a new bare name" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); cd "$tmp"
+    mkdir -p fio-jobfiles/default
+    printf "[j]\nrw=read\n" > fio-jobfiles/default/011-x.job
+    chmod -w fio-jobfiles
+    out=$( (source "$OLDPWD/wekatester"
+            SCRIPT_DIR=$tmp; WORKLOAD=default; CUSTOM_SET=mynew
+            resolve_custom_set) 2>&1 ); rc=$?
+    chmod +w fio-jobfiles
+    [ "$rc" -ne 0 ] && case "$out" in *"not writable"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "resolve: existing path is used as-is (no copy)" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    (source ./wekatester
+     WORKLOAD=default; CUSTOM_SET=$SETFIX
+     resolve_custom_set >/dev/null
+     [ "$SET_DIR_OVERRIDE" = "$SETFIX" ] && [ ! -f "$SETFIX/011-bandwidthR.job" ])'
+t_assert "customize -r: layout generated silently, no editor, keep implied" bash -c '
+    source ./tests/helpers.sh; set_fixture; editor_fixture
+    (source ./wekatester
+     FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
+     EDITOR="$ED/stub-ed"
+     customize_jobfiles >/dev/null
+     [ -f "$SETFIX/000-wekatester-layout.job" ] && [ "$TEMP_REMOVE" -eq 0 ])
+    [ ! -f "$ED/order" ]'
+t_assert "customize -r without -g: existing layout untouched" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
+    (source ./wekatester
+     FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
+     customize_jobfiles >/dev/null)
+    grep -q "^mine$" "$SETFIX/000-wekatester-layout.job"'
+t_assert "customize -g: existing layout regenerated even fast-tracked" bash -c '
+    source ./tests/helpers.sh; set_fixture
+    printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
+    (source ./wekatester
+     FAST_TRACK=1; REGEN_LAYOUT=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
+     customize_jobfiles >/dev/null)
+    ! grep -q "^mine$" "$SETFIX/000-wekatester-layout.job" &&
+    grep -q "^create_only=1$" "$SETFIX/000-wekatester-layout.job"'
+t_assert "temp set removed only when marked and only via finish_temp_set" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d)
+    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=0; finish_temp_set)
+    [ -d "$d" ] || exit 1
+    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=1; finish_temp_set >/dev/null)
+    [ ! -d "$d" ]'
+t_assert "preflight: unreachable -C candidate becomes the set name (fast track)" bash -c '
+    source ./tests/helpers.sh
+    stub=$(mktemp -d)
+    printf "#!/bin/sh\nexit 255\n" > "$stub/ssh"; chmod +x "$stub/ssh"   # unreachable
+    (source ./wekatester
+     PATH="$stub:$PATH"
+     CUSTOMIZE=1; FAST_TRACK=1; C_CANDIDATE=mysetname
+     HOSTS=(mysetname); MASTER=mysetname; FIO_BIN=/usr/bin/true
+     uname() { echo Linux; }
+     preflight >/dev/null 2>&1
+     [ "$CUSTOM_SET" = "mysetname" ] && [ "$LOCAL_MODE" -eq 1 ] && [ "$MASTER" = "localhost" ])'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
