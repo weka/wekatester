@@ -16,7 +16,7 @@
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
 # written to disk are the results_*.json outputs in the current directory.
 
-VERSION="2026-07-31"
+VERSION="2026-08-07"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
