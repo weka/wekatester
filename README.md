@@ -20,11 +20,15 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-l login] [-i keyfile]
-                  [-v] [-V] [-h] [server ...]
-       wekatester -s results.json [-r "bandwidth latency iops"]
+                  [--ignore-capacity] [-l login] [-i keyfile] [-C[set]]
+                  [-r] [-n] [-g] [-v] [-h] [--] [server ...]
+       wekatester -s results.json
+       wekatester --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
+
+Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
+give them are not (-Cmyset names myset, never MYSET).
 
   -d directory   target directory on the workers for test files (default: /mnt/weka)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
@@ -35,11 +39,20 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
+  -C[set], --customize[=set]
+                          copy a workload set, edit each jobfile, then run it;
+                          needs a terminal unless -r or -n is given. With no
+                          attached value the set may be the next bare token
+  -r             fast track: no prompts and no editors -- create whatever is
+                 needed and run
+  -n             dry run: create/generate, print the files and the run details,
+                 execute nothing
+  -g             force regeneration of existing layout jobfiles
   -s file        summarize an existing fio JSON results file and exit
-  -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
-  -V             display version number and exit
+  --version      display version number and exit
   -h             show this help and exit
+  --             everything after this is a server name
 
 With no server given, the test runs on the local host -- no ssh required.
 ```

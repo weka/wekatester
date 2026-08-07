@@ -24,8 +24,25 @@ WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfi
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
-REPORT_ITEMS=""                 # -r: report items for -s (default: all)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# -w was named on the command line rather than defaulted. The customize
+# workflow needs the distinction: re-copying -w's jobfiles over an existing
+# custom set destroys edits, so it may only happen when the operator actually
+# asked for that workload.
+WORKLOAD_EXPLICIT=0
+
+# Run-shape flags.
+FAST_TRACK=0        # -r: no prompts, no editors -- create what is needed and run
+DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
+REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
+
+# -C/--customize: copy a workload set, edit it, run it.
+CUSTOMIZE=0
+CUSTOM_SET=""       # the set named by an attached value or a consumed bare token
+# A bare -C leaves its following bare token in HOSTS and only remembers it here:
+# it could be a client or a set name, and preflight is what tells them apart.
+C_CANDIDATE=""
 
 # remote hosts are Linux: /dev/shm is guaranteed tmpfs.
 # The override is namespaced on purpose. This path is what cleanup feeds to
@@ -172,11 +189,15 @@ apply_ssh_auth_opts() {
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-l login] [-i keyfile]
-                  [-v] [-V] [-h] [server ...]
-       ${0##*/} -s results.json [-r "bandwidth latency iops"]
+                  [--ignore-capacity] [-l login] [-i keyfile] [-C[set]]
+                  [-r] [-n] [-g] [-v] [-h] [--] [server ...]
+       ${0##*/} -s results.json
+       ${0##*/} --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
+
+Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
+give them are not (-Cmyset names myset, never MYSET).
 
   -d directory   target directory on the workers for test files (default: $DIRECTORY)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
@@ -187,11 +208,20 @@ Basic performance test of a network/parallel filesystem (distributed fio).
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
+  -C[set], --customize[=set]
+                          copy a workload set, edit each jobfile, then run it;
+                          needs a terminal unless -r or -n is given. With no
+                          attached value the set may be the next bare token
+  -r             fast track: no prompts and no editors -- create whatever is
+                 needed and run
+  -n             dry run: create/generate, print the files and the run details,
+                 execute nothing
+  -g             force regeneration of existing layout jobfiles
   -s file        summarize an existing fio JSON results file and exit
-  -r items       report items for -s: any of "bandwidth latency iops" (default: all)
   -v             increase output verbosity (repeatable)
-  -V             display version number and exit
+  --version      display version number and exit
   -h             show this help and exit
+  --             everything after this is a server name
 
 With no server given, the test runs on the local host -- no ssh required.
 EOF
@@ -200,23 +230,73 @@ EOF
 # --- argument parsing ----------------------------------------------------------
 need_arg() { [ "$2" -ge 2 ] || { usage >&2; die "option $1 requires an argument"; }; }
 
+# bash 3.2 has no ${var,,}, so lowercasing goes through tr. The letters are
+# spelled out rather than given as A-Z or [:upper:]: both of those are
+# locale-dependent in tr, and a Turkish locale would map I to a dotless i.
+lower() { printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'; }
+
+# Case-fold an option token's NAME and nothing else, so the `case` below can
+# stay lowercase-only while -D, --AUTO=MAX and -CMySet all land on the right
+# arm. What must survive untouched is everything the user chose: a long
+# option's =value, and a short option's attached value.
+#
+#   --LOGIN=Ubuntu -> --login=Ubuntu     (name folded, value kept)
+#   -CMySet        -> -cMySet            (only the leading -C folded)
+#   -VV / -vV      -> -vv                (a run of v's is all name)
+normalize_opt() {   # normalize_opt <token>
+    case "$1" in
+        --)      printf '%s' "$1" ;;
+        --*=*)   printf '%s=%s' "$(lower "${1%%=*}")" "${1#*=}" ;;
+        --*)     lower "$1" ;;
+        # -v runs are name all the way down, so fold the whole token. Anything
+        # else keeps its tail: that tail is an attached value.
+        -[vV][vV]*) lower "$1" ;;
+        -?*)     printf '%s%s' "$(lower "${1:0:2}")" "${1:2}" ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
 parse_args() {
     HOSTS=()
+    # Whether a `--` appears anywhere decides how a bare token after -C is
+    # read, so it has to be known before the left-to-right pass reaches one.
+    # With `--` present the client list is explicit, which makes a bare
+    # pre---- token after -C unambiguously the set name; without it the token
+    # is more likely a client, so it stays in HOSTS as a mere candidate.
+    local opt arg tok servers_only=0 dashdash=0 c_pending=0
+    for tok in "$@"; do
+        [ "$tok" = "--" ] && { dashdash=1; break; }
+    done
     while [ $# -gt 0 ]; do
+        if [ "$servers_only" -eq 1 ]; then HOSTS+=("$1"); shift; continue; fi
         case "$1" in
+            -*) opt=$(normalize_opt "$1") ;;
+            *)  opt=$1 ;;
+        esac
+        # Every arm below matches and extracts from $opt, never $1: $1 still
+        # carries the user's capitalization and would miss the arm. $1 survives
+        # only in need_arg's message, which should echo what was typed.
+        case "$opt" in
+            --) servers_only=1; shift ;;
             -d) need_arg "$1" $#; DIRECTORY=$2; shift 2 ;;
-            -w) need_arg "$1" $#; WORKLOAD=$2; shift 2 ;;
+            -w) need_arg "$1" $#; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
             -f) need_arg "$1" $#; FIO_BIN=$2; shift 2 ;;
             -s) need_arg "$1" $#; SUMMARIZE_FILE=$2; shift 2 ;;
-            -r) need_arg "$1" $#; REPORT_ITEMS=$2; shift 2 ;;
+            -r) FAST_TRACK=1; shift ;;
+            -n) DRY_RUN=1; shift ;;
+            -g) REGEN_LAYOUT=1; shift ;;
             -a|--auto)
                 AUTO_LEVEL="max"
-                case "${2:-}" in safe|max) AUTO_LEVEL=$2; shift ;; esac
+                # The level is a keyword, not a value, so it is matched
+                # case-insensitively too -- and only consumed when it really is
+                # one, otherwise it is the first server name.
+                arg=$(lower "${2:-}")
+                case "$arg" in safe|max) AUTO_LEVEL=$arg; shift ;; esac
                 shift ;;
             --auto=*)
-                AUTO_LEVEL=${1#--auto=}
+                AUTO_LEVEL=$(lower "${opt#--auto=}")
                 case "$AUTO_LEVEL" in safe|max) ;; *)
-                    usage >&2; die "unknown auto level: $AUTO_LEVEL (safe|max)" ;;
+                    usage >&2; die "unknown auto level: ${opt#--auto=} (safe|max)" ;;
                 esac
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
@@ -224,23 +304,53 @@ parse_args() {
             # An =-form carries an argument that is merely empty, so need_arg
             # cannot catch it. Reject it here: silently ignoring --login= would
             # make the one spelling that looks most deliberate do nothing.
-            --login=*)     SSH_LOGIN=${1#--login=}
+            --login=*)     SSH_LOGIN=${opt#--login=}
                            [ -n "$SSH_LOGIN" ] || { usage >&2; die "option --login requires a value"; }
                            shift ;;
             -i|--identity) need_arg "$1" $#; SSH_IDENTITY=$2; shift 2 ;;
-            --identity=*)  SSH_IDENTITY=${1#--identity=}
+            --identity=*)  SSH_IDENTITY=${opt#--identity=}
                            [ -n "$SSH_IDENTITY" ] || { usage >&2; die "option --identity requires a value"; }
                            shift ;;
+            # -C with an attached value names the set outright. Bare -C arms
+            # the candidate rule handled by the bare-token arm below.
+            -c|--customize)  CUSTOMIZE=1; c_pending=1; shift ;;
+            -c?*)            CUSTOMIZE=1; CUSTOM_SET=${opt#-c}; shift ;;
+            --customize=*)   CUSTOMIZE=1; CUSTOM_SET=${opt#--customize=}
+                             [ -n "$CUSTOM_SET" ] || { usage >&2; die "option --customize requires a value"; }
+                             shift ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
-            -V) echo "${0##*/} version $VERSION"; exit 0 ;;
+            --version) echo "${0##*/} version $VERSION"; exit 0 ;;
             -h) usage; exit 0 ;;
             -*) usage >&2; die "unknown option: $1" ;;
-            *)  HOSTS+=("$1"); shift ;;
+            *)
+                if [ "$c_pending" -eq 1 ] && [ "$dashdash" -eq 1 ]; then
+                    # Clients come after --, so this token is the set name.
+                    [ -z "$CUSTOM_SET" ] || { usage >&2
+                        die "-C takes one set name before --; got '$CUSTOM_SET' and '$1'"; }
+                    CUSTOM_SET=$1
+                elif [ "$c_pending" -eq 1 ] && [ -z "$C_CANDIDATE" ]; then
+                    # Provisionally a client; preflight decides (see C_CANDIDATE).
+                    C_CANDIDATE=$1; HOSTS+=("$1")
+                else
+                    HOSTS+=("$1")
+                fi
+                shift ;;
         esac
     done
     MASTER=${HOSTS[0]:-}
+
+    # Combination checks live here rather than in main so they hold for every
+    # caller -- the test suite drives parse_args directly.
+    if [ -n "$SUMMARIZE_FILE" ]; then
+        [ "$CUSTOMIZE" -eq 0 ] || { usage >&2; die "-C cannot be combined with -s"; }
+        # -r no longer takes a report-items list; -s always prints all of them.
+        # Silently accepting the old form would demote its argument to a
+        # hostname, so name the change instead.
+        [ "$FAST_TRACK" -eq 0 ] || { usage >&2
+            die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
+    fi
 }
 
 # --- phase 1: preflight --------------------------------------------------------
@@ -970,7 +1080,7 @@ main() {
     # -s: offline re-summarize of an existing results file, no hosts involved
     if [ -n "$SUMMARIZE_FILE" ]; then
         [ -f "$SUMMARIZE_FILE" ] || die "no such file: $SUMMARIZE_FILE"
-        summarize "$SUMMARIZE_FILE" "$REPORT_ITEMS"
+        summarize "$SUMMARIZE_FILE" ""
         exit 0
     fi
 

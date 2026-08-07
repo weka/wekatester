@@ -29,6 +29,92 @@ t_assert "--ignore-capacity sets the override" bash -c '
 t_assert "capacity override defaults off" bash -c '
     source ./wekatester; parse_args -a h1; [ "$IGNORE_CAPACITY" -eq 0 ]'
 
+# --- parse_args: case-insensitive option names ---
+# Only the option NAME is normalized. Values and attached arguments keep the
+# case they were given, so a set or a path is never silently mangled.
+t_assert "case-insensitive short option"   test "$(p -D /x h1)" = "|/x|h1"
+t_assert "case-insensitive long option"    test "$(p --AUTO=MAX h1)" = "max|/mnt/weka|h1"
+t_assert "case-insensitive auto level arg" test "$(p -A SAFE h1)" = "safe|/mnt/weka|h1"
+t_assert "case-insensitive long name, value untouched" bash -c '
+    source ./wekatester; parse_args --LOGIN=Ubuntu h1; [ "$SSH_LOGIN" = Ubuntu ]'
+# -V used to print the version. It is verbosity now; version is long-only.
+# Asserted on the printed line, not just the exit status: the old -V exited 0
+# after printing the version, which a bare status check would have called a pass.
+t_assert "-V is verbosity, not version" bash -c '
+    out=$(source ./wekatester; parse_args -V h1; echo "V=$VERBOSITY H=${HOSTS[*]}")
+    [ "$out" = "V=1 H=h1" ] || { echo "$out" >&2; false; }'
+t_assert "-VV and -vV both count twice" bash -c '
+    source ./wekatester
+    ( parse_args -VV h1; [ "$VERBOSITY" -eq 2 ] ) &&
+    ( parse_args -vV h1; [ "$VERBOSITY" -eq 2 ] )'
+t_assert "--version prints the version and exits 0" bash -c '
+    out=$(./wekatester --version) || { echo "$out" >&2; exit 1; }
+    case "$out" in *"wekatester version "*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "--VERSION works too" bash -c './wekatester --VERSION >/dev/null'
+
+# --- parse_args: -r / -n / -g ---
+t_assert "-r/-n/-g default off" bash -c '
+    source ./wekatester; parse_args h1
+    [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && [ "$REGEN_LAYOUT" -eq 0 ]'
+t_assert "-r sets fast track" bash -c '
+    source ./wekatester; parse_args -r h1
+    [ "$FAST_TRACK" -eq 1 ] && [ "${HOSTS[*]}" = h1 ]'
+t_assert "-n sets dry run" bash -c '
+    source ./wekatester; parse_args -n h1; [ "$DRY_RUN" -eq 1 ]'
+t_assert "-g forces layout regeneration" bash -c '
+    source ./wekatester; parse_args -g h1; [ "$REGEN_LAYOUT" -eq 1 ]'
+# -r used to carry the report-items list for -s. That form has to fail loudly:
+# parsed as the new boolean it would silently demote "latency" to a hostname.
+t_assert "the old -s ... -r items form is refused" bash -c '
+    err=$( (source ./wekatester; parse_args -s /tmp/nope.json -r latency) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in *"-r"*"-s"*) true;; *) echo "$err" >&2; false;; esac'
+
+# --- parse_args: -- separator ---
+t_assert "-- passes flag-shaped tokens through as servers" bash -c '
+    source ./wekatester; parse_args -d /x -- -weird h2
+    [ "${HOSTS[*]}" = "-weird h2" ] && [ "$DIRECTORY" = /x ]'
+
+# --- parse_args: -C customize ---
+cz() { (source ./wekatester; parse_args "$@"
+        echo "$CUSTOMIZE|$CUSTOM_SET|$C_CANDIDATE|${HOSTS[*]-}"); }
+t_assert "-C off by default"                 test "$(cz h1)" = "0|||h1"
+t_assert "-Cmyset names the set"             test "$(cz -Cmyset h1)" = "1|myset||h1"
+t_assert "-c is the same option as -C"       test "$(cz -cmyset h1)" = "1|myset||h1"
+t_assert "an attached set name keeps its case" test "$(cz -CMySet h1)" = "1|MySet||h1"
+t_assert "--customize=set names the set"     test "$(cz --customize=MySet h1)" = "1|MySet||h1"
+t_assert "--customize= with no value errors" bash -c '
+    err=$( (source ./wekatester; parse_args --customize= h1) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in *"--customize requires a value"*) true;; *) echo "$err" >&2; false;; esac'
+# Bare -C: the following bare token is only a CANDIDATE set name. It stays in
+# HOSTS so preflight can try it as a client first (Task 5 resolves it).
+t_assert "bare -C records a candidate without consuming it" test "$(cz -C h1)" = "1||h1|h1"
+t_assert "bare -C records only the first candidate"         test "$(cz -C h1 h2)" = "1||h1|h1 h2"
+t_assert "bare --customize records a candidate too"         test "$(cz --customize h1)" = "1||h1|h1"
+# With -- present the client list is unambiguous, so a bare pre--- token
+# following -C is the set name outright -- and only one of them may be.
+t_assert "-C name -- h1 consumes name as the set" test "$(cz -C name -- h1)" = "1|name||h1"
+t_assert "two bare set names before -- is a usage error" bash -c '
+    err=$( (source ./wekatester; parse_args -C a b -- h1) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in *"one set name"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "-C with -s is a usage error" bash -c '
+    err=$( (source ./wekatester; parse_args -C -s /tmp/nope.json) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
+    case "$err" in *"-C"*"-s"*) true;; *) echo "$err" >&2; false;; esac'
+
+# --- parse_args: -w explicitness (Task 5 needs it for the recopy rule) ---
+t_assert "-w tracked as explicit only when given" bash -c '
+    source ./wekatester
+    ( parse_args h1; [ "$WORKLOAD_EXPLICIT" -eq 0 ] ) &&
+    ( parse_args -w mixed h1
+      [ "$WORKLOAD_EXPLICIT" -eq 1 ] && [ "$WORKLOAD" = mixed ] )'
+
 # --- mount guard classifier ---
 c() { (source ./wekatester; classify_mount_line "$1"); }
 t_assert "wekafs forcedirect ok"   test "$(c 'wekafs rw,relatime,forcedirect,inode_bits=auto')" = "ok"
@@ -344,10 +430,19 @@ t_assert "summarize: the create phase is not what gets reported" bash -c '
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
     out=$(./wekatester -s "$d/r.json" 2>&1)
     case "$out" in *"100.00 GiB/s"*|*"200.00 GiB/s"*|*" 9.0 ms"*) echo "$out" >&2; false;; *) true;; esac'
-t_assert "summarize: -r narrows the report" bash -c '
+# The -r CLI filter is gone: -s always prints every metric group.
+t_assert "summarize: -s reports every metric group" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
-    out=$(./wekatester -s "$d/r.json" -r latency 2>&1)
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in *bandwidth*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *iops*)      ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *latency*)   ;; *) echo "$out" >&2; exit 1;; esac'
+# The items argument itself lives on: report_directive still feeds it per job.
+t_assert "summarize: the items argument still narrows the report" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    out=$( (source ./wekatester; summarize "$d/r.json" latency) 2>&1 )
     case "$out" in *"average latency: 250.0 us"*) ;; *) echo "$out" >&2; exit 1;; esac
     case "$out" in *bandwidth*|*iops*) echo "$out" >&2; false;; *) true;; esac'
 t_assert "summarize: refuses results that are missing a host, by name" bash -c '
@@ -668,7 +763,7 @@ t_assert "local mode accepts -l/-i as no-ops" bash -c '
 t_assert "-s is unaffected by -l/-i" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
-    out=$(./wekatester -s "$d/r.json" -r bandwidth -l ubuntu -i /no/such/key 2>&1)
+    out=$(./wekatester -s "$d/r.json" -l ubuntu -i /no/such/key 2>&1)
     case "$out" in
         *"total bandwidth: 7.00 GiB/s"*) true;;
         *) echo "$out" >&2; false;;
