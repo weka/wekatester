@@ -1,6 +1,10 @@
 # wekatester auto mode (-a / --auto) and local mode — design
 
 2026-07-31 · branch `shell-rewrite`
+2026-08-07 · amended: case-insensitive CLI, `--` client separator, `-C`
+customize workflow, generated layout jobs, `-r` fast-track / `-n` dry-run /
+`-g` regen; `-r <items>` report filter removed (`-s` always prints the full
+summary). See "Layout phase" and "Customize workflow (-C)".
 
 ## Goal
 
@@ -335,6 +339,134 @@ unparsable, `available` is 0, and 0 disables the comparison entirely — no
 error, no warning, only the informational `auto: capacity required ...` line.
 Auto mode only (non-auto never computes a footprint, so `--ignore-capacity`
 is accepted and inert there).
+
+## CLI amendments (2026-08-07)
+
+- **Case-insensitive options.** Every option letter and long-option *name*
+  matches case-insensitively (`-C`≡`-c`, `--AUTO`≡`--auto`); attached values
+  and option arguments keep their case (`-Cmyset` names `myset`, not `MYSET`).
+  Implementation: normalize the option token, never its value, before the
+  `case`. Consequence: `-v`/`-V` merge — both mean verbosity; `--version`
+  becomes long-only.
+- **`-r <items>` removed.** `-s` always prints the full summary (all metric
+  groups). Frees `-r`.
+- **`-r`** — fast-track: create/copy/generate whatever is needed with zero
+  prompts and zero editors, then run.
+- **`-n`** — dry run: create/generate as needed without prompting; print the
+  full paths of created files, every jobfile's contents, and the would-be run
+  details (staged variants, derived tuning, capacity math); execute nothing.
+  `-n` performs preflight, the mount guard, and (with `-a`) the probe — those
+  are read-only host contact needed for accurate details — but never starts
+  fio servers and never runs a job.
+- **`-g`** — force regeneration of existing layout jobfiles (see Layout
+  phase for the full flag matrix).
+- **`--`** — everything after it is the client list (standard separator).
+- **`-c`/`-C[name]`** — customize workflow; see below. `-C` with `-s` is a
+  usage error. `-C` with `-a` is allowed but prints a notice before editing
+  begins naming the keys the tuner will override on non-latency files
+  (numjobs, iodepth, ioengine, filesize, nrfiles, filename_format) so the
+  operator cannot silently lose edits to auto tuning.
+
+## Layout phase (all runs)
+
+File layout becomes its own jobfile that always runs first. wekatester's run
+loop executes jobfiles serially and the fio coordinator does not exit until
+every client finishes, so jobfile boundaries are hard cross-client barriers:
+a layout job as JOBFILES[0] guarantees all files exist on all machines before
+any measured test starts, eliminating create-phase skew and mid-suite
+re-layout (the numjobs-superset trap).
+
+- **Generated, not hand-written.** A python heredoc `generate_layout
+  <setdir>` reads the set's `[0-9]*` jobfiles (skipping layout-marker files),
+  groups them by `filename_format` namespace (absent → per-file key, matching
+  the capacity model), computes each namespace's superset geometry (max
+  numjobs, max nrfiles, filesize; `size=`-only files via the capacity
+  fallback), and emits `000-wekatester-layout.job`: a shared `[global]`
+  (directory, create_serialize=0, ioengine from the set) plus one
+  `create_only=1` section per namespace with that namespace's
+  filename_format/filesize/nrfiles/numjobs and `blocksize=1Mi`.
+- **Marker + pristine hash.** The generated file carries
+  `# wekatester-layout: generated sha256=<hash of normalized body>`. A hash
+  mismatch means the operator edited it.
+- **Runtime behavior.** `stage_jobfiles` ensures a layout job exists as
+  JOBFILES[0] on every run: the set's own layout file when present, else one
+  generated transiently into `$WORK_DIR/gen/` (auto and non-auto paths both).
+- **Tuner interplay.** Layout-marker files are exempt from tier rules
+  (corrections only: directory, cpus_allowed). At `-a max` a *pristine*
+  layout's staged variant is re-derived per host from that host's tuned
+  geometry, so it covers the small-file namespace redirect; a *user-edited*
+  layout is staged as authored, with a one-time warning that it may not cover
+  tuned namespaces.
+- **Capacity model** skips layout-marker files (their footprint duplicates
+  the measured files' namespaces).
+- **run_jobs** times layout jobs and logs `layout: ... in Xs` instead of
+  summarizing them (their client_stats are create-phase zeros).
+- **Shipped jobfiles** gain a one-line note that layout is normally handled
+  by the generated job; their inline create sections remain for standalone
+  fio use and are idempotent no-ops after the layout job runs.
+- **Regeneration flag matrix** (interactive prompts are 5s single-key,
+  see Customize workflow):
+  - `-g` (alone or with `-r`/`-n`): always regenerate existing layout files.
+  - `-r` without `-g`: existing layout files are never touched; a set lacking
+    them gets layout generated silently.
+  - Neither `-r` nor `-g`, existing set with layout files: 5s prompt
+    skip-or-regenerate (timeout = skip), then the edit-layout prompt.
+  - The edit-layout prompt timing out (or `-r`) never modifies layout files.
+
+## Customize workflow (-C)
+
+`-C` copies a workload set, opens each jobfile in the operator's editor,
+generates layout, and optionally persists the set for reuse. It is the
+tool's first interactive surface; all prompts read `/dev/tty` (never stdin,
+which the transport deliberately /dev/nulls), via
+`exec 3<>"${WEKATESTER_PROMPT_TTY:-/dev/tty}"` + `[ -t 3 ]`. `-C` without
+`-r`/`-n` and without a terminal dies: "-C needs a terminal; use -r for
+unattended runs".
+
+**Argument forms.** Attached value (`-Cmyset`) = set name/path. Unattached
+bare tokens are presumed clients; if the token immediately following `-C`
+fails the ssh phase of preflight, prompt "treat '<token>' as the custom set
+name?" (5s, timeout = yes → it moves out of HOSTS and becomes the set name);
+under `-r`, no prompt — assume set name on ssh failure. When `--` is present,
+a bare pre-`--` token following `-C` is the set name outright (clients are
+enumerated after `--`); more than one such token is a usage error.
+
+**Set resolution.**
+1. No name: create `./fio-jobfiles/<YYYYMMDD-HHMMSS>/` (a "temp set") and
+   copy from `-w`'s set (default workload when -w absent).
+2. `/abs` or `./rel` path: exists → use it; missing → `mkdir -p` + copy.
+   Writability is checked silently first; failure warns and exits 1.
+3. Bare name: found under `fio-jobfiles/` (SCRIPT_DIR then ./, same lookup
+   as `-w`) → use as-is; missing → create `./fio-jobfiles/<name>/` + copy.
+   Unwritable `fio-jobfiles` warns and exits 1.
+4. Existing set with an *explicit* `-w` (tracked as WORKLOAD_EXPLICIT):
+   untimed y/N confirm before re-copying `-w` over it. Under `-r` the recopy
+   never happens (destruction requires interactive consent).
+5. Shipped sets are always copied, never edited in place.
+
+**Flow** (after `verify_mount_mode`, before `start_fio_servers` — hosts are
+validated before the operator invests editing time; nothing is staged or
+running while an editor sits open): copy/resolve → editor over each jobfile
+in run order ($VISUAL → $EDITOR → vi, all three fds on the tty, nonzero exit
+dies) → layout generation per the flag matrix → edit-layout prompt (5s,
+default no) → temp sets only: keep-for-reuse prompt (enter/y/space/timeout =
+keep; esc/n = auto-remove after a *fully successful* run; any failure or
+partial results means the set is never removed) → run with the set as the
+workload. `-r` skips every prompt and editor (keep = yes). `-n` skips
+editors/prompts, prints paths + contents + run details, exits 0.
+
+**Prompt primitive** (bash 3.2, verified by probe): `IFS= read -r -s -n 1
+[-t secs] <&$PROMPT_IN_FD` with a per-character escape-sequence drain
+(3.2 discards partial `-n N` input on timeout) classifying
+enter/space/esc/escseq/char; `read -s` must use fd redirection, never `-u`
+(which echoes); whole-second timeouts only. `confirm_timed <secs> <default>
+<msg>`: enter/y/space = yes, esc/n = no, anything else or timeout = default;
+the resolved answer is echoed to the tty and logged to stdout. The
+destructive recopy uses an untimed strict confirm (only `y` = yes, EOF =
+die). Ctrl-C at any prompt aborts via the existing INT trap (verified: read
+does not swallow SIGINT and bash restores termios on the signal path). Test
+seam: PROMPT_IN_FD/PROMPT_OUT_FD preset by tests run the prompts over plain
+pipes; WEKATESTER_PROMPT_TTY=/dev/null pins the no-TTY die.
 
 ## Non-goals (v1)
 
