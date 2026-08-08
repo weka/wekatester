@@ -16,7 +16,7 @@
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
 # written to disk are the results_*.json outputs in the current directory.
 
-VERSION="2026-08-07"
+VERSION="2026-08-08"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -364,7 +364,16 @@ EOF
 }
 
 # --- argument parsing ----------------------------------------------------------
-need_arg() { [ "$2" -ge 2 ] || { usage >&2; die "option $1 requires an argument"; }; }
+# An option's value never starts with a dash: nothing wekatester takes as a
+# value looks like that, but a mistyped flag sequence does (-f -g quietly made
+# "-g" the fio binary in the field, and preflight then hunted for a binary
+# named -g). Refusing here turns that into a one-line answer.
+need_arg() {   # need_arg <option-as-typed> <argc> <next-token>
+    [ "$2" -ge 2 ] || { usage >&2; die "option $1 requires an argument"; }
+    case "$3" in
+        -?*) usage >&2; die "option $1 requires an argument, got '$3' (looks like another option)" ;;
+    esac
+}
 
 # bash 3.2 has no ${var,,}, so lowercasing goes through tr. The letters are
 # spelled out rather than given as A-Z or [:upper:]: both of those are
@@ -414,10 +423,10 @@ parse_args() {
         # only in need_arg's message, which should echo what was typed.
         case "$opt" in
             --) servers_only=1; shift ;;
-            -d) need_arg "$1" $#; DIRECTORY=$2; shift 2 ;;
-            -w) need_arg "$1" $#; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
-            -f) need_arg "$1" $#; FIO_BIN=$2; shift 2 ;;
-            -s) need_arg "$1" $#; SUMMARIZE_FILE=$2; shift 2 ;;
+            -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; shift 2 ;;
+            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
+            -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
+            -s) need_arg "$1" $# "${2:-}"; SUMMARIZE_FILE=$2; shift 2 ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -436,14 +445,14 @@ parse_args() {
                 esac
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
-            -l|--login)    need_arg "$1" $#; SSH_LOGIN=$2; shift 2 ;;
+            -l|--login)    need_arg "$1" $# "${2:-}"; SSH_LOGIN=$2; shift 2 ;;
             # An =-form carries an argument that is merely empty, so need_arg
             # cannot catch it. Reject it here: silently ignoring --login= would
             # make the one spelling that looks most deliberate do nothing.
             --login=*)     SSH_LOGIN=${opt#--login=}
                            [ -n "$SSH_LOGIN" ] || { usage >&2; die "option --login requires a value"; }
                            shift ;;
-            -i|--identity) need_arg "$1" $#; SSH_IDENTITY=$2; shift 2 ;;
+            -i|--identity) need_arg "$1" $# "${2:-}"; SSH_IDENTITY=$2; shift 2 ;;
             --identity=*)  SSH_IDENTITY=${opt#--identity=}
                            [ -n "$SSH_IDENTITY" ] || { usage >&2; die "option --identity requires a value"; }
                            shift ;;
@@ -583,10 +592,13 @@ classify_mount_line() {
     esac
 }
 
-# All workers: -d must not be a cached-mode wekafs mount.
+# All workers: -d must not be a cached-mode wekafs mount, and it must be
+# writable by the login user -- fio creates every data file there, and its
+# client mode reports a worker-side EACCES so quietly that without this probe
+# the run "succeeds" with zero IO.
 verify_mount_mode() {
-    log "checking mount mode of $DIRECTORY on ${#HOSTS[@]} host(s)..."
-    local host line verdict failed=() mode_fail=0
+    log "checking mount mode and writability of $DIRECTORY on ${#HOSTS[@]} host(s)..."
+    local host line verdict failed=() mode_fail=0 write_fail=0
     for host in "${HOSTS[@]}"; do
         line=$(run_host "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
             || { failed+=("$host: findmnt failed for $DIRECTORY -- does it exist? (wrong -d?)")
@@ -596,8 +608,15 @@ verify_mount_mode() {
             ok)   ;;
             skip) debug "$host: $DIRECTORY is not wekafs; guard skipped" ;;
             fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
-                   mode_fail=1 ;;
+                   mode_fail=1
+                   continue ;;
         esac
+        # One probe file, created and removed, as the same user fio will run
+        # as. On a shared filesystem the mount root's owner/mode is a property
+        # of the filesystem itself, so one failing host usually means all do.
+        run_host "$host" "p='$DIRECTORY'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"" \
+            || { failed+=("$host: cannot create files in $DIRECTORY -- fix the root's owner/mode (a one-time 'sudo chmod 1777 $DIRECTORY' on any host persists in the filesystem) or run as a user that can write")
+                 write_fail=1; }
     done
     if [ ${#failed[@]} -gt 0 ]; then
         for line in "${failed[@]}"; do log "ERROR: $line" >&2; done
@@ -608,9 +627,11 @@ verify_mount_mode() {
         # confidently wrong advice pointing away from the real fault.
         [ "$mode_fail" -eq 0 ] || \
             die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+        [ "$write_fail" -eq 0 ] || \
+            die "$DIRECTORY is not writable on every host; fio cannot lay out its files there"
         die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
     fi
-    debug "mount mode ok on all hosts"
+    debug "mount mode and writability ok on all hosts"
 }
 
 # --- phase 2: fio server lifecycle ---------------------------------------------
@@ -1615,6 +1636,73 @@ report_directive() {
 # For each jobfile: run the fio coordinator on $MASTER against all hosts,
 # capture JSON locally, hand it to the summarizer. One results file per job
 # so a crashed suite keeps everything already measured.
+# fio --client exits 0 even when every job on every worker failed (a
+# long-standing fio quirk: the client's exit code does not carry worker-side
+# job errors), so success has to be read out of the results themselves. Two
+# signals: a nonzero per-job "error" field, and -- for measured jobs -- a
+# last-entry-per-host (the measured section, same rule the summarizer uses)
+# that moved zero bytes and zero ios. Layout jobs skip the second signal:
+# create_only stats are legitimately all zeros. A layout failure that somehow
+# reports neither signal still cannot slip through the run: the first
+# measured job then finds no files and trips the zero-IO check itself.
+check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
+    python3 - "$1" "$2" <<'PYEOF'
+import json, os, sys
+
+path, mode = sys.argv[1], sys.argv[2]
+raw = open(path).read()
+start = raw.find("{")
+if start < 0:
+    sys.exit(f"{path}: no JSON in fio output")
+try:
+    data = json.loads(raw[start:])
+except ValueError as exc:
+    sys.exit(f"{path}: cannot parse fio JSON: {exc}")
+
+stats = [s for s in data.get("client_stats", []) if s.get("jobname") != "All clients"]
+if not stats:
+    sys.exit(f"{path}: fio returned no per-job stats -- the jobs did not run")
+
+bad = []
+for s in stats:
+    err = int(s.get("error") or 0)
+    if err:
+        host = s.get("hostname", s.get("jobname", "?"))
+        try:
+            desc = f" ({os.strerror(err)})"
+        except (ValueError, OverflowError):
+            desc = ""
+        bad.append(f"{host}: job '{s.get('jobname', '?')}' error {err}{desc}")
+
+if mode == "measured" and not bad:
+    per_host = {}
+    for s in stats:
+        per_host[s.get("hostname", s["jobname"])] = s
+    for host, s in sorted(per_host.items()):
+        moved = 0
+        for d in ("read", "write", "trim"):
+            io = s.get(d) or {}
+            moved += int(io.get("total_ios") or 0)
+            moved += int(io.get("io_bytes") or io.get("bw_bytes") or 0)
+        if moved == 0:
+            bad.append(f"{host}: measured job moved no data (zero bytes, zero ios)")
+
+if bad:
+    for b in bad:
+        print(f"ERROR: {b}", file=sys.stderr)
+    # fio's own log text precedes the JSON and names the underlying cause
+    # (e.g. "failed to create dir ...: Permission denied"); surface a few.
+    shown = 0
+    for l in raw[:start].splitlines():
+        if "error" in l.lower() or "failed" in l.lower():
+            print(f"ERROR: {l.strip()}", file=sys.stderr)
+            shown += 1
+            if shown == 3:
+                break
+    sys.exit(1)
+PYEOF
+}
+
 run_jobs() {
     local stamp job outfile report cmd host t0 t1
     stamp=$(date '+%Y-%m-%d_%H%M')
@@ -1631,6 +1719,8 @@ run_jobs() {
             t0=$(date +%s)
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "layout failed for $job (partial output in $outfile)"
+            check_fio_errors "$outfile" layout \
+                || die "layout $job failed -- the files were not created (raw output in $outfile)"
             t1=$(date +%s)
             log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
             continue
@@ -1640,6 +1730,8 @@ run_jobs() {
         debug "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
             || die "fio run failed for $job (partial output in $outfile)"
+        check_fio_errors "$outfile" measured \
+            || die "job $job failed on at least one host (raw output in $outfile)"
         # Expected-host guard. Assumption: fio keys each client_stats entry by
         # the name we passed to --client=, not by the worker's own hostname
         # (lab evidence: a multi-host run keys per_host by backend-N while

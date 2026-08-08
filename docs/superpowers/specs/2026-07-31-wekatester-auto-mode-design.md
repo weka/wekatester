@@ -299,9 +299,28 @@ hosts, then die, naming each offending host and its actual mode (e.g.
 only the `forcedirect` mount mode guarantees the wekafs client stays out of
 the IO path entirely — without it, client-side caching can flatter results.
 Non-wekafs targets skip the guard (the tool supports generic filesystems;
-`direct=1` remains the only control there). A worker where `-d` is not
-mounted at all fails preflight naturally when fio tries to create files —
-out of scope here.
+`direct=1` remains the only control there).
+
+**Write probe (same pass).** After a host's mount mode passes (or is skipped
+as non-wekafs), create and remove one dotfile under `-d` as the login user.
+Lab-falsified assumption this replaces: "a worker where fio cannot create
+files fails naturally" — it does not. fio's client mode reports worker-side
+EACCES so quietly that a run against a root-owned mount root "succeeds" in
+seconds with zero IO (observed on the rebuilt shrw lab, 2026-08-08). The
+probe turns that into a one-second preflight failure whose message carries
+the fix (`chmod` the mount root once — shared filesystem, persists — or run
+as a user that can write), and it fires before `-C` opens any editor, so no
+editing time is invested in a run that cannot work.
+
+**Run failure detection (run_jobs).** `fio --client` exits 0 even when every
+job on every worker failed, so each results file is checked after its run:
+any per-job `error` field nonzero → die naming host, job, and errno; for
+measured jobs additionally the last entry per host (the measured section,
+same rule the summarizer uses) must have moved nonzero bytes+ios. Layout
+jobs skip the zero-IO signal (create_only stats are legitimately zero); a
+layout failure that reports neither signal is still caught when the first
+measured job trips its own zero-IO check. Any such death is a failed run:
+temp `-C` sets are preserved.
 
 ## Capacity check
 
@@ -355,9 +374,11 @@ is accepted and inert there).
 - **`-n`** — dry run: create/generate as needed without prompting; print the
   full paths of created files, every jobfile's contents, and the would-be run
   details (staged variants, derived tuning, capacity math); execute nothing.
-  `-n` performs preflight, the mount guard, and (with `-a`) the probe — those
-  are read-only host contact needed for accurate details — but never starts
-  fio servers and never runs a job.
+  `-n` performs preflight, the mount guard, and (with `-a`) the probe — host
+  contact needed for accurate details — but never starts fio servers and
+  never runs a job. (The mount guard includes the write probe: it creates and
+  removes one dotfile under `-d`, the only write `-n` performs, because a
+  dry run that cannot predict "every job will EACCES" is not a dry run.)
 - **`-g`** — force regeneration of existing layout jobfiles (see Layout
   phase for the full flag matrix).
 - **`--`** — everything after it is the client list (standard separator).

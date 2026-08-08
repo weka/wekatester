@@ -1059,6 +1059,107 @@ t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
      [ -f ./custom/011-new.job ] && [ ! -f ./custom/011-old.job ] &&
      [ ! -f ./custom/000-wekatester-layout.job ])'
 
+# --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
+# In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
+# a binary named -g on every host with a bewildering message.
+t_assert "parse: an option value that looks like another option is refused" bash -c '
+    err=$( (source ./wekatester; parse_args -f -g h1) 2>&1 >/dev/null )
+    case "$err" in
+        *"option -f requires an argument, got '\''-g'\'' (looks like another option)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "parse: a trailing valueless option still dies asking for an argument" bash -c '
+    err=$( (source ./wekatester; parse_args h1 -w) 2>&1 >/dev/null )
+    case "$err" in
+        *"option -w requires an argument"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
+# The mount pass now also proves fio can create files under -d: a root-owned
+# mount root otherwise fails every job later with an EACCES that fio client
+# mode only half-reports. Stubs key off the command string ($2).
+t_assert "mount guard: unwritable -d dies with the chmod hint before anything runs" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
+            run_host() { case "$2" in (findmnt*) echo "wekafs rw,forcedirect";; (*) return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in
+        *"localhost: cannot create files in /mnt/weka"*"chmod 1777"*"/mnt/weka is not writable on every host"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: a mode failure skips the probe and keeps the remount advice" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
+            run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (*) echo probed >&2; return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in *probed*) echo "probe ran after a mode failure: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"must be mounted with forcedirect; remount"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: writable non-wekafs -d passes with the probe" bash -c '
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/data
+     run_host() { case "$2" in findmnt*) echo "xfs rw,noatime";; *) return 0;; esac; }
+     verify_mount_mode)'
+
+# fio --client exits 0 even when every worker-side job failed; success is read
+# from the results. The lab run "succeeded" in 5s per job with zero IO while
+# every process died on EACCES.
+t_assert "check_fio_errors: a nonzero per-job error field fails the run, naming the host" bash -c '
+    tmp=$(mktemp -d)
+    cat > "$tmp/r.json" <<"JSON"
+<vega-1> fio: failed to create dir (/mnt/weka/vega-1.0): Permission denied
+{ "client_stats": [
+    { "jobname": "layout-1", "hostname": "vega-1", "error": 13,
+      "read": { "total_ios": 0 }, "write": { "total_ios": 0 } } ] }
+JSON
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        *"vega-1: job '\''layout-1'\'' error 13"*"Permission denied"*) true;;
+        *) echo "rc=$rc $err" >&2; false;;
+    esac'
+t_assert "check_fio_errors: a measured job that moved zero bytes and ios fails" bash -c '
+    tmp=$(mktemp -d)
+    cat > "$tmp/r.json" <<"JSON"
+{ "client_stats": [
+    { "jobname": "create", "hostname": "vega-1",
+      "read": { "total_ios": 0 }, "write": { "total_ios": 900 } },
+    { "jobname": "bw", "hostname": "vega-1",
+      "read": { "total_ios": 0, "bw_bytes": 0 }, "write": { "total_ios": 0, "bw_bytes": 0 } } ] }
+JSON
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" measured) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        *"vega-1: measured job moved no data"*) true;;
+        *) echo "rc=$rc $err" >&2; false;;
+    esac'
+t_assert "check_fio_errors: layout mode accepts all-zero create_only stats" bash -c '
+    tmp=$(mktemp -d)
+    cat > "$tmp/r.json" <<"JSON"
+{ "client_stats": [
+    { "jobname": "layout-1", "hostname": "vega-1", "error": 0,
+      "read": { "total_ios": 0 }, "write": { "total_ios": 0 } } ] }
+JSON
+    (source ./wekatester; check_fio_errors "$tmp/r.json" layout)'
+t_assert "check_fio_errors: a healthy multi-host results file passes measured mode" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); fio_json_fixture "$tmp/r.json"
+    (source ./wekatester; check_fio_errors "$tmp/r.json" measured)'
+t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pass" bash -c '
+    tmp=$(mktemp -d)
+    printf "{ \"client_stats\": [] }\n" > "$tmp/r.json"
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >/dev/null )
+    rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        *"no per-job stats"*) true;;
+        *) echo "rc=$rc $err" >&2; false;;
+    esac'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
