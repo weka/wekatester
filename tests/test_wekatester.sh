@@ -981,6 +981,84 @@ t_assert "preflight: unreachable -C candidate becomes the set name (fast track)"
      preflight >/dev/null 2>&1
      [ "$CUSTOM_SET" = "mysetname" ] && [ "$LOCAL_MODE" -eq 1 ] && [ "$MASTER" = "localhost" ])'
 
+# --- review fixes: layout union geometry, shipped-set protection, ordering ---
+t_assert "generator: divergent geometries yield one section each (union, not grid)" bash -c '
+    source ./tests/helpers.sh
+    S=$(mktemp -d)
+    printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=4\n[a]\nrw=read\n" > "$S/011-a.job"
+    printf "# report iops\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\n[b]\nrw=randread\n" > "$S/031-b.job"
+    printf "# report iops\n[global]\nfilename_format=x/\$jobnum\nfilesize=15G\nnumjobs=2\nnrfiles=2\n[c]\nrw=randread\n" > "$S/032-c.job"
+    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    f="$S/000-wekatester-layout.job"
+    [ "$(grep -c "^create_only=1$" "$f")" -eq 3 ] &&
+    [ "$(grep -c "^stonewall$" "$f")" -eq 3 ]'
+t_assert "generator: dominated geometry is pruned to one section" bash -c '
+    source ./tests/helpers.sh
+    S=$(mktemp -d)
+    printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=32\n[a]\nrw=read\n" > "$S/011-a.job"
+    printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=64\n[b]\nrw=randread\n" > "$S/031-b.job"
+    printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=1\n[c]\nrw=randread\n" > "$S/021-c.job"
+    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    f="$S/000-wekatester-layout.job"
+    [ "$(grep -c "^create_only=1$" "$f")" -eq 1 ] && grep -q "^numjobs=64$" "$f"'
+t_assert "tuner: pristine layout re-derived at SAFE tier too (tuned numjobs)" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/000-wekatester-layout.job"
+    grep -q "re-derived by wekatester auto\[safe\]" "$v" && grep -q "^numjobs=5$" "$v" &&
+    ! grep -q "^numjobs=4$" "$v"'
+t_assert "capacity: layout union raises required above per-namespace max" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    rm -f "$FIX/src/011-bw.job"
+    printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[a]\nrw=read\niodepth=1\n" > "$FIX/src/011-a.job"
+    printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\nioengine=libaio\ndirectory=/orig\n[b]\nrw=read\niodepth=1\n" > "$FIX/src/012-b.job"
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 h1 h2) 2>/dev/null )
+    # per-namespace max = 2x27x1G=54G/host; union = 5x1 + 5x27 wait: safe tunes numjobs to 5 for both
+    # a: numjobs=5 nrfiles=1 -> 5 files; b: numjobs=5 nrfiles=27 -> 135 files; b dominates a
+    # union = 135G/host x 2 hosts = 270G; namespace max = 135G x 2 = 270G -- equal here, so
+    # assert the required is the union value (270), proving layout_footprint is consulted
+    case "$out" in *"required ~270.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); cd "$tmp"
+    mkdir -p fio-jobfiles/smoke
+    printf "# report bandwidth\n[global]\nfilesize=1M\n[j]\nrw=read\n" > fio-jobfiles/smoke/011-x.job
+    before=$(ls fio-jobfiles/smoke | md5)
+    (source "$OLDPWD/wekatester"
+     SCRIPT_DIR=$tmp; CUSTOM_SET=smoke; FAST_TRACK=1; CUSTOMIZE=1
+     customize_jobfiles >/dev/null
+     [ "$TEMP_SET" -eq 1 ] &&
+     case "$SET_DIR_OVERRIDE" in ./fio-jobfiles/2*) true;; *) false;; esac &&
+     [ -f "$SET_DIR_OVERRIDE/000-wekatester-layout.job" ])
+    after=$(ls fio-jobfiles/smoke | md5)
+    [ "$before" = "$after" ]'
+t_assert "staging: marker layout with a late-sorting name is forced first" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    mv "$SETFIX/000-wekatester-layout.job" "$SETFIX/090-mylayout.job"
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+     WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
+     TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+     stage_jobfiles >/dev/null
+     [ "${JOBFILES[0]}" = "090-mylayout.job" ] && [ "${#JOBFILES[@]}" -eq 3 ])'
+t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); cd "$tmp"
+    mkdir -p fio-jobfiles/fresh custom
+    printf "[global]\nfilesize=1M\n[new]\nrw=read\n" > fio-jobfiles/fresh/011-new.job
+    printf "[global]\nfilesize=1M\n[old]\nrw=read\n" > custom/011-old.job
+    printf "# wekatester-layout: generated sha256=stale\nSTALE\n" > custom/000-wekatester-layout.job
+    (source "$OLDPWD/wekatester"
+     PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+     SCRIPT_DIR=$tmp; WORKLOAD=fresh; WORKLOAD_EXPLICIT=1; CUSTOM_SET=./custom
+     printf "y" | { resolve_custom_set >/dev/null; }
+     [ -f ./custom/011-new.job ] && [ ! -f ./custom/011-old.job ] &&
+     [ ! -f ./custom/000-wekatester-layout.job ])'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh

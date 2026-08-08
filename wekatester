@@ -46,6 +46,9 @@ C_CANDIDATE=""
 SET_DIR_OVERRIDE="" # the resolved custom set dir; stage_jobfiles runs it instead of -w
 TEMP_SET=0          # 1 = the set is a <date>-<time> temp dir
 TEMP_REMOVE=0       # 1 = operator chose not to keep it; removed after a clean run
+# The sets distributed with wekatester: -C never edits these in place, only
+# copies of them. Anything else under fio-jobfiles is a custom set.
+SHIPPED_SETS="default mixed 2x400Gb wekawithin smoke"
 
 # remote hosts are Linux: /dev/shm is guaranteed tmpfs.
 # The override is namespaced on purpose. This path is what cleanup feeds to
@@ -922,9 +925,11 @@ for h in hosts:
 
 def derive_layout_variant(h):
     """Re-derive layout sections from this host's already-tuned variants, so
-    the layout covers what will actually run (e.g. the wt-small namespace the
-    max tier redirects iops/latency files into). Twin of generate_layout in
-    the bash layer -- keep the grouping rules in sync."""
+    the layout covers what will actually run (the tuned numjobs, and at max
+    tier the wt-small namespace iops/latency files are redirected into).
+    Twin of generate_layout in the bash layer -- keep the rules in sync:
+    one section per pruned contributor, never one independent-max section,
+    or the layout over-provisions by the cross-product of the divergences."""
     namespaces, engines = {}, {}
     for j in jobs:
         if j in layout_set: continue
@@ -937,36 +942,45 @@ def derive_layout_variant(h):
             key, section, out_fmt = f"__jobname__:{sec}", sec, ""
         eng = first_value(vlines, "ioengine")
         if eng: engines[eng] = engines.get(eng, 0) + 1
-        ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt,
-                                         "numjobs": 0, "nrfiles": 0,
-                                         "filesize": "", "filesize_b": -1,
-                                         "size": "", "size_b": -1})
-        ns["numjobs"] = max(ns["numjobs"], int(first_value(vlines, "numjobs") or 1))
-        ns["nrfiles"] = max(ns["nrfiles"], int(first_value(vlines, "nrfiles") or 1))
-        for k in ("filesize", "size"):
-            v = first_value(vlines, k)
+        fs, size = first_value(vlines, "filesize"), first_value(vlines, "size")
+        size_b = -1
+        for v in (fs, size):
             if v:
-                try: b = parse_size(v)
-                except ValueError: continue
-                if b > ns[k + "_b"]:
-                    ns[k + "_b"], ns[k] = b, v
+                try: size_b = max(size_b, parse_size(v))
+                except ValueError: pass
+        ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt, "contribs": []})
+        ns["contribs"].append({"numjobs": int(first_value(vlines, "numjobs") or 1),
+                               "nrfiles": int(first_value(vlines, "nrfiles") or 1),
+                               "size_b": size_b, "fs": fs, "sz": size})
+
+    def prune(contribs):
+        kept = []
+        for a in sorted(contribs, key=lambda c: (-c["numjobs"], -c["nrfiles"], -c["size_b"])):
+            if not any(a["numjobs"] <= b["numjobs"] and a["nrfiles"] <= b["nrfiles"]
+                       and a["size_b"] <= b["size_b"] for b in kept):
+                kept.append(a)
+        return kept
+
     best = max(engines, key=lambda e: engines[e]) if engines else "libaio"
-    out = ["# re-derived by wekatester auto[max] from this host's tuned variants",
+    out = [f"# re-derived by wekatester auto[{tier}] from this host's tuned variants",
            "[global]", f"directory={directory}",
            f"cpus_allowed={fmt_cpulist(facts[h]['usable'])}",
            "create_serialize=0", f"ioengine={best}"]
     n = 0
     for key in sorted(namespaces):
-        ns = namespaces[key]; n += 1
-        out.append("")
-        out.append(f"[{ns['section'] or 'layout-%d' % n}]")
-        out.append("create_only=1")
-        out.append("blocksize=1Mi")
-        if ns["fmt"]: out.append(f"filename_format={ns['fmt']}")
-        if ns["filesize"]: out.append(f"filesize={ns['filesize']}")
-        elif ns["size"]: out.append(f"size={ns['size']}")
-        if ns["nrfiles"] > 1: out.append(f"nrfiles={ns['nrfiles']}")
-        out.append(f"numjobs={ns['numjobs']}")
+        ns = namespaces[key]
+        for c in prune(ns["contribs"]):
+            n += 1
+            out.append("")
+            out.append(f"[{ns['section'] or 'layout-%d' % n}]")
+            out.append("stonewall")
+            out.append("create_only=1")
+            out.append("blocksize=1Mi")
+            if ns["fmt"]: out.append(f"filename_format={ns['fmt']}")
+            if c["fs"]: out.append(f"filesize={c['fs']}")
+            elif c["sz"]: out.append(f"size={c['sz']}")
+            if c["nrfiles"] > 1: out.append(f"nrfiles={c['nrfiles']}")
+            out.append(f"numjobs={c['numjobs']}")
     return out
 
 for job in jobs:
@@ -1038,18 +1052,20 @@ for job in jobs:
     kind = "latency" if is_latency else ("bandwidth" if is_bw else "iops" if is_iops else "all")
     print(f"auto[{tier}]: {job} type={kind}")
 
-# Layout jobs last: at max tier the tuned variants above are their ground
-# truth. A pristine (never-edited) layout is re-derived per host so it covers
-# the redirected namespaces; an edited one is the operator's word -- stage it
-# with corrections only and say so once.
+# Layout jobs last: the tuned variants above are their ground truth at BOTH
+# tiers -- safe re-tunes numjobs too, and a layout built from the un-tuned
+# sources would create the source superset (e.g. 64 jobs' worth of 10G files
+# for a run tuned down to 5 jobs). A pristine (never-edited) layout is
+# re-derived per host; an edited one is the operator's word -- stage it with
+# corrections only and say so once.
 for job in sorted(layout_set):
     lines = open(os.path.join(src, job)).read().splitlines()
     pristine = layout_pristine(lines)
-    if not pristine and tier == "max":
-        warn_once(f"{job}: user-edited layout staged as-is; it may not cover "
-                  "auto-tuned namespaces (regenerate with -g)")
+    if not pristine:
+        warn_once(f"{job}: user-edited layout staged as-is; it may not match "
+                  "the auto-tuned geometry (regenerate with -g)")
     for h in hosts:
-        if tier == "max" and pristine:
+        if pristine:
             out = derive_layout_variant(h)
         else:
             out = override(lines, "directory", directory)
@@ -1087,20 +1103,52 @@ def footprint(path):
                       "count; it contributes nothing to the capacity estimate")
     return 0   # neither filesize nor a usable size: nothing we can size
 
+# The staged layout variant is what actually gets created, section by
+# section, so its per-section sum is the truest footprint (overlapping grids
+# within a namespace over-count slightly -- upward, which is the safe
+# direction). The per-namespace max over measured jobs is kept as a second
+# estimate and the LARGER of the two wins: an operator-edited layout that
+# covers less than the measured jobs need must not shrink the answer.
+def layout_footprint(path):
+    total, numjobs, nrfiles, size_b, per_file = 0, 1, 1, 0, True
+    def flush():
+        return numjobs * (nrfiles if per_file else 1) * size_b
+    in_section = False
+    for line in open(path):
+        line = line.strip()
+        if re.match(r"^\[.+\]$", line):
+            if in_section: total += flush()
+            in_section, numjobs, nrfiles, size_b, per_file = \
+                line != "[global]", 1, 1, 0, True
+            continue
+        m = re.match(r"^(numjobs|nrfiles|filesize|size)=(\S+)", line)
+        if not m or not in_section: continue
+        k, v = m.groups()
+        if k == "numjobs": numjobs = int(v)
+        elif k == "nrfiles": nrfiles = int(v)
+        else:
+            try: size_b = parse_size(v)
+            except ValueError: size_b = 0
+            per_file = (k == "filesize")   # size= is the per-job total
+    if in_section: total += flush()
+    return total
+
 required = 0
 for h in hosts:
     namespaces = {}
+    layout_total = 0
     for job in jobs:
-        if job in layout_set:
-            continue   # a layout job's footprint IS the other files' namespaces
         p = os.path.join(work, "jobs", h, job)
+        if job in layout_set:
+            layout_total += layout_footprint(p)
+            continue
         # No filename_format means fio expands its default ($jobname...) per
         # section, so each jobfile owns its own files: give it a private key so
         # distinct jobfiles sum. Sharing one literal default key would collapse
         # them to a single max and under-count the real footprint.
         ns = job_value(p, "filename_format", "") or f"__default__:{job}"
         namespaces[ns] = max(namespaces.get(ns, 0), footprint(p))
-    required += sum(namespaces.values())
+    required += max(sum(namespaces.values()), layout_total)
 
 avail = 0
 df_path = os.path.join(work, "probe", "_df")
@@ -1174,7 +1222,13 @@ def last_section(lines):
         if m: name = m.group(1)
     return name
 
-namespaces = {}   # key -> dict(section, fmt, numjobs, nrfiles, filesize_str, filesize_b, size_str, size_b)
+# One namespace collects CONTRIBUTORS -- each source job's own geometry.
+# Emitting one section per (pruned) contributor lays out exactly the union of
+# files the jobs will open. A single independent-max section (max numjobs x
+# max nrfiles x max filesize) would instead create the full cross-product
+# grid, over-provisioning disk by integer factors whenever the geometries
+# diverge -- and the capacity guard would never see it coming.
+namespaces = {}   # key -> dict(section, fmt, contribs=[{numjobs,nrfiles,size_b,fs,sz}])
 engines = {}
 directory = ""
 for f in sorted(os.listdir(src)):
@@ -1196,24 +1250,30 @@ for f in sorted(os.listdir(src)):
     eng = first_value(lines, "ioengine")
     if eng: engines[eng] = engines.get(eng, 0) + 1
     directory = directory or first_value(lines, "directory")
-    numjobs = int(first_value(lines, "numjobs") or 1)
-    nrfiles = int(first_value(lines, "nrfiles") or 1)
     fs, size = first_value(lines, "filesize"), first_value(lines, "size")
-    ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt,
-                                     "numjobs": 0, "nrfiles": 0,
-                                     "filesize": "", "filesize_b": -1,
-                                     "size": "", "size_b": -1})
-    ns["numjobs"] = max(ns["numjobs"], numjobs)
-    ns["nrfiles"] = max(ns["nrfiles"], nrfiles)
-    for k, v in (("filesize", fs), ("size", size)):
+    size_b = -1
+    for v in (fs, size):
         if v:
-            try: b = parse_size(v)
-            except ValueError: continue   # e.g. size=50%: not derivable
-            if b > ns[k + "_b"]:
-                ns[k + "_b"], ns[k] = b, v
+            try: size_b = max(size_b, parse_size(v))
+            except ValueError: pass   # e.g. size=50%: not derivable
+    ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt, "contribs": []})
+    ns["contribs"].append({"numjobs": int(first_value(lines, "numjobs") or 1),
+                           "nrfiles": int(first_value(lines, "nrfiles") or 1),
+                           "size_b": size_b, "fs": fs, "sz": size})
 
 if not namespaces:
     sys.exit(f"ERROR: no jobfiles to derive a layout from in {src}")
+
+def prune(contribs):
+    """Keep only contributors no kept contributor's grid fully covers.
+    Descending order makes it one pass: a duplicate or dominated entry always
+    meets its dominator first."""
+    kept = []
+    for a in sorted(contribs, key=lambda c: (-c["numjobs"], -c["nrfiles"], -c["size_b"])):
+        if not any(a["numjobs"] <= b["numjobs"] and a["nrfiles"] <= b["nrfiles"]
+                   and a["size_b"] <= b["size_b"] for b in kept):
+            kept.append(a)
+    return kept
 
 body = []
 body.append("# Auto-generated by wekatester: lays out every file the set's jobs")
@@ -1227,17 +1287,22 @@ best_engine = max(engines, key=lambda e: engines[e]) if engines else "libaio"
 body.append(f"ioengine={best_engine}")
 n = 0
 for key in sorted(namespaces):
-    ns = namespaces[key]; n += 1
-    body.append("")
-    body.append(f"[{ns['section'] or 'layout-%d' % n}]")
-    body.append("create_only=1")
-    body.append("blocksize=1Mi")
-    if ns["fmt"]: body.append(f"filename_format={ns['fmt']}")
-    if ns["filesize"]: body.append(f"filesize={ns['filesize']}")
-    elif ns["size"]: body.append(f"size={ns['size']}")
-    else: body.append(f"# WARNING: no derivable file size in this namespace ({key})")
-    if ns["nrfiles"] > 1: body.append(f"nrfiles={ns['nrfiles']}")
-    body.append(f"numjobs={ns['numjobs']}")
+    ns = namespaces[key]
+    for c in prune(ns["contribs"]):
+        n += 1
+        body.append("")
+        body.append(f"[{ns['section'] or 'layout-%d' % n}]")
+        # stonewall serializes the sections: overlapping grids within a
+        # namespace must not create the same file concurrently.
+        body.append("stonewall")
+        body.append("create_only=1")
+        body.append("blocksize=1Mi")
+        if ns["fmt"]: body.append(f"filename_format={ns['fmt']}")
+        if c["fs"]: body.append(f"filesize={c['fs']}")
+        elif c["sz"]: body.append(f"size={c['sz']}")
+        else: body.append(f"# WARNING: no derivable file size in this namespace ({key})")
+        if c["nrfiles"] > 1: body.append(f"nrfiles={c['nrfiles']}")
+        body.append(f"numjobs={c['numjobs']}")
 
 normalized = "\n".join(l.rstrip() for l in body)
 digest = hashlib.sha256(normalized.encode()).hexdigest()
@@ -1293,6 +1358,25 @@ resolve_custom_set() {
             fi
             ;;
         *)
+            # A bare name that names a SHIPPED set is a request to customize a
+            # copy of it, never the set itself -- shipped jobfiles are the
+            # tool's checked-in baseline and are only ever edited via a copy.
+            case " $SHIPPED_SETS " in
+                *" $CUSTOM_SET "*)
+                    log "'$CUSTOM_SET' ships with wekatester; customizing a copy of it"
+                    WORKLOAD=$CUSTOM_SET
+                    src=$(workload_src_dir) || exit 1
+                    [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
+                        die "cannot create a custom set: ./fio-jobfiles is not writable here"
+                    dst="./fio-jobfiles/$(date +%Y%m%d-%H%M%S)"
+                    mkdir -p "$dst" || die "cannot create $dst"
+                    copy_set_into "$src" "$dst"
+                    created=1; TEMP_SET=1
+                    SET_DIR_OVERRIDE=$dst
+                    log "custom set: $dst"
+                    return 0
+                    ;;
+            esac
             # Bare name: same lookup as -w; created under ./fio-jobfiles when new.
             if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
                 dst="$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
@@ -1312,10 +1396,16 @@ resolve_custom_set() {
     esac
     # An existing set plus an explicit -w is a request to refresh it from that
     # workload -- destructive to its edits, so it needs a real yes with no
-    # timeout, and it never happens on an unattended run.
+    # timeout, and it never happens on an unattended run. A refresh is a
+    # REPLACE: the old jobfiles (including any stale layout job describing
+    # geometry that no longer exists) are cleared first, not overlaid.
     if [ "$created" -eq 0 ] && [ "$WORKLOAD_EXPLICIT" -eq 1 ] \
             && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        if confirm_destructive "re-copy $WORKLOAD over $dst, overwriting its jobfiles?"; then
+        if confirm_destructive "replace the jobfiles in $dst with a fresh copy of $WORKLOAD?"; then
+            local old
+            for old in "$dst"/[0-9]*; do
+                [ -f "$old" ] && rm -f "$old"
+            done
             copy_set_into "$src" "$dst"
         fi
     fi
@@ -1484,6 +1574,22 @@ stage_jobfiles() {
     if [ "$has_layout" -eq 0 ]; then
         generate_layout "$JOBFILE_SRC" "$SET_DIR" || die "layout generation failed"
         discover_jobfiles "$SET_DIR"
+    fi
+    # The layout job must run FIRST or it is not a barrier: a custom set may
+    # carry a marker-detected layout file whose numeric prefix sorts it later,
+    # so enforce the order rather than trust the name.
+    local reordered=() lay=""
+    for job in "${JOBFILES[@]}"; do
+        if [ -z "$lay" ] && is_layout_file "$SET_DIR/$job"; then
+            lay=$job
+        else
+            reordered+=("$job")
+        fi
+    done
+    if [ -n "$lay" ] && [ "$lay" != "${JOBFILES[0]}" ]; then
+        log "layout job $lay moved to run first (a layout job is only a barrier at position one)"
+        JOBFILES=("$lay")
+        [ ${#reordered[@]} -eq 0 ] || JOBFILES=("$lay" "${reordered[@]}")
     fi
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 

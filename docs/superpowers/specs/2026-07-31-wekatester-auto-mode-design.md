@@ -436,13 +436,20 @@ enumerated after `--`); more than one such token is a usage error.
    copy from `-w`'s set (default workload when -w absent).
 2. `/abs` or `./rel` path: exists → use it; missing → `mkdir -p` + copy.
    Writability is checked silently first; failure warns and exits 1.
-3. Bare name: found under `fio-jobfiles/` (SCRIPT_DIR then ./, same lookup
-   as `-w`) → use as-is; missing → create `./fio-jobfiles/<name>/` + copy.
-   Unwritable `fio-jobfiles` warns and exits 1.
-4. Existing set with an *explicit* `-w` (tracked as WORKLOAD_EXPLICIT):
-   untimed y/N confirm before re-copying `-w` over it. Under `-r` the recopy
+3. Bare name: a name that matches a SHIPPED set (default, mixed, 2x400Gb,
+   wekawithin, smoke) customizes a fresh `<date>-<time>` temp copy of it —
+   shipped sets are the checked-in baseline and are never edited in place.
+   Any other name found under `fio-jobfiles/` (SCRIPT_DIR then ./, same
+   lookup as `-w`) is an existing custom set → used as-is; missing → create
+   `./fio-jobfiles/<name>/` + copy. Unwritable `fio-jobfiles` warns and
+   exits 1.
+4. Existing custom set with an *explicit* `-w` (tracked as
+   WORKLOAD_EXPLICIT): untimed y/N confirm before REPLACING its jobfiles
+   with a fresh copy of `-w` (old jobfiles, including any stale layout job,
+   are cleared first — a refresh is not an overlay). Under `-r` the recopy
    never happens (destruction requires interactive consent).
-5. Shipped sets are always copied, never edited in place.
+5. Shipped sets are always copied, never edited in place (rule 3 enforces
+   this for the bare-name spelling too).
 
 **Flow** (after `verify_mount_mode`, before `start_fio_servers` — hosts are
 validated before the operator invests editing time; nothing is staged or
