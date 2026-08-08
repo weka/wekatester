@@ -14,7 +14,8 @@
 #
 # All transient staging (jobfiles, control sockets, remote jobfile copies,
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
-# written to disk are the results_*.json outputs in the current directory.
+# written to disk are the results_*.json outputs in the output directory
+# (./results by default, -o/--output to choose another).
 
 VERSION="2026-08-08"
 
@@ -22,6 +23,7 @@ VERSION="2026-08-08"
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
 WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
+OUTPUT_DIR="results"            # local directory for the fio JSON result files
 VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -324,20 +326,24 @@ edit_jobfile() {   # edit_jobfile <path>
 
 usage() {
     cat <<EOF
-usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-a [safe|max]]
-                  [--ignore-capacity] [-l login] [-i keyfile] [-C[set]]
-                  [-r] [-n] [-g] [-v] [-h] [--] [server ...]
+usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
+                  [-a [safe|max]] [--ignore-capacity] [-l login] [-i keyfile]
+                  [-C[set]] [-r] [-n] [-g] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
 
 Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
-give them are not (-Cmyset names myset, never MYSET).
+give them are not (-Cmyset names myset, never MYSET). A value may be attached
+or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
+attaching is the way to pass a value that starts with a dash.
 
   -d directory   target directory on the workers for test files (default: $DIRECTORY)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
+  -o, --output dir        local directory for the fio JSON result files
+                          (default: $OUTPUT_DIR; created if missing)
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
@@ -373,6 +379,19 @@ need_arg() {   # need_arg <option-as-typed> <argc> <next-token>
     case "$3" in
         -?*) usage >&2; die "option $1 requires an argument, got '$3' (looks like another option)" ;;
     esac
+}
+
+# A short option's attached value: -wsmoke and -w=smoke both mean smoke (one
+# leading = is stripped, so the GNU-style spelling works too). Attaching is
+# also the escape hatch for a value that genuinely starts with a dash, which
+# need_arg refuses in detached form. Empty after stripping dies: -w= looks
+# deliberate but names nothing. Sets OPT_VAL rather than printing so the die
+# fires in the parsing shell, not inside a command substitution.
+OPT_VAL=""
+opt_val() {   # opt_val <normalized-token> <canonical-option>
+    OPT_VAL=${1#"$2"}
+    OPT_VAL=${OPT_VAL#=}
+    [ -n "$OPT_VAL" ] || { usage >&2; die "option $2 requires a value"; }
 }
 
 # bash 3.2 has no ${var,,}, so lowercasing goes through tr. The letters are
@@ -424,9 +443,18 @@ parse_args() {
         case "$opt" in
             --) servers_only=1; shift ;;
             -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; shift 2 ;;
+            -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; shift ;;
             -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
+            -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; WORKLOAD_EXPLICIT=1; shift ;;
             -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
+            -f?*) opt_val "$opt" -f; FIO_BIN=$OPT_VAL; shift ;;
             -s) need_arg "$1" $# "${2:-}"; SUMMARIZE_FILE=$2; shift 2 ;;
+            -s?*) opt_val "$opt" -s; SUMMARIZE_FILE=$OPT_VAL; shift ;;
+            -o|--output)   need_arg "$1" $# "${2:-}"; OUTPUT_DIR=$2; shift 2 ;;
+            --output=*)    OUTPUT_DIR=${opt#--output=}
+                           [ -n "$OUTPUT_DIR" ] || { usage >&2; die "option --output requires a value"; }
+                           shift ;;
+            -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -444,6 +472,13 @@ parse_args() {
                     usage >&2; die "unknown auto level: ${opt#--auto=} (safe|max)" ;;
                 esac
                 shift ;;
+            -a?*)
+                opt_val "$opt" -a
+                AUTO_LEVEL=$(lower "$OPT_VAL")
+                case "$AUTO_LEVEL" in safe|max) ;; *)
+                    usage >&2; die "unknown auto level: $OPT_VAL (safe|max)" ;;
+                esac
+                shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             -l|--login)    need_arg "$1" $# "${2:-}"; SSH_LOGIN=$2; shift 2 ;;
             # An =-form carries an argument that is merely empty, so need_arg
@@ -452,14 +487,16 @@ parse_args() {
             --login=*)     SSH_LOGIN=${opt#--login=}
                            [ -n "$SSH_LOGIN" ] || { usage >&2; die "option --login requires a value"; }
                            shift ;;
+            -l?*)          opt_val "$opt" -l; SSH_LOGIN=$OPT_VAL; shift ;;
             -i|--identity) need_arg "$1" $# "${2:-}"; SSH_IDENTITY=$2; shift 2 ;;
             --identity=*)  SSH_IDENTITY=${opt#--identity=}
                            [ -n "$SSH_IDENTITY" ] || { usage >&2; die "option --identity requires a value"; }
                            shift ;;
+            -i?*)          opt_val "$opt" -i; SSH_IDENTITY=$OPT_VAL; shift ;;
             # -C with an attached value names the set outright. Bare -C arms
             # the candidate rule handled by the bare-token arm below.
             -c|--customize)  CUSTOMIZE=1; c_pending=1; shift ;;
-            -c?*)            CUSTOMIZE=1; CUSTOM_SET=${opt#-c}; shift ;;
+            -c?*)            CUSTOMIZE=1; opt_val "$opt" -c; CUSTOM_SET=$OPT_VAL; shift ;;
             --customize=*)   CUSTOMIZE=1; CUSTOM_SET=${opt#--customize=}
                              [ -n "$CUSTOM_SET" ] || { usage >&2; die "option --customize requires a value"; }
                              shift ;;
@@ -1515,6 +1552,7 @@ dry_run_report() {
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
     log "would run, per job in the order above: fio --output-format=json --client=<host> $TARGET_DIR/<host>/<job>"
+    log "results would be written to: $OUTPUT_DIR/"
 }
 
 # --- phase 3: stage jobfiles ---------------------------------------------------
@@ -1711,7 +1749,7 @@ run_jobs() {
         for host in "${HOSTS[@]}"; do
             cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
         done
-        outfile="results_${stamp}_${job%.job}.json"
+        outfile="$OUTPUT_DIR/results_${stamp}_${job%.job}.json"
         if is_layout_file "$SET_DIR/$job"; then
             # The layout job is a barrier, not a measurement: its stats are
             # create-phase zeros, so it gets a duration instead of a summary.
@@ -1740,7 +1778,7 @@ run_jobs() {
         # no special case here. The lab gate re-verifies both.
         summarize "$outfile" "$report" "${HOSTS[*]}"
     done
-    log "raw fio results: results_${stamp}_*.json"
+    log "raw fio results: $OUTPUT_DIR/results_${stamp}_*.json"
 }
 
 # Parse a fio JSON results file and print the human summary.
@@ -1931,6 +1969,11 @@ main() {
         dry_run_report
         exit 0
     fi
+    # After the dry-run exit on purpose: -n predicts the results location
+    # without creating it. Checked before any daemon starts so an unwritable
+    # -o cannot kill the run after the benchmark already burned its minutes.
+    mkdir -p -- "$OUTPUT_DIR" || die "cannot create output directory $OUTPUT_DIR"
+    [ -w "$OUTPUT_DIR" ] || die "output directory $OUTPUT_DIR is not writable"
     start_fio_servers
     verify_fio_ports
     [ -n "$AUTO_LEVEL" ] && probe_workers

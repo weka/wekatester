@@ -1059,6 +1059,55 @@ t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
      [ -f ./custom/011-new.job ] && [ ! -f ./custom/011-old.job ] &&
      [ ! -f ./custom/000-wekatester-layout.job ])'
 
+# --- -o/--output and the results directory ---
+t_assert "parse: results dir defaults to ./results" bash -c '
+    (source ./wekatester; parse_args h1; [ "$OUTPUT_DIR" = results ])'
+t_assert "parse: -o detached, --output=, and attached -o all set the output dir" bash -c '
+    (source ./wekatester; parse_args -o out1 h1;        [ "$OUTPUT_DIR" = out1 ]) &&
+    (source ./wekatester; parse_args --output=out2 h1;  [ "$OUTPUT_DIR" = out2 ]) &&
+    (source ./wekatester; parse_args -oout3 h1;         [ "$OUTPUT_DIR" = out3 ]) &&
+    (source ./wekatester; parse_args -o=out4 h1;        [ "$OUTPUT_DIR" = out4 ]) &&
+    (source ./wekatester; parse_args -Oout5 h1;         [ "$OUTPUT_DIR" = out5 ])'
+t_assert "run_jobs: the results file lands in OUTPUT_DIR" bash -c '
+    source ./tests/helpers.sh
+    tmp=$(mktemp -d); mkdir "$tmp/out" "$tmp/set"
+    printf "# report bandwidth\n[global]\nfilesize=1M\n[bw]\nrw=read\n" > "$tmp/set/011-bw.job"
+    fio_json_single_fixture "$tmp/fixture.json"
+    (source ./wekatester
+     HOSTS=(vega-1); MASTER=vega-1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+     SET_DIR=$tmp/set; JOBFILES=(011-bw.job); OUTPUT_DIR=$tmp/out
+     run_host() { cat "$tmp/fixture.json"; }
+     run_jobs >/dev/null) &&
+    ls "$tmp"/out/results_*_011-bw.json >/dev/null'
+
+# --- every value-taking option works attached, detached, and =-attached ---
+t_assert "parse: attached values work for -d -w -f -s -l -i" bash -c '
+    (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -lubuntu -i/k h1
+     [ "$DIRECTORY" = /x ] && [ "$WORKLOAD" = smoke ] && [ "$WORKLOAD_EXPLICIT" = 1 ] &&
+     [ "$FIO_BIN" = /opt/fio ] && [ "$SSH_LOGIN" = ubuntu ] && [ "$SSH_IDENTITY" = /k ]) &&
+    (source ./wekatester; parse_args -sfile.json; [ "$SUMMARIZE_FILE" = file.json ])'
+t_assert "parse: =-attached values strip exactly one leading =" bash -c '
+    (source ./wekatester; parse_args -d=/x h1;  [ "$DIRECTORY" = /x ]) &&
+    (source ./wekatester; parse_args -c=foo h1; [ "$CUSTOM_SET" = foo ])'
+t_assert "parse: an attached value keeps its case even when the option is folded" bash -c '
+    (source ./wekatester; parse_args -WSmoke h1; [ "$WORKLOAD" = Smoke ])'
+t_assert "parse: attaching is the escape hatch for a dash-leading value" bash -c '
+    (source ./wekatester; parse_args -w-odd h1; [ "$WORKLOAD" = -odd ])'
+t_assert "parse: an empty attached value dies instead of naming nothing" bash -c '
+    err=$( (source ./wekatester; parse_args -w= h1) 2>&1 >/dev/null )
+    case "$err" in
+        *"option -w requires a value"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" bash -c '
+    (source ./wekatester; parse_args -asafe h1; [ "$AUTO_LEVEL" = safe ]) &&
+    (source ./wekatester; parse_args -a=MAX h1; [ "$AUTO_LEVEL" = max ]) &&
+    err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >/dev/null )
+    case "$err" in
+        *"unknown auto level: bogus (safe|max)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.

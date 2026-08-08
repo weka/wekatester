@@ -7,6 +7,7 @@
 
 # benchmark outputs
 results_*.json
+results/
 
 # SDD scratch
 .superpowers/

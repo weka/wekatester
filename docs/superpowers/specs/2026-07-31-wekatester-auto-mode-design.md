@@ -381,6 +381,17 @@ is accepted and inert there).
   dry run that cannot predict "every job will EACCES" is not a dry run.)
 - **`-g`** — force regeneration of existing layout jobfiles (see Layout
   phase for the full flag matrix).
+- **`-o`/`--output <dir>`** — local directory for the fio JSON result files.
+  Default `./results`, created (mkdir -p) just before the run phase — after
+  the `-n` exit, so a dry run predicts the location without creating it —
+  and checked writable before any daemon starts.
+- **Attached and detached values (all value-taking options).** `-w smoke`,
+  `-wsmoke` and `-w=smoke` are equivalent (one leading `=` is stripped from
+  an attached value); same for -d/-f/-s/-o/-l/-i/-c and `-asafe`/`-amax`.
+  Detached values that look like options are refused (`-f -g` was quietly
+  making `-g` the fio binary); the attached form is the escape hatch for a
+  value that genuinely starts with a dash. An attached value that is empty
+  after stripping (`-w=`) dies rather than silently naming nothing.
 - **`--`** — everything after it is the client list (standard separator).
 - **`-c`/`-C[name]`** — customize workflow; see below. `-C` with `-s` is a
   usage error. `-C` with `-a` is allowed but prints a notice before editing
