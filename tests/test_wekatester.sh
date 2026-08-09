@@ -1261,6 +1261,23 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
 
+# A failed backend-RAM query is survivable (the tuner floors the working
+# set), but the operator should hear the one command that usually fixes it.
+t_assert "probe: failed weka RAM query hints at weka user login and continues" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+            WORK_DIR=$d; DIRECTORY=/mnt/weka
+            run_host() { case "$2" in
+                (*"weka cluster servers list"*) return 1;;
+                (*) echo stubbed;;
+            esac; }
+            probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
+    case "$err" in
+        *"could not query weka backend RAM"*"weka user login"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.

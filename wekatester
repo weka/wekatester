@@ -699,6 +699,7 @@ kill_fio_cmd() {
 }
 
 start_fio_servers() {
+    echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
     local pids=() failed=() host i
     for host in "${HOSTS[@]}"; do
@@ -790,6 +791,7 @@ probe_remote_cmd() {
 
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
 probe_workers() {
+    echo
     log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
     mkdir -p "$WORK_DIR/probe"
     local pids=() failed=() host i
@@ -811,6 +813,7 @@ probe_workers() {
         # the tuner prints the floor it actually used; no number here, so the
         # two cannot disagree
         log "WARNING: could not query weka backend RAM; using the working-set floor" >&2
+        log "NOTE: an expired weka session is the usual cause -- 'weka user login' on $MASTER resolves it; continuing with the default file sizing" >&2
     fi
 }
 
@@ -1486,6 +1489,7 @@ resolve_custom_set() {
 # decide the temp set's fate. Interactive parts are skipped wholesale by
 # -r (fast track) and -n (dry run).
 customize_jobfiles() {
+    echo
     resolve_custom_set
     local dst=$SET_DIR_OVERRIDE job f interactive=1 had_layout=0
     if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then interactive=0; fi
@@ -1645,6 +1649,7 @@ stage_unlink_variants() {
 }
 
 stage_jobfiles() {
+    echo
     # -C already resolved a set to run; otherwise -w names one.
     if [ -n "$SET_DIR_OVERRIDE" ]; then
         JOBFILE_SRC=$SET_DIR_OVERRIDE
@@ -1838,6 +1843,7 @@ PYEOF
 
 run_jobs() {
     local job outfile report cmd host t0 t1
+    echo
     for job in "${JOBFILES[@]}"; do
         cmd="'$FIO_BIN' --output-format=json"
         for host in "${HOSTS[@]}"; do
@@ -1857,6 +1863,7 @@ run_jobs() {
                 || die "layout $job failed -- the files were not created (raw output in $outfile)"
             t1=$(date +%s)
             log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            echo
             continue
         fi
         if [ "$job" = "$UNLINK_JOB" ]; then
@@ -1870,6 +1877,7 @@ run_jobs() {
                 || die "unlink $job failed -- test files may remain (raw output in $outfile)"
             t1=$(date +%s)
             log "unlink: test files removed in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            echo
             continue
         fi
         report=$(report_directive "$SET_DIR/$job")
@@ -1888,6 +1896,7 @@ run_jobs() {
         summarize "$outfile" "$report" "${HOSTS[*]}"
     done
     log "raw fio results: $RUN_DIR/"
+    echo
 }
 
 # Parse fio JSON results and print the human summary.
@@ -2103,6 +2112,7 @@ main() {
     fi
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
+    echo
     [ "$STAGE_BASE" = /dev/shm ] || debug "no /dev/shm here; local staging in $STAGE_BASE"
 
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
