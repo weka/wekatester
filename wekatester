@@ -17,7 +17,7 @@
 # written to disk are the results_*.json outputs in the output directory
 # (./results by default, -o/--output to choose another).
 
-VERSION="2026-08-08"
+VERSION="2026-08-09"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -1654,11 +1654,13 @@ stage_variants() {
 # -u: one final job removes every file the layout created. Derived per host
 # from the STAGED layout variant -- the one file guaranteed to name exactly
 # the union grid this host laid out, whatever the tier or hand edits did --
-# by injecting unlink=1: fio opens each file (create is a no-op on an
-# existing grid) and unlinks it on completion, per client, including the
-# client-prefixed names only fio can reconstruct. The layout marker line is
-# dropped so the unlink job is never mistaken for a layout job and pulled to
-# position one; appending to JOBFILES pins it last instead.
+# by injecting unlink=1: fio opens each file and unlinks it on completion,
+# per client, including the client-prefixed names only fio can reconstruct.
+# Every sizing line is rewritten to 4k so a missing or partial grid member
+# costs a 4k layout before its unlink, never a full-size rewrite (fio's file
+# COUNT and names come from numjobs/nrfiles/format, not size). The layout
+# marker line is dropped so the unlink job is never mistaken for a layout
+# job and pulled to position one; appending to JOBFILES pins it last.
 UNLINK_JOB="999-wekatester-unlink.job"
 stage_unlink_variants() {
     local host src
@@ -1669,11 +1671,59 @@ stage_unlink_variants() {
         [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the -u unlink job"
         awk -v marker="$LAYOUT_MARKER" '
             index($0, marker) == 1 { next }
+            /^filesize=/ { print "filesize=4k"; next }
+            /^size=/     { print "filesize=4k"; next }
             { print }
             /^\[global\]/ && !ins { print "unlink=1"; ins = 1 }
         ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB"
     done
     JOBFILES+=("$UNLINK_JOB")
+}
+
+# The layout trap this rebuild variant exists for: fio lays a file out by
+# ftruncating it to FULL SIZE first and writing the data after, so an
+# interrupted layout leaves st_size-complete files that are mostly holes --
+# and every later create_only run trusts st_size and skips them, forever
+# (verified against fio 3.42). The rebuild variant converts each layout
+# section to rw=write + create_on_open=1: existing files are written through
+# end to end (holes filled), missing files are created and written ONCE
+# (create_on_open suppresses the setup-phase pre-layout that would double
+# the writes). It never truncates ahead of writing, so an interrupted
+# REBUILD cannot reproduce the trap: it leaves short files fio's own size
+# check catches next time. Staged for every run; run_jobs picks it over the
+# layout job only when the completion marker is absent.
+REBUILD_JOB="000-wekatester-relayout.job"
+stage_rebuild_variants() {
+    local host src
+    is_layout_file "$SET_DIR/${JOBFILES[0]}" \
+        || die "no layout job at position one; cannot derive the rebuild variant"
+    for host in "${HOSTS[@]}"; do
+        src="$WORK_DIR/jobs/$host/${JOBFILES[0]}"
+        [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the rebuild variant"
+        awk -v marker="$LAYOUT_MARKER" '
+            index($0, marker) == 1 { next }
+            /^create_only=1$/ { print "rw=write"; print "create_on_open=1"; next }
+            { print }
+        ' "$src" > "$WORK_DIR/jobs/$host/$REBUILD_JOB"
+    done
+}
+
+# Geometry fingerprint of the staged layout: which files, how many, how big,
+# on which clients. Only grid-shaping lines count -- cpus_allowed, ioengine
+# and comments may differ run to run without changing a single file name or
+# size. Hosts are hashed sorted so argument order cannot force a rebuild.
+layout_geometry_hash() {
+    python3 - "$WORK_DIR/jobs" "${JOBFILES[0]}" "${HOSTS[@]}" <<'PYEOF'
+import hashlib, os, re, sys
+jobs, lay, hosts = sys.argv[1], sys.argv[2], sorted(sys.argv[3:])
+h = hashlib.sha256()
+for host in hosts:
+    h.update(host.encode() + b"\0")
+    for line in open(os.path.join(jobs, host, lay)):
+        if re.match(r"^(\[|filename_format=|filesize=|size=|nrfiles=|numjobs=)", line):
+            h.update(line.strip().encode() + b"\n")
+print(h.hexdigest()[:16])
+PYEOF
 }
 
 stage_jobfiles() {
@@ -1722,6 +1772,7 @@ stage_jobfiles() {
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 
     stage_variants "$SET_DIR"
+    stage_rebuild_variants
     [ "$UNLINK" -eq 0 ] || stage_unlink_variants
 
     # A dry run inspects the staged variants without touching the master.
@@ -1870,7 +1921,7 @@ PYEOF
 }
 
 run_jobs() {
-    local job outfile report cmd host t0 t1
+    local job outfile report cmd host t0 t1 ghash marker jobref missing
     echo
     for job in "${JOBFILES[@]}"; do
         cmd="'$FIO_BIN' --output-format=json"
@@ -1883,12 +1934,46 @@ run_jobs() {
         if is_layout_file "$SET_DIR/$job"; then
             # The layout job is a barrier, not a measurement: its stats are
             # create-phase zeros, so it gets a duration instead of a summary.
-            log "laying out files ($job) on ${#HOSTS[@]} host(s)..."
+            #
+            # Completion marker: fio's create_only trusts st_size, and its
+            # own layout ftruncates to full size BEFORE writing -- an
+            # interrupted layout leaves size-complete files full of holes
+            # that every later run would silently trust. A marker file under
+            # -d, named by the layout's geometry hash, attests "this grid
+            # was laid out to completion"; without it the rebuild variant
+            # writes every file end to end. The marker comes OFF before fio
+            # runs and back only after the error check, so an interrupted
+            # layout can never leave one behind.
+            ghash=$(layout_geometry_hash) || die "cannot hash the layout geometry"
+            marker="$DIRECTORY/.wekatester-layout-$ghash.done"
+            jobref=$job
+            missing=0
+            for host in "${HOSTS[@]}"; do
+                run_host "$host" "[ -f '$marker' ]" || missing=1
+            done
+            if [ "$missing" -eq 1 ]; then
+                jobref=$REBUILD_JOB
+                cmd="'$FIO_BIN' --output-format=json"
+                for host in "${HOSTS[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR/$host/$REBUILD_JOB'"
+                done
+                log "no completion marker for this layout geometry (first run, interrupted layout, or geometry change) -- rebuilding every file with full writes"
+            fi
+            for host in "${HOSTS[@]}"; do
+                run_host "$host" "rm -f '$marker'" \
+                    || die "cannot clear the layout marker on $host"
+            done
+            outfile="$RUN_DIR/results_${jobref%.job}.json"
+            log "laying out files ($jobref) on ${#HOSTS[@]} host(s)..."
             t0=$(date +%s)
             run_host "$MASTER" "$cmd" > "$outfile" \
-                || die "layout failed for $job (partial output in $outfile)"
+                || die "layout failed for $jobref (partial output in $outfile)"
             check_fio_errors "$outfile" layout \
-                || die "layout $job failed -- the files were not created (raw output in $outfile)"
+                || die "layout $jobref failed -- the files were not created (raw output in $outfile)"
+            for host in "${HOSTS[@]}"; do
+                run_host "$host" "printf '%s\n' 'wekatester layout complete: geometry $ghash' > '$marker'" \
+                    || die "cannot write the layout marker on $host"
+            done
             t1=$(date +%s)
             log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
             echo
@@ -1903,6 +1988,13 @@ run_jobs() {
                 || die "unlink failed for $job (partial output in $outfile)"
             check_fio_errors "$outfile" layout \
                 || die "unlink $job failed -- test files may remain (raw output in $outfile)"
+            # The grid is gone: its completion marker must not outlive it.
+            ghash=$(layout_geometry_hash) || die "cannot hash the layout geometry"
+            marker="$DIRECTORY/.wekatester-layout-$ghash.done"
+            for host in "${HOSTS[@]}"; do
+                run_host "$host" "rm -f '$marker'" \
+                    || die "cannot remove the layout marker on $host"
+            done
             t1=$(date +%s)
             log "unlink: test files removed in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
             echo

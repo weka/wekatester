@@ -1245,6 +1245,7 @@ numjobs=16"
      [ "${JOBFILES[2]}" = 999-wekatester-unlink.job ] &&
      grep -q "^unlink=1$" "$u1" && grep -q "numjobs=16" "$u1" &&
      grep -q "numjobs=8" "$u2" &&
+     grep -q "^filesize=4k$" "$u1" && ! grep -q "filesize=10G" "$u1" &&
      ! grep -q "wekatester-layout: generated" "$u1" &&
      ! is_layout_file "$u1" &&
      awk "/^\[global\]/{g=1} /^unlink=1$/{if(g)ok=1} END{exit !ok}" "$u1")'
@@ -1257,7 +1258,9 @@ t_assert "run_jobs: the unlink job is timed, never summarized" bash -c '
 JSON
     out=$( (source ./wekatester
             HOSTS=(h1); MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
-            SET_DIR=$d/set; RUN_DIR=$d/out
+            SET_DIR=$d/set; RUN_DIR=$d/out; WORK_DIR=$d; DIRECTORY=/mnt/weka
+            mkdir -p "$d/jobs/h1"
+            printf "[global]\n[l]\nfilesize=10G\nnumjobs=4\n" > "$d/jobs/h1/999-wekatester-unlink.job"
             JOBFILES=(999-wekatester-unlink.job)
             run_host() { cat "$d/r.json"; }
             run_jobs) 2>&1 )
@@ -1278,6 +1281,102 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
      [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >/dev/null || exit 1
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
+
+# --- partial-layout healing: rebuild variant + completion markers ---
+# fio ftruncates a file to FULL SIZE before writing its layout, so an
+# interrupted layout leaves size-complete holes that create_only trusts
+# forever (verified against fio 3.42). The rebuild variant writes through.
+t_assert "rebuild variant: rw=write + create_on_open replace create_only, geometry kept" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1)
+     mkdir -p "$d/jobs/h1" "$SET_DIR"
+     printf "%s\n" "# wekatester-layout: generated sha256=abc" "[global]" "directory=/mnt/weka" \
+         "[layout-1]" "create_only=1" "blocksize=1Mi" "filesize=10G" "numjobs=16" \
+         > "$d/jobs/h1/000-wekatester-layout.job"
+     cp "$d/jobs/h1/000-wekatester-layout.job" "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     stage_rebuild_variants
+     r=$d/jobs/h1/000-wekatester-relayout.job
+     grep -q "^rw=write$" "$r" && grep -q "^create_on_open=1$" "$r" &&
+     ! grep -q "^create_only=1$" "$r" && ! grep -q "wekatester-layout: generated" "$r" &&
+     grep -q "^filesize=10G$" "$r" && grep -q "^numjobs=16$" "$r")'
+t_assert "geometry hash: host order and cpu steering do not matter, the grid does" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; mkdir -p "$d/jobs/h1" "$d/jobs/h2"
+     printf "[global]\ncpus_allowed=0-3\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "[global]\ncpus_allowed=0-7\n[l]\nfilesize=10G\nnumjobs=8\n"  > "$d/jobs/h2/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     HOSTS=(h1 h2); a=$(layout_geometry_hash)
+     HOSTS=(h2 h1); b=$(layout_geometry_hash)
+     sed -i.bak "s/cpus_allowed=0-3/cpus_allowed=4-9/" "$d/jobs/h1/000-wekatester-layout.job"
+     HOSTS=(h1 h2); c=$(layout_geometry_hash)
+     sed -i.bak "s/numjobs=16/numjobs=32/" "$d/jobs/h1/000-wekatester-layout.job"
+     HOSTS=(h1 h2); e=$(layout_geometry_hash)
+     [ "$a" = "$b" ] && [ "$a" = "$c" ] && [ "$a" != "$e" ])'
+run_jobs_marker_case() {   # run_jobs_marker_case <marker-present-rc>; prints output, oplog in $d/oplog
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1); MASTER=h1
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$d/jobs/h1" "$SET_DIR" "$RUN_DIR"
+     printf "[global]\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     printf "{ \"client_stats\": [ { \"jobname\": \"l\", \"hostname\": \"h1\", \"error\": 0, \"read\": {\"total_ios\":0}, \"write\": {\"total_ios\":0} } ] }\n" > "$d/r.json"
+     JOBFILES=(000-wekatester-layout.job)
+     MARKER_RC=$1
+     run_host() { case "$2" in
+         ("[ -f "*) return "$MARKER_RC";;
+         ("rm -f "*) echo "RM: $2" >> "$WORK_DIR/oplog";;
+         (*printf*)  echo "MARK: $2" >> "$WORK_DIR/oplog";;
+         (*)         echo "FIO: $2" >> "$WORK_DIR/oplog"; cat "$WORK_DIR/r.json";;
+     esac; }
+     run_jobs) 2>&1
+    echo "OPLOG_DIR=$d"
+}
+export -f run_jobs_marker_case
+t_assert "layout marker present: create_only path, marker cleared then rewritten" bash -c '
+    source ./tests/helpers.sh
+    out=$(run_jobs_marker_case 0)
+    d=${out##*OPLOG_DIR=}
+    case "$out" in *"rebuilding every file"*) echo "$out" >&2; false;; *) true;; esac &&
+    grep -q "FIO: .*000-wekatester-layout.job" "$d/oplog" &&
+    ! grep -q "relayout" "$d/oplog" &&
+    grep -q "^RM: rm -f ./mnt/weka/.wekatester-layout-" "$d/oplog" &&
+    mline=$(grep -n "^MARK:" "$d/oplog" | head -1 | cut -d: -f1) &&
+    fline=$(grep -n "^FIO:" "$d/oplog" | head -1 | cut -d: -f1) &&
+    [ "$mline" -gt "$fline" ]'
+t_assert "layout marker missing: rebuild variant runs and says why" bash -c '
+    source ./tests/helpers.sh
+    out=$(run_jobs_marker_case 1)
+    d=${out##*OPLOG_DIR=}
+    case "$out" in
+        *"no completion marker"*"rebuilding every file with full writes"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    grep -q "FIO: .*000-wekatester-relayout.job" "$d/oplog" &&
+    grep -q "^MARK: " "$d/oplog"'
+t_assert "unlink job removes its geometry marker after the grid is gone" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1); MASTER=h1
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$d/jobs/h1" "$SET_DIR" "$RUN_DIR"
+     printf "[global]\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     printf "{ \"client_stats\": [ { \"jobname\": \"l\", \"hostname\": \"h1\", \"error\": 0, \"read\": {\"total_ios\":0}, \"write\": {\"total_ios\":0} } ] }\n" > "$d/r.json"
+     JOBFILES=(000-wekatester-layout.job 999-wekatester-unlink.job)
+     run_host() { case "$2" in
+         ("[ -f "*) return 0;;
+         ("rm -f "*) echo "RM: $2" >> "$WORK_DIR/oplog";;
+         (*printf*)  echo "MARK: $2" >> "$WORK_DIR/oplog";;
+         (*)         cat "$WORK_DIR/r.json";;
+     esac; }
+     run_jobs >/dev/null
+     # layout branch: clear + rewrite (1 RM, 1 MARK); unlink branch: 1 more RM
+     [ "$(grep -c "^RM: " "$WORK_DIR/oplog")" -eq 2 ] &&
+     [ "$(grep -c "^MARK: " "$WORK_DIR/oplog")" -eq 1 ])'
 
 # A failed backend-RAM query is survivable (the tuner floors the working
 # set), but the operator should hear the one command that usually fixes it.

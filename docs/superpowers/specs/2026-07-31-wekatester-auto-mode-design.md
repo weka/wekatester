@@ -465,6 +465,37 @@ re-layout (the numjobs-superset trap).
 - **Runtime behavior.** `stage_jobfiles` ensures a layout job exists as
   JOBFILES[0] on every run: the set's own layout file when present, else one
   generated transiently into `$WORK_DIR/gen/` (auto and non-auto paths both).
+- **Completion markers + the rebuild variant (partial-layout healing).**
+  fio lays a file out by ftruncating to FULL SIZE first, then writing — an
+  interrupted layout leaves st_size-complete files that are mostly holes,
+  and every later `create_only` run trusts st_size and skips them forever
+  (verified against fio 3.42; lab-observed on shrw). Therefore: a marker
+  file `<dir>/.wekatester-layout-<geometry-hash>.done` attests that this
+  exact grid was laid out to completion. The hash covers only grid-shaping
+  lines of every host's staged layout variant (section names,
+  filename_format, filesize/size, nrfiles, numjobs) plus the sorted host
+  list — cpus_allowed/ioengine/comments may change without forcing a
+  rebuild, and host argument order never does. Lifecycle: check on every
+  host → REMOVE on every host → run fio → `check_fio_errors` → write on
+  every host. Removing before the run means an interrupted layout can never
+  leave a marker behind (even the marker-present create_only path can be
+  interrupted while re-laying a deleted file). When any host lacks the
+  marker, run_jobs runs `000-wekatester-relayout.job` instead — every
+  section converted to `rw=write` + `create_on_open=1`, staged per host on
+  every run — which writes every file end to end: holes filled, missing
+  files created and written ONCE (create_on_open suppresses the setup
+  pre-layout). Self-consistency: the rebuild variant never truncates ahead
+  of writing, so an interrupted REBUILD leaves short files that fio's own
+  size check catches next run — it cannot reproduce the trap; only fio's
+  ftruncate-first layout can, and the marker lifecycle covers that path.
+  First run after deploying this feature rebuilds everything, loudly, by
+  design. `-u`'s unlink job removes its geometry's marker (the grid is
+  gone), and its sizing lines are rewritten to 4k so a missing grid member
+  costs a 4k layout before its unlink, never a full-size rewrite. Manual
+  force-rebuild: `rm '<dir>'/.wekatester-layout-*.done`. Stale markers for
+  other geometries are safe: missing files are re-laid by create_only; only
+  size-complete sparse files are dangerous, and only an interrupted
+  ftruncate-first layout creates those.
 - **Tuner interplay.** Layout-marker files are exempt from tier rules
   (corrections only: directory, cpus_allowed). At `-a max` a *pristine*
   layout's staged variant is re-derived per host from that host's tuned
