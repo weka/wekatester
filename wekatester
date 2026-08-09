@@ -744,14 +744,18 @@ verify_fio_ports() {
 }
 
 cleanup() {
-    local host f
+    local host f pids=()
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
         for host in "${HOSTS[@]}"; do
             run_host "$host" "$(kill_fio_cmd); rm -rf '$TARGET_DIR'" &
+            pids+=($!)
         done
-        wait
+        # These pids only -- a bare `wait` also waits on the run-log tees,
+        # which cannot exit until finalize_run_dir closes their fifos AFTER
+        # cleanup returns: that is a deadlock, not a slow teardown.
+        wait "${pids[@]}" || true
     fi
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         # close any ControlMaster still running, then drop the whole work dir.

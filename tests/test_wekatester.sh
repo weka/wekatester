@@ -1106,6 +1106,24 @@ t_assert "run bundle: the console keeps working after finalize restores it" bash
         *"run bundle: $d/res/20260101-000001.tgz"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+t_assert "run bundle: cleanup returns while the log tees still run (bare-wait deadlock)" bash -c '
+    d=$(mktemp -d)
+    # cleanup runs BEFORE finalize_run_dir in the EXIT trap, so the two tee
+    # processes are still alive when it waits for its teardown sshs. A bare
+    # `wait` there waits on the tees too -- and they cannot EOF until finalize
+    # restores the fds after cleanup returns: a deadlock, seen live on shrw
+    # when a failed auto-tune died with the run log active. timeout is the
+    # assertion: the deadlocked version never returns.
+    timeout 10 bash -c "
+        source ./wekatester
+        OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000002; RUN_DIR=$d/res/20260101-000002
+        WORK_DIR=$d/work; mkdir -p \"\$RUN_DIR\" \"\$WORK_DIR\"
+        start_run_log
+        LOCAL_MODE=1; HOSTS=(localhost); FIO_STARTED=1
+        TARGET_DIR=$d/scratch; FIO_BIN=/nonexistent-fio; FIO_PIDFILE=$d/absent.pid
+        cleanup
+        finalize_run_dir" >/dev/null 2>&1 &&
+    test -f "$d/res/20260101-000002.tgz"'
 t_assert "run bundle: snapshot copies the per-host staged variants" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
