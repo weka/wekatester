@@ -991,7 +991,25 @@ t_assert "generator: divergent geometries yield one section each (union, not gri
     (source ./wekatester; generate_layout "$S" "$S") >/dev/null
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 3 ] &&
-    [ "$(grep -c "^stonewall$" "$f")" -eq 3 ]'
+    ! grep -q "^stonewall$" "$f" &&
+    [ "$(grep -c "^wait_for=" "$f")" -eq 2 ]'
+t_assert "generator: distinct namespaces lay out in parallel (no ordering between them)" bash -c '
+    S=$(mktemp -d)
+    printf "# report bandwidth\n[global]\nfilename_format=big/\$jobnum\nfilesize=10G\nnumjobs=4\n[a]\nrw=read\n" > "$S/011-a.job"
+    printf "# report iops\n[global]\nfilename_format=small.\$jobnum\nfilesize=1G\nnumjobs=8\n[b]\nrw=randread\n" > "$S/031-b.job"
+    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    f="$S/000-wekatester-layout.job"
+    [ "$(grep -c "^create_only=1$" "$f")" -eq 2 ] &&
+    ! grep -q "^stonewall$" "$f" && ! grep -q "^wait_for=" "$f"'
+t_assert "generator: a jobname namespace with several contributors gets unique chained names" bash -c '
+    S=$(mktemp -d)
+    printf "[global]\nfilesize=1G\nnumjobs=4\n[shared]\nrw=read\n" > "$S/011-a.job"
+    printf "[global]\nfilesize=2G\nnumjobs=2\n[shared]\nrw=read\n" > "$S/012-b.job"
+    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    f="$S/000-wekatester-layout.job"
+    [ "$(grep -c "filename_format=shared.\$jobnum.\$filenum" "$f")" -eq 2 ] &&
+    [ "$(grep -c "^wait_for=layout-" "$f")" -eq 1 ] &&
+    ! grep -q "^\[shared\]$" "$f"'
 t_assert "generator: dominated geometry is pruned to one section" bash -c '
     source ./tests/helpers.sh
     S=$(mktemp -d)

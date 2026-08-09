@@ -1041,14 +1041,26 @@ def derive_layout_variant(h):
     n = 0
     for key in sorted(namespaces):
         ns = namespaces[key]
-        for c in prune(ns["contribs"]):
+        kept = prune(ns["contribs"])
+        prev = None
+        for c in kept:
             n += 1
+            # Same naming and ordering rules as generate_layout: unique names
+            # when a jobname namespace has several contributors, wait_for
+            # chains WITHIN a namespace only, namespaces lay out in parallel.
+            if ns["section"] and len(kept) == 1:
+                sec, fmt = ns["section"], ns["fmt"]
+            elif ns["section"]:
+                sec, fmt = "layout-%d" % n, f"{ns['section']}.$jobnum.$filenum"
+            else:
+                sec, fmt = "layout-%d" % n, ns["fmt"]
             out.append("")
-            out.append(f"[{ns['section'] or 'layout-%d' % n}]")
-            out.append("stonewall")
+            out.append(f"[{sec}]")
+            if prev: out.append(f"wait_for={prev}")
+            prev = sec
             out.append("create_only=1")
             out.append("blocksize=1Mi")
-            if ns["fmt"]: out.append(f"filename_format={ns['fmt']}")
+            if fmt: out.append(f"filename_format={fmt}")
             if c["fs"]: out.append(f"filesize={c['fs']}")
             elif c["sz"]: out.append(f"size={c['sz']}")
             if c["nrfiles"] > 1: out.append(f"nrfiles={c['nrfiles']}")
@@ -1360,16 +1372,32 @@ body.append(f"ioengine={best_engine}")
 n = 0
 for key in sorted(namespaces):
     ns = namespaces[key]
-    for c in prune(ns["contribs"]):
+    kept = prune(ns["contribs"])
+    prev = None
+    for c in kept:
         n += 1
+        # A jobname namespace (no filename_format) names its files after the
+        # section, so a lone contributor keeps that name; several need
+        # distinct names for wait_for, so fio's default naming
+        # ($jobname.$jobnum.$filenum) is reproduced explicitly instead.
+        if ns["section"] and len(kept) == 1:
+            sec, fmt = ns["section"], ns["fmt"]
+        elif ns["section"]:
+            sec, fmt = "layout-%d" % n, f"{ns['section']}.$jobnum.$filenum"
+        else:
+            sec, fmt = "layout-%d" % n, ns["fmt"]
         body.append("")
-        body.append(f"[{ns['section'] or 'layout-%d' % n}]")
-        # stonewall serializes the sections: overlapping grids within a
-        # namespace must not create the same file concurrently.
-        body.append("stonewall")
+        body.append(f"[{sec}]")
+        # Contributors of one namespace have overlapping grids and must not
+        # lay out the same file concurrently (fio's extend can unlink a file
+        # another section is mid-write on), so they chain via wait_for.
+        # Distinct namespaces touch disjoint files: those sections run in
+        # parallel -- a global stonewall here would only slow the layout.
+        if prev: body.append(f"wait_for={prev}")
+        prev = sec
         body.append("create_only=1")
         body.append("blocksize=1Mi")
-        if ns["fmt"]: body.append(f"filename_format={ns['fmt']}")
+        if fmt: body.append(f"filename_format={fmt}")
         if c["fs"]: body.append(f"filesize={c['fs']}")
         elif c["sz"]: body.append(f"size={c['sz']}")
         else: body.append(f"# WARNING: no derivable file size in this namespace ({key})")

@@ -442,12 +442,23 @@ re-layout (the numjobs-superset trap).
 - **Generated, not hand-written.** A python heredoc `generate_layout
   <setdir>` reads the set's `[0-9]*` jobfiles (skipping layout-marker files),
   groups them by `filename_format` namespace (absent → per-file key, matching
-  the capacity model), computes each namespace's superset geometry (max
-  numjobs, max nrfiles, filesize; `size=`-only files via the capacity
-  fallback), and emits `000-wekatester-layout.job`: a shared `[global]`
-  (directory, create_serialize=0, ioengine from the set) plus one
-  `create_only=1` section per namespace with that namespace's
+  the capacity model), and emits `000-wekatester-layout.job`: a shared
+  `[global]` (directory, create_serialize=0, ioengine from the set) plus one
+  `create_only=1` section per dominance-pruned CONTRIBUTOR (the union of the
+  file grids the jobs will open — a single max-of-everything section would
+  create the cross-product) with that contributor's
   filename_format/filesize/nrfiles/numjobs and `blocksize=1Mi`.
+- **Section ordering.** Contributors of the SAME namespace have overlapping
+  grids and must not lay out the same file concurrently (fio's extend can
+  unlink a file another section is mid-write on): they chain via
+  `wait_for=<prev>`. Sections of distinct namespaces touch disjoint files
+  and run in parallel — no stonewall anywhere; a global barrier was pure
+  slowdown (lab-observed: big-file and small-file namespaces laid out
+  serially for no reason). A jobname namespace (no filename_format) keeps
+  its section name when it has one contributor — fio's default naming embeds
+  the jobname — but several contributors need distinct names for wait_for,
+  so `layout-N` sections reproduce the default naming explicitly via
+  `filename_format=<jobname>.$jobnum.$filenum`.
 - **Marker + pristine hash.** The generated file carries
   `# wekatester-layout: generated sha256=<hash of normalized body>`. A hash
   mismatch means the operator edited it.
