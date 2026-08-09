@@ -1068,17 +1068,56 @@ t_assert "parse: -o detached, --output=, and attached -o all set the output dir"
     (source ./wekatester; parse_args -oout3 h1;         [ "$OUTPUT_DIR" = out3 ]) &&
     (source ./wekatester; parse_args -o=out4 h1;        [ "$OUTPUT_DIR" = out4 ]) &&
     (source ./wekatester; parse_args -Oout5 h1;         [ "$OUTPUT_DIR" = out5 ])'
-t_assert "run_jobs: the results file lands in OUTPUT_DIR" bash -c '
+t_assert "run_jobs: the results file lands in RUN_DIR, no timestamp infix" bash -c '
     source ./tests/helpers.sh
     tmp=$(mktemp -d); mkdir "$tmp/out" "$tmp/set"
     printf "# report bandwidth\n[global]\nfilesize=1M\n[bw]\nrw=read\n" > "$tmp/set/011-bw.job"
     fio_json_single_fixture "$tmp/fixture.json"
     (source ./wekatester
      HOSTS=(vega-1); MASTER=vega-1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
-     SET_DIR=$tmp/set; JOBFILES=(011-bw.job); OUTPUT_DIR=$tmp/out
+     SET_DIR=$tmp/set; JOBFILES=(011-bw.job); RUN_DIR=$tmp/out
      run_host() { cat "$tmp/fixture.json"; }
      run_jobs >/dev/null) &&
-    ls "$tmp"/out/results_*_011-bw.json >/dev/null'
+    test -f "$tmp/out/results_011-bw.json"'
+
+# --- run bundle: log capture, jobfile snapshot, tgz finalize ---
+t_assert "run bundle: stdout and stderr both land in wekatester.log; tgz replaces the dir" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000000; RUN_DIR=$d/res/$RUN_STAMP
+     WORK_DIR=$d/work; mkdir -p "$RUN_DIR" "$WORK_DIR"
+     start_run_log
+     log "hello bundle"
+     echo "oops goes to stderr" >&2
+     finalize_run_dir) >/dev/null 2>&1
+    test -f "$d/res/20260101-000000.tgz" &&
+    test ! -d "$d/res/20260101-000000" &&
+    tar -xzOf "$d/res/20260101-000000.tgz" 20260101-000000/wekatester.log > "$d/log" &&
+    grep -q "hello bundle" "$d/log" && grep -q "oops goes to stderr" "$d/log"'
+t_assert "run bundle: the console keeps working after finalize restores it" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+            OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000001; RUN_DIR=$d/res/$RUN_STAMP
+            WORK_DIR=$d/work; mkdir -p "$RUN_DIR" "$WORK_DIR"
+            start_run_log
+            log "captured"
+            finalize_run_dir) 2>&1 )
+    case "$out" in
+        *"run bundle: $d/res/20260101-000001.tgz"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "run bundle: snapshot copies the per-host staged variants" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d/w; RUN_DIR=$d/r
+     mkdir -p "$WORK_DIR/jobs/h1" "$WORK_DIR/jobs/h2" "$RUN_DIR"
+     echo geometry-h1 > "$WORK_DIR/jobs/h1/011-a.job"
+     echo geometry-h2 > "$WORK_DIR/jobs/h2/011-a.job"
+     snapshot_jobfiles)
+    grep -q geometry-h1 "$d/r/fio-jobfiles/h1/011-a.job" &&
+    grep -q geometry-h2 "$d/r/fio-jobfiles/h2/011-a.job"'
+t_assert "run bundle: finalize is a no-op when no run dir was created" bash -c '
+    (source ./wekatester; RUN_DIR=""; finalize_run_dir)'
 
 # --- every value-taking option works attached, detached, and =-attached ---
 t_assert "parse: attached values work for -d -w -f -s -l -i" bash -c '

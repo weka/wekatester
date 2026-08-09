@@ -14,7 +14,7 @@ wekatester uses fio's native client/server mode:
 - An `fio --server` daemon is started on every worker (daemonized with a pidfile in `/dev/shm`; on exit it is killed via that pidfile only — never by name, so fio jobs that are not ours are untouched).
 - The **first host on the command line acts as the coordinator**: jobfiles are staged only to that host, and the fio client process runs there, driving all the workers. Aggregation across workers is done by fio itself (the "All clients" totals).
 - ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
-- All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the results files in the output directory (`./results` by default, `-o` to choose another).
+- All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
 - With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
 
 # Usage
@@ -35,8 +35,8 @@ attaching is the way to pass a value that starts with a dash.
   -d directory   target directory on the workers for test files (default: /mnt/weka)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
   -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
-  -o, --output dir        local directory for the fio JSON result files
-                          (default: results; created if missing)
+  -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
+                          results, run log, staged jobfiles (default: results)
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
@@ -69,7 +69,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-f fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`.
 
-`-o output_dir` — where the raw fio JSON result files land on the machine running wekatester. Defaults to `./results`, created on first use.
+`-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
 `-s results.json` — offline mode: re-summarize an existing results file and exit, no hosts involved. The full summary (all metric groups) is always printed.
 
@@ -154,7 +154,13 @@ Remember that `BatchMode` means keys must be usable without a passphrase prompt 
 When the workers want a different login or a specific key and editing `~/.ssh/config` isn't practical — you're root on the coordinator driving `ubuntu@` client nodes, say — use `-l login` and `-i keyfile`. They become `-o User=` and `-o IdentityFile=` internally, so ssh and scp both honour them. `-i` also sets `IdentitiesOnly=yes`, which keeps the ssh agent's other keys from being offered — those attempts count against sshd's `MaxAuthTries` and can exhaust it before the key you named is reached. It bounds the agent, not your config: `IdentityFile` entries in `~/.ssh/config` still apply. A key path that is missing, unreadable, or not a regular file (`-i ~/.ssh` instead of `-i ~/.ssh/id_ed25519`) is reported before the first connection, and neither option may contain whitespace (`SSH_OPTS` is a whitespace-split option list). In local mode both are accepted and ignored — there is no ssh to configure.
 
 # Output
-Each job prints a summary block as it completes, and the raw fio JSON is kept — one file per job, named `results_<timestamp>_<jobname>.json` in the output directory (`./results` by default, `-o` to choose another), so a crashed suite keeps everything already measured.
+Each job prints a summary block as it completes, and every run leaves one self-contained bundle in the output directory (`./results` by default, `-o` to choose another). During the run the bundle is a `<date>-<time>/` directory holding:
+
+- `results_<jobname>.json` — the raw fio JSON, one file per job, written as each job completes;
+- `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
+- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth).
+
+On success the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive. A failed or interrupted run keeps the directory uncompressed instead, so the log and any partial results stay directly inspectable — a crashed suite keeps everything already measured.
 
 The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency:
 
@@ -175,10 +181,11 @@ laying out files (000-wekatester-layout.job) on 2 host(s)...
 layout: complete in 41s across 2 host(s)
 ```
 
-Any results file can be re-summarized later with `-s`:
+Any results file can be re-summarized later with `-s` — extract it from the bundle first:
 
 ```
-./wekatester -s results/results_2026-07-30_1112_011-bandwidthR.json
+tar -xzf results/20260808-231119.tgz
+./wekatester -s 20260808-231119/results_011-bandwidthR.json
 ```
 
 # Caveats

@@ -381,10 +381,21 @@ is accepted and inert there).
   dry run that cannot predict "every job will EACCES" is not a dry run.)
 - **`-g`** — force regeneration of existing layout jobfiles (see Layout
   phase for the full flag matrix).
-- **`-o`/`--output <dir>`** — local directory for the fio JSON result files.
-  Default `./results`, created (mkdir -p) just before the run phase — after
-  the `-n` exit, so a dry run predicts the location without creating it —
-  and checked writable before any daemon starts.
+- **`-o`/`--output <dir>`** — local directory for the run bundles. Default
+  `./results`, created (mkdir -p) just before the run phase — after the `-n`
+  exit, so a dry run predicts the location without creating it — and checked
+  writable before any daemon starts. Each run creates `<dir>/<date>-<time>/`
+  holding `results_<jobname>.json` per job (no timestamp infix — the
+  directory carries it), `wekatester.log` (stdout AND stderr of the run
+  phase, captured via two fifos + two tees because bash 3.2 cannot wait on a
+  process substitution and the log must be drained before archiving; fds 5/6
+  hold the real console), and `fio-jobfiles/<host>/` — the staged per-host
+  variants, snapshotted after staging because they are the execution truth
+  (-C temp sets vanish after clean runs; auto mode rewrites geometry).
+  On success the EXIT trap — after cleanup, so teardown is in the log —
+  compresses the directory to `<dir>/<date>-<time>.tgz` and removes it.
+  A failed or interrupted run (rc != 0) keeps the directory uncompressed.
+  Finalize never dies: a tar failure leaves the directory and says so.
 - **Attached and detached values (all value-taking options).** `-w smoke`,
   `-wsmoke` and `-w=smoke` are equivalent (one leading `=` is stripped from
   an attached value); same for -d/-f/-s/-o/-l/-i/-c and `-asafe`/`-amax`.

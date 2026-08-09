@@ -23,7 +23,9 @@ VERSION="2026-08-08"
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
 WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
-OUTPUT_DIR="results"            # local directory for the fio JSON result files
+OUTPUT_DIR="results"            # local directory for the run bundles
+RUN_STAMP=""                    # <date>-<time> of this run, set at run start
+RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -342,8 +344,8 @@ attaching is the way to pass a value that starts with a dash.
   -d directory   target directory on the workers for test files (default: $DIRECTORY)
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
-  -o, --output dir        local directory for the fio JSON result files
-                          (default: $OUTPUT_DIR; created if missing)
+  -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
+                          results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
@@ -1552,7 +1554,7 @@ dry_run_report() {
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
     log "would run, per job in the order above: fio --output-format=json --client=<host> $TARGET_DIR/<host>/<job>"
-    log "results would be written to: $OUTPUT_DIR/"
+    log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
 }
 
 # --- phase 3: stage jobfiles ---------------------------------------------------
@@ -1674,6 +1676,63 @@ report_directive() {
 # For each jobfile: run the fio coordinator on $MASTER against all hosts,
 # capture JSON locally, hand it to the summarizer. One results file per job
 # so a crashed suite keeps everything already measured.
+# --- run bundle -----------------------------------------------------------------
+# Every run gets $OUTPUT_DIR/<date>-<time>/ holding the fio JSON results, a
+# wekatester.log of everything the operator saw, and a snapshot of the staged
+# jobfiles. A successful run is folded into <date>-<time>.tgz and the
+# directory removed; a failed run keeps the directory uncompressed so the log
+# and any partial results stay directly inspectable.
+
+# Everything printed from here on is also written to $RUN_DIR/wekatester.log.
+# Two fifos + two tees rather than >(process substitution): bash 3.2 cannot
+# wait on a substituted process, and finalize must drain the log before
+# archiving it. stdout and stderr keep their identities on the console.
+TEE_PIDS=()
+start_run_log() {
+    local p="$WORK_DIR/log"
+    mkdir "$p" || die "cannot create log pipe dir $p"
+    mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
+    tee -a "$RUN_DIR/wekatester.log" < "$p/out" &
+    TEE_PIDS+=($!)
+    tee -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
+    TEE_PIDS+=($!)
+    # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
+    # already closed by the time the run phase starts).
+    exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
+    debug "logging to $RUN_DIR/wekatester.log"
+}
+
+# The bundle must show what actually ran: the per-host staged variants. The
+# source set may not exist by the time anyone reads the bundle (-C temp sets
+# are removed after a clean run), and auto mode rewrites geometry per host at
+# staging -- the variants are the execution truth.
+snapshot_jobfiles() {
+    mkdir "$RUN_DIR/fio-jobfiles" || die "cannot create $RUN_DIR/fio-jobfiles"
+    cp -R "$WORK_DIR/jobs/." "$RUN_DIR/fio-jobfiles/" \
+        || die "cannot copy the staged jobfiles into $RUN_DIR/fio-jobfiles"
+}
+
+# Success only (the EXIT trap gates on rc): compress the run directory to
+# <stamp>.tgz and remove it. Runs inside the EXIT trap, after cleanup, so the
+# log also holds the teardown messages -- which is why it must never die: a
+# tar failure just leaves the directory uncompressed and says so.
+finalize_run_dir() {
+    [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
+    if [ ${#TEE_PIDS[@]} -gt 0 ]; then
+        # Restore the console and let the tees drain: their pipes EOF when
+        # these redirected fds close, and only a drained log may be archived.
+        exec 1>&5 2>&6 5>&- 6>&-
+        wait "${TEE_PIDS[@]}"
+        TEE_PIDS=()
+    fi
+    if tar -czf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
+        rm -rf "$RUN_DIR"
+        log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz"
+    else
+        log "ERROR: could not compress $RUN_DIR; leaving it uncompressed" >&2
+    fi
+}
+
 # fio --client exits 0 even when every job on every worker failed (a
 # long-standing fio quirk: the client's exit code does not carry worker-side
 # job errors), so success has to be read out of the results themselves. Two
@@ -1742,14 +1801,15 @@ PYEOF
 }
 
 run_jobs() {
-    local stamp job outfile report cmd host t0 t1
-    stamp=$(date '+%Y-%m-%d_%H%M')
+    local job outfile report cmd host t0 t1
     for job in "${JOBFILES[@]}"; do
         cmd="'$FIO_BIN' --output-format=json"
         for host in "${HOSTS[@]}"; do
             cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
         done
-        outfile="$OUTPUT_DIR/results_${stamp}_${job%.job}.json"
+        # No timestamp in the name: the run directory carries it, and the
+        # bundle keeps runs apart better than a filename infix ever did.
+        outfile="$RUN_DIR/results_${job%.job}.json"
         if is_layout_file "$SET_DIR/$job"; then
             # The layout job is a barrier, not a measurement: its stats are
             # create-phase zeros, so it gets a duration instead of a summary.
@@ -1778,7 +1838,7 @@ run_jobs() {
         # no special case here. The lab gate re-verifies both.
         summarize "$outfile" "$report" "${HOSTS[*]}"
     done
-    log "raw fio results: $OUTPUT_DIR/results_${stamp}_*.json"
+    log "raw fio results: $RUN_DIR/"
 }
 
 # Parse a fio JSON results file and print the human summary.
@@ -1949,8 +2009,11 @@ main() {
     # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
     # statement, so a Ctrl-C would tear the run down and keep going. Signals
     # exit instead, and the single EXIT trap is the only place cleanup runs
-    # (it is idempotent anyway) while preserving the exit status.
-    trap 'rc=$?; cleanup; exit $rc' EXIT
+    # (it is idempotent anyway) while preserving the exit status. The bundle
+    # is finalized here, after cleanup, so its log holds the teardown too --
+    # and only on success: any failure or Ctrl-C keeps the run directory
+    # uncompressed for inspection.
+    trap 'rc=$?; cleanup; [ "$rc" -ne 0 ] || finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     preflight
@@ -1969,15 +2032,20 @@ main() {
         dry_run_report
         exit 0
     fi
-    # After the dry-run exit on purpose: -n predicts the results location
+    # After the dry-run exit on purpose: -n predicts the bundle location
     # without creating it. Checked before any daemon starts so an unwritable
     # -o cannot kill the run after the benchmark already burned its minutes.
     mkdir -p -- "$OUTPUT_DIR" || die "cannot create output directory $OUTPUT_DIR"
     [ -w "$OUTPUT_DIR" ] || die "output directory $OUTPUT_DIR is not writable"
+    RUN_STAMP=$(date '+%Y%m%d-%H%M%S')
+    RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
+    mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
+    start_run_log
     start_fio_servers
     verify_fio_ports
     [ -n "$AUTO_LEVEL" ] && probe_workers
     stage_jobfiles
+    snapshot_jobfiles
     run_jobs
     finish_temp_set
 }
