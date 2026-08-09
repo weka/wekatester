@@ -1195,6 +1195,72 @@ t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" b
         *) echo "$err" >&2; false;;
     esac'
 
+# --- -u/--unlink: a final generated job removes what the layout created ---
+t_assert "parse: -u, -U and --unlink arm the unlink job; default off" bash -c '
+    (source ./wekatester; parse_args h1;          [ "$UNLINK" = 0 ]) &&
+    (source ./wekatester; parse_args -u h1;       [ "$UNLINK" = 1 ]) &&
+    (source ./wekatester; parse_args -U h1;       [ "$UNLINK" = 1 ]) &&
+    (source ./wekatester; parse_args --UNLINK h1; [ "$UNLINK" = 1 ])'
+t_assert "unlink job derives from the staged layout variant: unlink=1, no marker, runs last" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1 h2)
+     mkdir -p "$d/jobs/h1" "$d/jobs/h2" "$SET_DIR"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/mnt/weka
+ioengine=libaio
+
+[layout-1]
+stonewall
+create_only=1
+filename_format=\$filenum/\$jobnum
+filesize=10G
+numjobs=16"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "%s\n" "$lay" | sed s/numjobs=16/numjobs=8/ > "$d/jobs/h2/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job 011-bw.job)
+     stage_unlink_variants
+     u1=$d/jobs/h1/999-wekatester-unlink.job
+     u2=$d/jobs/h2/999-wekatester-unlink.job
+     [ "${JOBFILES[2]}" = 999-wekatester-unlink.job ] &&
+     grep -q "^unlink=1$" "$u1" && grep -q "numjobs=16" "$u1" &&
+     grep -q "numjobs=8" "$u2" &&
+     ! grep -q "wekatester-layout: generated" "$u1" &&
+     ! is_layout_file "$u1" &&
+     awk "/^\[global\]/{g=1} /^unlink=1$/{if(g)ok=1} END{exit !ok}" "$u1")'
+t_assert "run_jobs: the unlink job is timed, never summarized" bash -c '
+    d=$(mktemp -d); mkdir "$d/set" "$d/out"
+    cat > "$d/r.json" <<"JSON"
+{ "client_stats": [
+    { "jobname": "layout-1", "hostname": "h1", "error": 0,
+      "read": { "total_ios": 0 }, "write": { "total_ios": 0 } } ] }
+JSON
+    out=$( (source ./wekatester
+            HOSTS=(h1); MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+            SET_DIR=$d/set; RUN_DIR=$d/out
+            JOBFILES=(999-wekatester-unlink.job)
+            run_host() { cat "$d/r.json"; }
+            run_jobs) 2>&1 )
+    case "$out" in
+        *"removing test files (999-wekatester-unlink.job)"*"unlink: test files removed in"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in *bandwidth*) echo "unlink job got summarized: $out" >&2; false;; *) true;; esac'
+t_assert "staging with -u ships the unlink job to the target, last in run order" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d)
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; UNLINK=1
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles
+     [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >/dev/null || exit 1
+    u="$d/target/localhost/999-wekatester-unlink.job"
+    test -f "$u" && grep -q "^unlink=1$" "$u"'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.

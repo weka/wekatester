@@ -40,6 +40,7 @@ WORKLOAD_EXPLICIT=0
 FAST_TRACK=0        # -r: no prompts, no editors -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
+UNLINK=0            # -u: remove the workload's data files after the last job
 
 # -C/--customize: copy a workload set, edit it, run it.
 CUSTOMIZE=0
@@ -330,7 +331,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-a [safe|max]] [--ignore-capacity] [-l login] [-i keyfile]
-                  [-C[set]] [-r] [-n] [-g] [-v] [-h] [--] [server ...]
+                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
@@ -361,6 +362,8 @@ attaching is the way to pass a value that starts with a dash.
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
+  -u, --unlink   remove the workload's data files from -d after the last job
+                 that uses them (a failed run keeps them for the rerun)
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable)
@@ -461,6 +464,7 @@ parse_args() {
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
+            -u|--unlink) UNLINK=1; shift ;;
             -a|--auto)
                 AUTO_LEVEL="max"
                 # The level is a keyword, not a value, so it is matched
@@ -1615,6 +1619,31 @@ stage_variants() {
     done
 }
 
+# -u: one final job removes every file the layout created. Derived per host
+# from the STAGED layout variant -- the one file guaranteed to name exactly
+# the union grid this host laid out, whatever the tier or hand edits did --
+# by injecting unlink=1: fio opens each file (create is a no-op on an
+# existing grid) and unlinks it on completion, per client, including the
+# client-prefixed names only fio can reconstruct. The layout marker line is
+# dropped so the unlink job is never mistaken for a layout job and pulled to
+# position one; appending to JOBFILES pins it last instead.
+UNLINK_JOB="999-wekatester-unlink.job"
+stage_unlink_variants() {
+    local host src
+    is_layout_file "$SET_DIR/${JOBFILES[0]}" \
+        || die "no layout job at position one; cannot derive the -u unlink job"
+    for host in "${HOSTS[@]}"; do
+        src="$WORK_DIR/jobs/$host/${JOBFILES[0]}"
+        [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the -u unlink job"
+        awk -v marker="$LAYOUT_MARKER" '
+            index($0, marker) == 1 { next }
+            { print }
+            /^\[global\]/ && !ins { print "unlink=1"; ins = 1 }
+        ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB"
+    done
+    JOBFILES+=("$UNLINK_JOB")
+}
+
 stage_jobfiles() {
     # -C already resolved a set to run; otherwise -w names one.
     if [ -n "$SET_DIR_OVERRIDE" ]; then
@@ -1660,6 +1689,7 @@ stage_jobfiles() {
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 
     stage_variants "$SET_DIR"
+    [ "$UNLINK" -eq 0 ] || stage_unlink_variants
 
     # A dry run inspects the staged variants without touching the master.
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -1827,6 +1857,19 @@ run_jobs() {
                 || die "layout $job failed -- the files were not created (raw output in $outfile)"
             t1=$(date +%s)
             log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            continue
+        fi
+        if [ "$job" = "$UNLINK_JOB" ]; then
+            # Cleanup, not measurement: error-checked like a layout job (its
+            # stats are open/unlink zeros), timed instead of summarized.
+            log "removing test files ($job) on ${#HOSTS[@]} host(s)..."
+            t0=$(date +%s)
+            run_host "$MASTER" "$cmd" > "$outfile" \
+                || die "unlink failed for $job (partial output in $outfile)"
+            check_fio_errors "$outfile" layout \
+                || die "unlink $job failed -- test files may remain (raw output in $outfile)"
+            t1=$(date +%s)
+            log "unlink: test files removed in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
             continue
         fi
         report=$(report_directive "$SET_DIR/$job")

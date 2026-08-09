@@ -410,6 +410,19 @@ is accepted and inert there).
   making `-g` the fio binary); the attached form is the escape hatch for a
   value that genuinely starts with a dash. An attached value that is empty
   after stripping (`-w=`) dies rather than silently naming nothing.
+- **`-u`/`--unlink`** — remove the workload's data files after the last job
+  that uses them. Implemented as one generated `999-wekatester-unlink.job`
+  appended to JOBFILES at staging (never marker-tagged, so the layout-first
+  reorder cannot hoist it): a per-host copy of that host's STAGED layout
+  variant — the one file guaranteed to name exactly the union grid this host
+  laid out, whatever the tier or hand edits did — with `unlink=1` injected
+  into `[global]` and the marker line dropped. fio opens each file (create
+  is a no-op on an existing grid) and unlinks it on completion, per client,
+  including the client-prefixed names only fio can reconstruct. run_jobs
+  treats it like layout: timed (`unlink: test files removed in Xs`), never
+  summarized, error-checked in layout mode (its stats are legitimately
+  zeros). A failed run dies before it: files persist for debugging and the
+  rerun's layout reuses them. Empty per-client namespace dirs may remain.
 - **`--`** — everything after it is the client list (standard separator).
 - **`-c`/`-C[name]`** — customize workflow; see below. `-C` with `-s` is a
   usage error. `-C` with `-a` is allowed but prints a notice before editing

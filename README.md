@@ -21,7 +21,7 @@ wekatester uses fio's native client/server mode:
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-a [safe|max]] [--ignore-capacity] [-l login] [-i keyfile]
-                  [-C[set]] [-r] [-n] [-g] [-v] [-h] [--] [server ...]
+                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        wekatester -s results.json
        wekatester --version
 
@@ -52,6 +52,8 @@ attaching is the way to pass a value that starts with a dash.
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
+  -u, --unlink   remove the workload's data files from -d after the last job
+                 that uses them (a failed run keeps them for the rerun)
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable)
@@ -73,6 +75,8 @@ With no server given, the test runs on the local host -- no ssh required.
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
 `-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
+
+`-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout job (so it always matches the exact file grid that was laid out, whatever auto tuning or hand edits did) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
