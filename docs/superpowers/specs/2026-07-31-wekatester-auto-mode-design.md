@@ -368,7 +368,13 @@ is accepted and inert there).
   `case`. Consequence: `-v`/`-V` merge — both mean verbosity; `--version`
   becomes long-only.
 - **`-r <items>` removed.** `-s` always prints the full summary (all metric
-  groups). Frees `-r`.
+  groups). Frees `-r`. `-s` also accepts a run-bundle `.tgz`: every
+  `results_*.json` inside is summarized in job order under a `==== <job> ====`
+  header, read straight from the archive via python tarfile (in memory,
+  nothing extracted to disk). Layout results are skipped — the reserved name
+  plus any job whose bundled jobfile carries the layout marker. An
+  unparseable member (a failed run's casualty) is reported in place and the
+  rest still summarize; only a bundle with no results files at all errors.
 - **`-r`** — fast-track: create/copy/generate whatever is needed with zero
   prompts and zero editors, then run.
 - **`-n`** — dry run: create/generate as needed without prompting; print the
@@ -392,10 +398,11 @@ is accepted and inert there).
   hold the real console), and `fio-jobfiles/<host>/` — the staged per-host
   variants, snapshotted after staging because they are the execution truth
   (-C temp sets vanish after clean runs; auto mode rewrites geometry).
-  On success the EXIT trap — after cleanup, so teardown is in the log —
-  compresses the directory to `<dir>/<date>-<time>.tgz` and removes it.
-  A failed or interrupted run (rc != 0) keeps the directory uncompressed.
-  Finalize never dies: a tar failure leaves the directory and says so.
+  The EXIT trap — after cleanup, so teardown is in the log — compresses the
+  directory to `<dir>/<date>-<time>.tgz` and removes it, for EVERY outcome:
+  failed and interrupted runs compress the same way (`-s` reads the archive
+  directly, so nothing is lost to the fold). Finalize never dies: a tar
+  failure leaves the directory uncompressed and says so.
 - **Attached and detached values (all value-taking options).** `-w smoke`,
   `-wsmoke` and `-w=smoke` are equivalent (one leading `=` is stripped from
   an attached value); same for -d/-f/-s/-o/-l/-i/-c and `-asafe`/`-amax`.

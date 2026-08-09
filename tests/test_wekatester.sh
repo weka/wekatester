@@ -1119,6 +1119,36 @@ t_assert "run bundle: snapshot copies the per-host staged variants" bash -c '
 t_assert "run bundle: finalize is a no-op when no run dir was created" bash -c '
     (source ./wekatester; RUN_DIR=""; finalize_run_dir)'
 
+# --- -s reads run bundles straight from the archive (nothing extracted) ---
+t_assert "-s summarizes every job in a bundle, in order, skipping layout results" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); b="$d/20260101-000000"; mkdir -p "$b/fio-jobfiles/h1"
+    fio_json_single_fixture "$b/results_011-bw.json"
+    fio_json_fixture "$b/results_021-mix.json"
+    printf "%s sha256=abc\n[l]\ncreate_only=1\n" "# wekatester-layout: generated" \
+        > "$b/fio-jobfiles/h1/010-mylayout.job"
+    printf "{ \"client_stats\": [] }\n" > "$b/results_010-mylayout.json"
+    printf "{ \"client_stats\": [] }\n" > "$b/results_000-wekatester-layout.json"
+    printf "no json here\n" > "$b/results_030-broken.json"
+    tar -czf "$d/bundle.tgz" -C "$d" 20260101-000000
+    out=$(./wekatester -s "$d/bundle.tgz") || { echo "$out" >&2; exit 1; }
+    case "$out" in
+        *"==== 010-mylayout ===="*|*"==== 000-wekatester-layout ===="*)
+            echo "layout results leaked into the summary:" >&2; echo "$out" >&2; exit 1;;
+    esac
+    case "$out" in
+        *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*"==== 021-mix ===="*"total bandwidth: 7.00 GiB/s"*"==== 030-broken ===="*"no JSON in fio output"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "-s on a bundle with no results files errors" bash -c '
+    d=$(mktemp -d); mkdir "$d/x"; echo hi > "$d/x/wekatester.log"
+    tar -czf "$d/b.tgz" -C "$d" x
+    ! out=$(./wekatester -s "$d/b.tgz" 2>&1) &&
+    case "$out" in
+        *"no results_*.json files in the bundle"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+
 # --- every value-taking option works attached, detached, and =-attached ---
 t_assert "parse: attached values work for -d -w -f -s -l -i" bash -c '
     (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -lubuntu -i/k h1

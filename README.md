@@ -52,7 +52,8 @@ attaching is the way to pass a value that starts with a dash.
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
-  -s file        summarize an existing fio JSON results file and exit
+  -s file        summarize an existing results .json -- or every job in a run
+                 bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable)
   --version      display version number and exit
   -h             show this help and exit
@@ -71,7 +72,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
-`-s results.json` — offline mode: re-summarize an existing results file and exit, no hosts involved. The full summary (all metric groups) is always printed.
+`-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -160,7 +161,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth).
 
-On success the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive. A failed or interrupted run keeps the directory uncompressed instead, so the log and any partial results stay directly inspectable — a crashed suite keeps everything already measured.
+At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 
 The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency:
 
@@ -181,11 +182,10 @@ laying out files (000-wekatester-layout.job) on 2 host(s)...
 layout: complete in 41s across 2 host(s)
 ```
 
-Any results file can be re-summarized later with `-s` — extract it from the bundle first:
+Any run can be re-summarized later with `-s` — point it at the bundle (no extraction; it reads the archive in memory) or at a single extracted `.json`:
 
 ```
-tar -xzf results/20260808-231119.tgz
-./wekatester -s 20260808-231119/results_011-bandwidthR.json
+./wekatester -s results/20260808-231119.tgz
 ```
 
 # Caveats
