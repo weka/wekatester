@@ -1282,6 +1282,100 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
 
+# --- -e/--engine: one engine everywhere ---
+t_assert "parse: -e in all spellings sets the engine; value case kept; -e= dies" bash -c '
+    (source ./wekatester; parse_args -e libaio h1;      [ "$ENGINE" = libaio ]) &&
+    (source ./wekatester; parse_args -elibaio h1;       [ "$ENGINE" = libaio ]) &&
+    (source ./wekatester; parse_args --engine=io_uring h1; [ "$ENGINE" = io_uring ]) &&
+    (source ./wekatester; parse_args -EPsync h1;        [ "$ENGINE" = Psync ]) &&
+    ! (source ./wekatester; parse_args -e= h1)'
+t_assert "override_variant_key: replaces, inserts into [global], or creates it" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     printf "[global]\nioengine=libaio\n[j]\nrw=read\n" > "$d/a"
+     printf "[global]\nfilesize=1G\n[j]\nrw=read\n"     > "$d/b"
+     printf "[j]\nrw=read\n"                            > "$d/c"
+     override_variant_key "$d/a" ioengine xyzeng
+     override_variant_key "$d/b" ioengine xyzeng
+     override_variant_key "$d/c" ioengine xyzeng)
+    grep -q "^ioengine=xyzeng$" "$d/a" && ! grep -q libaio "$d/a" &&
+    grep -q "^ioengine=xyzeng$" "$d/b" &&
+    head -2 "$d/c" | grep -q "^\[global\]$" && grep -q "^ioengine=xyzeng$" "$d/c"'
+t_assert "-e stamps every staged variant, and the rebuild variant inherits it" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d)
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; ENGINE=xyzeng
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles) >/dev/null || exit 1
+    v="$d/target/localhost/011-smoke-readbw.job"
+    grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
+    grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-relayout.job"'
+t_assert "probe: -e engine missing from a worker refuses early, naming it" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(h1 h2); MASTER=h1
+            WORK_DIR=$d; DIRECTORY=/mnt/weka; ENGINE=io_uring
+            run_host() { case "$2" in
+                (*enghelp*) [ "$1" = h1 ] && echo "engines io_uring libaio psync" \
+                                          || echo "engines libaio psync";;
+                (*) echo stubbed;;
+            esac; }
+            probe_workers) 2>&1 >/dev/null )
+    case "$err" in
+        *"ioengine '\''io_uring'\'' is not available"*"h2"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
+# --- -p/--password: askpass over a fifo, no sshpass ---
+t_assert "parse: -p and --password arm password auth; default off" bash -c '
+    (source ./wekatester; parse_args h1;            [ "$PASSWORD_AUTH" = 0 ]) &&
+    (source ./wekatester; parse_args -p h1;         [ "$PASSWORD_AUTH" = 1 ]) &&
+    (source ./wekatester; parse_args --PASSWORD h1; [ "$PASSWORD_AUTH" = 1 ])'
+t_assert "-p: the password flows prompt -> fifo -> askpass -> ssh, once per host" bash -c '
+    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
+    cat > "$stub/ssh" <<"EOF"
+#!/bin/bash
+[ -n "$SSH_ASKPASS" ] || exit 9
+pw=$("$SSH_ASKPASS") || exit 8
+[ "$pw" = "sekrit" ] || exit 7
+EOF
+    chmod +x "$stub/ssh"
+    printf "sekrit\n" | (source ./wekatester
+        PATH="$stub:$PATH"
+        WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS="-o BatchMode=yes"
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_password_masters) >/dev/null'
+t_assert "-p: a rejected password dies naming the host, without hanging" bash -c '
+    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
+    cat > "$stub/ssh" <<"EOF"
+#!/bin/bash
+pw=$("$SSH_ASKPASS") || exit 8
+[ "$pw" = "sekrit" ] || exit 7
+EOF
+    chmod +x "$stub/ssh"
+    err=$(printf "wrong\n" | (source ./wekatester
+        PATH="$stub:$PATH"
+        WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS=""
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_password_masters) 2>&1 >/dev/null )
+    case "$err" in
+        *"password login failed for h1"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "-p: an empty password dies before any connection" bash -c '
+    d=$(mktemp -d)
+    err=$(printf "\n" | (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1)
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_password_masters) 2>&1 >/dev/null )
+    case "$err" in
+        *"empty password"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
 # --- partial-layout healing: rebuild variant + completion markers ---
 # fio ftruncates a file to FULL SIZE before writing its layout, so an
 # interrupted layout leaves size-complete holes that create_only trusts

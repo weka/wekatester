@@ -20,8 +20,9 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-a [safe|max]] [--ignore-capacity] [-l login] [-i keyfile]
-                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
+                  [-e engine] [-a [safe|max]] [--ignore-capacity]
+                  [-l login] [-i keyfile] [-p] [-C[set]]
+                  [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        wekatester -s results.json
        wekatester --version
 
@@ -37,12 +38,16 @@ attaching is the way to pass a value that starts with a dash.
   -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: results)
+  -e, --engine eng        force this fio ioengine on every staged jobfile,
+                          overriding the jobfiles and auto tuning
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
+  -p, --password          prompt once for an ssh password and use it for every
+                          worker (no sshpass involved; needs a terminal)
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -73,6 +78,10 @@ With no server given, the test runs on the local host -- no ssh required.
 `-f fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`.
 
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
+
+`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. With `-a`, the probe checks the engine is actually loadable by every worker's fio (`fio --enghelp`) and refuses early, naming the hosts that lack it; without `-a` a bad engine still fails loudly at the first job. Values are passed to fio as typed.
+
+`-p/--password` — password-based ssh without sshpass: one prompt (on your terminal, never echoed), then wekatester authenticates every worker's connection through an `SSH_ASKPASS` helper fed over a fifo in tmpfs. The password never appears on a command line, in a file on disk, or in any process's environment; the multiplexed connections are pinned open for the whole run so it is asked for exactly once. A wrong password fails immediately naming the host. Needs a terminal — for unattended runs use keys (`-i`).
 
 `-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
 

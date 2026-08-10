@@ -410,6 +410,34 @@ is accepted and inert there).
   making `-g` the fio binary); the attached form is the escape hatch for a
   value that genuinely starts with a dash. An attached value that is empty
   after stripping (`-w=`) dies rather than silently naming nothing.
+- **`-e`/`--engine <eng>`** — force this fio ioengine everywhere. Applied at
+  staging as a post-pass over every staged variant (replace `ioengine=`
+  lines, or insert into `[global]`, created if absent) after `stage_variants`
+  and BEFORE the rebuild/unlink derivations, so those inherit it. Beats the
+  tuner (which may have stamped `common_engines[0]` first; the post-pass
+  wins). With `-a`, probe_workers checks the engine against every host's
+  `fio --enghelp` line and dies early naming the hosts that lack it; without
+  `-a`, a bad engine fails at the first job via check_fio_errors. The value
+  is never case-folded.
+- **`-p`/`--password`** — password ssh without sshpass. One hidden prompt on
+  the tty (require_interactive; unattended advice points at `-i`), then
+  before preflight — after the traps, so half-established masters still get
+  cleanup's `-O exit` — each host's ControlMaster is established with an
+  `SSH_ASKPASS` helper fed through a fifo in the /dev/shm WORK_DIR.
+  Hardening over the classic recipe: the shell holds the fifo open
+  read-write (fd 4) so the password write never blocks if ssh dies before
+  asking; the helper reads exactly ONE LINE so it never waits for an EOF the
+  held fd would withhold (a stale unread line feeds the next host the same
+  password); `NumberOfPasswordPrompts=1` makes a wrong password a clean
+  per-host failure. The auth overrides (`BatchMode=no`) go BEFORE
+  `$SSH_OPTS`: ssh takes the FIRST value of a repeated option, and SSH_OPTS
+  carries `BatchMode=yes`. `setsid` is used when present (pre-8.4 OpenSSH
+  needs the tty detached; macOS lacks setsid and honors
+  `SSH_ASKPASS_REQUIRE=force` instead). Password mode sets
+  `ControlPersist=yes` (instead of 60s): a worker idle past a short persist
+  window would need the password again mid-run. The password lives only in
+  a shell variable and the fifo; never argv, disk, or a child's environment.
+  Local mode refuses `-p`.
 - **`-u`/`--unlink`** — remove the workload's data files after the last job
   that uses them. Implemented as one generated `999-wekatester-unlink.job`
   appended to JOBFILES at staging (never marker-tagged, so the layout-first

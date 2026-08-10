@@ -17,13 +17,15 @@
 # written to disk are the results_*.json outputs in the output directory
 # (./results by default, -o/--output to choose another).
 
-VERSION="2026-08-09"
+VERSION="2026-08-10"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
 WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
+ENGINE=""                       # -e: force this fio ioengine everywhere
+PASSWORD_AUTH=0                 # -p: prompt once for an ssh password
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
@@ -213,7 +215,7 @@ PROMPT_IN_FD=""      # read side  -- the suite presets these two and then
 PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
 PROMPT_DRAIN_SECS=1  # bash 3.2 read -t takes whole seconds; 1 is the floor
 
-require_interactive() {   # require_interactive <what-needs-it>
+require_interactive() {   # require_interactive <what-needs-it> [advice]
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
     # exec with only redirections reports failure without killing the shell
     # (non-posix bash), so the open is testable. Its own stderr line names the
@@ -222,7 +224,7 @@ require_interactive() {   # require_interactive <what-needs-it>
         PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
         return 0
     fi
-    die "$1 needs a terminal; use -r for unattended runs"
+    die "$1 needs a terminal; ${2:-use -r for unattended runs}"
 }
 
 # Hand the run phase back exactly the world it has today: no child inherits a
@@ -330,8 +332,9 @@ edit_jobfile() {   # edit_jobfile <path>
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-a [safe|max]] [--ignore-capacity] [-l login] [-i keyfile]
-                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
+                  [-e engine] [-a [safe|max]] [--ignore-capacity]
+                  [-l login] [-i keyfile] [-p] [-C[set]]
+                  [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
@@ -347,12 +350,16 @@ attaching is the way to pass a value that starts with a dash.
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
+  -e, --engine eng        force this fio ioengine on every staged jobfile,
+                          overriding the jobfiles and auto tuning
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
+  -p, --password          prompt once for an ssh password and use it for every
+                          worker (no sshpass involved; needs a terminal)
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -461,6 +468,12 @@ parse_args() {
                            [ -n "$OUTPUT_DIR" ] || { usage >&2; die "option --output requires a value"; }
                            shift ;;
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
+            -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
+            --engine=*)    ENGINE=${opt#--engine=}
+                           [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
+                           shift ;;
+            -e?*) opt_val "$opt" -e; ENGINE=$OPT_VAL; shift ;;
+            -p|--password) PASSWORD_AUTH=1; shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -774,6 +787,51 @@ cleanup() {
     fi
 }
 
+# --- password logins (-p) -------------------------------------------------------
+# One interactive prompt; each host's ControlMaster is fed the password by an
+# SSH_ASKPASS helper reading a fifo in the /dev/shm work dir -- no sshpass,
+# and the password never appears on a command line, on disk, or in any
+# environment beyond this shell. Deadlock-proofing over the classic recipe:
+# the shell holds the fifo open read-write (fd 4) so the password write can
+# never block when ssh dies before asking, and the helper reads exactly ONE
+# LINE so it never waits for an EOF that the held fd would forever withhold.
+# A stale unread line just feeds the next host the same password.
+# NumberOfPasswordPrompts=1 turns a wrong password into a clean per-host
+# failure instead of a second, hanging prompt. The auth overrides go BEFORE
+# $SSH_OPTS: for repeated ssh -o options the FIRST value wins, and SSH_OPTS
+# carries BatchMode=yes, which would silently disable askpass.
+establish_password_masters() {
+    local pw fifo askpass host setsid_bin pid
+    require_interactive "-p" "use key-based auth (-i) for unattended runs"
+    printf 'ssh password for %s host(s): ' "${#HOSTS[@]}" >&"$PROMPT_OUT_FD"
+    IFS= read -r -s pw <&"$PROMPT_IN_FD" || die "no password read"
+    printf '\n' >&"$PROMPT_OUT_FD"
+    [ -n "$pw" ] || die "empty password"
+    fifo="$WORK_DIR/pw.fifo"
+    askpass="$WORK_DIR/askpass.sh"
+    mkfifo -m 600 "$fifo" || die "cannot create the password fifo"
+    printf '#!/bin/sh\nIFS= read -r pw < "%s"\nprintf "%%s\\n" "$pw"\n' "$fifo" > "$askpass"
+    chmod 700 "$askpass" || die "cannot mark the askpass helper executable"
+    exec 4<>"$fifo"
+    # setsid detaches the tty for OpenSSH older than 8.4, which lacks
+    # SSH_ASKPASS_REQUIRE; macOS has no setsid and does not need it (its ssh
+    # honors the force flag). DISPLAY only has to be non-empty for old ssh.
+    setsid_bin=$(command -v setsid || true)
+    log "opening password-authenticated connections to ${#HOSTS[@]} host(s)..."
+    for host in "${HOSTS[@]}"; do
+        SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-wekatester}" \
+            $setsid_bin ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 \
+            $SSH_OPTS "$host" true </dev/null &
+        pid=$!
+        printf '%s\n' "$pw" >&4
+        wait "$pid" || die "password login failed for $host"
+    done
+    pw=""
+    exec 4>&-
+    rm -f "$fifo" "$askpass"
+    debug "password-backed control masters established"
+}
+
 # --- phase 2b: probe workers for auto-mode system info -----------------------
 # Remote fact-gathering snippet. Dumb by design: emits raw lines, all
 # interpretation happens locally in the tuner.
@@ -794,7 +852,7 @@ probe_workers() {
     echo
     log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
     mkdir -p "$WORK_DIR/probe"
-    local pids=() failed=() host i
+    local pids=() failed=() host i bad=()
     for host in "${HOSTS[@]}"; do
         run_host "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
         pids+=($!)
@@ -803,6 +861,17 @@ probe_workers() {
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
     done
     [ ${#failed[@]} -eq 0 ] || die "probe failed on: ${failed[*]}"
+
+    # -e names an engine explicitly, and the probe already knows what each
+    # worker's fio can load -- refuse now rather than fail at job start.
+    if [ -n "$ENGINE" ]; then
+        for host in "${HOSTS[@]}"; do
+            grep "^engines " "$WORK_DIR/probe/$host" | grep -qw "$ENGINE" \
+                || bad+=("$host")
+        done
+        [ ${#bad[@]} -eq 0 ] \
+            || die "ioengine '$ENGINE' is not available (fio --enghelp) on: ${bad[*]}"
+    fi
 
     run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
@@ -1680,6 +1749,23 @@ stage_unlink_variants() {
     JOBFILES+=("$UNLINK_JOB")
 }
 
+# Stamp key=value into a staged variant: replace every existing line, or
+# insert into [global] (created if missing) so fio cannot quietly fall back
+# to a per-file default. Same three cases as the directory override.
+override_variant_key() {   # override_variant_key <file> <key> <value>
+    local f=$1 key=$2 val=$3 tmp="$1.tmp.$$"
+    if grep -q "^$key=" "$f"; then
+        awk -v k="$key" -v v="$val" \
+            'index($0, k "=") == 1 { print k "=" v; next } { print }' "$f" > "$tmp"
+    elif grep -q '^\[global\]' "$f"; then
+        awk -v k="$key" -v v="$val" \
+            '{ print } /^\[global\]/ && !ins { print k "=" v; ins = 1 }' "$f" > "$tmp"
+    else
+        { printf '[global]\n%s=%s\n' "$key" "$val"; cat "$f"; } > "$tmp"
+    fi
+    mv "$tmp" "$f"
+}
+
 # The layout trap this rebuild variant exists for: fio lays a file out by
 # ftruncating it to FULL SIZE first and writing the data after, so an
 # interrupted layout leaves st_size-complete files that are mostly holes --
@@ -1744,7 +1830,7 @@ stage_jobfiles() {
     # set gets one generated transiently -- it never touches the source dir.
     SET_DIR="$WORK_DIR/set"
     mkdir -p "$SET_DIR"
-    local job has_layout=0
+    local job has_layout=0 v
     for job in "${JOBFILES[@]}"; do
         cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
         is_layout_file "$JOBFILE_SRC/$job" && has_layout=1
@@ -1772,6 +1858,14 @@ stage_jobfiles() {
     log "staging ${#JOBFILES[@]} jobfiles from $JOBFILE_SRC to $MASTER:$TARGET_DIR"
 
     stage_variants "$SET_DIR"
+    if [ -n "$ENGINE" ]; then
+        # -e is an explicit operator choice: it beats the jobfiles and the
+        # tuner in every staged variant -- including the layout job, and so
+        # everything derived from it below (rebuild and unlink variants).
+        for v in "$WORK_DIR"/jobs/*/*; do
+            [ -f "$v" ] && override_variant_key "$v" ioengine "$ENGINE"
+        done
+    fi
     stage_rebuild_variants
     [ "$UNLINK" -eq 0 ] || stage_unlink_variants
 
@@ -2210,6 +2304,7 @@ PYEOF
 
 # --- main ----------------------------------------------------------------------
 main() {
+    local persist
     # -s: offline re-summarize of an existing results file, no hosts involved
     if [ -n "$SUMMARIZE_FILE" ]; then
         [ -f "$SUMMARIZE_FILE" ] || die "no such file: $SUMMARIZE_FILE"
@@ -2218,6 +2313,8 @@ main() {
     fi
 
     resolve_local_mode
+    [ "$PASSWORD_AUTH" -eq 0 ] || [ "$LOCAL_MODE" -eq 0 ] \
+        || die "-p needs remote workers; local mode never runs ssh"
     # -l/-i land in SSH_OPTS here, before the staging dir exists and long before
     # preflight opens the first connection: a bad key path costs nothing to
     # report and leaves nothing behind. ControlMaster opts are appended below.
@@ -2240,9 +2337,14 @@ main() {
     # multiplex every ssh/scp in this run over one connection per host.
     # %C hashes host/port/user into a short, safe socket name. Local mode never
     # runs ssh, so there is nothing to multiplex -- and cleanup's socket loop
-    # already no-ops on the empty socket dir.
+    # already no-ops on the empty socket dir. Password mode pins the masters
+    # for the whole run: a worker idle past a short persist window would need
+    # the password again mid-run, after the prompt machinery is gone --
+    # cleanup's explicit -O exit loop is their teardown.
+    persist=60s
+    [ "$PASSWORD_AUTH" -eq 0 ] || persist=yes
     [ "$LOCAL_MODE" -eq 1 ] || \
-        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=60s"
+        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=$persist"
 
     # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
     # statement, so a Ctrl-C would tear the run down and keep going. Signals
@@ -2254,6 +2356,10 @@ main() {
     trap 'rc=$?; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    # After the traps: a half-established set of password masters must still
+    # get cleanup's -O exit teardown. Before preflight: every later ssh in
+    # the run rides these sockets and never sees an auth prompt.
+    [ "$PASSWORD_AUTH" -eq 0 ] || establish_password_masters
     preflight
     verify_mount_mode
     # The customize flow sits after host validation (no editing time invested
