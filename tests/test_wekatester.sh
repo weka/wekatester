@@ -1117,12 +1117,14 @@ t_assert "-s summarizes every job in a bundle, in order, skipping layout results
         > "$b/fio-jobfiles/h1/010-mylayout.job"
     printf "{ \"client_stats\": [] }\n" > "$b/results_010-mylayout.json"
     printf "{ \"client_stats\": [] }\n" > "$b/results_000-wekatester-layout.json"
+    printf "{ \"client_stats\": [] }\n" > "$b/results_000-wekatester-relayout.json"
+    printf "{ \"client_stats\": [] }\n" > "$b/results_999-wekatester-unlink.json"
     printf "no json here\n" > "$b/results_030-broken.json"
     tar -czf "$d/bundle.tgz" -C "$d" 20260101-000000
     out=$(./wekatester -s "$d/bundle.tgz") || { echo "$out" >&2; exit 1; }
     case "$out" in
-        *"==== 010-mylayout ===="*|*"==== 000-wekatester-layout ===="*)
-            echo "layout results leaked into the summary:" >&2; echo "$out" >&2; exit 1;;
+        *"==== 010-mylayout ===="*|*"==== 000-wekatester-layout ===="*|*"==== 000-wekatester-relayout ===="*|*"==== 999-wekatester-unlink ===="*)
+            echo "layout/cleanup results leaked into the summary:" >&2; echo "$out" >&2; exit 1;;
     esac
     case "$out" in
         *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*"==== 021-mix ===="*"total bandwidth: 7.00 GiB/s"*"==== 030-broken ===="*"no JSON in fio output"*) true;;

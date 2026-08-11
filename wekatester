@@ -2391,9 +2391,10 @@ def summarize_bundle(path):
     with tarfile.open(path, "r:*") as tf:
         members = [m for m in tf.getmembers() if m.isfile()]
         # Layout results are barriers, not measurements: skip the reserved
-        # name plus any job whose bundled jobfile carries the layout marker
-        # (a renamed layout in a custom set).
-        layout = {LAYOUT_JOB}
+        # names (the rebuild variant is deliberately unmarked, so it must be
+        # named here) plus any job whose bundled jobfile carries the layout
+        # marker (a renamed layout in a custom set).
+        layout = {LAYOUT_JOB, "000-wekatester-relayout", "999-wekatester-unlink"}
         for m in members:
             if re.search(r"(^|/)fio-jobfiles/.+\.job$", m.name):
                 head = tf.extractfile(m).read(4096).decode(errors="replace")
