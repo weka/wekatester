@@ -21,7 +21,7 @@ wekatester uses fio's native client/server mode:
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max]] [--ignore-capacity]
-                  [-l login] [-i keyfile] [-p] [-C[set]]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-C[set]]
                   [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        wekatester -s results.json
        wekatester --version
@@ -43,11 +43,15 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
-  -l, --login user        ssh login user for the workers (remote runs only)
-  -i, --identity keyfile  ssh private key for the workers (remote runs only);
-                          keeps the agent's other keys from being offered
-  -p, --password          prompt once for an ssh login (unless -l gave one) and
-                          password, used for every worker; no sshpass involved
+  -i, --identity [login:]keyfile[,...]
+                          ssh key(s) to try, each optionally bound to a login;
+                          repeatable, tried in the order given
+  -p, --password [n]      prompt for n (default 1) login/password pairs, tried
+                          after the keys; no sshpass involved
+                          Every credential is tried against every worker --
+                          existing ssh sessions and plain defaults first, then
+                          keys, then passwords -- and per worker the first
+                          success wins
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -81,7 +85,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. With `-a`, the probe checks the engine is actually loadable by every worker's fio (`fio --enghelp`) and refuses early, naming the hosts that lack it; without `-a` a bad engine still fails loudly at the first job. Values are passed to fio as typed.
 
-`-p/--password` — password-based ssh without sshpass. Prompts for the login name first (skipped if `-l` named one; empty keeps ssh's default) and then the password (never echoed), and authenticates every worker's connection through an `SSH_ASKPASS` helper fed over a fifo in tmpfs. The password never appears on a command line, in a file on disk, or in any process's environment; the multiplexed connections are pinned open for the whole run so it is asked for exactly once. A wrong password fails immediately naming the host. Needs a terminal — for unattended runs use keys (`-i`).
+`-i` / `-p` — the credential pool; see **Authentication** below.
 
 `-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
 
@@ -113,7 +117,7 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 Jobfiles get edited in the field — `-C` makes that a guided flow instead of `cp -r` and hope:
 
 ```
-./wekatester -C -l ubuntu -i key.pem 10.30.0.1 10.30.0.2      # temp set from -w's workload
+./wekatester -C -i ubuntu:key.pem 10.30.0.1 10.30.0.2         # temp set from -w's workload
 ./wekatester -Cmyset host1 host2                              # named: ./fio-jobfiles/myset
 ./wekatester -C ./path/to/set -- host1 host2                  # explicit path; hosts after --
 ```
@@ -167,7 +171,17 @@ Because wekatester uses the real ssh client, anything you can express in `~/.ssh
 
 Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
 
-When the workers want a different login or a specific key and editing `~/.ssh/config` isn't practical — you're root on the coordinator driving `ubuntu@` client nodes, say — use `-l login` and `-i keyfile`. They become `-o User=` and `-o IdentityFile=` internally, so ssh and scp both honour them. `-i` also sets `IdentitiesOnly=yes`, which keeps the ssh agent's other keys from being offered — those attempts count against sshd's `MaxAuthTries` and can exhaust it before the key you named is reached. It bounds the agent, not your config: `IdentityFile` entries in `~/.ssh/config` still apply. A key path that is missing, unreadable, or not a regular file (`-i ~/.ssh` instead of `-i ~/.ssh/id_ed25519`) is reported before the first connection, and neither option may contain whitespace (`SSH_OPTS` is a whitespace-split option list). In local mode both are accepted and ignored — there is no ssh to configure.
+# Authentication
+A large client list rarely shares one credential, so wekatester carries a pool and finds each worker's own. `-i [login:]keyfile` names a key, optionally bound to a login (`-i ubuntu:lab.pem`); it takes comma-separated lists and may be repeated, accumulating in order. A bare path (`-i lab.pem`) means ssh's default user. `-p [n]` prompts — on your terminal, passwords never echoed — for *n* (default 1) login/password pairs; an empty login answer means ssh's default user. `-i` and `-p` combine freely.
+
+Connection establishment runs before anything else touches a host, in rounds, each round trying one credential against **all still-unconnected workers in parallel**:
+
+1. **existing ssh sessions** — a live ControlMaster from your own ssh config is detected (`ssh -O check`) and reused as-is. wekatester never closes a master it didn't create: its teardown only touches its own socket directory.
+2. **plain defaults** — your agent and `~/.ssh/config` identities;
+3. **each `-i` key**, in the order given;
+4. **each `-p` pair**, in the order given — keys go first because failed password attempts burn sshd's `MaxAuthTries` counters.
+
+Per worker, the first success wins and every later ssh/scp in the run rides that session (multiplexed, pinned open until the run ends). Keys are tried with `IdentitiesOnly=yes` so the agent's other keys aren't offered alongside. Passwords are fed through an `SSH_ASKPASS` helper over a per-attempt fifo in tmpfs — no `sshpass`, and the password never appears on a command line, on disk, or in any process's environment; a wrong one fails cleanly rather than hanging. A key path that is missing or unreadable (`-i ~/.ssh` instead of `-i ~/.ssh/id_ed25519`) is reported before the first connection; entries may not contain whitespace. Workers that no credential reaches are named and fail preflight. `-p` needs a terminal — unattended runs should use keys. In local mode both options are accepted and ignored — there is no ssh to configure.
 
 # Output
 Each job prints a summary block as it completes, and every run leaves one self-contained bundle in the output directory (`./results` by default, `-o` to choose another). During the run the bundle is a `<date>-<time>/` directory holding:

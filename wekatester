@@ -25,7 +25,6 @@ WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfi
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
 ENGINE=""                       # -e: force this fio ioengine everywhere
-PASSWORD_AUTH=0                 # -p: prompt once for an ssh password
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
@@ -75,15 +74,23 @@ else
 fi
 
 # BatchMode: fail cleanly instead of hanging on an interactive prompt.
-# ControlMaster opts are appended in main() once the socket dir exists.
+# ControlMaster opts live in CONTROL_OPTS (set in main once the socket dir
+# exists); they are applied per host, because a host reached over a
+# pre-existing user-owned master must NOT get our ControlPath.
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+CONTROL_OPTS=""
 
-# -l / -i: login user and identity file for the workers, for the case where the
-# host you drive the run from is not the user the workers expect (root on the
-# coordinator, ubuntu@ on the clients) and ~/.ssh/config cannot say so. Recorded
-# here by parse_args; apply_ssh_auth_opts folds them into SSH_OPTS in main.
-SSH_LOGIN=""
-SSH_IDENTITY=""
+# Credentials to try against every client, first success per client wins:
+# pre-existing masters, then plain defaults (agent/ssh_config), then each -i
+# key, then each -p password -- keys before passwords, each in the order
+# given. -l is gone: the login travels with its credential.
+IDENT_RAW=()        # -i entries as typed ([login:]key, comma lists, repeatable)
+IDENT_LOGINS=()     # validated split of IDENT_RAW ("" = ssh's default user)
+IDENT_KEYS=()
+PW_COUNT=0          # -p [n]: how many login/password pairs to prompt for
+PW_LOGINS=()        # prompted pairs ("" login = ssh's default user)
+PW_SECRETS=()       # passwords live only here and in the per-attempt fifos
+AUTH_DIR=""          # $WORK_DIR/auth: per-host winning-credential state
 
 # Local mode: no server on the command line, so the "cluster" is this host and
 # the transport below executes directly instead of over ssh. Set by
@@ -119,11 +126,27 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 # own stdin, and so can a backgrounded one whenever job control is in effect
 # (bash only auto-redirects async commands to /dev/null when it is not). The
 # invariant has to hold on both sides of the branch or it is not an invariant.
+# Per-host transport delta, written by establish_connections. A host that
+# was reached over a pre-existing (user-owned) master gets NO control opts:
+# ssh's own config routes it through that master, and cleanup never touches
+# sockets it did not create. Every other host rides a master in our socket
+# dir, addressed (via %C) with the same User= its winning credential used.
+# No AUTH_DIR (unit tests, or a path that never established) means no delta.
+host_ssh_opts() {   # host_ssh_opts <host>
+    if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.external" ]; then
+        return 0
+    fi
+    printf '%s' "$CONTROL_OPTS"
+    if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.user" ]; then
+        printf ' -o User=%s' "$(cat "$AUTH_DIR/$1.user")"
+    fi
+}
+
 run_host() {   # run_host <host> <command-string>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         bash -c "$2" </dev/null
     else
-        ssh -n $SSH_OPTS "$1" "$2"
+        ssh -n $SSH_OPTS $(host_ssh_opts "$1") "$1" "$2"
     fi
 }
 
@@ -135,7 +158,7 @@ copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
     else
         # ${!#} is the last positional (the destination), ${@:1:$#-1} is
         # everything before it; both are bash 3.2-safe.
-        scp $SSH_OPTS -q -r "${@:1:$#-1}" "$MASTER:${!#}"
+        scp $SSH_OPTS $(host_ssh_opts "$MASTER") -q -r "${@:1:$#-1}" "$MASTER:${!#}"
     fi
 }
 
@@ -157,46 +180,43 @@ resolve_local_mode() {
     log "no servers given: running on the local host (no ssh required)"
 }
 
-# Fold -l/-i into SSH_OPTS. Both become `-o` forms rather than ssh's own -l/-i
-# flags, because `-o` is the one spelling BOTH ssh and scp accept (scp's -l is a
-# bandwidth limit) -- so the two transport wrappers pick them up with no change
-# at any call site, including the `$MASTER:` scp destination.
+# Split every -i entry into (login, keyfile) pairs, kept in the order given.
+# The FIRST colon separates login from path; no colon means ssh's default
+# user with that key. Key paths are validated now: left to ssh, a typo
+# surfaces as an auth failure on every host at once, which reads like a
+# cluster problem instead of a typo. Everything becomes `-o` forms later
+# because that is the one spelling BOTH ssh and scp accept.
 #
 # Called from main in the run path only, after resolve_local_mode has decided
 # whether ssh is involved at all and before anything can touch a host.
-apply_ssh_auth_opts() {
+validate_credentials() {
+    local raw entry login key
     if [ "$LOCAL_MODE" -eq 1 ]; then
         # No ssh in local mode, so the flags are accepted and ignored rather
         # than treated as a usage error -- same shape as --ignore-capacity
         # outside auto mode.
-        [ -z "$SSH_LOGIN$SSH_IDENTITY" ] || debug "local mode: ignoring -l/-i (no ssh involved)"
+        [ ${#IDENT_RAW[@]} -eq 0 ] && [ "$PW_COUNT" -eq 0 ] \
+            || debug "local mode: ignoring -i/-p (no ssh involved)"
         return 0
     fi
-    # SSH_OPTS is expanded unquoted on purpose -- it is an option list, and the
-    # shell splitting it is what turns it into argv. A value with whitespace in
-    # it would therefore arrive as several options instead of one, so refuse it
-    # here rather than hand ssh a command line nobody wrote.
-    case "$SSH_LOGIN" in
-        *[[:space:]]*) die "login must not contain whitespace (SSH_OPTS is whitespace-split)" ;;
-    esac
-    case "$SSH_IDENTITY" in
-        *[[:space:]]*) die "identity file must not contain whitespace (SSH_OPTS is whitespace-split)" ;;
-    esac
-    [ -z "$SSH_LOGIN" ] || SSH_OPTS="$SSH_OPTS -o User=$SSH_LOGIN"
-    if [ -n "$SSH_IDENTITY" ]; then
-        # Name a bad key path now. Left to ssh it surfaces as a BatchMode
-        # authentication failure on every host at once, which reads like a
-        # cluster problem instead of a typo. -f as well as -r: a directory is
-        # readable, and `-i ~/.ssh` is the likeliest way to mistype a key path.
-        { [ -f "$SSH_IDENTITY" ] && [ -r "$SSH_IDENTITY" ]; } || \
-            die "identity file not readable: $SSH_IDENTITY"
-        # IdentitiesOnly is deliberate: with an explicit key, do not also let a
-        # running agent offer its whole keyring. Those attempts are counted by
-        # sshd's MaxAuthTries and can lock the run out before the right key is
-        # ever tried. It bounds the agent, not ssh_config -- IdentityFile
-        # entries from the config are still eligible.
-        SSH_OPTS="$SSH_OPTS -o IdentityFile=$SSH_IDENTITY -o IdentitiesOnly=yes"
-    fi
+    for raw in ${IDENT_RAW[@]+"${IDENT_RAW[@]}"}; do
+        # ssh option lists are whitespace-split into argv; a login or path
+        # with whitespace would arrive as several options nobody wrote.
+        case "$raw" in
+            *[[:space:]]*) die "-i entries must not contain whitespace: '$raw'" ;;
+        esac
+        for entry in $(printf '%s' "$raw" | tr ',' ' '); do
+            case "$entry" in
+                *:*) login=${entry%%:*}; key=${entry#*:} ;;
+                *)   login=""; key=$entry ;;
+            esac
+            [ -n "$key" ] || die "empty key path in -i entry: '$entry'"
+            { [ -f "$key" ] && [ -r "$key" ]; } || \
+                die "identity file not readable: $key"
+            IDENT_LOGINS+=("$login")
+            IDENT_KEYS+=("$key")
+        done
+    done
 }
 
 # --- interactive prompting (-C) --------------------------------------------------
@@ -333,7 +353,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max]] [--ignore-capacity]
-                  [-l login] [-i keyfile] [-p] [-C[set]]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-C[set]]
                   [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
@@ -355,11 +375,15 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
   --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
-  -l, --login user        ssh login user for the workers (remote runs only)
-  -i, --identity keyfile  ssh private key for the workers (remote runs only);
-                          keeps the agent's other keys from being offered
-  -p, --password          prompt once for an ssh login (unless -l gave one) and
-                          password, used for every worker; no sshpass involved
+  -i, --identity [login:]keyfile[,...]
+                          ssh key(s) to try, each optionally bound to a login;
+                          repeatable, tried in the order given
+  -p, --password [n]      prompt for n (default 1) login/password pairs, tried
+                          after the keys; no sshpass involved
+                          Every credential is tried against every worker --
+                          existing ssh sessions and plain defaults first, then
+                          keys, then passwords -- and per worker the first
+                          success wins
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -473,7 +497,34 @@ parse_args() {
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
                            shift ;;
             -e?*) opt_val "$opt" -e; ENGINE=$OPT_VAL; shift ;;
-            -p|--password) PASSWORD_AUTH=1; shift ;;
+            # -p's count is optional like -a's level: consumed only when the
+            # next token is a plain positive integer, else it is a server name.
+            # A leading zero is rejected too, not normalized: "00" is all
+            # digits yet [ "00" -eq 0 ] is true, so it would silently skip
+            # the prompts while the key rounds still ran.
+            -p|--password)
+                PW_COUNT=1
+                case "${2:-}" in
+                    ("" | *[!0-9]*) ;;
+                    (0*) usage >&2; die "-p needs a positive count of login/password pairs, got '$2'" ;;
+                    (*) PW_COUNT=$2; shift ;;
+                esac
+                shift ;;
+            --password=*)
+                PW_COUNT=${opt#--password=}
+                case "$PW_COUNT" in
+                    ("" | *[!0-9]* | 0*) usage >&2
+                        die "option --password takes a positive count of login/password pairs" ;;
+                esac
+                shift ;;
+            -p?*)
+                opt_val "$opt" -p
+                PW_COUNT=$OPT_VAL
+                case "$PW_COUNT" in
+                    (*[!0-9]* | 0*) usage >&2
+                        die "option -p takes a positive count of login/password pairs, got '$OPT_VAL'" ;;
+                esac
+                shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -500,19 +551,17 @@ parse_args() {
                 esac
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
-            -l|--login)    need_arg "$1" $# "${2:-}"; SSH_LOGIN=$2; shift 2 ;;
-            # An =-form carries an argument that is merely empty, so need_arg
-            # cannot catch it. Reject it here: silently ignoring --login= would
-            # make the one spelling that looks most deliberate do nothing.
-            --login=*)     SSH_LOGIN=${opt#--login=}
-                           [ -n "$SSH_LOGIN" ] || { usage >&2; die "option --login requires a value"; }
-                           shift ;;
-            -l?*)          opt_val "$opt" -l; SSH_LOGIN=$OPT_VAL; shift ;;
-            -i|--identity) need_arg "$1" $# "${2:-}"; SSH_IDENTITY=$2; shift 2 ;;
-            --identity=*)  SSH_IDENTITY=${opt#--identity=}
-                           [ -n "$SSH_IDENTITY" ] || { usage >&2; die "option --identity requires a value"; }
-                           shift ;;
-            -i?*)          opt_val "$opt" -i; SSH_IDENTITY=$OPT_VAL; shift ;;
+            # -i is repeatable and each value may be a comma list of
+            # [login:]keyfile combos; entries accumulate in the order given.
+            # Validation waits for validate_credentials, once local mode is
+            # known. An empty =-form is rejected here: need_arg cannot see it,
+            # and silently ignoring --identity= would make the one spelling
+            # that looks most deliberate do nothing.
+            -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
+            --identity=*)  arg=${opt#--identity=}
+                           [ -n "$arg" ] || { usage >&2; die "option --identity requires a value"; }
+                           IDENT_RAW+=("$arg"); shift ;;
+            -i?*)          opt_val "$opt" -i; IDENT_RAW+=("$OPT_VAL"); shift ;;
             # -C with an attached value names the set outright. Bare -C arms
             # the candidate rule handled by the bare-token arm below.
             -c|--customize)  CUSTOMIZE=1; c_pending=1; shift ;;
@@ -787,59 +836,136 @@ cleanup() {
     fi
 }
 
-# --- password logins (-p) -------------------------------------------------------
-# One interactive prompt; each host's ControlMaster is fed the password by an
-# SSH_ASKPASS helper reading a fifo in the /dev/shm work dir -- no sshpass,
-# and the password never appears on a command line, on disk, or in any
-# environment beyond this shell. Deadlock-proofing over the classic recipe:
-# the shell holds the fifo open read-write (fd 4) so the password write can
-# never block when ssh dies before asking, and the helper reads exactly ONE
-# LINE so it never waits for an EOF that the held fd would forever withhold.
-# A stale unread line just feeds the next host the same password.
-# NumberOfPasswordPrompts=1 turns a wrong password into a clean per-host
-# failure instead of a second, hanging prompt. The auth overrides go BEFORE
-# $SSH_OPTS: for repeated ssh -o options the FIRST value wins, and SSH_OPTS
-# carries BatchMode=yes, which would silently disable askpass.
-establish_password_masters() {
-    local pw fifo askpass host setsid_bin pid login
+# --- connection establishment ----------------------------------------------------
+# Try every credential against every client, keeping the first success per
+# client. Rounds, in order: pre-existing user-owned masters, plain defaults
+# (agent and ssh_config), each -i key, each -p password -- keys before
+# passwords because a wrong password costs lockout counters, and each group
+# in the order given. Every round attempts ONLY the clients still
+# unconnected, all in parallel. Nothing here dies on a failed host: a client
+# no credential reaches simply fails preflight -- which is also what lets a
+# bare -C candidate resolve into a set name.
+#
+# Passwords ride the SSH_ASKPASS-over-fifo trick (no sshpass): one fifo PER
+# ATTEMPT so parallel readers never race, written from a subshell that holds
+# its own read-write fd -- the write cannot block if ssh dies before asking
+# -- and the helper reads exactly ONE LINE so it never waits on an EOF.
+# NumberOfPasswordPrompts=1 turns a wrong password into a clean failure.
+# The auth overrides go BEFORE $SSH_OPTS: ssh keeps the FIRST value of a
+# repeated option, and SSH_OPTS carries BatchMode=yes, which would silently
+# disable askpass.
+prompt_password_creds() {
+    local j login pw
     require_interactive "-p" "use key-based auth (-i) for unattended runs"
-    # A password is only half a credential: ask for the login too, unless -l
-    # already named it. Empty keeps ssh's default (the local user).
-    if [ -z "$SSH_LOGIN" ]; then
-        printf 'ssh login for the workers (empty for %s): ' "$(id -un)" >&"$PROMPT_OUT_FD"
+    for ((j = 1; j <= PW_COUNT; j++)); do
+        printf 'ssh login %d of %d (empty for %s): ' "$j" "$PW_COUNT" "$(id -un)" >&"$PROMPT_OUT_FD"
         IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"
-        if [ -n "$login" ]; then
-            SSH_LOGIN=$login
-            SSH_OPTS="$SSH_OPTS -o User=$SSH_LOGIN"
-        fi
-    fi
-    printf 'ssh password for %s host(s): ' "${#HOSTS[@]}" >&"$PROMPT_OUT_FD"
-    IFS= read -r -s pw <&"$PROMPT_IN_FD" || die "no password read"
-    printf '\n' >&"$PROMPT_OUT_FD"
-    [ -n "$pw" ] || die "empty password"
-    fifo="$WORK_DIR/pw.fifo"
-    askpass="$WORK_DIR/askpass.sh"
-    mkfifo -m 600 "$fifo" || die "cannot create the password fifo"
-    printf '#!/bin/sh\nIFS= read -r pw < "%s"\nprintf "%%s\\n" "$pw"\n' "$fifo" > "$askpass"
-    chmod 700 "$askpass" || die "cannot mark the askpass helper executable"
-    exec 4<>"$fifo"
-    # setsid detaches the tty for OpenSSH older than 8.4, which lacks
-    # SSH_ASKPASS_REQUIRE; macOS has no setsid and does not need it (its ssh
-    # honors the force flag). DISPLAY only has to be non-empty for old ssh.
-    setsid_bin=$(command -v setsid || true)
-    log "opening password-authenticated connections to ${#HOSTS[@]} host(s)..."
-    for host in "${HOSTS[@]}"; do
-        SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-wekatester}" \
-            $setsid_bin ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 \
-            $SSH_OPTS "$host" true </dev/null &
-        pid=$!
-        printf '%s\n' "$pw" >&4
-        wait "$pid" || die "password login failed for $host"
+        case "$login" in
+            *[[:space:]]*) die "logins must not contain whitespace" ;;
+        esac
+        printf 'password for %s: ' "${login:-the default user}" >&"$PROMPT_OUT_FD"
+        IFS= read -r -s pw <&"$PROMPT_IN_FD" || die "no password read"
+        printf '\n' >&"$PROMPT_OUT_FD"
+        [ -n "$pw" ] || die "empty password (pair $j of $PW_COUNT)"
+        PW_LOGINS+=("$login")
+        PW_SECRETS+=("$pw")
     done
-    pw=""
-    exec 4>&-
-    rm -f "$fifo" "$askpass"
-    debug "password-backed control masters established"
+}
+
+# One connection attempt. Modes: external = is a user-owned master already
+# alive for this host (ssh -O check via the user's own config -- OUR
+# ControlPath deliberately absent)? default/key = establish a master in our
+# socket dir with BatchMode. pw = same, fed through askpass.
+SETSID_BIN=""
+attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
+    local u=() fifo rc
+    [ -z "$3" ] || u=(-o "User=$3")
+    case "$1" in
+        external)
+            ssh -O check $SSH_OPTS "$2" > "$AUTH_DIR/$2.extcheck" 2>&1 ;;
+        default)
+            ssh -n "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+        key)
+            ssh -n "${u[@]}" -o "IdentityFile=$4" -o IdentitiesOnly=yes \
+                $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+        pw)
+            fifo="$AUTH_DIR/$2.fifo"
+            mkfifo -m 600 "$fifo" || return 1
+            # Hold the fifo open read-write for the whole attempt (auth_round
+            # backgrounds attempt_host, so fd 4 is private to this attempt):
+            # a fifo discards its contents when its last fd closes, and the
+            # helper's read-open blocks until SOME writer exists -- both
+            # problems end as long as this fd outlives the ssh below. The
+            # write itself can never block (we are our own reader), and the
+            # helper reads exactly ONE LINE so it never waits for an EOF
+            # this held fd would withhold.
+            exec 4<>"$fifo"
+            printf '%s\n' "${PW_SECRETS[$4]}" >&4
+            WEKATESTER_PW_FIFO="$fifo" SSH_ASKPASS="$AUTH_DIR/askpass.sh" \
+                SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-wekatester}" \
+                $SETSID_BIN ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 \
+                "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true </dev/null
+            rc=$?
+            exec 4>&-
+            rm -f "$fifo"
+            return "$rc" ;;
+    esac
+}
+
+# One round: this credential against every still-unconnected client, in
+# parallel. Winners record their per-host transport delta and leave the pool.
+REMAINING=()
+auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
+    [ ${#REMAINING[@]} -gt 0 ] || return 0
+    local host pids=() left=() i n=0
+    for host in "${REMAINING[@]}"; do
+        attempt_host "$2" "$host" "$3" "$4" &
+        pids+=($!)
+    done
+    for i in "${!REMAINING[@]}"; do
+        host=${REMAINING[$i]}
+        if wait "${pids[$i]}"; then
+            n=$((n + 1))
+            [ "$2" != external ] || : > "$AUTH_DIR/$host.external"
+            [ -z "$3" ] || printf '%s\n' "$3" > "$AUTH_DIR/$host.user"
+            debug "$host: connected via $1"
+        else
+            left+=("$host")
+        fi
+    done
+    REMAINING=()
+    [ ${#left[@]} -eq 0 ] || REMAINING=("${left[@]}")
+    [ "$n" -eq 0 ] || log "auth: $n host(s) connected via $1"
+}
+
+establish_connections() {
+    AUTH_DIR="$WORK_DIR/auth"
+    mkdir -p "$AUTH_DIR" || die "cannot create $AUTH_DIR"
+    [ "$PW_COUNT" -eq 0 ] || prompt_password_creds
+    # The helper resolves its fifo at run time from the attempt's environment
+    # (single-quoted heredoc-style: no expansion here).
+    printf '#!/bin/sh\nIFS= read -r pw < "$WEKATESTER_PW_FIFO"\nprintf "%%s\\n" "$pw"\n' \
+        > "$AUTH_DIR/askpass.sh"
+    chmod 700 "$AUTH_DIR/askpass.sh" || die "cannot mark the askpass helper executable"
+    # setsid detaches the tty for OpenSSH older than 8.4, which lacks
+    # SSH_ASKPASS_REQUIRE; macOS has no setsid and does not need it.
+    SETSID_BIN=$(command -v setsid || true)
+    log "connecting to ${#HOSTS[@]} host(s)..."
+    REMAINING=("${HOSTS[@]}")
+    auth_round "an existing ssh session" external "" ""
+    auth_round "default ssh auth" default "" ""
+    local i
+    for i in "${!IDENT_KEYS[@]}"; do
+        auth_round "key ${IDENT_LOGINS[$i]:+${IDENT_LOGINS[$i]}:}${IDENT_KEYS[$i]}" \
+            key "${IDENT_LOGINS[$i]}" "${IDENT_KEYS[$i]}"
+    done
+    for i in "${!PW_SECRETS[@]}"; do
+        auth_round "password $((i + 1)) (${PW_LOGINS[$i]:-default user})" \
+            pw "${PW_LOGINS[$i]}" "$i"
+    done
+    PW_SECRETS=()
+    [ ${#REMAINING[@]} -eq 0 ] \
+        || log "WARNING: no working ssh credentials for: ${REMAINING[*]}" >&2
 }
 
 # --- phase 2b: probe workers for auto-mode system info -----------------------
@@ -2322,12 +2448,10 @@ main() {
     fi
 
     resolve_local_mode
-    [ "$PASSWORD_AUTH" -eq 0 ] || [ "$LOCAL_MODE" -eq 0 ] \
-        || die "-p needs remote workers; local mode never runs ssh"
-    # -l/-i land in SSH_OPTS here, before the staging dir exists and long before
-    # preflight opens the first connection: a bad key path costs nothing to
-    # report and leaves nothing behind. ControlMaster opts are appended below.
-    apply_ssh_auth_opts
+    # -i entries are split and their key paths checked here, before the
+    # staging dir exists and long before the first connection: a bad key path
+    # costs nothing to report and leaves nothing behind.
+    validate_credentials
     command -v python3 >/dev/null || die "python3 is required for result parsing"
     # -C's editors and prompts need a terminal; a missing one (or a bogus
     # $EDITOR) costs nothing to report now and everything to discover after
@@ -2349,9 +2473,11 @@ main() {
     # already no-ops on the empty socket dir. The masters persist for the
     # WHOLE run (cleanup's explicit -O exit loop is their teardown): a worker
     # idle past a short persist window would reconnect mid-run -- slow with
-    # keys, impossible with -p once the prompt machinery is gone.
+    # keys, impossible with -p once the prompt machinery is gone. Kept apart
+    # from SSH_OPTS because hosts riding a pre-existing user-owned master get
+    # SSH_OPTS but NOT these (host_ssh_opts decides per host).
     [ "$LOCAL_MODE" -eq 1 ] || \
-        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=yes"
+        CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=yes"
 
     # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
     # statement, so a Ctrl-C would tear the run down and keep going. Signals
@@ -2363,10 +2489,11 @@ main() {
     trap 'rc=$?; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    # After the traps: a half-established set of password masters must still
-    # get cleanup's -O exit teardown. Before preflight: every later ssh in
-    # the run rides these sockets and never sees an auth prompt.
-    [ "$PASSWORD_AUTH" -eq 0 ] || establish_password_masters
+    # After the traps: half-established masters must still get cleanup's
+    # -O exit teardown (which only ever touches OUR socket dir -- masters it
+    # did not create are left in place). Before preflight: every later ssh
+    # rides the winning credential's session and never sees an auth prompt.
+    [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight
     verify_mount_mode
     # The customize flow sits after host validation (no editing time invested

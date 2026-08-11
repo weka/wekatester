@@ -22,29 +22,18 @@ hand-tuning jobfiles per site.
   (so `-a host1 host2` works). Unknown level → usage error.
 - New: `--ignore-capacity` (long only, no argument, default off) — overrides
   the auto-mode capacity abort; see Capacity check.
-- New: `-l login` / `--login[=]login` and `-i keyfile` / `--identity[=]keyfile`,
-  for workers that want a login or a key that `~/.ssh/config` cannot supply
-  (root on the coordinator driving `ubuntu@` clients). They are translated,
-  not passed through: `-l` becomes `-o User=<login>` and `-i` becomes
-  `-o IdentityFile=<path> -o IdentitiesOnly=yes`. The `-o` spelling is the
-  point — it is accepted by **both** ssh and scp (scp's own `-l` is a bandwidth
-  limit), so appending to `SSH_OPTS` reaches both transport wrappers with no
-  call-site change. `IdentitiesOnly=yes` is deliberate: once a key is named
-  explicitly, a running agent must not also offer its whole keyring, because
-  those attempts count against sshd's `MaxAuthTries` and can exhaust it before
-  the right key is tried. It bounds the agent only — `IdentityFile` entries
-  from `ssh_config` remain eligible.
-- `parse_args` only records the two values (`SSH_LOGIN`, `SSH_IDENTITY`);
-  `apply_ssh_auth_opts`, called from `main` after `resolve_local_mode` and
-  before any host contact, validates them and appends to `SSH_OPTS`. Guards
-  there: a `-i` path that is not a readable regular file dies naming the path
-  (left to ssh it looks like a cluster-wide auth failure rather than a typo,
-  and `-f` as well as `-r` because a directory passes `-r` and `-i ~/.ssh` is
-  the likeliest mistype), and neither value may contain whitespace, since
-  `SSH_OPTS` is expanded unquoted by design. In local mode both are accepted
-  no-ops — there is no ssh to configure. Empty `=`-forms (`--login=`) are a
-  usage error: `need_arg` cannot see them, and ignoring them silently would
-  make the most deliberate-looking spelling do nothing.
+- SUPERSEDED (2026-08-10): `-l/--login` is REMOVED — the login now travels
+  with its credential. `-i [login:]keyfile[,...]` (repeatable; entries
+  accumulate in order; first colon splits login from path; no colon = ssh's
+  default user) and `-p [n]` (optional count, default 1, of login/password
+  pairs to prompt for) form a credential POOL; see Connection establishment
+  below. Everything still becomes `-o` forms (User=/IdentityFile=/
+  IdentitiesOnly=yes) because that is the one spelling both ssh and scp
+  accept, key paths are still validated up front (readable regular file;
+  whitespace refused since option lists are whitespace-split), and local
+  mode still accepts and ignores both. `parse_args` records raw entries
+  (`IDENT_RAW`, `PW_COUNT`); `validate_credentials` (replacing
+  apply_ssh_auth_opts) splits and checks them after resolve_local_mode.
 - The `server ...` positional is now optional (`[server ...]` in the synopsis):
   with none given the run happens on the local host — see Local mode.
 - All existing options and behavior without `-a` are unchanged, except that
@@ -405,7 +394,8 @@ is accepted and inert there).
   failure leaves the directory uncompressed and says so.
 - **Attached and detached values (all value-taking options).** `-w smoke`,
   `-wsmoke` and `-w=smoke` are equivalent (one leading `=` is stripped from
-  an attached value); same for -d/-f/-s/-o/-l/-i/-c and `-asafe`/`-amax`.
+  an attached value); same for -d/-f/-s/-o/-e/-i/-c, `-asafe`/`-amax` and
+  `-p3`.
   Detached values that look like options are refused (`-f -g` was quietly
   making `-g` the fio binary); the attached form is the escape hatch for a
   value that genuinely starts with a dash. An attached value that is empty
@@ -419,31 +409,40 @@ is accepted and inert there).
   `fio --enghelp` line and dies early naming the hosts that lack it; without
   `-a`, a bad engine fails at the first job via check_fio_errors. The value
   is never case-folded.
-- **`-p`/`--password`** — password ssh without sshpass. Prompts for the
-  login name first unless `-l` named one (a password is only half a
-  credential; empty keeps ssh's default user, a given name lands in
-  SSH_OPTS as `-o User=`), then one hidden password prompt on the tty
-  (require_interactive; unattended advice points at `-i`), then
-  before preflight — after the traps, so half-established masters still get
-  cleanup's `-O exit` — each host's ControlMaster is established with an
-  `SSH_ASKPASS` helper fed through a fifo in the /dev/shm WORK_DIR.
-  Hardening over the classic recipe: the shell holds the fifo open
-  read-write (fd 4) so the password write never blocks if ssh dies before
-  asking; the helper reads exactly ONE LINE so it never waits for an EOF the
-  held fd would withhold (a stale unread line feeds the next host the same
-  password); `NumberOfPasswordPrompts=1` makes a wrong password a clean
-  per-host failure. The auth overrides (`BatchMode=no`) go BEFORE
-  `$SSH_OPTS`: ssh takes the FIRST value of a repeated option, and SSH_OPTS
-  carries `BatchMode=yes`. `setsid` is used when present (pre-8.4 OpenSSH
-  needs the tty detached; macOS lacks setsid and honors
-  `SSH_ASKPASS_REQUIRE=force` instead). ControlPersist is `yes` for EVERY
-  remote run (not only `-p`): a worker idle past a short persist window
-  would reconnect mid-run — slow with keys, impossible with a password once
-  the prompt machinery is gone; cleanup's `-O exit` loop is the teardown
-  (a kill -9 can orphan masters — acceptable, they idle on sockets in a
-  removed WORK_DIR). The password lives only in a shell variable and the
-  fifo; never argv, disk, or a child's environment. Local mode refuses
-  `-p`.
+- **Connection establishment (`establish_connections`, every remote run).**
+  Runs after the traps (half-established masters still get cleanup's
+  `-O exit`) and before preflight. `-p` pairs are prompted up front
+  (require_interactive; hidden passwords; empty login = ssh default;
+  whitespace refused). Then ROUNDS, each trying one credential against all
+  still-unconnected clients IN PARALLEL, first success per client wins:
+  (1) pre-existing user-owned masters — `ssh -O check` through the user's
+  own config, our ControlPath deliberately absent; a hit writes
+  `$AUTH_DIR/<host>.external` and that host gets NO control opts from then
+  on (ssh_config routes it through the user's master), which also
+  guarantees wekatester never closes a master it did not create, since
+  cleanup only `-O exit`s its own socket dir; (2) plain defaults
+  (agent/ssh_config) establishing a master in our socket dir; (3) each `-i`
+  key in order (`-o User=` when the entry bound one, `IdentityFile=` +
+  `IdentitiesOnly=yes`); (4) each `-p` pair in order — keys before
+  passwords because failed password attempts burn MaxAuthTries. Winning
+  logins persist in `$AUTH_DIR/<host>.user`; `host_ssh_opts` folds the
+  per-host delta (control opts + `User=`) into every later ssh/scp, keeping
+  the ControlPath `%C` hash consistent with establishment. Passwords ride
+  SSH_ASKPASS over a fifo PER ATTEMPT (parallel readers never share one):
+  written from a subshell holding its own read-write fd (the write cannot
+  block if ssh dies before asking), the helper reads exactly ONE LINE
+  (fifo path via env `WEKATESTER_PW_FIFO`), `NumberOfPasswordPrompts=1`,
+  auth overrides BEFORE `$SSH_OPTS` (ssh keeps the FIRST value of a
+  repeated option; SSH_OPTS carries `BatchMode=yes`), `setsid` when present
+  (pre-8.4 OpenSSH; macOS lacks it and honors `SSH_ASKPASS_REQUIRE=force`).
+  ControlPersist is `yes` for every remote run: an idle worker reconnecting
+  mid-run is slow with keys and impossible with a password once the prompt
+  machinery is gone; a kill -9 can orphan masters — acceptable. Passwords
+  live only in `PW_SECRETS` (cleared after the rounds) and the fifos; never
+  argv, disk, or a child's environment. NOTHING here dies on an unreachable
+  host: clients no credential reaches are warned about and left for
+  preflight, which is also what lets a bare `-C` candidate resolve into a
+  set name.
 - **`-u`/`--unlink`** — remove the workload's data files after the last job
   that uses them. Implemented as one generated `999-wekatester-unlink.job`
   appended to JOBFILES at staging (never marker-tagged, so the layout-first

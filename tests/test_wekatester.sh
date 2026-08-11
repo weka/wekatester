@@ -36,7 +36,7 @@ t_assert "case-insensitive short option"   test "$(p -D /x h1)" = "|/x|h1"
 t_assert "case-insensitive long option"    test "$(p --AUTO=MAX h1)" = "max|/mnt/weka|h1"
 t_assert "case-insensitive auto level arg" test "$(p -A SAFE h1)" = "safe|/mnt/weka|h1"
 t_assert "case-insensitive long name, value untouched" bash -c '
-    source ./wekatester; parse_args --LOGIN=Ubuntu h1; [ "$SSH_LOGIN" = Ubuntu ]'
+    source ./wekatester; parse_args --ENGINE=Uring h1; [ "$ENGINE" = Uring ]'
 # -V used to print the version. It is verbosity now; version is long-only.
 # Asserted on the printed line, not just the exit status: the old -V exited 0
 # after printing the version, which a bare status check would have called a pass.
@@ -650,135 +650,87 @@ t_assert "a bare TARGET_DIR in the environment is ignored" bash -c '
     out=$(TARGET_DIR=/tmp/hijacked bash -c "source ./wekatester; echo \$TARGET_DIR")
     [ "$out" = "/dev/shm/fio-jobfiles" ] || { echo "$out" >&2; false; }'
 
-# --- ssh login and identity (-l / -i) ---
-# The letters mirror ssh's own. parse_args only records them; apply_ssh_auth_opts
-# validates and folds them into SSH_OPTS, so the parse stays pure.
-a() { (source ./wekatester; parse_args "$@"; echo "$SSH_LOGIN|$SSH_IDENTITY"); }
-t_assert "login and identity default to empty" test "$(a h1)" = "|"
-t_assert "-l sets the login"           test "$(a -l ubuntu h1)" = "ubuntu|"
-t_assert "--login value sets the login" test "$(a --login ubuntu h1)" = "ubuntu|"
-t_assert "--login=value sets the login" test "$(a --login=ubuntu h1)" = "ubuntu|"
-t_assert "-i sets the identity"        test "$(a -i /tmp/k h1)" = "|/tmp/k"
-t_assert "--identity value sets the identity" test "$(a --identity /tmp/k h1)" = "|/tmp/k"
-t_assert "--identity=value sets the identity" test "$(a --identity=/tmp/k h1)" = "|/tmp/k"
-t_assert "-l/-i do not swallow the host list" bash -c '
-    source ./wekatester; parse_args -l ubuntu -i /tmp/k h1 h2
-    [ "${HOSTS[*]}" = "h1 h2" ]'
-t_assert "-l with no value errors" bash -c '! (source ./wekatester; parse_args -l)'
-t_assert "-i with no value errors" bash -c '! (source ./wekatester; parse_args -i)'
-# The =-forms carry an argument that happens to be empty, so need_arg cannot see
-# them. Left alone they were silent no-ops -- the one spelling of "I gave you a
-# login" that quietly did nothing.
-t_assert "--login= with an empty value errors" bash -c '
-    ! (source ./wekatester; parse_args --login= h1)'
-t_assert "--identity= with an empty value errors" bash -c '
+# --- ssh credential pool (-i / -p) ---
+# parse_args only accumulates raw entries; validate_credentials splits and
+# checks them once local mode is known, so the parse stays pure.
+t_assert "-i accumulates repeatable and comma-separated entries in order" bash -c '
+    source ./wekatester; parse_args -i a:k1 -i b:k2,k3 --identity=k4 h1 h2
+    [ "${IDENT_RAW[*]}" = "a:k1 b:k2,k3 k4" ] && [ "${HOSTS[*]}" = "h1 h2" ]'
+t_assert "-i with no value errors; --identity= empty errors" bash -c '
+    ! (source ./wekatester; parse_args -i) &&
     ! (source ./wekatester; parse_args --identity= h1)'
-# parse_args stays pure: SSH_OPTS is only touched by the apply step.
-t_assert "parse_args leaves SSH_OPTS alone" bash -c '
-    out=$(source ./wekatester; parse_args -l ubuntu -i /tmp/k h1; echo "$SSH_OPTS")
-    case "$out" in *User=*|*IdentityFile=*) echo "$out" >&2; false;; *) true;; esac'
-
-# Both are translated to `-o` forms because those are valid for ssh AND scp
-# (scp has no -l, and -i differs in nothing but luck), so both transport
-# wrappers inherit them with no change at the call sites. The bracketing stub
-# proves each lands as its own argv entry rather than one glued string.
-t_assert "-l/-i reach the ssh command line as separate -o options" bash -c '
-    source ./tests/helpers.sh; echo_transport_fixture
-    k=$(mktemp)
-    out=$(source ./wekatester
-          LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"
-          SSH_LOGIN=ubuntu; SSH_IDENTITY="$k"
-          apply_ssh_auth_opts
-          run_host vega-1 "df -kP /mnt/weka")
-    [ "$out" = "SSH[-n][-o][BatchMode=yes][-o][User=ubuntu][-o][IdentityFile=$k][-o][IdentitiesOnly=yes][vega-1][df -kP /mnt/weka]" ] ||
-        { echo "$out" >&2; false; }'
-t_assert "-l/-i reach the scp command line too" bash -c '
-    source ./tests/helpers.sh; echo_transport_fixture
-    k=$(mktemp)
-    out=$(source ./wekatester
-          LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
-          SSH_LOGIN=ubuntu; SSH_IDENTITY="$k"
-          apply_ssh_auth_opts
-          copy_to_master /w/jobs/h1 /dev/shm/fio-jobfiles/)
-    [ "$out" = "SCP[-o][BatchMode=yes][-o][User=ubuntu][-o][IdentityFile=$k][-o][IdentitiesOnly=yes][-q][-r][/w/jobs/h1][vega-1:/dev/shm/fio-jobfiles/]" ] ||
-        { echo "$out" >&2; false; }'
-t_assert "-l alone adds only User" bash -c '
-    out=$(source ./wekatester
-          LOCAL_MODE=0; SSH_OPTS="-o BatchMode=yes"; SSH_LOGIN=ubuntu
-          apply_ssh_auth_opts; echo "$SSH_OPTS")
-    [ "$out" = "-o BatchMode=yes -o User=ubuntu" ] || { echo "$out" >&2; false; }'
-
+t_assert "validate_credentials splits login:key pairs; bare paths get the default user" bash -c '
+    d=$(mktemp -d); : > "$d/k1"; : > "$d/k2"; : > "$d/k3"
+    (source ./wekatester
+     LOCAL_MODE=0; IDENT_RAW=("ubuntu:$d/k1,$d/k2" "root:$d/k3")
+     validate_credentials
+     [ "${IDENT_LOGINS[*]}" = "ubuntu  root" ] || { echo "logins: ${IDENT_LOGINS[*]}" >&2; exit 1; }
+     [ "${IDENT_KEYS[*]}" = "$d/k1 $d/k2 $d/k3" ])'
 # A bad key path must be named before the first ssh, not after ssh has already
 # failed for a reason the operator has to reverse-engineer from BatchMode noise.
-t_assert "an unreadable identity file dies, naming the path" bash -c '
-    err=$( (source ./wekatester
-            LOCAL_MODE=0; SSH_IDENTITY=/no/such/key
-            apply_ssh_auth_opts) 2>&1 >/dev/null )
-    case "$err" in
-        *"identity file not readable: /no/such/key"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-# `-i ~/.ssh` is the likeliest typo of `-i ~/.ssh/id_ed25519`, and a directory
-# passes a bare -r test, so the guard has to demand a regular file.
-t_assert "an identity path that is a directory is refused" bash -c '
-    d=$(mktemp -d)
-    err=$( (source ./wekatester
-            LOCAL_MODE=0; SSH_IDENTITY="$d"
-            apply_ssh_auth_opts) 2>&1 >/dev/null )
-    case "$err" in
-        *"identity file not readable: $d"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-# SSH_OPTS is expanded unquoted on purpose (it is an option list), so a value
-# with whitespace in it would split into extra ssh options rather than travel
-# as one. Refuse it instead of building a command line nobody asked for.
-t_assert "a login containing whitespace is refused" bash -c '
-    err=$( (source ./wekatester
-            LOCAL_MODE=0; SSH_LOGIN="ubuntu -o ProxyCommand=nc"
-            apply_ssh_auth_opts) 2>&1 >/dev/null )
-    case "$err" in
-        *"must not contain whitespace"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-# The file here exists and is readable: only the space in its name is wrong, so
-# this pins that the whitespace guard runs before (not instead of) the -r check.
-t_assert "an identity path containing whitespace is refused" bash -c '
+# A directory must be refused too: -i ~/.ssh is the likeliest typo and a
+# directory passes a bare -r test.
+t_assert "validate_credentials refuses missing keys, directories, and whitespace" bash -c '
     d=$(mktemp -d); k="$d/my key"; : > "$k"
-    err=$( (source ./wekatester
-            LOCAL_MODE=0; SSH_IDENTITY="$k"
-            apply_ssh_auth_opts) 2>&1 >/dev/null )
-    case "$err" in
-        *"must not contain whitespace"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-# Local mode never runs ssh, so the flags are accepted and ignored -- including
-# a key path that would be fatal on a remote run.
-t_assert "local mode accepts -l/-i as no-ops" bash -c '
-    out=$(source ./wekatester
-          LOCAL_MODE=1; SSH_LOGIN=ubuntu; SSH_IDENTITY=/no/such/key
-          apply_ssh_auth_opts && echo "OPTS:$SSH_OPTS")
-    case "$out" in OPTS:*) ;; *) echo "expected a clean return, got: $out" >&2; exit 1;; esac
-    case "$out" in *User=*|*IdentityFile=*) echo "$out" >&2; false;; *) true;; esac'
-# -s exits before the apply step, so an unusable key cannot break offline mode.
-t_assert "-s is unaffected by -l/-i" bash -c '
+    err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=(/no/such/key)
+            validate_credentials) 2>&1 >/dev/null )
+    case "$err" in *"identity file not readable: /no/such/key"*) true;; *) echo "$err" >&2; exit 1;; esac
+    err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("ubuntu:$d")
+            validate_credentials) 2>&1 >/dev/null )
+    case "$err" in *"identity file not readable: $d"*) true;; *) echo "$err" >&2; exit 1;; esac
+    err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("ubuntu:$k")
+            validate_credentials) 2>&1 >/dev/null )
+    case "$err" in *"must not contain whitespace"*) true;; *) echo "$err" >&2; exit 1;; esac'
+# Local mode never runs ssh, so the credential flags are accepted and ignored
+# -- including a key path that would be fatal on a remote run.
+t_assert "local mode accepts -i/-p as no-ops" bash -c '
+    (source ./wekatester
+     LOCAL_MODE=1; IDENT_RAW=(/no/such/key); PW_COUNT=2
+     validate_credentials
+     [ ${#IDENT_KEYS[@]} -eq 0 ])'
+t_assert "-s is unaffected by -i" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
-    out=$(./wekatester -s "$d/r.json" -l ubuntu -i /no/such/key 2>&1)
+    out=$(./wekatester -s "$d/r.json" -i /no/such/key 2>&1)
     case "$out" in
         *"total bandwidth: 7.00 GiB/s"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-# Every assertion above calls apply_ssh_auth_opts directly, so none of them
-# would notice the call going missing from main. This one drives the real
-# binary end to end -- parse_args, main, apply -- and a named host means it can
-# only be reporting the key before preflight, since nothing here can reach h1.
-t_assert "the real binary applies -l/-i before it contacts a host" bash -c '
+# None of the direct calls above would notice the validate step going missing
+# from main. This drives the real binary end to end; a named host means the
+# key was reported before preflight, since nothing here can reach h1.
+t_assert "the real binary validates -i before it contacts a host" bash -c '
     out=$(./wekatester -i /no/such/key h1 2>&1); rc=$?
     [ "$rc" -eq 1 ] || { echo "rc=$rc: $out" >&2; exit 1; }
     case "$out" in
         *"identity file not readable: /no/such/key"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+
+# Per-host transport delta: an external host gets no control opts at all (its
+# master belongs to the user); a host we connected gets control opts plus the
+# User= its winning credential used, keeping the %C socket hash consistent.
+t_assert "host_ssh_opts: external hosts bypass our control opts, ours carry User" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     AUTH_DIR=$d; CONTROL_OPTS="-o ControlPath=/x/%C"
+     : > "$d/h1.external"
+     printf "ubuntu\n" > "$d/h2.user"
+     [ -z "$(host_ssh_opts h1)" ] &&
+     [ "$(host_ssh_opts h2)" = "-o ControlPath=/x/%C -o User=ubuntu" ] &&
+     [ "$(host_ssh_opts h3)" = "-o ControlPath=/x/%C" ])'
+t_assert "the winning login reaches ssh and scp argv per host" bash -c '
+    source ./tests/helpers.sh; echo_transport_fixture
+    d=$(mktemp -d)
+    out=$(source ./wekatester
+          LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
+          AUTH_DIR=$d; CONTROL_OPTS="-o CtlDummy=1"
+          printf "ubuntu\n" > "$d/vega-1.user"
+          run_host vega-1 "df -kP /mnt/weka"
+          copy_to_master /w/jobs/h1 /dev/shm/fio-jobfiles/)
+    [ "$out" = "SSH[-n][-o][BatchMode=yes][-o][CtlDummy=1][-o][User=ubuntu][vega-1][df -kP /mnt/weka]
+SCP[-o][BatchMode=yes][-o][CtlDummy=1][-o][User=ubuntu][-q][-r][/w/jobs/h1][vega-1:/dev/shm/fio-jobfiles/]" ] ||
+        { echo "$out" >&2; false; }'
 
 # --- interactive prompt primitive (fd seam; no pty anywhere) ---
 t_assert "prompt: timeout takes the default" bash -c '
@@ -1186,10 +1138,10 @@ t_assert "-s on a bundle with no results files errors" bash -c '
     esac'
 
 # --- every value-taking option works attached, detached, and =-attached ---
-t_assert "parse: attached values work for -d -w -f -s -l -i" bash -c '
-    (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -lubuntu -i/k h1
+t_assert "parse: attached values work for -d -w -f -s -i" bash -c '
+    (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -iubuntu:/k h1
      [ "$DIRECTORY" = /x ] && [ "$WORKLOAD" = smoke ] && [ "$WORKLOAD_EXPLICIT" = 1 ] &&
-     [ "$FIO_BIN" = /opt/fio ] && [ "$SSH_LOGIN" = ubuntu ] && [ "$SSH_IDENTITY" = /k ]) &&
+     [ "$FIO_BIN" = /opt/fio ] && [ "${IDENT_RAW[0]}" = ubuntu:/k ]) &&
     (source ./wekatester; parse_args -sfile.json; [ "$SUMMARIZE_FILE" = file.json ])'
 t_assert "parse: =-attached values strip exactly one leading =" bash -c '
     (source ./wekatester; parse_args -d=/x h1;  [ "$DIRECTORY" = /x ]) &&
@@ -1329,74 +1281,86 @@ t_assert "probe: -e engine missing from a worker refuses early, naming it" bash 
         *) echo "$err" >&2; false;;
     esac'
 
-# --- -p/--password: askpass over a fifo, no sshpass ---
-t_assert "parse: -p and --password arm password auth; default off" bash -c '
-    (source ./wekatester; parse_args h1;            [ "$PASSWORD_AUTH" = 0 ]) &&
-    (source ./wekatester; parse_args -p h1;         [ "$PASSWORD_AUTH" = 1 ]) &&
-    (source ./wekatester; parse_args --PASSWORD h1; [ "$PASSWORD_AUTH" = 1 ])'
-t_assert "-p: login and password flow prompt -> fifo -> askpass -> ssh, once per host" bash -c '
-    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
-    cat > "$stub/ssh" <<"EOF"
-#!/bin/bash
-case "$*" in *"User=ubuntu"*) ;; *) exit 6;; esac
-[ -n "$SSH_ASKPASS" ] || exit 9
-pw=$("$SSH_ASKPASS") || exit 8
-[ "$pw" = "sekrit" ] || exit 7
-EOF
-    chmod +x "$stub/ssh"
-    printf "ubuntu\nsekrit\n" | (source ./wekatester
-        PATH="$stub:$PATH"
-        WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS="-o BatchMode=yes"
-        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        establish_password_masters) >/dev/null'
-t_assert "-p: -l skips the login prompt; empty answer keeps ssh defaults" bash -c '
-    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
-    cat > "$stub/ssh" <<"EOF"
-#!/bin/bash
-case "$*" in *"User="*) exit 6;; esac
-pw=$("$SSH_ASKPASS") || exit 8
-[ "$pw" = "sekrit" ] || exit 7
-EOF
-    chmod +x "$stub/ssh"
-    # -l preset (SSH_LOGIN set): only the password is read from the prompt fd
-    printf "sekrit\n" | (source ./wekatester
-        PATH="$stub:$PATH"
-        WORK_DIR=$d; HOSTS=(h1); SSH_OPTS=""; SSH_LOGIN=ubuntu
-        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        establish_password_masters) >/dev/null &&
-    # no -l, empty login answer: ssh defaults, still no User=
-    printf "\nsekrit\n" | (source ./wekatester
-        PATH="$stub:$PATH"
-        WORK_DIR=$d/2; mkdir -p "$d/2"; HOSTS=(h1); SSH_OPTS=""
-        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        establish_password_masters) >/dev/null'
-t_assert "-p: a rejected password dies naming the host, without hanging" bash -c '
-    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
-    cat > "$stub/ssh" <<"EOF"
-#!/bin/bash
-pw=$("$SSH_ASKPASS") || exit 8
-[ "$pw" = "sekrit" ] || exit 7
-EOF
-    chmod +x "$stub/ssh"
-    err=$(printf "\nwrong\n" | (source ./wekatester
-        PATH="$stub:$PATH"
-        WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS=""
-        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        establish_password_masters) 2>&1 >/dev/null )
-    case "$err" in
-        *"password login failed for h1"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-t_assert "-p: an empty password dies before any connection" bash -c '
+# --- -p/--password: a count of prompted login/password pairs ---
+t_assert "parse: -p count is optional and never eats a hostname" bash -c '
+    (source ./wekatester; parse_args h1;      [ "$PW_COUNT" = 0 ]) &&
+    (source ./wekatester; parse_args -p h1;   [ "$PW_COUNT" = 1 ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args -p 3 h1; [ "$PW_COUNT" = 3 ]) &&
+    (source ./wekatester; parse_args -p2 h1;  [ "$PW_COUNT" = 2 ]) &&
+    (source ./wekatester; parse_args --password=2 h1; [ "$PW_COUNT" = 2 ]) &&
+    (source ./wekatester; parse_args --PASSWORD h1;   [ "$PW_COUNT" = 1 ])'
+t_assert "parse: a zero, zero-led, or non-numeric -p count dies" bash -c '
+    ! (source ./wekatester; parse_args -p 0 h1) &&
+    ! (source ./wekatester; parse_args -p0 h1) &&
+    ! (source ./wekatester; parse_args -p 00 h1) &&
+    ! (source ./wekatester; parse_args --password=007 h1) &&
+    ! (source ./wekatester; parse_args --password=zork h1)'
+t_assert "prompt_password_creds collects n pairs; empty password dies" bash -c '
     d=$(mktemp -d)
-    err=$(printf "\n\n" | (source ./wekatester
-        WORK_DIR=$d; HOSTS=(h1)
-        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        establish_password_masters) 2>&1 >/dev/null )
+    (printf "ubuntu\npw1\nroot\npw2\n" | (source ./wekatester
+        PW_COUNT=2; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        prompt_password_creds
+        [ "${PW_LOGINS[*]}" = "ubuntu root" ] && [ "${PW_SECRETS[*]}" = "pw1 pw2" ]) >/dev/null) &&
+    err=$(printf "ubuntu\n\n" | (source ./wekatester
+        PW_COUNT=1; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        prompt_password_creds) 2>&1 >/dev/null )
     case "$err" in
         *"empty password"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+
+# --- connection establishment: rounds, in order, only over unconnected hosts ---
+# Four hosts, four different winning credentials: h4 has a live user-owned
+# master (-O check), h3 works with plain defaults, h1 needs key ubuntu:k1,
+# h2 needs password root/pw1. h5 matches nothing. The stub ssh really runs
+# the askpass helper, so the fifo plumbing is exercised, and it logs every
+# invocation so round ordering and the shrinking host pool are provable.
+t_assert "auth rounds: first success per host wins; later rounds skip connected hosts" bash -c '
+    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"; k1=$d/k1; : > "$k1"
+    cat > "$stub/ssh" <<"EOF"
+#!/bin/bash
+# log the target host as its own leading token: hostnames can occur inside
+# key paths too (macOS mktemp lives under /var/folders/h3/...)
+host=${!#}; [ "$host" != true ] || host=${@:$#-1:1}
+echo "$host $*" >> "$WT_TEST_LOG"
+case "$*" in
+    *"-O check"*) case "$*" in (*h4*) exit 0;; (*) exit 1;; esac ;;
+esac
+if [ -n "$SSH_ASKPASS" ]; then
+    pw=$("$SSH_ASKPASS") || exit 8
+    [ "$pw" = "pw1" ] || exit 7
+    case "$*" in (*User=root*h2*) exit 0;; (*) exit 1;; esac
+fi
+case "$*" in
+    (*IdentityFile=*) case "$*" in (*User=ubuntu*h1*) exit 0;; (*) exit 1;; esac ;;
+    (*h3*) exit 0 ;;
+    (*) exit 1 ;;
+esac
+EOF
+    chmod +x "$stub/ssh"
+    err=$(printf "root\npw1\n" | (source ./wekatester
+        PATH="$stub:$PATH"; export WT_TEST_LOG=$d/log
+        WORK_DIR=$d; HOSTS=(h1 h2 h3 h4 h5); SSH_OPTS="-o BatchMode=yes"
+        IDENT_LOGINS=(ubuntu); IDENT_KEYS=("$k1"); PW_COUNT=1
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_connections
+        [ ${#REMAINING[@]} -eq 1 ] && [ "${REMAINING[0]}" = h5 ]) 2>&1 >/dev/null ) || \
+        { echo "engine failed: $err" >&2; exit 1; }
+    test -f "$d/auth/h4.external" &&
+    [ "$(cat "$d/auth/h1.user")" = ubuntu ] &&
+    [ "$(cat "$d/auth/h2.user")" = root ] &&
+    test ! -f "$d/auth/h3.user" && test ! -f "$d/auth/h3.external" &&
+    case "$err" in
+        *"no working ssh credentials for: h5"*) true;;
+        *) echo "$err" >&2; exit 1;;
+    esac &&
+    # the pool shrinks: h4 tried once (external), h3 twice, h1 three times,
+    # h2 four, h5 all four rounds
+    [ "$(grep -c "^h4 " "$d/log")" -eq 1 ] &&
+    [ "$(grep -c "^h3 " "$d/log")" -eq 2 ] &&
+    [ "$(grep -c "^h1 " "$d/log")" -eq 3 ] &&
+    [ "$(grep -c "^h2 " "$d/log")" -eq 4 ] &&
+    [ "$(grep -c "^h5 " "$d/log")" -eq 4 ]'
 
 # --- partial-layout healing: rebuild variant + completion markers ---
 # fio ftruncates a file to FULL SIZE before writing its layout, so an
