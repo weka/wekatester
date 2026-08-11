@@ -1799,7 +1799,7 @@ dry_run_report() {
     echo
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
-    log "would run, per job in the order above: fio --output-format=json --client=<host> $TARGET_DIR/<host>/<job>"
+    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
     log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
 }
 
@@ -2154,7 +2154,12 @@ run_jobs() {
     local job outfile report cmd host t0 t1 ghash marker jobref missing
     echo
     for job in "${JOBFILES[@]}"; do
-        cmd="'$FIO_BIN' --output-format=json"
+        # --eta=never: we never display ETA (output goes to a file), and the
+        # periodic SEND_ETA polls are how a saturated worker gets DROPPED --
+        # a full-rate multi-minute layout write starves the fio server's
+        # control thread past the poll timeout (seen live: "timeout on cmd
+        # SEND_ETA ... client timed out" 15 minutes into a 3.3TB relayout).
+        cmd="'$FIO_BIN' --output-format=json --eta=never"
         for host in "${HOSTS[@]}"; do
             cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
         done
@@ -2183,7 +2188,7 @@ run_jobs() {
             done
             if [ "$missing" -eq 1 ]; then
                 jobref=$REBUILD_JOB
-                cmd="'$FIO_BIN' --output-format=json"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
                 for host in "${HOSTS[@]}"; do
                     cmd="$cmd --client=$host '$TARGET_DIR/$host/$REBUILD_JOB'"
                 done
