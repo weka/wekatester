@@ -46,8 +46,8 @@ attaching is the way to pass a value that starts with a dash.
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
-  -p, --password          prompt once for an ssh password and use it for every
-                          worker (no sshpass involved; needs a terminal)
+  -p, --password          prompt once for an ssh login (unless -l gave one) and
+                          password, used for every worker; no sshpass involved
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -81,7 +81,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. With `-a`, the probe checks the engine is actually loadable by every worker's fio (`fio --enghelp`) and refuses early, naming the hosts that lack it; without `-a` a bad engine still fails loudly at the first job. Values are passed to fio as typed.
 
-`-p/--password` — password-based ssh without sshpass: one prompt (on your terminal, never echoed), then wekatester authenticates every worker's connection through an `SSH_ASKPASS` helper fed over a fifo in tmpfs. The password never appears on a command line, in a file on disk, or in any process's environment; the multiplexed connections are pinned open for the whole run so it is asked for exactly once. A wrong password fails immediately naming the host. Needs a terminal — for unattended runs use keys (`-i`).
+`-p/--password` — password-based ssh without sshpass. Prompts for the login name first (skipped if `-l` named one; empty keeps ssh's default) and then the password (never echoed), and authenticates every worker's connection through an `SSH_ASKPASS` helper fed over a fifo in tmpfs. The password never appears on a command line, in a file on disk, or in any process's environment; the multiplexed connections are pinned open for the whole run so it is asked for exactly once. A wrong password fails immediately naming the host. Needs a terminal — for unattended runs use keys (`-i`).
 
 `-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
 

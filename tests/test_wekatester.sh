@@ -1334,18 +1334,40 @@ t_assert "parse: -p and --password arm password auth; default off" bash -c '
     (source ./wekatester; parse_args h1;            [ "$PASSWORD_AUTH" = 0 ]) &&
     (source ./wekatester; parse_args -p h1;         [ "$PASSWORD_AUTH" = 1 ]) &&
     (source ./wekatester; parse_args --PASSWORD h1; [ "$PASSWORD_AUTH" = 1 ])'
-t_assert "-p: the password flows prompt -> fifo -> askpass -> ssh, once per host" bash -c '
+t_assert "-p: login and password flow prompt -> fifo -> askpass -> ssh, once per host" bash -c '
     d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
     cat > "$stub/ssh" <<"EOF"
 #!/bin/bash
+case "$*" in *"User=ubuntu"*) ;; *) exit 6;; esac
 [ -n "$SSH_ASKPASS" ] || exit 9
 pw=$("$SSH_ASKPASS") || exit 8
 [ "$pw" = "sekrit" ] || exit 7
 EOF
     chmod +x "$stub/ssh"
-    printf "sekrit\n" | (source ./wekatester
+    printf "ubuntu\nsekrit\n" | (source ./wekatester
         PATH="$stub:$PATH"
         WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS="-o BatchMode=yes"
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_password_masters) >/dev/null'
+t_assert "-p: -l skips the login prompt; empty answer keeps ssh defaults" bash -c '
+    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"
+    cat > "$stub/ssh" <<"EOF"
+#!/bin/bash
+case "$*" in *"User="*) exit 6;; esac
+pw=$("$SSH_ASKPASS") || exit 8
+[ "$pw" = "sekrit" ] || exit 7
+EOF
+    chmod +x "$stub/ssh"
+    # -l preset (SSH_LOGIN set): only the password is read from the prompt fd
+    printf "sekrit\n" | (source ./wekatester
+        PATH="$stub:$PATH"
+        WORK_DIR=$d; HOSTS=(h1); SSH_OPTS=""; SSH_LOGIN=ubuntu
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        establish_password_masters) >/dev/null &&
+    # no -l, empty login answer: ssh defaults, still no User=
+    printf "\nsekrit\n" | (source ./wekatester
+        PATH="$stub:$PATH"
+        WORK_DIR=$d/2; mkdir -p "$d/2"; HOSTS=(h1); SSH_OPTS=""
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
         establish_password_masters) >/dev/null'
 t_assert "-p: a rejected password dies naming the host, without hanging" bash -c '
@@ -1356,7 +1378,7 @@ pw=$("$SSH_ASKPASS") || exit 8
 [ "$pw" = "sekrit" ] || exit 7
 EOF
     chmod +x "$stub/ssh"
-    err=$(printf "wrong\n" | (source ./wekatester
+    err=$(printf "\nwrong\n" | (source ./wekatester
         PATH="$stub:$PATH"
         WORK_DIR=$d; HOSTS=(h1 h2); SSH_OPTS=""
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
@@ -1367,7 +1389,7 @@ EOF
     esac'
 t_assert "-p: an empty password dies before any connection" bash -c '
     d=$(mktemp -d)
-    err=$(printf "\n" | (source ./wekatester
+    err=$(printf "\n\n" | (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1)
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
         establish_password_masters) 2>&1 >/dev/null )

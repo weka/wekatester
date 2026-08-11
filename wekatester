@@ -358,8 +358,8 @@ attaching is the way to pass a value that starts with a dash.
   -l, --login user        ssh login user for the workers (remote runs only)
   -i, --identity keyfile  ssh private key for the workers (remote runs only);
                           keeps the agent's other keys from being offered
-  -p, --password          prompt once for an ssh password and use it for every
-                          worker (no sshpass involved; needs a terminal)
+  -p, --password          prompt once for an ssh login (unless -l gave one) and
+                          password, used for every worker; no sshpass involved
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -801,8 +801,18 @@ cleanup() {
 # $SSH_OPTS: for repeated ssh -o options the FIRST value wins, and SSH_OPTS
 # carries BatchMode=yes, which would silently disable askpass.
 establish_password_masters() {
-    local pw fifo askpass host setsid_bin pid
+    local pw fifo askpass host setsid_bin pid login
     require_interactive "-p" "use key-based auth (-i) for unattended runs"
+    # A password is only half a credential: ask for the login too, unless -l
+    # already named it. Empty keeps ssh's default (the local user).
+    if [ -z "$SSH_LOGIN" ]; then
+        printf 'ssh login for the workers (empty for %s): ' "$(id -un)" >&"$PROMPT_OUT_FD"
+        IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"
+        if [ -n "$login" ]; then
+            SSH_LOGIN=$login
+            SSH_OPTS="$SSH_OPTS -o User=$SSH_LOGIN"
+        fi
+    fi
     printf 'ssh password for %s host(s): ' "${#HOSTS[@]}" >&"$PROMPT_OUT_FD"
     IFS= read -r -s pw <&"$PROMPT_IN_FD" || die "no password read"
     printf '\n' >&"$PROMPT_OUT_FD"
@@ -2304,7 +2314,6 @@ PYEOF
 
 # --- main ----------------------------------------------------------------------
 main() {
-    local persist
     # -s: offline re-summarize of an existing results file, no hosts involved
     if [ -n "$SUMMARIZE_FILE" ]; then
         [ -f "$SUMMARIZE_FILE" ] || die "no such file: $SUMMARIZE_FILE"
@@ -2337,14 +2346,12 @@ main() {
     # multiplex every ssh/scp in this run over one connection per host.
     # %C hashes host/port/user into a short, safe socket name. Local mode never
     # runs ssh, so there is nothing to multiplex -- and cleanup's socket loop
-    # already no-ops on the empty socket dir. Password mode pins the masters
-    # for the whole run: a worker idle past a short persist window would need
-    # the password again mid-run, after the prompt machinery is gone --
-    # cleanup's explicit -O exit loop is their teardown.
-    persist=60s
-    [ "$PASSWORD_AUTH" -eq 0 ] || persist=yes
+    # already no-ops on the empty socket dir. The masters persist for the
+    # WHOLE run (cleanup's explicit -O exit loop is their teardown): a worker
+    # idle past a short persist window would reconnect mid-run -- slow with
+    # keys, impossible with -p once the prompt machinery is gone.
     [ "$LOCAL_MODE" -eq 1 ] || \
-        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=$persist"
+        SSH_OPTS="$SSH_OPTS -o ControlMaster=auto -o ControlPath=$WORK_DIR/c/%C -o ControlPersist=yes"
 
     # A bare `trap cleanup INT TERM` runs cleanup and then RESUMES at the next
     # statement, so a Ctrl-C would tear the run down and keep going. Signals

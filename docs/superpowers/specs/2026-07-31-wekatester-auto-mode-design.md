@@ -419,8 +419,11 @@ is accepted and inert there).
   `fio --enghelp` line and dies early naming the hosts that lack it; without
   `-a`, a bad engine fails at the first job via check_fio_errors. The value
   is never case-folded.
-- **`-p`/`--password`** — password ssh without sshpass. One hidden prompt on
-  the tty (require_interactive; unattended advice points at `-i`), then
+- **`-p`/`--password`** — password ssh without sshpass. Prompts for the
+  login name first unless `-l` named one (a password is only half a
+  credential; empty keeps ssh's default user, a given name lands in
+  SSH_OPTS as `-o User=`), then one hidden password prompt on the tty
+  (require_interactive; unattended advice points at `-i`), then
   before preflight — after the traps, so half-established masters still get
   cleanup's `-O exit` — each host's ControlMaster is established with an
   `SSH_ASKPASS` helper fed through a fifo in the /dev/shm WORK_DIR.
@@ -433,11 +436,14 @@ is accepted and inert there).
   `$SSH_OPTS`: ssh takes the FIRST value of a repeated option, and SSH_OPTS
   carries `BatchMode=yes`. `setsid` is used when present (pre-8.4 OpenSSH
   needs the tty detached; macOS lacks setsid and honors
-  `SSH_ASKPASS_REQUIRE=force` instead). Password mode sets
-  `ControlPersist=yes` (instead of 60s): a worker idle past a short persist
-  window would need the password again mid-run. The password lives only in
-  a shell variable and the fifo; never argv, disk, or a child's environment.
-  Local mode refuses `-p`.
+  `SSH_ASKPASS_REQUIRE=force` instead). ControlPersist is `yes` for EVERY
+  remote run (not only `-p`): a worker idle past a short persist window
+  would reconnect mid-run — slow with keys, impossible with a password once
+  the prompt machinery is gone; cleanup's `-O exit` loop is the teardown
+  (a kill -9 can orphan masters — acceptable, they idle on sockets in a
+  removed WORK_DIR). The password lives only in a shell variable and the
+  fifo; never argv, disk, or a child's environment. Local mode refuses
+  `-p`.
 - **`-u`/`--unlink`** — remove the workload's data files after the last job
   that uses them. Implemented as one generated `999-wekatester-unlink.job`
   appended to JOBFILES at staging (never marker-tagged, so the layout-first
