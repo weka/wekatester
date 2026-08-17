@@ -723,16 +723,17 @@ classify_mount_line() {
 # client mode reports a worker-side EACCES so quietly that without this probe
 # the run "succeeds" with zero IO.
 verify_mount_mode() {
-    log "checking mount mode and writability of $DIRECTORY on ${#HOSTS[@]} host(s)..."
-    local host line verdict failed=() mode_fail=0 write_fail=0
+    log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
+    local host line verdict failed=() mode_fail=0 write_fail=0 hd
     for host in "${HOSTS[@]}"; do
-        line=$(run_host "$host" "findmnt -T '$DIRECTORY' -n -o FSTYPE,OPTIONS") \
-            || { failed+=("$host: findmnt failed for $DIRECTORY -- does it exist? (wrong -d?)")
+        hd=$(host_dir "$host")
+        line=$(run_host "$host" "findmnt -T '$hd' -n -o FSTYPE,OPTIONS") \
+            || { failed+=("$host: findmnt failed for $hd -- does it exist? (wrong -d?)")
                  continue; }
         verdict=$(classify_mount_line "$line")
         case "$verdict" in
             ok)   ;;
-            skip) debug "$host: $DIRECTORY is not wekafs; guard skipped" ;;
+            skip) debug "$host: $hd is not wekafs; guard skipped" ;;
             fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
                    mode_fail=1
                    continue ;;
@@ -740,8 +741,8 @@ verify_mount_mode() {
         # One probe file, created and removed, as the same user fio will run
         # as. On a shared filesystem the mount root's owner/mode is a property
         # of the filesystem itself, so one failing host usually means all do.
-        run_host "$host" "p='$DIRECTORY'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"" \
-            || { failed+=("$host: cannot create files in $DIRECTORY -- fix the root's owner/mode (a one-time 'sudo chmod 1777 $DIRECTORY' on any host persists in the filesystem) or run as a user that can write")
+        run_host "$host" "p='$hd'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"" \
+            || { failed+=("$host: cannot create files in $hd -- fix the root's owner/mode (a one-time 'sudo chmod 1777 $hd' on any host persists in the filesystem) or run as a user that can write")
                  write_fail=1; }
     done
     if [ ${#failed[@]} -gt 0 ]; then
@@ -1228,17 +1229,34 @@ auto_tune() {
     python3 - "$@" <<'PYEOF' || return 1
 import json, math, os, re, sys
 
-# Validate the flag slot before unpacking: without this, an old-style 5-arg
-# call (no ignore_capacity) silently succeeds -- argv[5] becomes the first
-# hostname, which reads as "not 1", drops that host from both the tuning loop
-# and the capacity total, and exits 0. Wrong quietly is worse than not running.
-if len(sys.argv) < 7 or sys.argv[5] not in ("0", "1"):
+# Validate the flag slot before unpacking: without this, an old-style call
+# silently succeeds -- a positional shifts into the host list, drops a host
+# from both the tuning loop and the capacity total, and exits 0. Wrong
+# quietly is worse than not running.
+if len(sys.argv) < 8 or sys.argv[5] not in ("0", "1"):
     sys.exit("ERROR: auto_tune: usage: <src> <work> <tier> <directory> "
-             "<ignore_capacity 0|1> <host>...")
+             "<ignore_capacity 0|1> <targets-final|-> <host>...")
 
 src, work, tier, directory = sys.argv[1:5]
 ignore_capacity = sys.argv[5] == "1"
-hosts = sys.argv[6:]
+targets_path = sys.argv[6]
+hosts = sys.argv[7:]
+
+# Host-file resolution (targets.final): per-host overrides that beat the
+# tuner -- CLI beats the file upstream, the file beats what is derived here.
+TARGETS = {}
+if targets_path != "-" and os.path.exists(targets_path):
+    _tf = ("login", "engine", "cpus", "dir",
+           "bw_nj", "bw_fs", "bw_nr", "bw_qd",
+           "lat_nj", "lat_fs", "lat_nr", "lat_qd",
+           "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+    for _line in open(targets_path):
+        _p = _line.rstrip("\n").split("\t")
+        if len(_p) == len(_tf) + 1:
+            TARGETS[_p[0]] = {k: v for k, v in zip(_tf, _p[1:]) if v != "-"}
+
+def target(h, key):
+    return TARGETS.get(h, {}).get(key, "")
 
 SMALL_FILESIZE = "1G"; SMALL_BYTES = 2**30
 CACHE_MULT = 2; WS_FLOOR = 8 * 2**30
@@ -1472,8 +1490,9 @@ for job in jobs:
     lines = open(os.path.join(src, job)).read().splitlines()
     items = report_items(os.path.join(src, job))
     for h in hosts:
-        out = override(lines, "directory", directory)
-        out = override(out, "cpus_allowed", fmt_cpulist(facts[h]["usable"]))
+        out = override(lines, "directory", target(h, "dir") or directory)
+        out = override(out, "cpus_allowed",
+                       target(h, "cpus") or fmt_cpulist(facts[h]["usable"]))
 
         is_latency = "latency" in items
         is_bw = "bandwidth" in items and not is_latency
@@ -1526,6 +1545,17 @@ for job in jobs:
             # the source set it: inserting size= would cap a job that had no cap.
             if any(re.match(r"^size=", l) for l in lines):
                 out = override(out, "size", f"{nr}G")
+
+        # host-file values land LAST: the file beats the tuner, per type
+        kind_key = "lat" if is_latency else ("bw" if is_bw else "iops" if is_iops else "")
+        if kind_key:
+            for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                               ("nr", "nrfiles"), ("qd", "iodepth")):
+                v = target(h, f"{kind_key}_{tkey}")
+                if v:
+                    out = override(out, jkey, v)
+        if target(h, "engine"):
+            out = override(out, "ioengine", target(h, "engine"))
 
         header = [f"# generated by wekatester auto[{tier}] for {h}",
                   f"# usable cores: {fmt_cpulist(facts[h]['usable'])} "
@@ -2272,15 +2302,45 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # Build $WORK_DIR/jobs/<host>/<job> for every host. Auto mode delegates to
 # the tuner; plain mode copies with the directory override (variants are
 # identical across hosts, but one layout = one code path).
+# Host-file geometry (targets.final fields: 6.. per type nj/fs/nr/qd) onto a
+# staged variant, by the jobfile's report type. Returns 0 when it changed
+# anything -- the caller re-derives that host's layout from the new grid.
+apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
+    local host=$1 f=$2 items base changed=1
+    [ -f "$WORK_DIR/targets.final" ] || return 1
+    items=$(report_directive "$f")
+    local kind=""
+    case " $items " in
+        (*" latency "*) kind=lat ;;
+        (*" bandwidth "*) kind=bw ;;
+        (*" iops "*) kind=iops ;;
+    esac
+    [ -n "$kind" ] || return 1
+    case "$kind" in
+        (bw)   base=6 ;;
+        (lat)  base=10 ;;
+        (iops) base=14 ;;
+    esac
+    local v key i=0
+    for key in numjobs filesize nrfiles iodepth; do
+        v=$(targets_field "$host" $((base + i)) "$WORK_DIR/targets.final")
+        i=$((i + 1))
+        [ -z "$v" ] || { override_variant_key "$f" "$key" "$v"; changed=0; }
+    done
+    return $changed
+}
+
 stage_variants() {
-    local srcdir=$1 job base host
+    local srcdir=$1 job base host hd heng geo_changed
     if [ -n "$AUTO_LEVEL" ]; then
         auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" \
-            "$IGNORE_CAPACITY" "${HOSTS[@]}" || die "auto tuning failed"
+            "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi
     for host in "${HOSTS[@]}"; do
         mkdir -p "$WORK_DIR/jobs/$host"
+        hd=$(host_dir "$host")
+        geo_changed=1
         for job in "$srcdir"/[0-9]*; do
             base=${job##*/}
             # override directory= wherever it appears; jobfiles without one get
@@ -2288,19 +2348,65 @@ stage_variants() {
             # at all get the section created at the top -- otherwise the
             # insert matches nothing and fio silently writes to the server's cwd
             if grep -q '^directory=' "$job"; then
-                awk -v dir="$DIRECTORY" \
+                awk -v dir="$hd" \
                     '/^directory=/ { print "directory=" dir; next } { print }' \
                     "$job" > "$WORK_DIR/jobs/$host/$base"
             elif grep -q '^\[global\]' "$job"; then
-                awk -v dir="$DIRECTORY" \
+                awk -v dir="$hd" \
                     '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
                     "$job" > "$WORK_DIR/jobs/$host/$base"
             else
-                { printf '[global]\ndirectory=%s\n' "$DIRECTORY"; cat "$job"; } \
+                { printf '[global]\ndirectory=%s\n' "$hd"; cat "$job"; } \
                     > "$WORK_DIR/jobs/$host/$base"
             fi
+            is_layout_file "$WORK_DIR/jobs/$host/$base" && continue
+            ! apply_targets_geometry "$host" "$WORK_DIR/jobs/$host/$base" || geo_changed=0
         done
+        # host-file geometry changed this host's grid: its layout must
+        # describe THAT grid, so re-derive it from the staged variants --
+        # unless the operator hand-edited the layout, which is preserved
+        # with the same warning the tuner gives.
+        if [ "$geo_changed" -eq 0 ]; then
+            # pristineness is judged on the SOURCE layout: the staged copy
+            # always differs from its sha (the directory override edits it)
+            if layout_variant_pristine "$srcdir"; then
+                generate_layout "$WORK_DIR/jobs/$host" "$WORK_DIR/jobs/$host" >/dev/null \
+                    || die "per-host layout derivation failed for $host"
+            else
+                log "WARNING: $host: hand-edited layout kept as authored; it may not match the host-file geometry" >&2
+            fi
+        fi
+        # host-file engine (final resolution) applies per host; the global -e
+        # post-pass in stage_jobfiles still runs after this and wins.
+        heng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
+        if [ -n "$heng" ]; then
+            for job in "$WORK_DIR/jobs/$host"/*; do
+                [ -f "$job" ] && override_variant_key "$job" ioengine "$heng"
+            done
+        fi
     done
+}
+
+# Is the layout file in this staged dir still the generated original?
+layout_variant_pristine() {   # layout_variant_pristine <dir>
+    local f
+    for f in "$1"/[0-9]*; do
+        is_layout_file "$f" || continue
+        python3 - "$f" <<'PYEOF'
+import hashlib, re, sys
+lines = open(sys.argv[1]).read().splitlines()
+MARKER = "# wekatester-layout: generated"
+for l in lines[:3]:
+    m = re.match(re.escape(MARKER) + r" sha256=([0-9a-f]{64})\s*$", l)
+    if m:
+        body = [x for x in lines if not x.startswith(MARKER)]
+        digest = hashlib.sha256("\n".join(x.rstrip() for x in body).encode()).hexdigest()
+        sys.exit(0 if digest == m.group(1) else 1)
+sys.exit(1)
+PYEOF
+        return $?
+    done
+    return 0   # no layout staged yet: nothing to preserve
 }
 
 # -u: one final job removes every file the layout created. Derived per host
@@ -2627,10 +2733,10 @@ run_jobs() {
             # runs and back only after the error check, so an interrupted
             # layout can never leave one behind.
             ghash=$(layout_geometry_hash) || die "cannot hash the layout geometry"
-            marker="$DIRECTORY/.wekatester-layout-$ghash.done"
             jobref=$job
             missing=0
             for host in "${HOSTS[@]}"; do
+                marker="$(host_dir "$host")/.wekatester-layout-$ghash.done"
                 run_host "$host" "[ -f '$marker' ]" || missing=1
             done
             if [ "$missing" -eq 1 ]; then
@@ -2642,6 +2748,7 @@ run_jobs() {
                 log "no completion marker for this layout geometry (first run, interrupted layout, or geometry change) -- rebuilding every file with full writes"
             fi
             for host in "${HOSTS[@]}"; do
+                marker="$(host_dir "$host")/.wekatester-layout-$ghash.done"
                 run_host "$host" "rm -f '$marker'" \
                     || die "cannot clear the layout marker on $host"
             done
@@ -2653,6 +2760,7 @@ run_jobs() {
             check_fio_errors "$outfile" layout \
                 || die "layout $jobref failed -- the files were not created (raw output in $outfile)"
             for host in "${HOSTS[@]}"; do
+                marker="$(host_dir "$host")/.wekatester-layout-$ghash.done"
                 run_host "$host" "printf '%s\n' 'wekatester layout complete: geometry $ghash' > '$marker'" \
                     || die "cannot write the layout marker on $host"
             done
@@ -2672,8 +2780,8 @@ run_jobs() {
                 || die "unlink $job failed -- test files may remain (raw output in $outfile)"
             # The grid is gone: its completion marker must not outlive it.
             ghash=$(layout_geometry_hash) || die "cannot hash the layout geometry"
-            marker="$DIRECTORY/.wekatester-layout-$ghash.done"
             for host in "${HOSTS[@]}"; do
+                marker="$(host_dir "$host")/.wekatester-layout-$ghash.done"
                 run_host "$host" "rm -f '$marker'" \
                     || die "cannot remove the layout marker on $host"
             done
