@@ -1919,6 +1919,137 @@ targets_field() {   # targets_field <host> <fieldno> [phasefile]
     [ "$v" = "-" ] || printf '%s' "$v"
 }
 
+# -a writeback: record what the tuner derived into the host file, for
+# re-use. Only when a host file is in play (-t, or a -C set which owns one).
+# Fill-missing by default: a field the FILE already provides (any line, by
+# the folding rules) is left alone. With -g an untimed prompt offers
+# overwrite instead -- except under -r, which cannot prompt and assumes
+# fill-missing. Updates never edit in place: a superseded host line is
+# commented out FIRST, then the new line appended (append-before-comment
+# would trip the duplicate-host-fatal rule on the very next parse).
+writeback_targets() {
+    [ -n "$AUTO_LEVEL" ] || return 0
+    local wb="$TARGETS_FILE" mode=fill
+    [ -n "$wb" ] || { [ -n "$SET_DIR_OVERRIDE" ] && wb="$SET_DIR_OVERRIDE/hostlist.csv"; }
+    [ -n "$wb" ] && [ -f "$wb" ] || return 0
+    if [ "$REGEN_LAYOUT" -eq 1 ] && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        require_interactive "-a -g"
+        if confirm_timed 0 no "-g: overwrite existing host-file values with the newly derived ones? [y = overwrite, n = fill missing only]"; then
+            mode=overwrite
+        fi
+    fi
+    # file-only resolution (no CLI merge): what does the FILE itself provide?
+    resolve_targets phase2 "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
+        > "$WORK_DIR/targets.fileonly" 2>/dev/null || : > "$WORK_DIR/targets.fileonly"
+    python3 - "$wb" "$mode" "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "host file writeback failed ($wb)"
+import csv, os, re, sys
+
+wb, mode, work = sys.argv[1:4]
+hosts = sys.argv[4:]
+FIELDS = ("login", "engine", "cpus", "dir",
+          "bw_nj", "bw_fs", "bw_nr", "bw_qd",
+          "lat_nj", "lat_fs", "lat_nr", "lat_qd",
+          "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+
+def load_tsv(path):
+    out = {}
+    if os.path.exists(path):
+        for line in open(path):
+            p = line.rstrip("\n").split("\t")
+            if len(p) == len(FIELDS) + 1:
+                out[p[0]] = {k: v for k, v in zip(FIELDS, p[1:]) if v != "-"}
+    return out
+
+fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
+
+def first_value(lines, key):
+    for l in lines:
+        m = re.match(rf"^{key}=(\S+)", l)
+        if m:
+            return m.group(1)
+    return ""
+
+# derive per-host values from the STAGED variants -- the execution truth
+KIND = {"latency": "lat", "bandwidth": "bw", "iops": "iops"}
+derived = {}
+for host in hosts:
+    jdir = os.path.join(work, "jobs", host)
+    if not os.path.isdir(jdir):
+        continue
+    d = {}
+    userf = os.path.join(work, "auth", f"{host}.user")
+    if os.path.exists(userf):
+        d["login"] = open(userf).read().strip()
+    for job in sorted(os.listdir(jdir)):
+        p = os.path.join(jdir, job)
+        lines = open(p).read().splitlines()
+        if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
+            continue
+        kinds = [KIND[w] for l in lines if l.startswith("# report")
+                 for w in l.split()[2:] if w in KIND]
+        # precedence latency > bandwidth > iops, same as the tuner
+        kind = "lat" if "lat" in kinds else ("bw" if "bw" in kinds else
+                                             ("iops" if "iops" in kinds else ""))
+        d.setdefault("engine", first_value(lines, "ioengine"))
+        d.setdefault("cpus", first_value(lines, "cpus_allowed"))
+        d.setdefault("dir", first_value(lines, "directory"))
+        if kind:
+            for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                               ("nr", "nrfiles"), ("qd", "iodepth")):
+                v = first_value(lines, jkey)
+                if v:
+                    d.setdefault(f"{kind}_{tkey}", v)
+    derived[host] = {k: v for k, v in d.items() if v}
+
+# desired host line per host
+updates = {}
+for host in hosts:
+    have = fileonly.get(host, {})
+    want = dict(have)
+    for k, v in derived.get(host, {}).items():
+        if mode == "overwrite" or k not in have:
+            want[k] = v
+    if want and want != have:
+        updates[host] = want
+
+if not updates:
+    print("host file: nothing to record")
+    sys.exit(0)
+
+# comment out superseded host lines, then append the new ones
+lines = open(wb).read().splitlines()
+out = []
+for line in lines:
+    try:
+        row = next(csv.reader([line]))
+    except StopIteration:
+        row = []
+    h = row[0].strip() if row else ""
+    if h and not h.startswith("#") and h.lower() != "host" and h in updates:
+        out.append("# superseded by -a: " + line)
+    else:
+        out.append(line)
+
+def geom(want, kind):
+    parts = [want.get(f"{kind}_{k}", "") for k in ("nj", "fs", "nr", "qd")]
+    return "/".join(parts).rstrip("/") if any(parts) else ""
+
+import io
+buf = io.StringIO()
+w = csv.writer(buf, lineterminator="\n")
+for host in hosts:
+    if host not in updates:
+        continue
+    want = updates[host]
+    w.writerow([host, want.get("login", ""), want.get("engine", ""),
+                want.get("cpus", ""), want.get("dir", ""),
+                geom(want, "bw"), geom(want, "lat"), geom(want, "iops")])
+with open(wb, "w") as fp:
+    fp.write("\n".join(out) + "\n" + buf.getvalue())
+print(f"host file: recorded {len(updates)} host line(s) in {wb} ({mode})")
+PYEOF
+}
+
 # The host's destination dir: the finished resolution when it exists, the
 # pre-auth phase otherwise, the global -d as the fallback.
 host_dir() {   # host_dir <host>
@@ -3102,6 +3233,7 @@ main() {
     start_fio_servers
     verify_fio_ports
     stage_jobfiles
+    writeback_targets
     snapshot_jobfiles
     run_jobs
     finish_temp_set

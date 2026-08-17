@@ -1760,6 +1760,50 @@ t_assert "host_dir: targets dir when resolved, global -d otherwise" bash -c '
      printf "h1\t-\t-\t-\t/mnt/f1\n" > "$d/targets.final"
      [ "$(host_dir h1)" = /mnt/f1 ] && [ "$(host_dir h2)" = /mnt/g ])'
 
+# --- -a writeback into the host file ---
+wb_fixture() {   # builds WORK_DIR with staged variants + a host file; echoes dirs
+    d=$(mktemp -d)
+    mkdir -p "$d/jobs/h1" "$d/auth"
+    printf "ubuntu\n" > "$d/auth/h1.user"
+    printf "# report iops\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1G\nnrfiles=8\niodepth=32\n" > "$d/jobs/h1/031-i.job"
+    : > "$d/engine.results"
+    echo "$d"
+}
+export -f wb_fixture
+t_assert "writeback: fill mode records derived values, keeps what the file provides" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "host,user_login,ioengine\nh1,,psync,,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    grep -q "^# superseded by -a: h1,,psync" "$f" &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,4/1G/8/32" &&
+    (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >/dev/null)'
+t_assert "writeback: nothing to record leaves the file untouched" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "h1,ubuntu,libaio,0-3,/mnt/w,,,4/1G/8/32\n" > "$f"
+    before=$(cat "$f")
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    [ "$(cat "$f")" = "$before" ]'
+t_assert "writeback: -g interactive overwrite replaces file values with derived ones" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "h1,,psync,9-11,,,,\n" > "$f"
+    printf "y" | (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
+     PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+     writeback_targets) >/dev/null
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,4/1G/8/32"'
+t_assert "writeback: -C set owns the target when -t was not given" bash -c '
+    d=$(wb_fixture); mkdir "$d/set"
+    (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=""; SET_DIR_OVERRIDE=$d/set
+     FAST_TRACK=1
+     writeback_targets) >/dev/null
+    tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.
