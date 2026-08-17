@@ -1270,7 +1270,7 @@ t_assert "-e stamps every staged variant, and the rebuild variant inherits it" b
 t_assert "probe: -e engine missing from a worker refuses early, naming it" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(h1 h2); MASTER=h1
+            LOCAL_MODE=1; HOSTS=(h1 h2); MASTER=h1; AUTO_LEVEL=max
             WORK_DIR=$d; DIRECTORY=/mnt/weka; ENGINE=io_uring
             run_host() { case "$2" in
                 (*enghelp*) [ "$1" = h1 ] && echo "engines io_uring libaio psync" \
@@ -1465,7 +1465,7 @@ t_assert "unlink job removes its geometry marker after the grid is gone" bash -c
 t_assert "probe: failed weka RAM query hints at weka user login and continues" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
+            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=max
             WORK_DIR=$d; DIRECTORY=/mnt/weka
             run_host() { case "$2" in
                 (*"weka cluster servers list"*) return 1;;
@@ -1630,6 +1630,99 @@ t_assert "auth rounds: the host file pins a host's login when the credential has
      auth_round "default ssh auth" default "" "" >/dev/null
      grep -qx "h1:ubuntu" "$d/log" && grep -qx "h2:" "$d/log" &&
      [ "$(cat "$AUTH_DIR/h1.user")" = ubuntu ] && test ! -f "$AUTH_DIR/h2.user")'
+
+# --- engine proving, pinning enforcement, priv lifecycle ---
+t_assert "engines: candidates are proven with a real job; auto probe list is rewritten" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; DIRECTORY=/mnt/x; FIO_BIN=fio
+     printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+     run_host() { case "$2" in (*ioengine=io_uring*) return 1;; (*) return 0;; esac; }
+     test_engines
+     grep -qx "h1 io_uring fail" "$d/engine.results" &&
+     grep -qx "h1 libaio ok" "$d/engine.results" &&
+     grep -q "^engines libaio psync$" "$d/probe/h1")'
+t_assert "engines: an enghelp-missing candidate fails without burning a job" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); ENGINE=exotic; DIRECTORY=/mnt/x; FIO_BIN=fio
+     printf "engines libaio psync\n" > "$d/probe/h1"
+     run_host() { echo "SHOULD NOT RUN" >> "$d/ran"; return 0; }
+     test_engines) 2>&1 | grep -q "ioengine .exotic. failed its test job on h1" &&
+    test ! -f "$d/ran"'
+t_assert "engines: a pinned -e engine failing its job is fatal, naming the evidence" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1 h2); ENGINE=io_uring; DIRECTORY=/mnt/x; FIO_BIN=fio
+        printf "engines io_uring\n" > "$d/probe/h1"
+        printf "engines io_uring\n" > "$d/probe/h2"
+        run_host() { case "$1" in (h2) return 1;; (*) return 0;; esac; }
+        test_engines) 2>&1 >/dev/null )
+    case "$err" in
+        *"ioengine '\''io_uring'\'' failed its test job on h2"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "finalize: a host-line engine that failed its test dies naming host+evidence" bash -c '
+    d=$(mktemp -d); f=$(mktemp)
+    printf "h1,,weird_eng,,,,,\n" > "$f"
+    printf "h1 weird_eng fail\n" > "$d/engine.results"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); TARGETS=1; TARGETS_FILE=$f
+        finalize_targets) 2>&1 >/dev/null )
+    case "$err" in
+        *"assigns ioengine '\''weird_eng'\'' to h1 but its test job failed"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "pinning: cpus outside the taskset with no escalator dies showing all three" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; mkdir -p "$d/auth"
+        printf "taskset 0-3\nweka_allowed 8-11\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 >/dev/null )
+    case "$err" in
+        *"requested cpus_allowed: 4-7"*"current taskset:       0-3"*"weka pinned cores:     8-11"*"outside the current taskset"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "pinning: overlap with weka cores dies without priv, warns and proceeds with it" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        printf "taskset 0-15\nweka_allowed 8-11\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 >/dev/null )
+    case "$err" in (*"overlap weka'\''s cores and no passwordless"*) true;; (*) echo "$err" >&2; exit 1;; esac
+    err2=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        printf "taskset 0-15\nweka_allowed 8-11\npriv sudo\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 >/dev/null )
+    case "$err2" in (*"WARNING"*"overlap weka"*"proceeding under sudo"*) true;; (*) echo "$err2" >&2; exit 1;; esac
+    [ "$(cat "$d/auth/h1.priv")" = sudo ] && [ "$(cat "$d/auth/h1.cpus")" = "8,10" ]'
+t_assert "pinning: an in-mask request with no escalator records cpus and proceeds" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+     printf "taskset 0-15\nweka_allowed 20-23\n" > "$d/probe/h1"
+     printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
+     check_cpu_pinning)
+    [ "$(cat "$d/auth/h1.cpus")" = "4-7" ] && test ! -s "$d/auth/h1.priv"'
+t_assert "kill_fio_cmd: priv prefixes kill/rm/pkill and the anchor survives" bash -c '
+    out=$(source ./wekatester; FIO_BIN=/usr/bin/fio; FIO_PIDFILE=/dev/shm/x.pid
+          kill_fio_cmd sudo)
+    case "$out" in
+        *"sudo kill "*"sudo rm -f"*"sudo pkill -9 -f"*"'\''^/usr/bin/fio --server"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "server launch: recorded cpus/priv shape the fio server command" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/auth"
+    printf "sudo\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2); FIO_BIN=fio
+        run_host() { echo "LAUNCH[$1]: $2"; }
+        start_fio_servers) 2>/dev/null )
+    echo "$out" | grep -q "LAUNCH\[h1\]: .*sudo taskset -c 4-7 '\''fio'\'' --server" &&
+    echo "$out" | grep "LAUNCH\[h2\]" | grep -vq taskset'
 
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted

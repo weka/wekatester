@@ -773,20 +773,36 @@ FIO_STARTED=0
 # is anchored to the fio binary so the shell running this snippet (whose own
 # cmdline contains the pattern) can never match itself, and the pidfile path
 # makes it ours alone -- fio runs that are not ours can never match.
-kill_fio_cmd() {
+kill_fio_cmd() {   # kill_fio_cmd [priv]
+    # A server launched under sudo/dzdo/doas taskset is root-owned: the kill,
+    # the pidfile removal, and the last-resort pkill all need the same
+    # escalator or every privileged run leaks a root fio server.
+    # The ^ anchor is load-bearing: the shell running this snippet carries
+    # the pattern in its OWN cmdline and must never match itself (an
+    # unanchored pkill -9 here once killed the teardown). taskset EXECs fio,
+    # so the daemon's argv still begins with the binary even when launched
+    # as "sudo taskset -c ... fio --server ...".
+    local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
-    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then kill \$(cat '$FIO_PIDFILE') || true; rm -f '$FIO_PIDFILE'; fi; \
+    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then ${priv}kill \$(cat '$FIO_PIDFILE') || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if pgrep -f '$pat' >/dev/null; then pkill -9 -f '$pat' || true; fi"
+        if pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
 }
 
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i
+    local pids=() failed=() host i priv cpus launch
     for host in "${HOSTS[@]}"; do
-        run_host "$host" \
-            "$(kill_fio_cmd); '$FIO_BIN' --server --daemonize='$FIO_PIDFILE'" &
+        priv=""; cpus=""
+        [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
+        [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        launch="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
+        # a requested cpu list pins the server (children inherit the mask);
+        # the escalator both widens a restrictive taskset and owns the kill
+        [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
+        [ -z "$priv" ] || launch="$priv $launch"
+        run_host "$host" "$(kill_fio_cmd "$priv"); $launch" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
@@ -1005,7 +1021,159 @@ probe_remote_cmd() {
     printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/task/*/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
-        echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\""
+        echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
+        echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
+        for pc in sudo dzdo doas; do command -v \$pc >/dev/null && \$pc -n true 2>/dev/null && { echo \"priv \$pc\"; break; }; done; true"
+}
+
+# Prove each host's ioengine candidates with a REAL one-file job on that
+# host's destination dir: --enghelp lists what fio was built with, not what
+# the kernel and filesystem will actually run (io_uring is the classic liar).
+# Candidates per host: the CLI -e engine, every engine the host file
+# mentions, and in auto mode the tuner's preference list -- all filtered by
+# enghelp first so impossible names never burn a job. Results land in
+# $WORK_DIR/engine.results as "host engine ok|fail" (phase2's input), and
+# each host's probe "engines" line is REWRITTEN to its functional subset, so
+# the tuner's common-engine pick is proven rather than advertised.
+test_engines() {
+    local host results="$WORK_DIR/engine.results" csv_engines="" cand
+    mkdir -p "$WORK_DIR/et"
+    : > "$results"
+    if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
+        csv_engines=$(awk -F, '!/^[[:space:]]*#/ {gsub(/[[:space:]]/, "", $3);
+            if ($3 != "" && $3 != "ioengine") print $3}' "$TARGETS_FILE" | sort -u | tr '\n' ' ')
+    fi
+    cand="$ENGINE $csv_engines"
+    [ -z "$AUTO_LEVEL" ] || cand="$cand io_uring libaio psync"
+    cand=$(printf '%s\n' $cand | awk '!seen[$0]++' | tr '\n' ' ')
+    [ -n "${cand// /}" ] || return 0
+    log "proving ioengine candidates on ${#HOSTS[@]} host(s):$(printf ' %s' $cand)"
+    for host in "${HOSTS[@]}"; do
+        (
+            hd=$(host_dir "$host")
+            avail=$(awk '$1 == "engines" {$1 = ""; print}' "$WORK_DIR/probe/$host")
+            for c in $cand; do
+                case " $avail " in
+                    *" $c "*) ;;
+                    *) echo "$host $c fail" >> "$results"; continue ;;
+                esac
+                if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
+                        '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
+                        --filesize=64k --filename=\"\$f\" --direct=1 \
+                        --output-format=json; rc=\$?; rm -f \"\$f\"; exit \$rc" \
+                        > "$WORK_DIR/et/$host.$c.out" 2>&1; then
+                    echo "$host $c ok" >> "$results"
+                else
+                    echo "$host $c fail" >> "$results"
+                fi
+            done
+        ) &
+    done
+    wait
+    # rewrite each probe's engines line to the proven subset (untested
+    # engines are dropped only in auto mode, where the list WAS the tests)
+    if [ -n "$AUTO_LEVEL" ]; then
+        for host in "${HOSTS[@]}"; do
+            local ok
+            ok=$(awk -v h="$host" '$1 == h && $3 == "ok" {printf " %s", $2}' "$results")
+            awk -v ok="$ok" '$1 == "engines" {print "engines" ok; next} {print}' \
+                "$WORK_DIR/probe/$host" > "$WORK_DIR/probe/$host.new"
+            mv "$WORK_DIR/probe/$host.new" "$WORK_DIR/probe/$host"
+        done
+    fi
+    # a PINNED engine failing anywhere is fatal, naming host and evidence
+    if [ -n "$ENGINE" ]; then
+        for host in "${HOSTS[@]}"; do
+            grep -q "^$host $ENGINE ok$" "$results" \
+                || die "ioengine '$ENGINE' failed its test job on $host (see $WORK_DIR/et/$host.$ENGINE.out)"
+        done
+    fi
+}
+
+# Finish the host-file resolution with the engine results, then insist any
+# host-line engine assignment actually works on its host.
+finalize_targets() {
+    [ "$TARGETS" -eq 1 ] || return 0
+    local host eng
+    resolve_targets phase2 "$TARGETS_FILE" "${ENGINE:--}" \
+        "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+        "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
+        || die "host file resolution failed ($TARGETS_FILE)"
+    for host in "${HOSTS[@]}"; do
+        eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
+        [ -z "$eng" ] && continue
+        grep -q "^$host $eng ok$" "$WORK_DIR/engine.results" 2>/dev/null \
+            || die "host file assigns ioengine '$eng' to $host but its test job failed (see $WORK_DIR/et/$host.$eng.out)"
+    done
+}
+
+# cpus_allowed enforcement. A host with a requested cpu list must either
+# already be allowed those cpus (taskset -cp) or have a passwordless
+# escalator to launch fio under `taskset -c` -- and a request overlapping
+# weka's own pinned cores is fatal without one, a warning with one (the
+# operator explicitly chose those cpus). The winning launch decision lands
+# in $WORK_DIR/auth/<host>.priv + <host>.cpus for the fio server lifecycle.
+check_cpu_pinning() {
+    local host req cur weka priv verdict
+    # local mode never ran establish_connections; the lifecycle still reads
+    # the same per-host files
+    [ -n "$AUTH_DIR" ] || { AUTH_DIR="$WORK_DIR/auth"; mkdir -p "$AUTH_DIR"; }
+    for host in "${HOSTS[@]}"; do
+        req=$(targets_field "$host" 4 "$WORK_DIR/targets.final")
+        [ -n "$req" ] || continue
+        cur=$(awk '$1 == "taskset" {print $2; exit}' "$WORK_DIR/probe/$host")
+        weka=$(awk '$1 == "weka_allowed" {printf "%s,", $2}' "$WORK_DIR/probe/$host")
+        priv=$(host_priv "$host")
+        verdict=$(python3 - "$req" "${cur:-}" "${weka%,}" <<'PYEOF'
+import sys
+def expand(s):
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part: continue
+        if "-" in part:
+            a, b = part.split("-", 1); out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+req, cur, weka = (expand(x) for x in sys.argv[1:4])
+flags = []
+if cur and not req <= cur:
+    flags.append("outside")
+if req & weka:
+    flags.append("overlap")
+print(" ".join(flags) or "ok")
+PYEOF
+)
+        case "$verdict" in
+            *overlap*)
+                if [ -n "$priv" ]; then
+                    log "WARNING: $host: requested cpus ($req) overlap weka's cores ($(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")); proceeding under $priv taskset as asked" >&2
+                else
+                    log "ERROR: $host: requested cpus_allowed: $req" >&2
+                    log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
+                    log "ERROR: $host: weka pinned cores:     $(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")" >&2
+                    die "$host: requested cpus overlap weka's cores and no passwordless sudo/dzdo/doas is available"
+                fi ;;
+        esac
+        case "$verdict" in
+            *outside*)
+                if [ -z "$priv" ]; then
+                    log "ERROR: $host: requested cpus_allowed: $req" >&2
+                    log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
+                    log "ERROR: $host: weka pinned cores:     $(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")" >&2
+                    die "$host: requested cpus are outside the current taskset and no passwordless sudo/dzdo/doas is available"
+                fi ;;
+        esac
+        # record the launch decision: escalate whenever a cpu list is
+        # requested and an escalator exists (taskset needs it when the mask
+        # must widen; harmless when it need not)
+        if [ -n "$priv" ]; then
+            printf '%s\n' "$priv" > "$AUTH_DIR/$host.priv"
+        fi
+        printf '%s\n' "$req" > "$AUTH_DIR/$host.cpus"
+        debug "$host: fio server will run ${priv:+under $priv }taskset -c $req"
+    done
 }
 
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
@@ -1034,6 +1202,7 @@ probe_workers() {
             || die "ioengine '$ENGINE' is not available (fio --enghelp) on: ${bad[*]}"
     fi
 
+    [ -n "$AUTO_LEVEL" ] || return 0   # df + backend RAM matter to the tuner only
     run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
     if ! run_host "$MASTER" "weka cluster servers list -J" \
@@ -1718,6 +1887,23 @@ targets_field() {   # targets_field <host> <fieldno> [phasefile]
     [ -f "$f" ] || return 0
     v=$(awk -F'\t' -v h="$1" -v n="$2" '$1 == h {print $n; exit}' "$f")
     [ "$v" = "-" ] || printf '%s' "$v"
+}
+
+# The host's destination dir: the finished resolution when it exists, the
+# pre-auth phase otherwise, the global -d as the fallback.
+host_dir() {   # host_dir <host>
+    local d=""
+    if [ -f "$WORK_DIR/targets.final" ]; then
+        d=$(targets_field "$1" 5 "$WORK_DIR/targets.final")
+    elif [ -f "$WORK_DIR/targets.phase1" ]; then
+        d=$(targets_field "$1" 5)
+    fi
+    printf '%s' "${d:-$DIRECTORY}"
+}
+
+host_priv() {   # host_priv <host> -> passwordless escalator ("" if none)
+    [ -f "$WORK_DIR/probe/$1" ] || return 0
+    awk '$1 == "priv" {print $2; exit}' "$WORK_DIR/probe/$1"
 }
 
 resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
@@ -2781,7 +2967,11 @@ main() {
         close_interactive
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        [ -n "$AUTO_LEVEL" ] && probe_workers
+        if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
+            probe_workers
+            test_engines
+            finalize_targets
+        fi
         stage_jobfiles
         dry_run_report
         exit 0
@@ -2795,9 +2985,14 @@ main() {
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     start_run_log
+    if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
+        probe_workers
+        test_engines
+        finalize_targets
+        check_cpu_pinning
+    fi
     start_fio_servers
     verify_fio_ports
-    [ -n "$AUTO_LEVEL" ] && probe_workers
     stage_jobfiles
     snapshot_jobfiles
     run_jobs
