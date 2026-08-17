@@ -1063,7 +1063,13 @@ test_engines() {
                     *" $c "*) ;;
                     *) echo "$host $c fail" >> "$results"; continue ;;
                 esac
+                # A broken engine on a real filesystem HANGS at least as
+                # often as it errors (io_uring's specialty, seen live on a
+                # field box) -- an unbounded test job hangs the whole run.
+                # A working engine finishes this 64k write in milliseconds;
+                # anything still going after the timeout is a fail.
                 if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
+                        timeout -k 5 ${WEKATESTER_ENGINE_TEST_TIMEOUT:-45} \
                         '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
                         --filesize=64k --filename=\"\$f\" --direct=1 \
                         --output-format=json; rc=\$?; rm -f \"\$f\"; exit \$rc" \
@@ -1071,6 +1077,7 @@ test_engines() {
                     echo "$host $c ok" >> "$results"
                 else
                     echo "$host $c fail" >> "$results"
+                    log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
                 fi
             done
         ) &

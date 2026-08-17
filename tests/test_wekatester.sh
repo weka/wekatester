@@ -1642,6 +1642,20 @@ t_assert "engines: candidates are proven with a real job; auto probe list is rew
      grep -qx "h1 io_uring fail" "$d/engine.results" &&
      grep -qx "h1 libaio ok" "$d/engine.results" &&
      grep -q "^engines libaio psync$" "$d/probe/h1")'
+t_assert "engines: a HANGING test job is killed by the timeout and recorded as fail" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest"; stub=$d/bin; mkdir -p "$stub"
+    printf "#!/bin/bash\ncase \"\$*\" in (*hangeng*) sleep 300;; (*) exit 0;; esac\n" > "$stub/fio"
+    chmod +x "$stub/fio"
+    start=$(date +%s)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
+     DIRECTORY=$d/dest; FIO_BIN=$stub/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
+     printf ",,hangeng,,,,,\n" > "$d/t.csv"
+     printf "engines hangeng libaio\n" > "$d/probe/localhost"
+     WEKATESTER_ENGINE_TEST_TIMEOUT=2 test_engines) >/dev/null 2>&1
+    took=$(( $(date +%s) - start ))
+    grep -qx "localhost hangeng fail" "$d/engine.results" &&
+    [ "$took" -lt 60 ]'
 t_assert "engines: an enghelp-missing candidate fails without burning a job" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     (source ./wekatester
