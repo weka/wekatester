@@ -822,6 +822,7 @@ start_fio_servers() {
         # the escalator both widens a restrictive taskset and owns the kill
         [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
         [ -z "$priv" ] || launch="$priv $launch"
+        [ -z "$priv" ] || log "NOTE: $host: fio runs under $priv -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2
         run_host "$host" "$(kill_fio_cmd "$priv"); $launch" &
         pids+=($!)
     done
@@ -867,12 +868,18 @@ verify_fio_ports() {
 }
 
 cleanup() {
-    local host f pids=()
+    local host f priv pids=()
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
         for host in "${HOSTS[@]}"; do
-            run_host "$host" "$(kill_fio_cmd); rm -rf '$TARGET_DIR'" &
+            # a privileged launch made a ROOT-owned server: the kill needs
+            # the same escalator or every privileged run leaks a root fio
+            # (seen live: "Operation not permitted" teardowns, orphan healed
+            # only by the NEXT privileged run's pre-start sweep)
+            priv=""
+            [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
+            run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR'" &
             pids+=($!)
         done
         # These pids only -- a bare `wait` also waits on the run-log tees,
@@ -1135,8 +1142,11 @@ test_engines() {
     # a PINNED engine failing anywhere is fatal, naming host and evidence
     if [ -n "$ENGINE" ]; then
         for host in "${HOSTS[@]}"; do
-            grep -q "^$host $ENGINE ok$" "$results" \
-                || die "ioengine '$ENGINE' failed its test job on $host (see $WORK_DIR/et/$host.$ENGINE.out)"
+            grep -q "^$host $ENGINE ok$" "$results" || {
+                # the workdir dies with the process: quote the evidence now
+                [ ! -f "$WORK_DIR/et/$host.$ENGINE.out" ] || tail -5 "$WORK_DIR/et/$host.$ENGINE.out" >&2
+                die "ioengine '$ENGINE' failed its test job on $host (fio output above)"
+            }
         done
     fi
 }
@@ -1153,8 +1163,11 @@ finalize_targets() {
     for host in "${HOSTS[@]}"; do
         eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
         [ -z "$eng" ] && continue
-        grep -q "^$host $eng ok$" "$WORK_DIR/engine.results" 2>/dev/null \
-            || die "host file assigns ioengine '$eng' to $host but its test job failed (see $WORK_DIR/et/$host.$eng.out)"
+        { [ -f "$WORK_DIR/engine.results" ] \
+              && grep -q "^$host $eng ok$" "$WORK_DIR/engine.results"; } || {
+            [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
+            die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
+        }
     done
 }
 
@@ -2694,6 +2707,7 @@ stage_unlink_variants() {
             index($0, marker) == 1 { next }
             /^filesize=/ { print "filesize=4k"; next }
             /^size=/     { print "filesize=4k"; next }
+            /^(blocksize|bs)=/ { print "blocksize=4k"; next }
             { print }
             /^\[global\]/ && !ins { print "unlink=1"; ins = 1 }
         ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB"
@@ -2738,54 +2752,28 @@ stage_rebuild_variants() {
     for host in "${HOSTS[@]}"; do
         src="$WORK_DIR/jobs/$host/${JOBFILES[0]}"
         [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the rebuild variant"
-        # Each layout section becomes a PAIR. create_on_open's lazy open does
-        # NOT create parent directories (only create_only's setup path does;
-        # seen live: a virgin filesystem ENOENTs every "<client>.N/j" open),
-        # so a tiny 4k create_only section runs first -- on a missing file it
-        # creates the file AND its directories at 4k cost, on any existing
-        # file (sparse included: st_size >= 4k) it is a no-op -- and the
-        # write-through section chains after it. The write section keeps the
-        # original name so cross-section wait_for chains stay intact, and it
-        # still never truncates ahead of writing: an interrupted rebuild
+        # Sections keep their names and geometry; create_only becomes
+        # rw=write + create_on_open=1: existing files are written through
+        # end to end (holes filled), missing files are created and written
+        # ONCE (create_on_open suppresses the setup-phase pre-layout that
+        # would double the writes). create_on_open never creates parent
+        # directories -- ensure_layout_dirs pre-makes the whole grid before
+        # any layout job runs -- and this variant never truncates ahead of
+        # writing, so an interrupted REBUILD cannot reproduce the trap: it
         # leaves short files fio's own size check catches next run.
         python3 - "$src" "$WORK_DIR/jobs/$host/$REBUILD_JOB" <<'PYEOF' || die "cannot derive the rebuild variant for $host"
 import sys
 
 MARKER = "# wekatester-layout: generated"
-lines = [l for l in open(sys.argv[1]).read().splitlines()
-         if not l.startswith(MARKER)]
-
 out = []
-i = 0
-# copy everything up to the first section header ([global] block, comments)
-while i < len(lines) and not (lines[i].startswith("[") and lines[i] != "[global]"):
-    out.append(lines[i])
-    i += 1
-
-while i < len(lines):
-    name = lines[i][1:-1]
-    i += 1
-    body = []
-    while i < len(lines) and not lines[i].startswith("["):
-        body.append(lines[i])
-        i += 1
-    body = [l for l in body if l.strip()]
-    dirs = [f"[{name}.dirs]"]
-    write = [f"[{name}]", f"wait_for={name}.dirs"]
-    for l in body:
-        if l.startswith("filesize=") or l.startswith("size="):
-            dirs.append("filesize=4k")
-            write.append(l)
-        elif l == "create_only=1":
-            dirs.append(l)
-            write.append("rw=write")
-            write.append("create_on_open=1")
-        else:
-            dirs.append(l)     # wait_for chains ride the dirs section
-            if not l.startswith("wait_for="):
-                write.append(l)
-    out.extend([""] + dirs + [""] + write)
-
+for l in open(sys.argv[1]).read().splitlines():
+    if l.startswith(MARKER):
+        continue
+    if l.strip() == "create_only=1":
+        out.append("rw=write")
+        out.append("create_on_open=1")
+    else:
+        out.append(l)
 open(sys.argv[2], "w").write("\n".join(out) + "\n")
 PYEOF
     done
@@ -3011,6 +2999,71 @@ if bad:
 PYEOF
 }
 
+# fio cannot be trusted to create the directory tree a filename_format
+# implies: create_on_open never mkdirs at all, and create_only's setup pass
+# on fio 3.28 mkdirs only each job's FIRST file's directory (seen live on
+# two labs: dir 0 created, every 1/* open ENOENTs with filesetup.c:174).
+# So the grid's directories are derived from the staged layout variant and
+# made here, before any layout job runs. Flat namespaces derive nothing.
+ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
+    local host cmd i pids=() hs=()
+    for host in "${HOSTS[@]}"; do
+        cmd=$(python3 - "$WORK_DIR/jobs/$host/$1" <<'PYEOF'
+import os, sys
+
+glb, sections, cur = {}, [], None
+for raw in open(sys.argv[1]):
+    line = raw.strip()
+    if not line or line[0] in "#;":
+        continue
+    if line.startswith("["):
+        name = line[1:-1]
+        cur = glb if name == "global" else {}
+        if name != "global":
+            sections.append((name, cur))
+        continue
+    if "=" in line and cur is not None:
+        k, v = line.split("=", 1)
+        cur[k.strip()] = v.strip()
+
+dirs = set()
+for name, sec in sections:
+    fmt = sec.get("filename_format", glb.get("filename_format"))
+    if not fmt or "/" not in fmt:
+        continue
+    sub = fmt.rsplit("/", 1)[0].replace("$jobname", name)
+    combos = [sub]
+    for var, key in (("$filenum", "nrfiles"), ("$jobnum", "numjobs")):
+        if var in sub:
+            count = int(sec.get(key, glb.get(key, 1)))
+            combos = [c.replace(var, str(n)) for c in combos for n in range(count)]
+    if any("$" in c for c in combos):
+        print(f"WARNING: cannot pre-create directories for [{name}]: "
+              f"unsupported variable in '{sub}'", file=sys.stderr)
+        continue
+    base = sec.get("directory", glb.get("directory", ""))
+    for c in combos:
+        dirs.add(os.path.join(base, c))
+
+# chunked so the remote command stays far below ssh's packet limit
+dirs = sorted(dirs)
+cmds = []
+while dirs:
+    chunk, dirs = dirs[:400], dirs[400:]
+    cmds.append("mkdir -p " + " ".join("'%s'" % d for d in chunk))
+print(" && ".join(cmds))
+PYEOF
+        ) || die "cannot derive the layout directory set for $host"
+        [ -n "$cmd" ] || continue
+        run_host "$host" "$cmd" &
+        pids+=($!); hs+=("$host")
+    done
+    # scoped wait, as always: the run-log tees are siblings here
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || die "cannot pre-create layout directories on ${hs[$i]}"
+    done
+}
+
 run_jobs() {
     local job outfile report cmd host t0 t1 ghash marker jobref missing
     echo
@@ -3055,6 +3108,7 @@ run_jobs() {
                 done
                 log "no completion marker for this layout geometry (first run, interrupted layout, or geometry change) -- rebuilding every file with full writes"
             fi
+            ensure_layout_dirs "$jobref"
             for host in "${HOSTS[@]}"; do
                 marker="$(host_dir "$host")/.wekatester-layout-$ghash.done"
                 run_host "$host" "rm -f '$marker'" \

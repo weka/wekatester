@@ -1193,6 +1193,7 @@ t_assert "unlink job derives from the staged layout variant: unlink=1, no marker
 [global]
 directory=/mnt/weka
 ioengine=libaio
+blocksize=1Mi
 
 [layout-1]
 stonewall
@@ -1211,6 +1212,7 @@ numjobs=16"
      grep -q "^unlink=1$" "$u1" && grep -q "numjobs=16" "$u1" &&
      grep -q "numjobs=8" "$u2" &&
      grep -q "^filesize=4k$" "$u1" && ! grep -q "filesize=10G" "$u1" &&
+     grep -q "^blocksize=4k$" "$u1" && ! grep -q "blocksize=1Mi" "$u1" &&
      ! grep -q "wekatester-layout: generated" "$u1" &&
      ! is_layout_file "$u1" &&
      awk "/^\[global\]/{g=1} /^unlink=1$/{if(g)ok=1} END{exit !ok}" "$u1")'
@@ -1391,15 +1393,55 @@ t_assert "rebuild variant: rw=write + create_on_open replace create_only, geomet
      JOBFILES=(000-wekatester-layout.job)
      stage_rebuild_variants
      r=$d/jobs/h1/000-wekatester-relayout.job
-     # paired sections: a 4k create_only opener (creates the DIRS) chained
-     # into the write-through section that keeps the original name
-     grep -q "^\[layout-1.dirs\]$" "$r" && grep -q "^\[layout-1\]$" "$r" &&
-     grep -q "^wait_for=layout-1.dirs$" "$r" &&
-     grep -q "^filesize=4k$" "$r" && grep -q "^filesize=10G$" "$r" &&
-     grep -q "^create_only=1$" "$r" && grep -q "^rw=write$" "$r" &&
-     grep -q "^create_on_open=1$" "$r" &&
+     # same sections, same geometry; only the layout mode changes (the
+     # directory grid comes from ensure_layout_dirs, never from fio)
+     grep -q "^\[layout-1\]$" "$r" && ! grep -q "\.dirs" "$r" &&
+     grep -q "^rw=write$" "$r" && grep -q "^create_on_open=1$" "$r" &&
+     ! grep -q "^create_only=1$" "$r" &&
+     grep -q "^filesize=10G$" "$r" && grep -q "^blocksize=1Mi$" "$r" &&
      ! grep -q "wekatester-layout: generated" "$r" &&
-     [ "$(grep -c "^numjobs=16$" "$r")" -eq 2 ])'
+     [ "$(grep -c "^numjobs=16$" "$r")" -eq 1 ])'
+t_assert "ensure_layout_dirs: \$filenum grid dirs are pre-created, flat names derive nothing" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1 h2)
+     mkdir -p "$d/jobs/h1" "$d/jobs/h2"
+     printf "[global]\ndirectory=/mnt/weka\nfilename_format=\$filenum/\$jobnum\n[l]\nnrfiles=3\nnumjobs=4\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "[global]\ndirectory=/mnt/weka\n[l]\nfilename_format=wt.\$jobnum\nnrfiles=3\nnumjobs=4\n" > "$d/jobs/h2/000-wekatester-layout.job"
+     run_host() { echo "$1: $2" >> "$WORK_DIR/oplog"; }
+     ensure_layout_dirs 000-wekatester-layout.job)
+    grep -q "^h1: mkdir -p ./mnt/weka/0. ./mnt/weka/1. ./mnt/weka/2.$" "$d/oplog" &&
+    ! grep -q "^h2:" "$d/oplog"'
+t_assert "ensure_layout_dirs: per-section format, directory and \$jobname override the global" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     mkdir -p "$d/jobs/h1"
+     printf "[global]\ndirectory=/mnt/weka\nfilename_format=\$filenum/\$jobnum\nnrfiles=2\n[a]\nnumjobs=2\n[b]\ndirectory=/mnt/other\nfilename_format=\$jobname.d/\$jobnum\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     run_host() { echo "$1: $2" >> "$WORK_DIR/oplog"; }
+     ensure_layout_dirs 000-wekatester-layout.job)
+    grep -q "^h1: mkdir -p ./mnt/other/b.d. ./mnt/weka/0. ./mnt/weka/1.$" "$d/oplog"'
+t_assert "ensure_layout_dirs: an unsupported format variable warns and skips, never mkdirs a literal" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     mkdir -p "$d/jobs/h1"
+     printf "[global]\ndirectory=/mnt/weka\n[a]\nfilename_format=\$clientuid/\$jobnum\nnumjobs=2\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     run_host() { echo "$1: $2" >> "$WORK_DIR/oplog"; }
+     ensure_layout_dirs 000-wekatester-layout.job) 2>&1 )
+    [ ! -f "$d/oplog" ] &&
+    case "$out" in *"cannot pre-create directories for [a]"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cleanup: a privileged host gets a privileged fio kill, an unprivileged one does not" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=""; HOSTS=(h1 h2); FIO_STARTED=1; TARGET_DIR=/dev/shm/x
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR"
+     printf "sudo" > "$AUTH_DIR/h1.priv"
+     run_host() { echo "$1: $2" >> "$d/oplog"; }
+     cleanup)
+    grep -q "^h1: .*sudo kill" "$d/oplog" &&
+    grep -q "^h2: if \[ -f" "$d/oplog" &&
+    ! grep -q "^h2: .*sudo" "$d/oplog"'
 t_assert "geometry hash: host order and cpu steering do not matter, the grid does" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -1421,6 +1463,7 @@ run_jobs_marker_case() {   # run_jobs_marker_case <marker-present-rc>; prints ou
      FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
      mkdir -p "$d/jobs/h1" "$SET_DIR" "$RUN_DIR"
      printf "[global]\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "[global]\n[l]\nrw=write\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-relayout.job"
      printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
      printf "{ \"client_stats\": [ { \"jobname\": \"l\", \"hostname\": \"h1\", \"error\": 0, \"read\": {\"total_ios\":0}, \"write\": {\"total_ios\":0} } ] }\n" > "$d/r.json"
      JOBFILES=(000-wekatester-layout.job)
