@@ -1293,8 +1293,14 @@ probe_workers() {
     [ -n "$AUTO_LEVEL" ] || return 0   # df + backend RAM matter to the tuner only
     run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
-    if ! run_host "$MASTER" "weka cluster servers list -J" \
-            > "$WORK_DIR/probe/_weka_ram.json"; then
+    # Process-level first: only COMPUTE processes hold the hugepage pool
+    # that matters (FE and DRIVES are fixed 1.4GiB of net/queue buffers),
+    # and only process rows carry roles. Server-level rows (ram_allocated,
+    # a per-machine sum) remain the fallback for CLIs without it.
+    if ! { run_host "$MASTER" "weka cluster process -J" \
+            > "$WORK_DIR/probe/_weka_ram.json" \
+        || run_host "$MASTER" "weka cluster servers list -J" \
+            > "$WORK_DIR/probe/_weka_ram.json"; }; then
         rm -f "$WORK_DIR/probe/_weka_ram.json"
         : > "$WORK_DIR/probe/_weka_ram.err"
         # the tuner prints the floor it actually used; no number here, so the
@@ -1468,14 +1474,26 @@ def override(lines, key, value):
     return ins
 
 # Cache ceiling for small-file working-set sizing, loaded once up front.
+# What this bounds (per weka source, fs/exports/types.d BlockOrigin): weka
+# backends hold NO user data in RAM -- every non-sparse block is served
+# from NVMe/OBS/peer, writes persist before ack, and direct=1 on a
+# forcedirect mount bypasses the client page cache. The hugepage pool a
+# process reports as memory/ram_allocated is metadata block cache plus
+# in-flight buffers; a working set beyond it defeats the METADATA cache,
+# which is what flatters small-working-set latency. Process rows carry
+# roles: only COMPUTE processes hold that pool (FE/DRIVES are fixed-size
+# network/queue buffers). Server rows (ram_allocated, per-machine sums)
+# have no roles and over-count a little -- fine for a ceiling.
 cache_bytes = 0
 ram_path = os.path.join(work, "probe", "_weka_ram.json")
 if os.path.exists(ram_path):
     try:
-        # 5.1 renamed the field to ram_allocated; fall back to the older
-        # (and any hypothetical newer) "memory" key when absent.
+        rows = json.load(open(ram_path))
+        if isinstance(rows, dict):   # some CLIs wrap the list
+            rows = next((v for v in rows.values() if isinstance(v, list)), [])
+        compute = [r for r in rows if "COMPUTE" in (r.get("roles") or [])]
         cache_bytes = sum((s.get("ram_allocated") or s.get("memory") or 0)
-                           for s in json.load(open(ram_path)))
+                           for s in (compute or rows))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         warn(f"could not parse weka RAM listing ({exc}); using working-set floor")
 if cache_bytes == 0:

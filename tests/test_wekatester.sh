@@ -256,7 +256,7 @@ t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" b
     esac'
 t_assert "weka RAM: memory key fallback (pre-5.1)" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "[{\"memory\": 12335448064}, {\"memory\": 12335448064}]\n" > "$FIX/probe/_weka_ram.json"
+    printf "[{\"memory\": 12335448064, \"roles\": [\"COMPUTE\"]}, {\"memory\": 12335448064, \"roles\": [\"COMPUTE\"]}, {\"memory\": 99999999999999, \"roles\": [\"FRONTEND\"]}]\n" > "$FIX/probe/_weka_ram.json"
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     grep -q "^nrfiles=5$" "$FIX/jobs/h1/031-iops.job"'
