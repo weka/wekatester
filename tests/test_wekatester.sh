@@ -1380,9 +1380,15 @@ t_assert "rebuild variant: rw=write + create_on_open replace create_only, geomet
      JOBFILES=(000-wekatester-layout.job)
      stage_rebuild_variants
      r=$d/jobs/h1/000-wekatester-relayout.job
-     grep -q "^rw=write$" "$r" && grep -q "^create_on_open=1$" "$r" &&
-     ! grep -q "^create_only=1$" "$r" && ! grep -q "wekatester-layout: generated" "$r" &&
-     grep -q "^filesize=10G$" "$r" && grep -q "^numjobs=16$" "$r")'
+     # paired sections: a 4k create_only opener (creates the DIRS) chained
+     # into the write-through section that keeps the original name
+     grep -q "^\[layout-1.dirs\]$" "$r" && grep -q "^\[layout-1\]$" "$r" &&
+     grep -q "^wait_for=layout-1.dirs$" "$r" &&
+     grep -q "^filesize=4k$" "$r" && grep -q "^filesize=10G$" "$r" &&
+     grep -q "^create_only=1$" "$r" && grep -q "^rw=write$" "$r" &&
+     grep -q "^create_on_open=1$" "$r" &&
+     ! grep -q "wekatester-layout: generated" "$r" &&
+     [ "$(grep -c "^numjobs=16$" "$r")" -eq 2 ])'
 t_assert "geometry hash: host order and cpu steering do not matter, the grid does" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -1705,33 +1711,33 @@ t_assert "pinning: cpus outside the taskset with no escalator dies showing all t
     d=$(mktemp -d); mkdir -p "$d/probe"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; mkdir -p "$d/auth"
-        printf "taskset 0-3\nweka_allowed 8-11\n" > "$d/probe/h1"
+        printf "taskset 0-3\nweka_allowed 8\nweka_allowed 9\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >/dev/null )
     case "$err" in
-        *"requested cpus_allowed: 4-7"*"current taskset:       0-3"*"weka pinned cores:     8-11"*"outside the current taskset"*) true;;
+        *"requested cpus_allowed: 4-7"*"current taskset:       0-3"*"weka dedicated cores:  8,9"*"outside the current taskset"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 t_assert "pinning: overlap with weka cores dies without priv, warns and proceeds with it" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "taskset 0-15\nweka_allowed 8-11\n" > "$d/probe/h1"
+        printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >/dev/null )
     case "$err" in (*"overlap weka'\''s cores and no passwordless"*) true;; (*) echo "$err" >&2; exit 1;; esac
     err2=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "taskset 0-15\nweka_allowed 8-11\npriv sudo\n" > "$d/probe/h1"
+        printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\npriv sudo\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >/dev/null )
-    case "$err2" in (*"WARNING"*"overlap weka"*"proceeding under sudo"*) true;; (*) echo "$err2" >&2; exit 1;; esac
+    case "$err2" in (*"WARNING"*"overlap weka'\''s dedicated cores (8,10)"*"proceeding under sudo"*) true;; (*) echo "$err2" >&2; exit 1;; esac
     [ "$(cat "$d/auth/h1.priv")" = sudo ] && [ "$(cat "$d/auth/h1.cpus")" = "8,10" ]'
 t_assert "pinning: an in-mask request with no escalator records cpus and proceeds" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-     printf "taskset 0-15\nweka_allowed 20-23\n" > "$d/probe/h1"
+     printf "taskset 0-15\nweka_allowed 20\nweka_allowed 0-15\n" > "$d/probe/h1"
      printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-7" ] && test ! -s "$d/auth/h1.priv"'
@@ -1831,6 +1837,34 @@ t_assert "writeback: -C set owns the target when -t was not given" bash -c '
      FAST_TRACK=1
      writeback_targets) >/dev/null
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
+
+# --- isolcpus awareness (field: isca224, isolcpus=domain,4-55) ---
+t_assert "tuner: isolcpus pins usable cores to the isolated set minus weka" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "isolated 4-7\n" >> "$FIX/probe/h1"
+    printf "isolated 4-7\n" >> "$FIX/probe/h2"
+    (source ./wekatester
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    grep -q "^cpus_allowed=4-7$" "$FIX/jobs/h1/011-bw.job"'
+t_assert "pinning: a mask mixing isolated and housekeeping cpus is fatal" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        printf "taskset 0-3\nisolated 4-15\npriv sudo\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t0-15\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 >/dev/null )
+    case "$err" in
+        *"mix isolated and housekeeping"*"silently collapses"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "pinning: a pure-isolated request needs no escalator (self-affinable)" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+     printf "taskset 0-3\nisolated 4-15\n" > "$d/probe/h1"
+     printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
+     check_cpu_pinning)
+    [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
 
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted

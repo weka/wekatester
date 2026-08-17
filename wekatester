@@ -251,6 +251,19 @@ require_interactive() {   # require_interactive <what-needs-it> [advice]
     die "$1 needs a terminal; ${2:-use -r for unattended runs}"
 }
 
+# Best-effort variant: open the terminal if there is one, say so if not --
+# for prompts that have a sane default on unattended runs (-r/-n), where
+# require_interactive's die would be wrong and writing to the unopened
+# prompt fds is a bad-fd error (seen live).
+try_interactive() {
+    if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
+    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
+        PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
+        return 0
+    fi
+    return 1
+}
+
 # Hand the run phase back exactly the world it has today: no child inherits a
 # readable terminal fd behind the transport's /dev/null-ed stdin.
 close_interactive() {
@@ -1029,6 +1042,7 @@ probe_remote_cmd() {
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
+        echo \"isolated \$([ -f /sys/devices/system/cpu/isolated ] && cat /sys/devices/system/cpu/isolated)\"; \
         for pc in sudo dzdo doas; do command -v \$pc >/dev/null && \$pc -n true 2>/dev/null && { echo \"priv \$pc\"; break; }; done; true"
 }
 
@@ -1158,9 +1172,10 @@ check_cpu_pinning() {
         req=$(targets_field "$host" 4 "$WORK_DIR/targets.final")
         [ -n "$req" ] || continue
         cur=$(awk '$1 == "taskset" {print $2; exit}' "$WORK_DIR/probe/$host")
-        weka=$(awk '$1 == "weka_allowed" {printf "%s,", $2}' "$WORK_DIR/probe/$host")
+        weka=$(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")
+        iso=$(awk '$1 == "isolated" {print $2; exit}' "$WORK_DIR/probe/$host")
         priv=$(host_priv "$host")
-        verdict=$(python3 - "$req" "${cur:-}" "${weka%,}" <<'PYEOF'
+        verdict=$(python3 - "$req" "${cur:-}" "${weka% }" "${iso:-}" <<'PYEOF'
 import sys
 def expand(s):
     out = set()
@@ -1172,23 +1187,46 @@ def expand(s):
         else:
             out.add(int(part))
     return out
-req, cur, weka = (expand(x) for x in sys.argv[1:4])
+req, cur = expand(sys.argv[1]), expand(sys.argv[2])
+iso = expand(sys.argv[4]) if len(sys.argv) > 4 else set()
+# same rule as the tuner: weka pins each dedicated io thread to exactly one
+# CPU; wide masks are floating utility threads and MUST be ignored, or the
+# union covers every CPU and everything "overlaps" (seen live)
+weka = set()
+for mask in sys.argv[3].split():
+    cpus = expand(mask)
+    if len(cpus) == 1:
+        weka |= cpus
 flags = []
-if cur and not req <= cur:
+if iso and (req & iso) and (req - iso):
+    # a mask mixing isolated and housekeeping cpus silently collapses onto
+    # the housekeeping partition -- worse than failing, it runs WRONG
+    flags.append("mixed")
+# isolated cpus are self-affinable (fio sets its own per-job affinity there
+# without privilege); only cpus outside BOTH the mask and the isolated set
+# genuinely need an escalator
+if cur and not req <= (cur | iso):
     flags.append("outside")
 if req & weka:
     flags.append("overlap")
-print(" ".join(flags) or "ok")
+print(("dedicated=" + (",".join(map(str, sorted(weka))) or "none")), " ".join(flags) or "ok")
 PYEOF
 )
+        local dedicated=${verdict%% *}; dedicated=${dedicated#dedicated=}
+        case "$verdict" in
+            *mixed*)
+                log "ERROR: $host: requested cpus_allowed: $req" >&2
+                log "ERROR: $host: isolated cpus (isolcpus): ${iso:-none}" >&2
+                die "$host: the requested cpus mix isolated and housekeeping cpus -- the kernel silently collapses such masks onto the housekeeping cpus; request a subset of the isolated set instead" ;;
+        esac
         case "$verdict" in
             *overlap*)
                 if [ -n "$priv" ]; then
-                    log "WARNING: $host: requested cpus ($req) overlap weka's cores ($(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")); proceeding under $priv taskset as asked" >&2
+                    log "WARNING: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); proceeding under $priv taskset as asked" >&2
                 else
                     log "ERROR: $host: requested cpus_allowed: $req" >&2
                     log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
-                    log "ERROR: $host: weka pinned cores:     $(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")" >&2
+                    log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
                     die "$host: requested cpus overlap weka's cores and no passwordless sudo/dzdo/doas is available"
                 fi ;;
         esac
@@ -1197,7 +1235,7 @@ PYEOF
                 if [ -z "$priv" ]; then
                     log "ERROR: $host: requested cpus_allowed: $req" >&2
                     log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
-                    log "ERROR: $host: weka pinned cores:     $(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")" >&2
+                    log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
                     die "$host: requested cpus are outside the current taskset and no passwordless sudo/dzdo/doas is available"
                 fi ;;
         esac
@@ -1334,11 +1372,13 @@ def parse_size(s):
 # --- probe facts ---
 facts = {}
 for h in hosts:
-    ncpus, weka, engines = 0, set(), []
+    ncpus, weka, engines, iso = 0, set(), [], set()
     for line in open(os.path.join(work, "probe", h)):
         f = line.split()
         if not f: continue
         if f[0] == "ncpus": ncpus = int(f[1])
+        elif f[0] == "isolated" and len(f) > 1:
+            iso = parse_cpulist(f[1])
         elif f[0] == "weka_allowed":
             # weka pins each dedicated io thread to exactly one CPU (a
             # single-CPU task-level mask); utility threads have wide masks
@@ -1350,7 +1390,23 @@ for h in hosts:
                 weka |= cpuset
         elif f[0] == "engines": engines = f[1:]
     usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
-    facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable, "engines": engines}
+    if iso:
+        # isolcpus: an affinity mask MIXING isolated and housekeeping cpus
+        # silently collapses onto the housekeeping partition (seen live:
+        # every fio worker crammed onto the 4 shared cpus). The isolated
+        # cpus are what the box set aside for exactly this work: pin to
+        # them, minus weka's own.
+        usable_iso = sorted(iso - weka)
+        if usable_iso:
+            warn(f"{h}: isolcpus detected; pinning fio to isolated cpus "
+                 f"{fmt_cpulist(usable_iso)} (housekeeping cpus excluded)")
+            usable = usable_iso
+        else:
+            warn(f"{h}: isolcpus detected but weka owns every isolated cpu; "
+                 f"falling back to the housekeeping cpus")
+            usable = sorted(set(range(ncpus)) - weka - iso) or usable
+    facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable,
+                "engines": engines, "isolated": sorted(iso)}
 
 if len({f["ncpus"] for f in facts.values()}) > 1:
     warn("system core counts differ between hosts: "
@@ -1930,8 +1986,14 @@ resolve_targets_file() {
     fi
     if [ ! -f "$candidate" ]; then
         if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
-            if ! confirm_timed 5 yes "host file $candidate does not exist; create it?"; then
-                die "host file $candidate does not exist"
+            # 5s prompt when a terminal exists; without one, the default
+            # (create and continue) applies -- never write to unopened fds
+            if try_interactive; then
+                if ! confirm_timed 5 yes "host file $candidate does not exist; create it?"; then
+                    die "host file $candidate does not exist"
+                fi
+            else
+                log "host file $candidate does not exist; creating it (unattended)"
             fi
         else
             require_interactive "-t"
@@ -2641,11 +2703,56 @@ stage_rebuild_variants() {
     for host in "${HOSTS[@]}"; do
         src="$WORK_DIR/jobs/$host/${JOBFILES[0]}"
         [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the rebuild variant"
-        awk -v marker="$LAYOUT_MARKER" '
-            index($0, marker) == 1 { next }
-            /^create_only=1$/ { print "rw=write"; print "create_on_open=1"; next }
-            { print }
-        ' "$src" > "$WORK_DIR/jobs/$host/$REBUILD_JOB"
+        # Each layout section becomes a PAIR. create_on_open's lazy open does
+        # NOT create parent directories (only create_only's setup path does;
+        # seen live: a virgin filesystem ENOENTs every "<client>.N/j" open),
+        # so a tiny 4k create_only section runs first -- on a missing file it
+        # creates the file AND its directories at 4k cost, on any existing
+        # file (sparse included: st_size >= 4k) it is a no-op -- and the
+        # write-through section chains after it. The write section keeps the
+        # original name so cross-section wait_for chains stay intact, and it
+        # still never truncates ahead of writing: an interrupted rebuild
+        # leaves short files fio's own size check catches next run.
+        python3 - "$src" "$WORK_DIR/jobs/$host/$REBUILD_JOB" <<'PYEOF' || die "cannot derive the rebuild variant for $host"
+import sys
+
+MARKER = "# wekatester-layout: generated"
+lines = [l for l in open(sys.argv[1]).read().splitlines()
+         if not l.startswith(MARKER)]
+
+out = []
+i = 0
+# copy everything up to the first section header ([global] block, comments)
+while i < len(lines) and not (lines[i].startswith("[") and lines[i] != "[global]"):
+    out.append(lines[i])
+    i += 1
+
+while i < len(lines):
+    name = lines[i][1:-1]
+    i += 1
+    body = []
+    while i < len(lines) and not lines[i].startswith("["):
+        body.append(lines[i])
+        i += 1
+    body = [l for l in body if l.strip()]
+    dirs = [f"[{name}.dirs]"]
+    write = [f"[{name}]", f"wait_for={name}.dirs"]
+    for l in body:
+        if l.startswith("filesize=") or l.startswith("size="):
+            dirs.append("filesize=4k")
+            write.append(l)
+        elif l == "create_only=1":
+            dirs.append(l)
+            write.append("rw=write")
+            write.append("create_on_open=1")
+        else:
+            dirs.append(l)     # wait_for chains ride the dirs section
+            if not l.startswith("wait_for="):
+                write.append(l)
+    out.extend([""] + dirs + [""] + write)
+
+open(sys.argv[2], "w").write("\n".join(out) + "\n")
+PYEOF
     done
 }
 
