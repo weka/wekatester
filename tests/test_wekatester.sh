@@ -1302,6 +1302,24 @@ t_assert "stamping: formats get the host prefix, unique_filename forced 0, defau
     grep -q "^filename_format=h1.\$jobname.\$jobnum.\$filenum$" "$b" &&
     grep -q "^filename_format=\$clientuid.\$jobnum$" "$c" &&
     grep -q "^unique_filename=0$" "$c"'
+t_assert "stamping: pinned hosts get cpus_allowed filled and policy=split, explicit lines win" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1 h2)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1" "$d/jobs/h2"
+     printf "4-15,28-55" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     printf "[global]\ncpus_allowed=2,3\ncpus_allowed_policy=shared\n[b]\nrw=read\n" > "$d/jobs/h1/012-b.job"
+     printf "[global]\ncpus_allowed=5-9\n[c]\nrw=read\n" > "$d/jobs/h2/013-c.job"
+     printf "[global]\nfilesize=1G\n[e]\nrw=read\n" > "$d/jobs/h2/014-e.job"
+     stamp_unique_names)
+    a=$d/jobs/h1/011-a.job; b=$d/jobs/h1/012-b.job
+    c=$d/jobs/h2/013-c.job; e=$d/jobs/h2/014-e.job
+    grep -q "^cpus_allowed=4-15,28-55$" "$a" && grep -q "^cpus_allowed_policy=split$" "$a" &&
+    grep -q "^cpus_allowed=2,3$" "$b" && grep -q "^cpus_allowed_policy=shared$" "$b" &&
+    ! grep -q "4-15" "$b" && ! grep -q "policy=split" "$b" &&
+    grep -q "^cpus_allowed=5-9$" "$c" && grep -q "^cpus_allowed_policy=split$" "$c" &&
+    ! grep -q "cpus_allowed" "$e"'
 t_assert "stamping: staged variants and the rebuild variant carry it end to end" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)

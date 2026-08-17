@@ -2792,13 +2792,25 @@ PYEOF
 # filename_format: the same collision safety, deterministic on every fio.
 # A format carrying $clientuid keeps its own uniqueness scheme untouched;
 # a jobfile with no format at all gets fio's default grid, host-prefixed.
+#
+# The same pass stamps the cpu spread. isolcpus cores have NO scheduler
+# load balancing: threads affined to a RANGE of isolated cpus never
+# migrate off the core they forked on (seen live: all 44 layout workers
+# timesharing cpu 4 of "4-15,28-55"). cpus_allowed_policy=split assigns
+# each job its own cpu explicitly -- no balancer needed -- and wraps
+# cleanly when jobs outnumber cpus (probed on fio 3.28). When the host
+# has a pinned cpu list, every variant without its own cpus_allowed gets
+# the host's list, and any variant with cpus but no explicit policy gets
+# split.
 stamp_unique_names() {
-    local host
+    local host cpus
     for host in "${HOSTS[@]}"; do
-        python3 - "$WORK_DIR/jobs/$host" "$host" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
+        cpus=""
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        python3 - "$WORK_DIR/jobs/$host" "$host" "$cpus" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
 import os, sys
 
-jobsdir, host = sys.argv[1], sys.argv[2]
+jobsdir, host, cpus = sys.argv[1], sys.argv[2], sys.argv[3]
 for name in sorted(os.listdir(jobsdir)):
     path = os.path.join(jobsdir, name)
     if not os.path.isfile(path):
@@ -2815,9 +2827,16 @@ for name in sorted(os.listdir(jobsdir)):
         elif s.startswith("unique_filename="):
             continue   # replaced by the forced 0 below
         out.append(l)
+    has_cpus = any(l.strip().startswith("cpus_allowed=") for l in out)
+    has_policy = any(l.strip().startswith("cpus_allowed_policy=") for l in out)
     ins = ["unique_filename=0"]
     if not has_fmt:
         ins.append("filename_format=%s.$jobname.$jobnum.$filenum" % host)
+    if cpus and not has_cpus:
+        ins.append("cpus_allowed=" + cpus)
+        has_cpus = True
+    if has_cpus and not has_policy:
+        ins.append("cpus_allowed_policy=split")
     if any(l.strip() == "[global]" for l in out):
         res, done = [], False
         for l in out:
