@@ -17,7 +17,7 @@
 # written to disk are the results_*.json outputs in the output directory
 # (./results by default, -o/--output to choose another).
 
-VERSION="2026-08-10"
+VERSION="2026-08-17"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -357,8 +357,8 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max]] [--ignore-capacity]
-                  [-i [login:]keyfile[,...]] [-p [n]] [-C[set]]
-                  [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
+                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
@@ -388,6 +388,11 @@ attaching is the way to pass a value that starts with a dash.
                           existing ssh sessions and plain defaults first, then
                           keys, then passwords -- and per worker the first
                           success wins
+  -t, --targets [file]    per-host settings from a CSV host file: login,
+                          ioengine, cpus_allowed, destination dir, per-test
+                          geometry. Bare -t = the set's own hostlist.csv,
+                          else ./hostlist.csv. CLI flags beat the file; the
+                          file beats the jobfiles and the tuner
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no

@@ -21,8 +21,8 @@ wekatester uses fio's native client/server mode:
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max]] [--ignore-capacity]
-                  [-i [login:]keyfile[,...]] [-p [n]] [-C[set]]
-                  [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
+                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        wekatester -s results.json
        wekatester --version
 
@@ -52,6 +52,11 @@ attaching is the way to pass a value that starts with a dash.
                           existing ssh sessions and plain defaults first, then
                           keys, then passwords -- and per worker the first
                           success wins
+  -t, --targets [file]    per-host settings from a CSV host file: login,
+                          ioengine, cpus_allowed, destination dir, per-test
+                          geometry. Bare -t = the set's own hostlist.csv,
+                          else ./hostlist.csv. CLI flags beat the file; the
+                          file beats the jobfiles and the tuner
   -C[set], --customize[=set]
                           copy a workload set, edit each jobfile, then run it;
                           needs a terminal unless -r or -n is given. With no
@@ -83,7 +88,9 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
-`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. With `-a`, the probe checks the engine is actually loadable by every worker's fio (`fio --enghelp`) and refuses early, naming the hosts that lack it; without `-a` a bad engine still fails loudly at the first job. Values are passed to fio as typed.
+`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. The engine is **proven with a real one-file job on every worker's destination** before anything runs — `--enghelp` only shows what fio was built with, and engines routinely pass it yet fail on the actual filesystem — and a host failing the test is fatal, naming the host and the evidence file. Values are passed to fio as typed.
+
+`-t [hostfile]` — per-host settings from one CSV; see **Host files** below.
 
 `-i` / `-p` — the credential pool; see **Authentication** below.
 
@@ -170,6 +177,23 @@ Because wekatester uses the real ssh client, anything you can express in `~/.ssh
 - `on-prem_ssh_config.example` — default key, host key checking off
 
 Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
+
+# Host files (-t)
+One CSV assigns per-host settings without a jobfile set per client:
+
+```
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth:nj/fs/nr/qd,latency:nj/fs/nr/qd,iops:nj/fs/nr/qd
+client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,1///1,12/1G/56/64
+,,io_uring,,,,,
+```
+
+A line naming a host assigns to that host (two lines naming the same host is an error, both line numbers named). Host-less lines are **selector** lines: their login and/or ioengine choose the hosts they apply to — a login selects hosts using that login, an ioengine selects hosts that **passed that engine's functional test** — and their remaining fields fold into any host whose more-specific settings left them unset. A host line beats two selectors beats one beats a global `,,...` line; a generic line never overrides a more specific one regardless of file order; equally specific conflicts keep the *first* line and print a warning. A host-less line's login is only ever a selector — logins are assigned by host lines, the CLI, or your ssh defaults. Empty fields mean "default"; geometry sub-fields may be omitted (`12/10G//8` sets numjobs, filesize and iodepth). Quote cpu lists (`"22,24"`), and `#` starts a comment.
+
+Without `-t` no host file is used. Bare `-t` prefers the active set's own `hostlist.csv`, falling back to `./hostlist.csv`; a named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. `-C` sets own a copy (taken from the file in use or the source set, template otherwise), which joins the editor flow and serves later runs of that set. Precedence overall: **CLI flags > host file > jobfiles/tuner**.
+
+Every ioengine the file (or `-e`) names is **proven with a real one-file job on that host's destination** before use — `--enghelp` lists what fio was built with, not what the kernel and filesystem will run — and in auto mode the tuner's common engine comes from the proven set. A requested `allowed_cpus` outside the host's current `taskset -cp` mask, or overlapping weka's pinned cores, is an error showing all three (request, mask, weka cores) unless passwordless sudo/dzdo/doas exists, in which case the fio server is launched under `<priv> taskset -c <cpus>` (overlap then warns instead — your explicit choice) and torn down with the same privilege. Each host may also point at its own `destination_folder`: the mount guard, write probe, layout markers, and staged variants all follow it (auto mode's capacity estimate still measures the master's filesystem — approximate when destinations differ).
+
+With `-a`, the derived values (established login, proven engine, cpus, directory, per-type geometry) are recorded back into the host file for re-use — filling only what the file didn't provide; add `-g` to be asked (no timeout) whether to overwrite instead. Updates never edit lines in place: the old host line is commented out and the new one appended, preserving history.
 
 # Authentication
 A large client list rarely shares one credential, so wekatester carries a pool and finds each worker's own. `-i [login:]keyfile` names a key, optionally bound to a login (`-i ubuntu:lab.pem`); it takes comma-separated lists and may be repeated, accumulating in order. A bare path (`-i lab.pem`) means ssh's default user. `-p [n]` prompts — on your terminal, passwords never echoed — for *n* (default 1) login/password pairs; an empty login answer means ssh's default user. `-i` and `-p` combine freely.

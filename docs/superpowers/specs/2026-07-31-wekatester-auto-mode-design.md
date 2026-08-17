@@ -456,6 +456,45 @@ is accepted and inert there).
   summarized, error-checked in layout mode (its stats are legitimately
   zeros). A failed run dies before it: files persist for debugging and the
   rerun's layout reuses them. Empty per-client namespace dirs may remain.
+- **`-t`/`--targets [file]` — host files (2026-08-17).** One CSV assigns
+  per-host login/ioengine/allowed_cpus/destination_folder and per-type
+  geometry (nj/fs/nr/qd for bandwidth/latency/iops columns, `type:` prefix
+  optional, `/`-separated with omissions allowed). Host lines assign
+  (duplicate host = fatal, both line numbers named); host-less lines are
+  SELECTORS (login = hosts using that login; ioengine = hosts that PASSED
+  the engine's functional test) whose remaining fields fold into hosts
+  whose more-specific settings left them unset. Specificity: host line >
+  two selectors > one > global; generic never overrides specific; equal
+  specificity keeps the FIRST line with a warning. A host-less line's
+  login is only a selector -- logins come from host lines/CLI/defaults --
+  which makes resolution two-phase and well-founded: phase1 (pre-auth)
+  supplies logins+dirs, phase2 folds engine-selector lines once the test
+  results exist. Bare `-t` prefers the source set's hostlist.csv, else
+  ./hostlist.csv; a missing named path prompts untimed create-or-quit (5s
+  defaulting to create under -r); -C sets own a copy that joins the editor
+  flow. Precedence: CLI > host file > jobfiles/tuner. ENGINES named
+  anywhere (file or -e) are proven with a real one-file direct-IO job on
+  each host's own destination during the probe (enghelp filters first); in
+  auto mode the probe's engines lines are rewritten to the proven subset
+  so the tuner's common pick is functional. cpus_allowed enforcement:
+  request outside `taskset -cp` or overlapping weka's cores dies showing
+  request/mask/weka-cores unless a passwordless escalator (sudo/dzdo/doas,
+  probed) exists; overlap WITH one warns and proceeds; the fio server then
+  launches as `<priv> taskset -c <cpus> fio --server` and the kill path
+  carries the same escalator (root servers must not leak). Per-host
+  destination threads through mount guard, write probe, markers, engine
+  tests, and staged variants; capacity still measures the master's df
+  (documented as approximate for split destinations). Per-host geometry on
+  the NON-auto path re-derives that host's layout from its staged variants
+  when the source layout is pristine (hand-edited layouts kept with the
+  tuner's warning). `-a` + host file: derived values (login/engine/cpus/
+  dir/geometry from staged variants) are recorded back fill-missing-only;
+  `-a -g` prompts untimed for overwrite (-r assumes fill); updates comment
+  out the superseded host line THEN append the replacement. Embedded
+  decisions surfaced for veto: -r+-a+-g assumes fill; weka-core overlap
+  with priv warns instead of dying; auto keeps the fleet-common (proven)
+  engine with per-host file/CLI overrides; CSV logins pin User= for
+  credentials lacking their own.
 - **`--`** — everything after it is the client list (standard separator).
 - **`-c`/`-C[name]`** — customize workflow; see below. `-C` with `-s` is a
   usage error. `-C` with `-a` is allowed but prints a notice before editing
