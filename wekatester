@@ -25,6 +25,9 @@ WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfi
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
 DIRECTORY_EXPLICIT=0            # -d was given (CLI beats a host file's dir)
+TARGETS=0                       # -t given: a host file is in play
+TARGETS_PATH=""                 # -t's explicit path ("" = bare -t, resolve later)
+TARGETS_FILE=""                 # the resolved host file actually in use
 ENGINE=""                       # -e: force this fio ioengine everywhere
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
@@ -526,6 +529,22 @@ parse_args() {
                         die "option -p takes a positive count of login/password pairs, got '$OPT_VAL'" ;;
                 esac
                 shift ;;
+            # -t's path is optional: the next token is consumed as a path
+            # only when it looks like one (contains / or ends .csv) --
+            # anything else is a server name. Bare -t resolves to the source
+            # set's hostlist.csv, else ./hostlist.csv (see resolve_targets_file).
+            -t|--targets)
+                TARGETS=1
+                case "${2:-}" in
+                    (*/* | *.csv) TARGETS_PATH=$2; shift ;;
+                esac
+                shift ;;
+            --targets=*)
+                TARGETS=1
+                TARGETS_PATH=${opt#--targets=}
+                [ -n "$TARGETS_PATH" ] || { usage >&2; die "option --targets requires a value"; }
+                shift ;;
+            -t?*) TARGETS=1; opt_val "$opt" -t; TARGETS_PATH=$OPT_VAL; shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -918,17 +937,22 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
 REMAINING=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() left=() i n=0
+    local host pids=() effs=() left=() i n=0 eff
     for host in "${REMAINING[@]}"; do
-        attempt_host "$2" "$host" "$3" "$4" &
+        # a credential's own login wins; else the host file pins this host's
+        eff=$3
+        [ -n "$eff" ] || eff=$(targets_field "$host" 2)
+        effs+=("${eff:-.}")
+        attempt_host "$2" "$host" "$eff" "$4" &
         pids+=($!)
     done
     for i in "${!REMAINING[@]}"; do
         host=${REMAINING[$i]}
         if wait "${pids[$i]}"; then
             n=$((n + 1))
+            eff=${effs[$i]}; [ "$eff" = "." ] && eff=""
             [ "$2" != external ] || : > "$AUTH_DIR/$host.external"
-            [ -z "$3" ] || printf '%s\n' "$3" > "$AUTH_DIR/$host.user"
+            [ -z "$eff" ] || printf '%s\n' "$eff" > "$AUTH_DIR/$host.user"
             debug "$host: connected via $1"
         else
             left+=("$host")
@@ -1642,6 +1666,60 @@ PYEOF
 # Output, one host per line, tab-separated, "-" = unset:
 #   host login engine cpus dir bw_nj/bw_fs/bw_nr/bw_qd lat_... iops_...
 # CLI values arrive as arguments and take precedence over the file.
+# A fresh host file: header plus a commented format reference, so an editor
+# session or a later -a writeback starts from something self-describing.
+write_targets_template() {   # write_targets_template <path>
+    cat > "$1" <<'CSVEOF' || die "cannot create host file $1"
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth:nj/fs/nr/qd,latency:nj/fs/nr/qd,iops:nj/fs/nr/qd
+# One host per line assigns to that host; lines without a host apply to the
+# hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
+# Example:  client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,1///1,12/1G/56/64
+# Example:  ,,io_uring,,,,,        (io_uring for every host that supports it)
+CSVEOF
+    log "created host file $1"
+}
+
+# Which file does -t mean? Explicit path wins (missing: confirm-create or
+# quit -- 5s defaulting to create under -r). Bare -t prefers the SOURCE
+# set's own hostlist.csv (-C resolves against the source too: the custom set
+# does not exist yet), else ./hostlist.csv, creating it with the same
+# confirmation if nothing exists anywhere. Without -t no file is ever used.
+resolve_targets_file() {
+    [ "$TARGETS" -eq 1 ] || return 0
+    local candidate
+    if [ -n "$TARGETS_PATH" ]; then
+        candidate=$TARGETS_PATH
+    else
+        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./hostlist.csv"
+    fi
+    if [ ! -f "$candidate" ]; then
+        if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+            if ! confirm_timed 5 yes "host file $candidate does not exist; create it?"; then
+                die "host file $candidate does not exist"
+            fi
+        else
+            require_interactive "-t"
+            if ! confirm_timed 0 no "host file $candidate does not exist; create it? [y = create, n = quit]"; then
+                die "host file $candidate does not exist"
+            fi
+        fi
+        write_targets_template "$candidate"
+    fi
+    TARGETS_FILE=$candidate
+    log "host file: $TARGETS_FILE"
+}
+
+# Per-host resolved values, phase1 (login/dir before auth). Field numbers
+# match resolve_targets' output: 2=login 3=engine 4=cpus 5=dir.
+targets_field() {   # targets_field <host> <fieldno> [phasefile]
+    local f=${3:-$WORK_DIR/targets.phase1} v
+    [ -f "$f" ] || return 0
+    v=$(awk -F'\t' -v h="$1" -v n="$2" '$1 == h {print $n; exit}' "$f")
+    [ "$v" = "-" ] || printf '%s' "$v"
+}
+
 resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     python3 - "$@" <<'PYEOF'
 import csv, sys
@@ -1875,9 +1953,36 @@ resolve_custom_set() {
 # The guided flow: edit each jobfile, sort out layout per the flag matrix,
 # decide the temp set's fate. Interactive parts are skipped wholesale by
 # -r (fast track) and -n (dry run).
+# -C sets own their host file: copy the one this run resolved (or the
+# source set's) into the new set, else start it from the template. With -t
+# active the set's copy becomes the file in use from here on -- edits to
+# engines/cpus/geometry apply THIS run (phase2 has not happened yet); login
+# edits apply from the NEXT run, since connections are already up.
+ensure_set_hostfile() {
+    local dst="$SET_DIR_OVERRIDE/hostlist.csv" src=""
+    if [ -f "$dst" ]; then
+        [ "$TARGETS" -eq 0 ] || TARGETS_FILE=$dst
+        return 0
+    fi
+    if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
+        src=$TARGETS_FILE
+    elif [ -f "$(workload_src_dir)/hostlist.csv" ]; then
+        src="$(workload_src_dir)/hostlist.csv"
+    fi
+    if [ -n "$src" ]; then
+        cp "$src" "$dst" || die "cannot copy host file into $SET_DIR_OVERRIDE"
+        log "host file copied into the set: $dst"
+    else
+        write_targets_template "$dst"
+    fi
+    [ "$TARGETS" -eq 0 ] || TARGETS_FILE=$dst
+    return 0
+}
+
 customize_jobfiles() {
     echo
     resolve_custom_set
+    ensure_set_hostfile
     local dst=$SET_DIR_OVERRIDE job f interactive=1 had_layout=0
     if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then interactive=0; fi
 
@@ -1892,6 +1997,8 @@ customize_jobfiles() {
             is_layout_file "$dst/$job" && continue   # layout editing is prompted below
             edit_jobfile "$dst/$job"
         done
+        # the set's host file is part of the editing surface too
+        [ ! -f "$dst/hostlist.csv" ] || edit_jobfile "$dst/hostlist.csv"
     fi
 
     # Layout, per the flag matrix: -g always regenerates; existing layout is
@@ -2653,6 +2760,15 @@ main() {
     # -O exit teardown (which only ever touches OUR socket dir -- masters it
     # did not create are left in place). Before preflight: every later ssh
     # rides the winning credential's session and never sees an auth prompt.
+    # Host file (-t): resolve which file applies and compute the pre-auth
+    # phase (logins, dirs) -- the auth rounds consume per-host logins from it.
+    if [ "$TARGETS" -eq 1 ]; then
+        resolve_targets_file
+        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
+            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
+            || die "host file resolution failed ($TARGETS_FILE)"
+    fi
     [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight
     verify_mount_mode

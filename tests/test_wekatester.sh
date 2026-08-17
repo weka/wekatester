@@ -1561,6 +1561,76 @@ t_assert "targets: host-less lines never assign a login" bash -c '
     # h1 has no login, so the root-selector line does not match it at all
     echo "$out" | grep -q "^h1	-	-	-	-" || { echo "$out" >&2; false; }'
 
+# --- host files (-t): flag, file resolution, prompts, -C ownership ---
+t_assert "parse: -t path heuristic -- paths consumed, hostnames left alone" bash -c '
+    (source ./wekatester; parse_args -t h1 h2
+     [ "$TARGETS" = 1 ] && [ -z "$TARGETS_PATH" ] && [ "${HOSTS[*]}" = "h1 h2" ]) &&
+    (source ./wekatester; parse_args -t mine.csv h1;  [ "$TARGETS_PATH" = mine.csv ]) &&
+    (source ./wekatester; parse_args -t ./x h1;       [ "$TARGETS_PATH" = ./x ]) &&
+    (source ./wekatester; parse_args -tmine.csv h1;   [ "$TARGETS_PATH" = mine.csv ]) &&
+    (source ./wekatester; parse_args --targets=a.csv h1; [ "$TARGETS_PATH" = a.csv ]) &&
+    (source ./wekatester; parse_args -T h1;           [ "$TARGETS" = 1 ])'
+t_assert "targets file: explicit missing path prompts; no creates nothing and quits" bash -c '
+    d=$(mktemp -d)
+    err=$(printf "n" | (source ./wekatester
+        TARGETS=1; TARGETS_PATH=$d/no.csv
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        resolve_targets_file) 2>&1 >/dev/null )
+    case "$err" in
+        *"host file $d/no.csv does not exist"*) true;;
+        *) echo "$err" >&2; exit 1;;
+    esac
+    test ! -f "$d/no.csv"'
+t_assert "targets file: yes creates the template and uses it" bash -c '
+    d=$(mktemp -d)
+    printf "y" | (source ./wekatester
+        TARGETS=1; TARGETS_PATH=$d/new.csv
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        resolve_targets_file
+        [ "$TARGETS_FILE" = "$d/new.csv" ]) >/dev/null
+    head -1 "$d/new.csv" | grep -q "^host,user_login"'
+t_assert "targets file: under -r a missing path is created after the 5s default" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+        TARGETS=1; TARGETS_PATH=$d/r.csv; FAST_TRACK=1
+        PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+        printf "\n" | resolve_targets_file) >/dev/null 2>&1
+    test -f "$d/r.csv"'
+t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist.csv" bash -c '
+    d=$(mktemp -d); cd "$d"
+    mkdir -p fio-jobfiles/myset
+    printf "[global]\n[j]\nrw=read\n" > fio-jobfiles/myset/011-a.job
+    printf "host,user_login\nh1,ubuntu\n" > fio-jobfiles/myset/hostlist.csv
+    printf "host,user_login\nh1,root\n" > hostlist.csv
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     TARGETS=1; WORKLOAD=myset; resolve_targets_file
+     [ "$TARGETS_FILE" = "$d/fio-jobfiles/myset/hostlist.csv" ]) >/dev/null &&
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
+     [ "$TARGETS_FILE" = "./hostlist.csv" ]) >/dev/null'
+t_assert "-C sets own a hostfile: resolved file copied in, template when none" bash -c '
+    d=$(mktemp -d); cd "$d"; mkdir -p set1 set2 fio-jobfiles/default
+    printf "[global]\n[j]\nrw=read\n" > fio-jobfiles/default/011-a.job
+    printf "host,user_login\nh9,opc\n" > mine.csv
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     SET_DIR_OVERRIDE=$d/set1; TARGETS=1; TARGETS_FILE=$d/mine.csv
+     ensure_set_hostfile
+     grep -q h9,opc "$d/set1/hostlist.csv" && [ "$TARGETS_FILE" = "$d/set1/hostlist.csv" ]) &&
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     SET_DIR_OVERRIDE=$d/set2; TARGETS=0
+     ensure_set_hostfile
+     head -1 "$d/set2/hostlist.csv" | grep -q "^host,user_login")'
+t_assert "auth rounds: the host file pins a host's login when the credential has none" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR"
+     printf "h1\tubuntu\t-\t-\t-\n" > "$d/targets.phase1"
+     attempt_host() { echo "$2:$3" >> "$d/log"; return 0; }
+     REMAINING=(h1 h2)
+     auth_round "default ssh auth" default "" "" >/dev/null
+     grep -qx "h1:ubuntu" "$d/log" && grep -qx "h2:" "$d/log" &&
+     [ "$(cat "$AUTH_DIR/h1.user")" = ubuntu ] && test ! -f "$AUTH_DIR/h2.user")'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.
