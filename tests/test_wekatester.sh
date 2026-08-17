@@ -1583,13 +1583,29 @@ t_assert "probe: failed weka RAM query hints at weka user login and continues" b
             LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=max
             WORK_DIR=$d; DIRECTORY=/mnt/weka
             run_host() { case "$2" in
-                (*"weka cluster servers list"*) return 1;;
+                (*"weka cluster process"*|*"weka cluster servers list"*) return 1;;
                 (*) echo stubbed;;
             esac; }
             probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
     case "$err" in
         *"could not query weka backend RAM"*"weka user login"*) true;;
         *) echo "$err" >&2; false;;
+    esac'
+t_assert "probe: server-level RAM fallback answers when process-level is missing" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=max
+            WORK_DIR=$d; DIRECTORY=/mnt/weka
+            run_host() { case "$2" in
+                (*"weka cluster process"*) return 1;;
+                (*"weka cluster servers list"*) echo "[{\"ram_allocated\": 123}]";;
+                (*) echo stubbed;;
+            esac; }
+            probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
+    grep -q "ram_allocated" "$d/probe/_weka_ram.json" &&
+    case "$err" in
+        *"could not query weka backend RAM"*) echo "$err" >&2; false;;
+        *) true;;
     esac'
 
 # --- host files (-t): the resolution engine ---
