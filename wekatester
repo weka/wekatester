@@ -1042,7 +1042,7 @@ probe_remote_cmd() {
 # each host's probe "engines" line is REWRITTEN to its functional subset, so
 # the tuner's common-engine pick is proven rather than advertised.
 test_engines() {
-    local host results="$WORK_DIR/engine.results" csv_engines="" cand
+    local host results="$WORK_DIR/engine.results" csv_engines="" cand et_pids=() _p
     mkdir -p "$WORK_DIR/et"
     : > "$results"
     if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
@@ -1066,23 +1066,46 @@ test_engines() {
                 # A broken engine on a real filesystem HANGS at least as
                 # often as it errors (io_uring's specialty, seen live on a
                 # field box) -- an unbounded test job hangs the whole run.
-                # A working engine finishes this 64k write in milliseconds;
-                # anything still going after the timeout is a fail.
+                # And timeout(1) alone is not enough: a direct-IO write on a
+                # sick mount parks fio in D state, where even SIGKILL does
+                # not land and timeout blocks forever waiting for the corpse
+                # (also seen live, same box, next engine). So: background the
+                # bounded job, POLL it, and if it will not die, ABANDON it --
+                # never wait on a possibly-uninterruptible child. A working
+                # engine finishes this 64k write in milliseconds.
+                tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
                 if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
-                        timeout -k 5 ${WEKATESTER_ENGINE_TEST_TIMEOUT:-45} \
+                        timeout -k 5 $tmo \
                         '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
                         --filesize=64k --filename=\"\$f\" --direct=1 \
-                        --output-format=json; rc=\$?; rm -f \"\$f\"; exit \$rc" \
+                        --output-format=json & p=\$!; i=0; \
+                        while kill -0 \$p 2>/dev/null && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
+                        if kill -0 \$p 2>/dev/null; then \
+                            kill -9 \$p 2>/dev/null; sleep 1; \
+                            kill -0 \$p 2>/dev/null && echo WEKATESTER_ENGINE_STUCK; \
+                            rm -f \"\$f\"; exit 124; \
+                        fi; \
+                        wait \$p; rc=\$?; rm -f \"\$f\"; exit \$rc" \
                         > "$WORK_DIR/et/$host.$c.out" 2>&1; then
                     echo "$host $c ok" >> "$results"
                 else
                     echo "$host $c fail" >> "$results"
-                    log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
+                    if grep -q WEKATESTER_ENGINE_STUCK "$WORK_DIR/et/$host.$c.out"; then
+                        log "WARNING: $host: ioengine $c test is STUCK in uninterruptible IO -- abandoned; direct IO on $(host_dir "$host") may be broken on this host" >&2
+                    else
+                        log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
+                    fi
                 fi
             done
         ) &
+        et_pids+=($!)
     done
-    wait
+    # SCOPED wait -- a bare `wait` here also waits on the run-log tees,
+    # which cannot exit until finalize closes their fifos: the same deadlock
+    # cleanup once had, and it presents as a silent hang right after the
+    # last per-engine warning (seen live: no fio running, no D state, just
+    # this wait).
+    for _p in "${et_pids[@]}"; do wait "$_p"; done
     # rewrite each probe's engines line to the proven subset (untested
     # engines are dropped only in auto mode, where the list WAS the tests)
     if [ -n "$AUTO_LEVEL" ]; then

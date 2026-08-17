@@ -1656,6 +1656,20 @@ t_assert "engines: a HANGING test job is killed by the timeout and recorded as f
     took=$(( $(date +%s) - start ))
     grep -qx "localhost hangeng fail" "$d/engine.results" &&
     [ "$took" -lt 60 ]'
+t_assert "engines: test_engines returns while unrelated background children live (bare-wait)" bash -c '
+    # the run-log tees are alive while test_engines runs; a bare `wait`
+    # there deadlocks on them -- seen live as a silent hang right after the
+    # last per-engine warning, with no fio running and no D state
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest"; stub=$d/bin; mkdir -p "$stub"
+    printf "#!/bin/bash\nexit 0\n" > "$stub/fio"; chmod +x "$stub/fio"
+    timeout 30 bash -c "
+        source ./wekatester
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; AUTO_LEVEL=max
+        DIRECTORY=$d/dest; FIO_BIN=$stub/fio
+        printf \"engines libaio\\n\" > \"$d/probe/localhost\"
+        sleep 300 &
+        test_engines >/dev/null 2>&1
+        echo TE_RETURNED" | grep -q TE_RETURNED'
 t_assert "engines: an enghelp-missing candidate fails without burning a job" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     (source ./wekatester
