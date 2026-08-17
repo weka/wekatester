@@ -1280,6 +1280,43 @@ t_assert "-e stamps every staged variant, and the rebuild variant inherits it" b
     v="$d/target/localhost/011-smoke-readbw.job"
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
     grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-relayout.job"'
+
+# --- deterministic filenames: unique_filename=0 + <host>. prefix ---
+# fio client mode invents its own filename prefix (version-dependent) unless
+# unique_filename=0; wekatester needs exact paths for the dir grid, capacity,
+# markers and unlink, so it takes over the uniqueness itself.
+t_assert "stamping: formats get the host prefix, unique_filename forced 0, defaults filled" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     mkdir -p "$d/jobs/h1"
+     printf "[global]\nunique_filename=1\nfilename_format=x/\$jobnum\n[a]\nrw=read\nfilename_format=y.\$filenum\n" > "$d/jobs/h1/011-a.job"
+     printf "[global]\nfilesize=1G\n[b]\nrw=read\n" > "$d/jobs/h1/012-b.job"
+     printf "[global]\nfilename_format=\$clientuid.\$jobnum\n[c]\nrw=read\n" > "$d/jobs/h1/013-c.job"
+     stamp_unique_names)
+    a=$d/jobs/h1/011-a.job; b=$d/jobs/h1/012-b.job; c=$d/jobs/h1/013-c.job
+    grep -q "^filename_format=h1.x/\$jobnum$" "$a" &&
+    grep -q "^filename_format=h1.y.\$filenum$" "$a" &&
+    grep -q "^unique_filename=0$" "$a" && ! grep -q "^unique_filename=1$" "$a" &&
+    grep -q "^unique_filename=0$" "$b" &&
+    grep -q "^filename_format=h1.\$jobname.\$jobnum.\$filenum$" "$b" &&
+    grep -q "^filename_format=\$clientuid.\$jobnum$" "$c" &&
+    grep -q "^unique_filename=0$" "$c"'
+t_assert "stamping: staged variants and the rebuild variant carry it end to end" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d)
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles) >/dev/null || exit 1
+    v="$d/target/localhost/011-smoke-readbw.job"
+    r="$d/target/localhost/000-wekatester-relayout.job"
+    grep -q "^unique_filename=0$" "$v" &&
+    grep -q "^filename_format=localhost\." "$v" &&
+    grep -q "^unique_filename=0$" "$r" &&
+    grep -q "^filename_format=localhost\." "$r"'
 t_assert "probe: -e engine missing from a worker refuses early, naming it" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester

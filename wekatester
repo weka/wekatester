@@ -2779,6 +2779,60 @@ PYEOF
     done
 }
 
+# fio in client/server mode silently prefixes generated filenames with its
+# own idea of the client's identity (unique_filename, on by default, so
+# workers sharing a filesystem cannot clobber each other) -- and the rule
+# differs by fio version: 3.28 rewrites the format to "<ip>.$filenum/..."
+# (probed live), RHEL8's fio prefixes some sections and not others (seen
+# live: layout-1 wrote the plain grid, layout-2 opened 127.0.0.1.1/*).
+# Nothing downstream can work against names it cannot predict -- the
+# pre-created directory grid, the capacity math, the unlink variant and
+# the completion markers all need exact paths. So every staged variant is
+# stamped with unique_filename=0 and an explicit "<host>." prefix on its
+# filename_format: the same collision safety, deterministic on every fio.
+# A format carrying $clientuid keeps its own uniqueness scheme untouched;
+# a jobfile with no format at all gets fio's default grid, host-prefixed.
+stamp_unique_names() {
+    local host
+    for host in "${HOSTS[@]}"; do
+        python3 - "$WORK_DIR/jobs/$host" "$host" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
+import os, sys
+
+jobsdir, host = sys.argv[1], sys.argv[2]
+for name in sorted(os.listdir(jobsdir)):
+    path = os.path.join(jobsdir, name)
+    if not os.path.isfile(path):
+        continue
+    lines = open(path).read().splitlines()
+    has_fmt = any(l.strip().startswith("filename_format=") for l in lines)
+    out = []
+    for l in lines:
+        s = l.strip()
+        if s.startswith("filename_format="):
+            val = s.split("=", 1)[1]
+            if "$clientuid" not in val:
+                l = "filename_format=" + host + "." + val
+        elif s.startswith("unique_filename="):
+            continue   # replaced by the forced 0 below
+        out.append(l)
+    ins = ["unique_filename=0"]
+    if not has_fmt:
+        ins.append("filename_format=%s.$jobname.$jobnum.$filenum" % host)
+    if any(l.strip() == "[global]" for l in out):
+        res, done = [], False
+        for l in out:
+            res.append(l)
+            if not done and l.strip() == "[global]":
+                res.extend(ins)
+                done = True
+        out = res
+    else:
+        out = ["[global]"] + ins + out
+    open(path, "w").write("\n".join(out) + "\n")
+PYEOF
+    done
+}
+
 # Geometry fingerprint of the staged layout: which files, how many, how big,
 # on which clients. Only grid-shaping lines count -- cpus_allowed, ioengine
 # and comments may differ run to run without changing a single file name or
@@ -2851,6 +2905,8 @@ stage_jobfiles() {
             [ -f "$v" ] && override_variant_key "$v" ioengine "$ENGINE"
         done
     fi
+    # after every per-host override, before the derived variants inherit it
+    stamp_unique_names
     stage_rebuild_variants
     [ "$UNLINK" -eq 0 ] || stage_unlink_variants
 
