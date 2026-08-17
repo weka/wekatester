@@ -24,6 +24,7 @@ DIRECTORY="/mnt/weka"           # target directory on the workers for test files
 WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
+DIRECTORY_EXPLICIT=0            # -d was given (CLI beats a host file's dir)
 ENGINE=""                       # -e: force this fio ioengine everywhere
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
@@ -479,8 +480,8 @@ parse_args() {
         # only in need_arg's message, which should echo what was typed.
         case "$opt" in
             --) servers_only=1; shift ;;
-            -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; shift 2 ;;
-            -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; shift ;;
+            -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; DIRECTORY_EXPLICIT=1; shift 2 ;;
+            -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; DIRECTORY_EXPLICIT=1; shift ;;
             -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
             -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; WORKLOAD_EXPLICIT=1; shift ;;
             -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
@@ -1615,6 +1616,159 @@ os.makedirs(outdir, exist_ok=True)
 with open(os.path.join(outdir, NAME), "w") as fp:
     fp.write(f"{MARKER} sha256={digest}\n" + normalized + "\n")
 print(f"layout: generated {os.path.join(outdir, NAME)} ({len(namespaces)} namespace(s))")
+PYEOF
+}
+
+# --- host files (-t) --------------------------------------------------------------
+# A hostlist.csv assigns per-host settings without a jobfile set per client:
+#   host,user_login,ioengine,allowed_cpus,destination_folder,\
+#       bandwidth:nj/fs/nr/qd,latency:nj/fs/nr/qd,iops:nj/fs/nr/qd
+# Lines naming a host assign to that host (two lines naming one host is
+# fatal). Host-less lines are SELECTOR lines: their login and/or ioengine
+# choose which hosts they apply to (login = hosts using that login; engine =
+# hosts that PASSED that engine's functional test), and their remaining
+# fields fold into any host whose more-specific config left them unset.
+# Specificity: host line > two selectors > one selector > global; generic
+# never overrides specific regardless of file order; equal specificity =
+# first line wins with a warning. A host-less line's login is ONLY a
+# selector -- logins are assigned by host lines, the CLI, or defaults,
+# which is what makes resolution well-founded: engine-selector lines need
+# test results, tests need auth, auth needs logins.
+#
+# Two phases for that same reason: phase1 (pre-auth) = logins + initial
+# dirs from host lines and login-selector folding; phase2 (post engine
+# tests, results in a file as "host engine ok|fail" lines -- NOT stdin,
+# the python heredoc owns stdin) = everything.
+# Output, one host per line, tab-separated, "-" = unset:
+#   host login engine cpus dir bw_nj/bw_fs/bw_nr/bw_qd lat_... iops_...
+# CLI values arrive as arguments and take precedence over the file.
+resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
+    python3 - "$@" <<'PYEOF'
+import csv, sys
+
+phase, path, cli_engine, cli_dir, results = sys.argv[1:6]
+hosts = sys.argv[6:]
+GEOM = ("bandwidth", "latency", "iops")
+FIELDS = ("login", "engine", "cpus", "dir",
+          "bw_nj", "bw_fs", "bw_nr", "bw_qd",
+          "lat_nj", "lat_fs", "lat_nr", "lat_qd",
+          "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+
+def warn(msg):
+    print(f"WARNING: {msg}", file=sys.stderr)
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def parse_geom(kind, raw, lineno):
+    """'bandwidth:12/10G/1/8' or bare '12/10G/1/8'; empty parts = unset."""
+    raw = raw.strip()
+    if not raw:
+        return {}
+    if ":" in raw:
+        pfx, rest = raw.split(":", 1)
+        if pfx.strip().lower() != kind:
+            die(f"{path}:{lineno}: column for {kind} carries prefix '{pfx}'")
+        raw = rest
+    parts = (raw.split("/") + ["", "", "", ""])[:4]
+    keys = {"bandwidth": "bw", "latency": "lat", "iops": "iops"}[kind]
+    out = {}
+    for key, val in zip(("nj", "fs", "nr", "qd"), parts):
+        if val.strip():
+            out[f"{keys}_{key}"] = val.strip()
+    return out
+
+# ---- parse ----
+entries = []      # {lineno, host, sel_login, sel_engine, fields{...}, nsel}
+host_lines = {}   # host -> lineno (duplicate host lines are fatal)
+try:
+    fp = open(path, newline="")
+except OSError as exc:
+    die(f"cannot read host file: {exc}")
+for lineno, row in enumerate(csv.reader(fp), start=1):
+    if not row or not "".join(row).strip():
+        continue
+    if row[0].strip().startswith("#"):
+        continue
+    if lineno == 1 and row[0].strip().lower() == "host":
+        continue   # header
+    row = [c.strip() for c in (row + [""] * 8)[:8]]
+    host, login, engine, cpus, ddir = row[0], row[1], row[2], row[3], row[4]
+    fields = {}
+    if engine:
+        fields["engine"] = engine
+    if cpus:
+        fields["cpus"] = cpus
+    if ddir:
+        fields["dir"] = ddir
+    for kind, raw in zip(GEOM, row[5:8]):
+        fields.update(parse_geom(kind, raw, lineno))
+    if host:
+        if login:
+            fields["login"] = login
+        if host in host_lines:
+            die(f"{path}:{lineno}: duplicate definition for host '{host}' "
+                f"(first at line {host_lines[host]})")
+        host_lines[host] = lineno
+        entries.append({"lineno": lineno, "host": host, "sel_login": "",
+                        "sel_engine": "", "fields": fields, "nsel": 3})
+    else:
+        # host-less: login/engine are SELECTORS; login is never assigned.
+        nsel = (1 if login else 0) + (1 if engine else 0)
+        entries.append({"lineno": lineno, "host": "", "sel_login": login,
+                        "sel_engine": engine, "fields": fields, "nsel": nsel})
+fp.close()
+
+# ---- phase2 input: engine test results ----
+passed = {}   # host -> set(engines that work)
+if phase == "phase2" and results != "-":
+    for line in open(results):
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == "ok":
+            passed.setdefault(parts[0], set()).add(parts[1])
+
+# ---- resolve per host ----
+def resolve(host):
+    cfg = {}
+    src = {}   # field -> (nsel, lineno) that set it, for conflict warnings
+    # host lines first (most specific, unique)
+    for e in entries:
+        if e["host"] == host:
+            for k, v in e["fields"].items():
+                cfg[k] = v
+                src[k] = (e["nsel"], e["lineno"])
+    login = cfg.get("login", "")
+    # host-less lines, most selectors first; ties resolved first-line-wins
+    for e in sorted((e for e in entries if not e["host"]),
+                    key=lambda e: (-e["nsel"], e["lineno"])):
+        if e["sel_login"] and e["sel_login"] != login:
+            continue
+        if e["sel_engine"]:
+            if phase != "phase2":
+                continue   # selector needs test results; folds in later
+            if e["sel_engine"] not in passed.get(host, set()):
+                continue
+        for k, v in e["fields"].items():
+            if k == "login":
+                continue   # selector only, never assigned from host-less lines
+            if k not in cfg:
+                cfg[k] = v
+                src[k] = (e["nsel"], e["lineno"])
+            elif src[k][0] == e["nsel"] and cfg[k] != v:
+                warn(f"{path}: host '{host}' field '{k}': line {e['lineno']} "
+                     f"conflicts with equally specific line {src[k][1]}; "
+                     f"keeping line {src[k][1]}")
+    # CLI beats the file
+    if cli_engine != "-":
+        cfg["engine"] = cli_engine
+    if cli_dir != "-":
+        cfg["dir"] = cli_dir
+    return cfg
+
+for host in hosts:
+    cfg = resolve(host)
+    print("\t".join([host] + [cfg.get(f, "-") or "-" for f in FIELDS]))
 PYEOF
 }
 

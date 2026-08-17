@@ -1477,6 +1477,90 @@ t_assert "probe: failed weka RAM query hints at weka user login and continues" b
         *) echo "$err" >&2; false;;
     esac'
 
+# --- host files (-t): the resolution engine ---
+# Field layout of a resolved line: host login engine cpus dir bw_nj bw_fs
+# bw_nr bw_qd lat_nj lat_fs lat_nr lat_qd iops_nj iops_fs iops_nr iops_qd
+rt() {   # rt <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> hosts...
+    (source ./wekatester; resolve_targets "$@")
+}
+export -f rt
+t_assert "targets: a host line assigns login/engine/cpus/dir to its host only" bash -c '
+    source ./tests/helpers.sh
+    f=$(mktemp)
+    printf "h1,ubuntu,libaio,\"22,24\",/mnt/a,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1 h2)
+    echo "$out" | grep -q "^h1	ubuntu	libaio	22,24	/mnt/a" &&
+    echo "$out" | grep -q "^h2	-	-	-	-"'
+t_assert "targets: duplicate host lines are fatal, naming both line numbers" bash -c '
+    f=$(mktemp)
+    printf "h1,ubuntu,,,,,,\nh1,root,,,,,,\n" > "$f"
+    err=$( (rt phase1 "$f" - - - h1) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        *"duplicate definition for host '\''h1'\''"*"line 1"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "targets: login-selector lines fold into hosts using that login, only" bash -c '
+    f=$(mktemp)
+    printf "h1,ubuntu,,,,,,\n,ubuntu,,0-7,/mnt/u,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1 h2)
+    echo "$out" | grep -q "^h1	ubuntu	-	0-7	/mnt/u" &&
+    echo "$out" | grep -q "^h2	-	-	-	-"'
+t_assert "targets: generic never overrides specific, regardless of order" bash -c '
+    f=$(mktemp)
+    printf ",,,0-3,,,,\nh1,ubuntu,,8-11,,,,\n,ubuntu,,4-7,,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1 h2)
+    # h1: host line cpus 8-11 beats login line 4-7 beats global 0-3
+    echo "$out" | grep -q "^h1	ubuntu	-	8-11" &&
+    # h2: no login -> only the global line applies
+    echo "$out" | grep -q "^h2	-	-	0-3"'
+t_assert "targets: equal specificity warns naming both lines; first wins; run continues" bash -c '
+    f=$(mktemp)
+    printf ",,,0-3,,,,\n,,,4-7,,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1 2>/dev/null)
+    err=$( (rt phase1 "$f" - - - h1) 2>&1 >/dev/null )
+    echo "$out" | grep -q "^h1	-	-	0-3" &&
+    case "$err" in
+        *"WARNING"*"line 2"*"line 1"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "targets: geometry columns parse with or without the type: prefix" bash -c '
+    f=$(mktemp)
+    printf "h1,,,,,bandwidth:12/10G//8,latency:1///1,4/1G/56/64\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1)
+    [ "$out" = "h1	-	-	-	-	12	10G	-	8	1	-	-	1	4	1G	56	64" ] ||
+        { echo "$out" >&2; false; }'
+t_assert "targets: a wrong type: prefix in a geometry column is fatal" bash -c '
+    f=$(mktemp)
+    printf "h1,,,,,iops:4///,,\n" > "$f"
+    ! rt phase1 "$f" - - - h1 2>/dev/null'
+t_assert "targets: CLI engine and dir beat the file everywhere" bash -c '
+    f=$(mktemp)
+    printf "h1,,libaio,,/mnt/file,,,\n" > "$f"
+    out=$(rt phase1 "$f" psync /mnt/cli - h1 h2)
+    echo "$out" | grep -q "^h1	-	psync	-	/mnt/cli" &&
+    echo "$out" | grep -q "^h2	-	psync	-	/mnt/cli"'
+t_assert "targets: engine-selector lines wait for phase2 and match only passing hosts" bash -c '
+    f=$(mktemp)
+    printf ",,io_uring,0-3,,,,\n" > "$f"
+    p1=$(rt phase1 "$f" - - - h1 h2)
+    echo "$p1" | grep -q "^h1	-	-	-	-" || { echo "phase1 leaked: $p1" >&2; exit 1; }
+    r=$(mktemp); printf "h1 io_uring ok\nh2 io_uring fail\n" > "$r"
+    p2=$(rt phase2 "$f" - - "$r" h1 h2)
+    echo "$p2" | grep -q "^h1	-	io_uring	0-3" &&
+    echo "$p2" | grep -q "^h2	-	-	-"'
+t_assert "targets: header, comments, blanks are skipped; commented old rows are inert" bash -c '
+    f=$(mktemp)
+    printf "host,user_login,ioengine\n# h1,root,psync\n\nh1,ubuntu,,,,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1)
+    echo "$out" | grep -q "^h1	ubuntu	-	-	-"'
+t_assert "targets: host-less lines never assign a login" bash -c '
+    f=$(mktemp)
+    printf ",root,,0-3,,,,\nh1,,,,,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1)
+    # h1 has no login, so the root-selector line does not match it at all
+    echo "$out" | grep -q "^h1	-	-	-	-" || { echo "$out" >&2; false; }'
+
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.
