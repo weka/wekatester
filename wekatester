@@ -391,7 +391,8 @@ attaching is the way to pass a value that starts with a dash.
                           overriding the jobfiles and auto tuning
   -a, --auto [safe|max]   derive system-specific fio options from the workers
                           (default level when omitted: max)
-  --ignore-capacity       run even if the workload needs more space than -d has (auto mode)
+  --ignore-capacity       when the workload needs more space than is available,
+                          ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -1678,19 +1679,56 @@ for job in sorted(layout_set):
             fp.write("\n".join(out) + "\n")
     print(f"auto[{tier}]: {job} type=layout")
 
-# Capacity: per host, group staged jobs by filename_format namespace; each
-# namespace's footprint is the max over its jobfiles of that jobfile's
-# footprint (files are shared within a namespace); host total = sum over
-# namespaces. Over-counting is survivable (--ignore-capacity exists);
-# under-counting defeats the guard, so every ambiguity rounds upward.
+# Capacity enforcement lives in check_capacity() now -- one universal
+# check for every run, auto or not, computed from the staged variants.
+PYEOF
+}
+
+# --- capacity check (every run) ----------------------------------------------------
+# Per host: group that host's STAGED variants by filename_format namespace
+# (absent -> the jobfile's own key: fio's default naming makes each file own
+# its files); a namespace costs the max of its jobfiles' footprints; the
+# host's requirement is the larger of the namespace sum and the staged
+# layout variant's per-section total (an operator-edited layout must not
+# shrink the answer). Compared against each host's OWN destination df.
+# Over capacity: die -- or with --ignore-capacity, PROMPT (untimed) and
+# continue on a yes; unattended runs with the flag continue with a warning.
+check_capacity() {
+    local host pids=() i failed=0
+    mkdir -p "$WORK_DIR/df"
+    for host in "${HOSTS[@]}"; do
+        run_host "$host" "df -kP '$(host_dir "$host")'" > "$WORK_DIR/df/$host" &
+        pids+=($!)
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || log "WARNING: cannot df on ${HOSTS[$i]}; its capacity is unchecked" >&2
+    done
+    python3 - "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
+import os, re, sys
+
+work = sys.argv[1]
+hosts = sys.argv[2:]
+SKIP = {"000-wekatester-relayout.job", "999-wekatester-unlink.job"}
+MARKER = "# wekatester-layout: generated"
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
+    if not m: raise ValueError(s)
+    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
+    return int(float(m.group(1)) * mult)
+
 def job_value(path, key, default):
     for line in open(path):
         m = re.match(rf"^{key}=(\S+)", line)
         if m: return m.group(1)
     return default
 
+def is_layout(path):
+    if os.path.basename(path) == "000-wekatester-layout.job": return True
+    with open(path) as fp:
+        return any(next(fp, "").startswith(MARKER) for _ in range(3))
+
 def footprint(path):
-    """Bytes one staged jobfile lays out on one host."""
     numjobs = int(job_value(path, "numjobs", "1"))
     filesize = job_value(path, "filesize", "")
     if filesize:
@@ -1698,25 +1736,17 @@ def footprint(path):
     size = job_value(path, "size", "")
     if size:
         try:
-            # size= is fio's per-job total ACROSS that job's files (fio divides
-            # it by nrfiles), so nrfiles must not multiply it a second time.
+            # size= is fio's per-job total across the job's files
             return numjobs * parse_size(size)
         except ValueError:
-            # e.g. size=50% -- a proportion of the device, not a byte count
-            warn_once(f"{os.path.basename(path)}: size={size} is not a byte "
-                      "count; it contributes nothing to the capacity estimate")
-    return 0   # neither filesize nor a usable size: nothing we can size
+            print(f"WARNING: {os.path.basename(path)}: size={size} is not a "
+                  "byte count; it contributes nothing to the capacity estimate",
+                  file=sys.stderr)
+    return 0
 
-# The staged layout variant is what actually gets created, section by
-# section, so its per-section sum is the truest footprint (overlapping grids
-# within a namespace over-count slightly -- upward, which is the safe
-# direction). The per-namespace max over measured jobs is kept as a second
-# estimate and the LARGER of the two wins: an operator-edited layout that
-# covers less than the measured jobs need must not shrink the answer.
 def layout_footprint(path):
     total, numjobs, nrfiles, size_b, per_file = 0, 1, 1, 0, True
-    def flush():
-        return numjobs * (nrfiles if per_file else 1) * size_b
+    def flush(): return numjobs * (nrfiles if per_file else 1) * size_b
     in_section = False
     for line in open(path):
         line = line.strip()
@@ -1733,47 +1763,52 @@ def layout_footprint(path):
         else:
             try: size_b = parse_size(v)
             except ValueError: size_b = 0
-            per_file = (k == "filesize")   # size= is the per-job total
+            per_file = (k == "filesize")
     if in_section: total += flush()
     return total
 
-required = 0
+gib = lambda n: f"{n / 2**30:.1f}"
+over = False
 for h in hosts:
-    namespaces = {}
-    layout_total = 0
-    for job in jobs:
-        p = os.path.join(work, "jobs", h, job)
-        if job in layout_set:
+    jdir = os.path.join(work, "jobs", h)
+    if not os.path.isdir(jdir): continue
+    namespaces, layout_total = {}, 0
+    for job in sorted(os.listdir(jdir)):
+        if job in SKIP: continue
+        p = os.path.join(jdir, job)
+        if is_layout(p):
             layout_total += layout_footprint(p)
             continue
-        # No filename_format means fio expands its default ($jobname...) per
-        # section, so each jobfile owns its own files: give it a private key so
-        # distinct jobfiles sum. Sharing one literal default key would collapse
-        # them to a single max and under-count the real footprint.
         ns = job_value(p, "filename_format", "") or f"__default__:{job}"
         namespaces[ns] = max(namespaces.get(ns, 0), footprint(p))
-    required += max(sum(namespaces.values()), layout_total)
-
-avail = 0
-df_path = os.path.join(work, "probe", "_df")
-if os.path.exists(df_path):
-    df_lines = open(df_path).read().splitlines()
-    if len(df_lines) >= 2:
-        avail = int(df_lines[1].split()[3]) * 1024
-
-gib = lambda n: f"{n / 2**30:.1f}"
-print(f"auto: capacity required ~{gib(required)}GiB, available {gib(avail)}GiB")
-# avail == 0 means df was unavailable/unparsable, not a full filesystem: with
-# no ground truth there is nothing to check, so stay silent either way.
-if avail and required > avail:
-    short = (f"workload needs ~{gib(required)}GiB but {directory} has only "
-             f"{gib(avail)}GiB available")
-    if ignore_capacity:
-        warn(f"{short} (--ignore-capacity: running anyway)")
-    else:
-        # fio would march into ENOSPC mid-run; abort during staging instead.
-        sys.exit(f"ERROR: {short} (use --ignore-capacity to run anyway)")
+    required = max(sum(namespaces.values()), layout_total)
+    avail = 0
+    dfp = os.path.join(work, "df", h)
+    if os.path.exists(dfp):
+        lines = open(dfp).read().splitlines()
+        if len(lines) >= 2:
+            avail = int(lines[1].split()[3]) * 1024
+    print(f"capacity: {h} needs ~{gib(required)}GiB, has {gib(avail)}GiB available")
+    # avail == 0 = df unavailable, not a full filesystem: nothing to check
+    if avail and required > avail:
+        over = True
+        print(f"ERROR: {h}: workload needs ~{gib(required)}GiB but only "
+              f"{gib(avail)}GiB is available", file=sys.stderr)
+sys.exit(2 if over else 0)
 PYEOF
+    case $? in
+        0) return 0 ;;
+        2) ;;
+        *) die "capacity check failed" ;;
+    esac
+    [ "$IGNORE_CAPACITY" -eq 1 ] \
+        || die "not enough capacity on at least one host (use --ignore-capacity to be asked anyway)"
+    if try_interactive; then
+        confirm_timed 0 no "not enough capacity: continue anyway and risk ENOSPC mid-run?" \
+            || die "not enough capacity"
+    else
+        log "WARNING: --ignore-capacity: not enough capacity, running anyway (unattended)" >&2
+    fi
 }
 
 # --- layout jobs -----------------------------------------------------------------
@@ -3354,6 +3389,7 @@ main() {
             finalize_targets
         fi
         stage_jobfiles
+        check_capacity
         dry_run_report
         exit 0
     fi
@@ -3375,6 +3411,7 @@ main() {
     start_fio_servers
     verify_fio_ports
     stage_jobfiles
+    check_capacity
     writeback_targets
     snapshot_jobfiles
     run_jobs
