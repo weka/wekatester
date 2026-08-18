@@ -1750,7 +1750,30 @@ t_assert "-C sets own a hostfile: resolved file copied in, template when none" b
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      SET_DIR_OVERRIDE=$d/set2; TARGETS=0
      ensure_set_hostfile
-     head -1 "$d/set2/hostlist.csv" | grep -q "^host,user_login")'
+     head -1 "$d/set2/hostlist.csv" | grep -q "^host,user_login" &&
+     [ "$TARGETS" -eq 1 ] && [ "$TARGETS_FILE" = "$d/set2/hostlist.csv" ])'
+t_assert "customize: host file opens first; jobfiles only behind the prompt (default no)" bash -c '
+    source ./tests/helpers.sh; set_fixture; editor_fixture
+    (source ./wekatester
+     CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
+     EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
+     exec 9<<<"nnn"
+     PROMPT_IN_FD=9; PROMPT_OUT_FD=2
+     customize_jobfiles) >/dev/null 2>&1
+    head -1 "$ED/order" | grep -q "hostlist.csv" &&
+    [ "$(wc -l < "$ED/order")" -eq 1 ]'
+t_assert "customize: answering yes to the prompt edits the jobfiles after the host file" bash -c '
+    source ./tests/helpers.sh; set_fixture; editor_fixture
+    (source ./wekatester
+     CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
+     EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
+     exec 9<<<"ynn"
+     PROMPT_IN_FD=9; PROMPT_OUT_FD=2
+     customize_jobfiles) >/dev/null 2>&1
+    head -1 "$ED/order" | grep -q "hostlist.csv" &&
+    [ "$(wc -l < "$ED/order")" -gt 1 ] &&
+    sed -n 2p "$ED/order" | grep -q "011-"
+'
 t_assert "auth rounds: the host file pins a host's login when the credential has none" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

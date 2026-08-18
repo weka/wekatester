@@ -408,7 +408,8 @@ attaching is the way to pass a value that starts with a dash.
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
   -C[set], --customize[=set]
-                          copy a workload set, edit each jobfile, then run it;
+                          copy a workload set, edit its host file (jobfiles
+                          on request), then run it;
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
   -r             fast track: no prompts and no editors -- create whatever is
@@ -2464,14 +2465,16 @@ resolve_custom_set() {
 # decide the temp set's fate. Interactive parts are skipped wholesale by
 # -r (fast track) and -n (dry run).
 # -C sets own their host file: copy the one this run resolved (or the
-# source set's) into the new set, else start it from the template. With -t
-# active the set's copy becomes the file in use from here on -- edits to
-# engines/cpus/geometry apply THIS run (phase2 has not happened yet); login
-# edits apply from the NEXT run, since connections are already up.
+# source set's) into the new set, else start it from the template. The
+# set's copy is honored whether or not -t was given -- it IS the set's
+# customization surface -- and becomes the file in use from here on:
+# edits to engines/cpus/dirs/geometry apply THIS run (phase2 has not
+# happened yet, and main re-verifies mounts after the editor closes);
+# login edits apply from the NEXT run, since connections are already up.
 ensure_set_hostfile() {
     local dst="$SET_DIR_OVERRIDE/hostlist.csv" src=""
     if [ -f "$dst" ]; then
-        [ "$TARGETS" -eq 0 ] || TARGETS_FILE=$dst
+        TARGETS=1; TARGETS_FILE=$dst
         return 0
     fi
     if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
@@ -2485,7 +2488,7 @@ ensure_set_hostfile() {
     else
         write_targets_template "$dst"
     fi
-    [ "$TARGETS" -eq 0 ] || TARGETS_FILE=$dst
+    TARGETS=1; TARGETS_FILE=$dst
     return 0
 }
 
@@ -2501,14 +2504,19 @@ customize_jobfiles() {
     done
 
     if [ "$interactive" -eq 1 ]; then
-        [ -z "$AUTO_LEVEL" ] || log "note: -a $AUTO_LEVEL will override numjobs/iodepth/ioengine (and filesize/nrfiles/filename_format on iops/latency files) in the staged copies of these jobfiles"
-        discover_jobfiles "$dst"
-        for job in "${JOBFILES[@]}"; do
-            is_layout_file "$dst/$job" && continue   # layout editing is prompted below
-            edit_jobfile "$dst/$job"
-        done
-        # the set's host file is part of the editing surface too
+        # The host file is the primary editing surface: one CSV carries
+        # per-host login/engine/cpus/destination and per-type geometry --
+        # most of what once meant editing every jobfile. The jobfiles stay
+        # editable behind the prompt.
         [ ! -f "$dst/hostlist.csv" ] || edit_jobfile "$dst/hostlist.csv"
+        if confirm_timed 5 no "edit the jobfiles individually too?"; then
+            [ -z "$AUTO_LEVEL" ] || log "note: -a $AUTO_LEVEL will override numjobs/iodepth/ioengine (and filesize/nrfiles/filename_format on iops/latency files) in the staged copies of these jobfiles"
+            discover_jobfiles "$dst"
+            for job in "${JOBFILES[@]}"; do
+                is_layout_file "$dst/$job" && continue   # layout editing is prompted below
+                edit_jobfile "$dst/$job"
+            done
+        fi
     fi
 
     # Layout, per the flag matrix: -g always regenerates; existing layout is
@@ -3528,6 +3536,15 @@ main() {
     if [ "$CUSTOMIZE" -eq 1 ]; then
         customize_jobfiles
         close_interactive
+        # The set's host file just became (or was edited as) the active
+        # targets file: refresh the pre-auth resolution and re-verify the
+        # mounts, since per-host destinations may have changed. Login edits
+        # cannot apply here -- connections are already up; next run.
+        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
+            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
+            || die "host file resolution failed ($TARGETS_FILE)"
+        verify_mount_mode
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
