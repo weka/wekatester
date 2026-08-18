@@ -196,9 +196,10 @@ Facts per worker, gathered by dumb remote commands and interpreted locally:
 Master-only extras:
 
 - `df -kP <directory>` → available capacity (shared-filesystem assumption)
-- `weka cluster servers list -J` → Σ `ram_allocated` (older releases:
-  `memory`) over backend entries = conservative DRAM cache ceiling. Query
-  failure → fall back to the working-set floor and warn.
+
+(The `weka cluster ...` RAM query this section once specified is retired —
+see the corrected Working-set sizing section. `-a` no longer runs any weka
+CLI command.)
 
 Any per-host probe failure: collect-all, then die (same policy as preflight).
 
@@ -256,24 +257,74 @@ for `directory=` that means fio writing its files into the fio server's cwd.
 (The non-auto awk staging path does the same.) Create-phase sections inherit
 the tuned global `numjobs`, keeping file coverage consistent.
 
-## Working-set sizing (max tier)
+## Working-set sizing (max tier) — CORRECTED 2026-08-18
 
-Rationale: for random-IO tests, file size is a cache-defeat parameter, not an
-accuracy parameter. The small-file working set must exceed the backends'
-DRAM read cache or iops/latency numbers measure RAM.
+The original rationale here was wrong, twice over. First it asserted that
+backend DRAM caches file data which the working set must exceed ("the
+small-file working set must exceed the backends' DRAM read cache or
+iops/latency numbers measure RAM"): a read of the weka source disproved
+this — `fs/exports/types.d` `BlockOrigin` has no RAM/cache member; every
+non-sparse block is served from NVMe/OBS/peer, writes persist before ack,
+and forcedirect + direct=1 bypasses the client page cache. Then the same
+formula was re-justified as a metadata-block-cache bound, whose math also
+does not hold: metadata footprint is on the order of 1:100+ of the data it
+maps, so a data working set of 2× the hugepage pool neither overflows the
+metadata cache nor needed to — warm metadata over cold NVMe data is
+steady-state production behavior, not a benchmark cheat. The only genuinely
+fake numbers were sparse-hole reads (RAM-speed shared zero buffer), and the
+layout/marker/write-through machinery eliminates those independently.
 
-- cache ceiling `C` = Σ backend container RAM (conservative: true data cache
-  is a fraction of this)
-- per-host working set `ws = max(8 GiB, 2 × C / n_workers)`
-- `nrfiles(iops) = max(2, ceil(ws / (numjobs × 1 GiB)))` — an iops job spreads
-  its IO over `numjobs` jobs, so each job only needs `ws / numjobs`
-- `nrfiles(latency) = min(8, max(2, ceil(ws / 1 GiB)))` — effective job count 1
-  (see Tuner): one QD1 job must cover `ws` alone. The cap keeps file-open and
-  layout cost bounded.
+Corrected model:
 
-Constants (documented in the script, single place):
-`SMALL_FILESIZE=1G`, `CACHE_MULT=2`, `WS_FLOOR=8G`,
-`IOPS_OUTSTANDING=64×cores`, `IODEPTH_CAP=128`, `LAT_NRFILES_CAP=8`.
+- per-host small-file working set `ws = WS_FLOOR` (8 GiB) — a practical
+  floor for job/file spread, not a cache bound
+- `nrfiles(iops) = max(2, ceil(ws / (numjobs × 1 GiB)))`
+- `nrfiles(latency) = min(8, max(2, ceil(ws / 1 GiB)))`
+- no weka CLI query, no DRAM parse, no COMPUTE-role filter
+
+Constants: `SMALL_FILESIZE=1G`, `WS_FLOOR=8G`, `IOPS_OUTSTANDING=64×cores`,
+`IODEPTH_CAP=128`, `LAT_NRFILES_CAP=8` (`CACHE_MULT` deleted).
+
+## Calibrated sizing: -a cal and -a hybrid (2026-08-18)
+
+`-a safe` and `-a max` retain rule-based derivation. Two new tiers replace
+guessed queue depths with measurement; the concrete answer to "why these
+numbers" becomes "measured on your clients against this cluster" and lives
+in hostlist.csv.
+
+Ladders (the calibration engine):
+
+- Runs after fio servers are up, before staging; scratch namespace
+  `.wekatester-cal/` under each host's destination dir; 2 small files per
+  job; the write pass doubles as the write ladder; final cal job carries
+  `unlink=1`; layout completion markers are untouched.
+- Set inspection picks the ladders: read/write bandwidth (bs=1M,
+  numjobs=usable cores) and/or iops (bs=4k) only for the directions and
+  report types the chosen set's jobs actually use.
+- Each ladder steps iodepth 1→2→4→8→… (iops caps at 128), ~10s per step
+  with 2s ramp, ALL clients in parallel (the knee is each client's ceiling
+  under contention — the condition the measured jobs run in). Per-client
+  knee = last step gaining ≥10% over the previous.
+- numjobs: calibration confirms usable-cores is past the knee; a knee below
+  full cores lowers numjobs instead.
+- Any calibration job error is fatal (preflight-grade).
+- Logged as a table: `cal: client-1 bw-read knee qd=8 (18.2GB/s)`.
+
+`-a hybrid`: identical, but the ladder starts at a formula rung derived
+from probed weka client io-core counts × named per-core budgets
+(`CAL_BW_PER_CORE=5GB/s`, `CAL_IOPS_PER_CORE=25k`) and only
+confirms/adjusts — typically 2 steps instead of 5-6.
+
+Persistence: knees land in hostlist.csv through the existing -a writeback
+(comment-then-append). `-a cal`/`-a hybrid` with a host whose relevant
+geometry columns are already filled SKIP that host's ladder and say so;
+`-g` forces re-measurement. Precedence unchanged: CLI > host file > tuner.
+
+Not calibrated: file sizes (floor rule above), latency (qd=1/nj=1 by
+definition), bs and rw mix (as authored).
+
+`-n` prints which ladders would run and why; it cannot calibrate (no fio
+servers exist in a dry run).
 
 ## Mount-mode guard (all runs, auto or not)
 
