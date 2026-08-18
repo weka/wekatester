@@ -1896,15 +1896,19 @@ t_assert "kill_fio_cmd: priv prefixes kill/rm/pkill and the anchor survives" bas
         *"sudo kill "*"sudo rm -f"*"sudo pkill -9 -f"*"'\''^/usr/bin/fio --server"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "server launch: recorded cpus/priv shape the fio server command" bash -c '
+t_assert "server launch: priv pins via taskset but fio drops to the login user" bash -c '
     d=$(mktemp -d); mkdir -p "$d/auth"
-    printf "sudo\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
-    out=$( (source ./wekatester
-        WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2); FIO_BIN=fio
-        run_host() { echo "LAUNCH[$1]: $2"; }
-        start_fio_servers) 2>/dev/null )
-    echo "$out" | grep -q "LAUNCH\[h1\]: .*sudo taskset -c 4-7 '\''fio'\'' --server" &&
-    echo "$out" | grep "LAUNCH\[h2\]" | grep -vq taskset'
+    printf "sudo -n\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
+    printf "8-9\n" > "$d/auth/h3.cpus"
+    (source ./wekatester
+     WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2 h3); FIO_BIN=fio
+     run_host() { echo "LAUNCH[$1]: $2"; }
+     start_fio_servers) >/dev/null 2>&1
+    grep -q "sudo -n runuser -u .* -- true" "$d/launch.h1" &&
+    grep -q "sudo -n taskset -c 4-7 runuser -u .* -- '\''fio'\'' --server" "$d/launch.h1" &&
+    grep -q "WEKATESTER_FIO_AS=root; sudo -n taskset -c 4-7 '\''fio'\'' --server" "$d/launch.h1" &&
+    grep -q "LAUNCH\[h2\]" "$d/launch.h2" && ! grep -q taskset "$d/launch.h2" &&
+    grep -q "taskset -c 8-9 '\''fio'\''" "$d/launch.h3" && ! grep -q runuser "$d/launch.h3"'
 
 # --- host files: per-host application to staging ---
 t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-derived" bash -c '
@@ -2013,6 +2017,45 @@ t_assert "pinning: a pure-isolated request needs no escalator (self-affinable)" 
      printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
+t_assert "pinning: privileges are as-needed -- self-affinable mask ignores an available escalator" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+     printf "taskset 0-3\nisolated 4-15\npriv dzdo -n\n" > "$d/probe/h1"
+     printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
+     check_cpu_pinning)
+    [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
+t_assert "host_priv: a multi-word escalator prefix survives intact" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    (source ./wekatester
+     WORK_DIR=$d
+     printf "ncpus 8\npriv ksu -e\n" > "$d/probe/h1"
+     [ "$(host_priv h1)" = "ksu -e" ] && [ -z "$(host_priv h2)" ])'
+t_assert "run_weka_master: user attempt first, one escalated retry, note on success" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    err=$( (source ./wekatester
+     WORK_DIR=$d; MASTER=m1
+     printf "priv pbrun\n" > "$d/probe/m1"
+     run_host() { case "$2" in
+         ("pbrun weka status") echo escalated;;
+         ("weka status") return 1;;
+     esac; }
+     run_weka_master "weka status" "$d/out" || echo RC_FAIL >&2) 2>&1 )
+    grep -q escalated "$d/out" &&
+    case "$err" in *"needed pbrun"*) true;; *) echo "$err" >&2; false;; esac &&
+    case "$err" in *RC_FAIL*) false;; *) true;; esac'
+t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash -c '
+    d=$(mktemp -d)
+    printf "#!/bin/sh\nexit 1\n" > "$d/dzdo"
+    printf "#!/bin/sh\nexec \"\$@\"\n" > "$d/pbrun"
+    printf "#!/bin/sh\nshift\nexec \"\$@\"\n" > "$d/timeout"
+    printf "#!/bin/sh\necho \"pid 0: 0-3\"\n" > "$d/taskset"
+    printf "#!/bin/sh\necho libaio\n" > "$d/fio"
+    chmod +x "$d"/*
+    cmd=$( (source ./wekatester; FIO_BIN=fio; probe_remote_cmd) )
+    out=$(PATH="$d:$PATH" bash -c "$cmd" 2>&1)
+    case "$out" in *"priv pbrun"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"priv dzdo"*|*"priv sudo"*) false;; *) true;; esac'
 
 # --- lab-gate regressions (rebuilt shrw, 2026-08-08) ---
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted

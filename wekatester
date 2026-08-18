@@ -813,23 +813,37 @@ kill_fio_cmd() {   # kill_fio_cmd [priv]
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch
+    local pids=() failed=() host i priv cpus launch base
     for host in "${HOSTS[@]}"; do
         priv=""; cpus=""
         [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
         [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        launch="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
+        base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
         # a requested cpu list pins the server (children inherit the mask);
-        # the escalator both widens a restrictive taskset and owns the kill
+        # a recorded escalator means the mask cannot be self-applied -- but
+        # the escalation is for the TASKSET, not for fio: fio drops back to
+        # the login user when runuser allows, keeping the test files
+        # user-owned (a root fio leaves files that later unprivileged runs
+        # EACCES on). No runuser, or a policy refusal, means a root fio --
+        # the remote says which happened and the NOTE below reports it.
+        launch=$base
         [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
-        [ -z "$priv" ] || launch="$priv $launch"
-        [ -z "$priv" ] || log "NOTE: $host: fio runs under $priv -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2
-        run_host "$host" "$(kill_fio_cmd "$priv"); $launch" &
+        if [ -n "$priv" ] && [ -n "$cpus" ]; then
+            launch="u=\$(id -un); if command -v runuser >/dev/null && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
+        elif [ -n "$priv" ]; then
+            launch="$priv $launch"
+        fi
+        run_host "$host" "$(kill_fio_cmd "$priv"); $launch" > "$WORK_DIR/launch.$host" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
+    done
+    for host in "${HOSTS[@]}"; do
+        [ ! -f "$WORK_DIR/launch.$host" ] \
+            || ! grep -q "WEKATESTER_FIO_AS=root" "$WORK_DIR/launch.$host" \
+            || log "NOTE: $host: fio runs as root (no runuser drop-back) -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2
     done
     [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
     sleep 2   # let the listeners settle before the first coordinator connect
@@ -1052,7 +1066,7 @@ probe_remote_cmd() {
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
         echo \"isolated \$([ -f /sys/devices/system/cpu/isolated ] && cat /sys/devices/system/cpu/isolated)\"; \
-        for pc in sudo dzdo doas; do command -v \$pc >/dev/null && \$pc -n true 2>/dev/null && { echo \"priv \$pc\"; break; }; done; true"
+        for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; break; fi; done; true"
 }
 
 # Prove each host's ioengine candidates with a REAL one-file job on that
@@ -1242,7 +1256,7 @@ PYEOF
                     log "ERROR: $host: requested cpus_allowed: $req" >&2
                     log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
                     log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
-                    die "$host: requested cpus overlap weka's cores and no passwordless sudo/dzdo/doas is available"
+                    die "$host: requested cpus overlap weka's cores and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
                 fi ;;
         esac
         case "$verdict" in
@@ -1251,21 +1265,38 @@ PYEOF
                     log "ERROR: $host: requested cpus_allowed: $req" >&2
                     log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
                     log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
-                    die "$host: requested cpus are outside the current taskset and no passwordless sudo/dzdo/doas is available"
+                    die "$host: requested cpus are outside the current taskset and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
                 fi ;;
         esac
-        # record the launch decision: escalate whenever a cpu list is
-        # requested and an escalator exists (taskset needs it when the mask
-        # must widen; harmless when it need not)
-        if [ -n "$priv" ]; then
+        # record the launch decision: escalate ONLY where the verdict says
+        # the mask cannot be self-applied (outside) or the operator chose
+        # weka-overlapping cpus (overlap). A self-affinable request runs as
+        # the login user even when an escalator exists -- privileges are
+        # as-needed, never just because they are available.
+        local need_priv=0
+        case "$verdict" in *outside*|*overlap*) need_priv=1 ;; esac
+        if [ -n "$priv" ] && [ "$need_priv" -eq 1 ]; then
             printf '%s\n' "$priv" > "$AUTH_DIR/$host.priv"
         fi
         printf '%s\n' "$req" > "$AUTH_DIR/$host.cpus"
-        debug "$host: fio server will run ${priv:+under $priv }taskset -c $req"
+        debug "$host: fio server will run ${priv:+$([ "$need_priv" -eq 1 ] && printf 'under %s ' "$priv")}taskset -c $req"
     done
 }
 
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
+# weka CLI on the master: always try as the login user first; a failure
+# gets ONE retry under the master's escalator (sites lock the weka socket
+# or config to root), then the caller's fallback applies. Escalation only
+# after the user attempt fails -- never first.
+run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
+    local mpriv
+    run_host "$MASTER" "$1" > "$2" && return 0
+    mpriv=$(host_priv "$MASTER")
+    [ -n "$mpriv" ] || return 1
+    run_host "$MASTER" "$mpriv $1" > "$2" || return 1
+    log "NOTE: $MASTER: '$1' needed $mpriv (the unprivileged attempt failed)" >&2
+}
+
 probe_workers() {
     echo
     log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
@@ -1298,10 +1329,8 @@ probe_workers() {
     # that matters (FE and DRIVES are fixed 1.4GiB of net/queue buffers),
     # and only process rows carry roles. Server-level rows (ram_allocated,
     # a per-machine sum) remain the fallback for CLIs without it.
-    if ! { run_host "$MASTER" "weka cluster process -J" \
-            > "$WORK_DIR/probe/_weka_ram.json" \
-        || run_host "$MASTER" "weka cluster servers list -J" \
-            > "$WORK_DIR/probe/_weka_ram.json"; }; then
+    if ! { run_weka_master "weka cluster process -J" "$WORK_DIR/probe/_weka_ram.json" \
+        || run_weka_master "weka cluster servers list -J" "$WORK_DIR/probe/_weka_ram.json"; }; then
         rm -f "$WORK_DIR/probe/_weka_ram.json"
         : > "$WORK_DIR/probe/_weka_ram.err"
         # the tuner prints the floor it actually used; no number here, so the
@@ -2226,9 +2255,14 @@ host_dir() {   # host_dir <host>
     printf '%s' "${d:-$DIRECTORY}"
 }
 
-host_priv() {   # host_priv <host> -> passwordless escalator ("" if none)
+host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
+    # the probe emits a PREFIX ("dzdo -n", "ksu -e", "pbrun"): sites that
+    # install an enterprise escalator usually mandate it, so the sweep tests
+    # dzdo/pbrun/sesu/pmrun/doas/ksu before sudo, non-interactively, and the
+    # first that can run `true` wins -- whatever cannot work as a command
+    # prefix fails that same test and self-eliminates
     [ -f "$WORK_DIR/probe/$1" ] || return 0
-    awk '$1 == "priv" {print $2; exit}' "$WORK_DIR/probe/$1"
+    awk '/^priv /{sub(/^priv /, ""); print; exit}' "$WORK_DIR/probe/$1"
 }
 
 resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
