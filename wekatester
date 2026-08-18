@@ -1283,11 +1283,14 @@ PYEOF
     done
 }
 
-# Gather per-host facts + master-side extras into $WORK_DIR/probe/.
-# weka CLI on the master: always try as the login user first; a failure
+# Run a weka CLI on the master: always try as the login user first; a failure
 # gets ONE retry under the master's escalator (sites lock the weka socket
 # or config to root), then the caller's fallback applies. Escalation only
 # after the user attempt fails -- never first.
+#
+# No caller at present: the backend-RAM query that used it is retired with
+# the DRAM ceiling (see probe_workers). Kept because it is the tested,
+# correct way to reach the weka CLI for any future master-side fact.
 run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
     local mpriv
     run_host "$MASTER" "$1" > "$2" && return 0
@@ -1297,6 +1300,7 @@ run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
     log "NOTE: $MASTER: '$1' needed $mpriv (the unprivileged attempt failed)" >&2
 }
 
+# Gather per-host facts + master-side extras into $WORK_DIR/probe/.
 probe_workers() {
     echo
     log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
@@ -1322,22 +1326,13 @@ probe_workers() {
             || die "ioengine '$ENGINE' is not available (fio --enghelp) on: ${bad[*]}"
     fi
 
-    [ -n "$AUTO_LEVEL" ] || return 0   # df + backend RAM matter to the tuner only
+    # df is the only master-side fact the tuner needs. The backend-RAM query
+    # that used to live here is gone with the DRAM ceiling it fed -- see the
+    # spec's "Working-set sizing (max tier) -- CORRECTED 2026-08-18": weka
+    # backends hold no user data in RAM, so there was never a cache to defeat.
+    [ -n "$AUTO_LEVEL" ] || return 0   # df matters to the tuner only
     run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
-    # Process-level first: only COMPUTE processes hold the hugepage pool
-    # that matters (FE and DRIVES are fixed 1.4GiB of net/queue buffers),
-    # and only process rows carry roles. Server-level rows (ram_allocated,
-    # a per-machine sum) remain the fallback for CLIs without it.
-    if ! { run_weka_master "weka cluster process -J" "$WORK_DIR/probe/_weka_ram.json" \
-        || run_weka_master "weka cluster servers list -J" "$WORK_DIR/probe/_weka_ram.json"; }; then
-        rm -f "$WORK_DIR/probe/_weka_ram.json"
-        : > "$WORK_DIR/probe/_weka_ram.err"
-        # the tuner prints the floor it actually used; no number here, so the
-        # two cannot disagree
-        log "WARNING: could not query weka backend RAM; using the working-set floor" >&2
-        log "NOTE: an expired weka session is the usual cause -- 'weka user login' on $MASTER resolves it; a weka CLI missing from this user's PATH is the other (the escalated retry covers it only when an escalator was detected); continuing with the default file sizing" >&2
-    fi
 }
 
 # One-shot tuner: reads all probe facts and all jobfiles, writes every
@@ -1350,7 +1345,7 @@ probe_workers() {
 # including the capacity check, so the caller aborts before fio starts.
 auto_tune() {
     python3 - "$@" <<'PYEOF' || return 1
-import json, math, os, re, sys
+import math, os, re, sys
 
 # Validate the flag slot before unpacking: without this, an old-style call
 # silently succeeds -- a positional shifts into the host list, drops a host
@@ -1382,7 +1377,7 @@ def target(h, key):
     return TARGETS.get(h, {}).get(key, "")
 
 SMALL_FILESIZE = "1G"; SMALL_BYTES = 2**30
-CACHE_MULT = 2; WS_FLOOR = 8 * 2**30
+WS_FLOOR = 8 * 2**30
 IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64; LAT_NRFILES_CAP = 8
 ENGINE_ORDER = ["io_uring", "libaio", "psync"]
 SMALL_FORMAT = "wt-small.$jobnum.$filenum"
@@ -1502,32 +1497,6 @@ def override(lines, key, value):
         if line.strip() == "[global]":
             ins.append(f"{key}={value}")
     return ins
-
-# Cache ceiling for small-file working-set sizing, loaded once up front.
-# What this bounds (per weka source, fs/exports/types.d BlockOrigin): weka
-# backends hold NO user data in RAM -- every non-sparse block is served
-# from NVMe/OBS/peer, writes persist before ack, and direct=1 on a
-# forcedirect mount bypasses the client page cache. The hugepage pool a
-# process reports as memory/ram_allocated is metadata block cache plus
-# in-flight buffers; a working set beyond it defeats the METADATA cache,
-# which is what flatters small-working-set latency. Process rows carry
-# roles: only COMPUTE processes hold that pool (FE/DRIVES are fixed-size
-# network/queue buffers). Server rows (ram_allocated, per-machine sums)
-# have no roles and over-count a little -- fine for a ceiling.
-cache_bytes = 0
-ram_path = os.path.join(work, "probe", "_weka_ram.json")
-if os.path.exists(ram_path):
-    try:
-        rows = json.load(open(ram_path))
-        if isinstance(rows, dict):   # some CLIs wrap the list
-            rows = next((v for v in rows.values() if isinstance(v, list)), [])
-        compute = [r for r in rows if "COMPUTE" in (r.get("roles") or [])]
-        cache_bytes = sum((s.get("ram_allocated") or s.get("memory") or 0)
-                           for s in (compute or rows))
-    except (ValueError, KeyError, TypeError, AttributeError) as exc:
-        warn(f"could not parse weka RAM listing ({exc}); using working-set floor")
-if cache_bytes == 0:
-    warn(f"weka backend RAM unknown; small-file working set floors at {WS_FLOOR // 2**30}GiB/host")
 
 LAYOUT_MARKER = "# wekatester-layout: generated"
 
@@ -1683,7 +1652,13 @@ for job in jobs:
         if tier == "max" and (is_iops or is_latency):
             out = override(out, "filesize", SMALL_FILESIZE)
             out = override(out, "filename_format", SMALL_FORMAT)
-            ws = max(WS_FLOOR, CACHE_MULT * cache_bytes // len(hosts))
+            # Per-host small-file working set is the floor, flat. It is a
+            # file-spread rule (enough files that jobs do not all pound one
+            # inode), NOT a cache bound: per the spec's "Working-set sizing
+            # (max tier) -- CORRECTED 2026-08-18", weka backends hold no user
+            # data in RAM (fs/exports/types.d BlockOrigin has no RAM member),
+            # so the DRAM ceiling this used to scale by was measuring nothing.
+            ws = WS_FLOOR
             eff_jobs = usable_n if is_iops else 1
             nr = max(2, math.ceil(ws / (max(eff_jobs, 1) * SMALL_BYTES)))
             if is_latency:

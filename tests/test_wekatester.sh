@@ -196,7 +196,8 @@ t_assert "max: iops iodepth and nrfiles derived" bash -c '
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
-    grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=5$" "$v"'
+    # ws = WS_FLOOR = 8GiB, 5 usable cores -> nrfiles = max(2, ceil(8/5)) = 2
+    grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v"'
 t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
@@ -245,7 +246,9 @@ t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     out=$( cap max 0 h1 h2 2>&1 )
-    case "$out" in *"capacity: h1 needs ~75.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (wt-small): 5 jobs x 2 files x 1G
+    # = 10GiB -- distinct namespaces, so the two sum to 60GiB
+    case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "garbage\n" > "$FIX/probe/_df"
@@ -254,13 +257,6 @@ t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" b
         *"has 0.0GiB available"*) grep -q ERROR <<< "$out" && false || true ;;
         *) false ;;
     esac'
-t_assert "weka RAM: memory key fallback (pre-5.1)" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "[{\"memory\": 12335448064, \"roles\": [\"COMPUTE\"]}, {\"memory\": 12335448064, \"roles\": [\"COMPUTE\"]}, {\"memory\": 99999999999999, \"roles\": [\"FRONTEND\"]}]\n" > "$FIX/probe/_weka_ram.json"
-    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^nrfiles=5$" "$FIX/jobs/h1/031-iops.job"'
-
 # --- stage_variants: per-host jobfile staging (Task 8) ---
 t_assert "non-auto staging produces per-host variants" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -388,7 +384,8 @@ t_assert "max: small-file redirect rewrites size= to nrfiles x 1G" bash -c '
     printf "# report iops\n[global]\nfilesize=10G\nsize=40G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
-    grep -q "^nrfiles=5$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^size=5G$" "$v"'
+    # nrfiles = 2 at the 8GiB floor, so size= is rewritten to 2 x 1G
+    grep -q "^nrfiles=2$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^size=2G$" "$v"'
 t_assert "max: latency size= follows the capped nrfiles" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report latency\n[global]\nfilesize=10G\nsize=40G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
@@ -1575,36 +1572,24 @@ t_assert "unlink job removes its geometry marker after the grid is gone" bash -c
      [ "$(grep -c "^RM: " "$WORK_DIR/oplog")" -eq 2 ] &&
      [ "$(grep -c "^MARK: " "$WORK_DIR/oplog")" -eq 1 ])'
 
-# A failed backend-RAM query is survivable (the tuner floors the working
-# set), but the operator should hear the one command that usually fixes it.
-t_assert "probe: failed weka RAM query hints at weka user login and continues" bash -c '
+# The probe runs no weka CLI at all under -a: the DRAM ceiling it fed is
+# retired (see the corrected "Working-set sizing (max tier)" spec section),
+# so df is the only master-side fact the tuner needs.
+t_assert "probe: -a runs no weka CLI on the master, only df" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=max
             WORK_DIR=$d; DIRECTORY=/mnt/weka
+            # "weka " with the space matches a CLI invocation only -- the
+            # remote probe snippet mentions wekanode/weka_allowed, not "weka "
             run_host() { case "$2" in
-                (*"weka cluster process"*|*"weka cluster servers list"*) return 1;;
+                (*"weka "*) echo "WEKA_CALLED: $2" >&2; return 1;;
                 (*) echo stubbed;;
             esac; }
             probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
+    test ! -e "$d/probe/_weka_ram.json" && test ! -e "$d/probe/_weka_ram.err" &&
     case "$err" in
-        *"could not query weka backend RAM"*"weka user login"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-t_assert "probe: server-level RAM fallback answers when process-level is missing" bash -c '
-    d=$(mktemp -d)
-    err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=max
-            WORK_DIR=$d; DIRECTORY=/mnt/weka
-            run_host() { case "$2" in
-                (*"weka cluster process"*) return 1;;
-                (*"weka cluster servers list"*) echo "[{\"ram_allocated\": 123}]";;
-                (*) echo stubbed;;
-            esac; }
-            probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
-    grep -q "ram_allocated" "$d/probe/_weka_ram.json" &&
-    case "$err" in
-        *"could not query weka backend RAM"*) echo "$err" >&2; false;;
+        *WEKA_CALLED*) echo "$err" >&2; false;;
         *) true;;
     esac'
 
