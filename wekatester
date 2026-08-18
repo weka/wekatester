@@ -2065,20 +2065,50 @@ CSVEOF
     log "created host file $1"
 }
 
+# The directory an existing -C set name points at, if any -- lookup only,
+# never creating (resolve_custom_set runs later and may create it). Shipped
+# names return nothing: those are always customized via a fresh copy.
+custom_set_probe_dir() {
+    [ "$CUSTOMIZE" -eq 1 ] && [ -n "$CUSTOM_SET" ] || return 0
+    case " $SHIPPED_SETS " in *" $CUSTOM_SET "*) return 0 ;; esac
+    case "$CUSTOM_SET" in
+        /*|./*) [ ! -d "$CUSTOM_SET" ] || printf '%s' "$CUSTOM_SET" ;;
+        *)  if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
+                printf '%s' "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
+            elif [ -d "./fio-jobfiles/$CUSTOM_SET" ]; then
+                printf '%s' "./fio-jobfiles/$CUSTOM_SET"
+            fi ;;
+    esac
+}
+
 # Which file does -t mean? Explicit path wins (missing: confirm-create or
-# quit -- 5s defaulting to create under -r). Bare -t prefers the SOURCE
-# set's own hostlist.csv (-C resolves against the source too: the custom set
-# does not exist yet), else ./hostlist.csv, creating it with the same
-# confirmation if nothing exists anywhere. Without -t no file is ever used.
+# quit -- 5s defaulting to create under -r). Bare -t looks in the job set
+# folders first: an existing -C set's own hostlist.csv, then the -w set's,
+# then ./hostlist.csv -- a set-folder copy beats ./hostlist.csv and is the
+# one later writebacks update. With -C and no file anywhere, the file
+# belongs IN the set: creation defers to ensure_set_hostfile (the -C editor
+# opens the fresh template), never a stray ./hostlist.csv. Without -C,
+# nothing anywhere creates ./hostlist.csv with the usual confirmation.
+# Without -t no file is ever used (except a -C set's own, always honored).
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
-    local candidate
+    local candidate cdir
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
     else
-        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
-        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
-        [ -f "$candidate" ] || candidate="./hostlist.csv"
+        cdir=$(custom_set_probe_dir)
+        candidate=""
+        [ -z "$cdir" ] || [ ! -f "$cdir/hostlist.csv" ] || candidate="$cdir/hostlist.csv"
+        if [ -z "$candidate" ]; then
+            candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+            [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+            [ -f "$candidate" ] || candidate="./hostlist.csv"
+        fi
+        if [ ! -f "$candidate" ] && [ "$CUSTOMIZE" -eq 1 ]; then
+            TARGETS_FILE=""
+            log "host file: none found; it will be created in the custom set"
+            return 0
+        fi
     fi
     if [ ! -f "$candidate" ]; then
         if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
@@ -3555,10 +3585,14 @@ main() {
     # phase (logins, dirs) -- the auth rounds consume per-host logins from it.
     if [ "$TARGETS" -eq 1 ]; then
         resolve_targets_file
-        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-            || die "host file resolution failed ($TARGETS_FILE)"
+        # empty = the -C defer case: the set's file does not exist yet;
+        # the post-customize phase1 refresh picks it up once created
+        if [ -n "$TARGETS_FILE" ]; then
+            resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
+                "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+                - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
+                || die "host file resolution failed ($TARGETS_FILE)"
+        fi
     fi
     [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight

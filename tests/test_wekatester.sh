@@ -1739,6 +1739,30 @@ t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
      [ "$TARGETS_FILE" = "./hostlist.csv" ]) >/dev/null'
+t_assert "bare -t: an existing -C set folder's hostlist.csv beats ./hostlist.csv" bash -c '
+    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/mine
+    printf "host,user_login\n" > hostlist.csv
+    printf "host,user_login\nh7,opc\n" > fio-jobfiles/mine/hostlist.csv
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     TARGETS=1; CUSTOMIZE=1; CUSTOM_SET=mine; WORKLOAD=default
+     resolve_targets_file
+     [ "$TARGETS_FILE" = "$d/fio-jobfiles/mine/hostlist.csv" ]) >/dev/null'
+t_assert "bare -t with -C and no file anywhere defers creation to the set" bash -c '
+    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles
+    out=$( (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     TARGETS=1; CUSTOMIZE=1; CUSTOM_SET=newset; WORKLOAD=default
+     resolve_targets_file
+     [ -z "$TARGETS_FILE" ] || exit 1) 2>&1 ) &&
+    case "$out" in *"created in the custom set"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ ! -f "$d/hostlist.csv" ]'
+t_assert "custom_set_probe_dir: shipped names and missing dirs probe to nothing" bash -c '
+    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/real
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     CUSTOMIZE=1
+     CUSTOM_SET=default; a=$(custom_set_probe_dir)
+     CUSTOM_SET=ghost;   b=$(custom_set_probe_dir)
+     CUSTOM_SET=real;    c=$(custom_set_probe_dir)
+     [ -z "$a" ] && [ -z "$b" ] && [ "$c" = "$d/fio-jobfiles/real" ])'
 t_assert "-C sets own a hostfile: resolved file copied in, template when none" bash -c '
     d=$(mktemp -d); cd "$d"; mkdir -p set1 set2 fio-jobfiles/default
     printf "[global]\n[j]\nrw=read\n" > fio-jobfiles/default/011-a.job
