@@ -1336,7 +1336,7 @@ probe_workers() {
         # the tuner prints the floor it actually used; no number here, so the
         # two cannot disagree
         log "WARNING: could not query weka backend RAM; using the working-set floor" >&2
-        log "NOTE: an expired weka session is the usual cause -- 'weka user login' on $MASTER resolves it; continuing with the default file sizing" >&2
+        log "NOTE: an expired weka session is the usual cause -- 'weka user login' on $MASTER resolves it; a weka CLI missing from this user's PATH is the other (the escalated retry covers it only when an escalator was detected); continuing with the default file sizing" >&2
     fi
 }
 

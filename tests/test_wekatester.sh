@@ -2044,6 +2044,17 @@ t_assert "run_weka_master: user attempt first, one escalated retry, note on succ
     grep -q escalated "$d/out" &&
     case "$err" in *"needed pbrun"*) true;; *) echo "$err" >&2; false;; esac &&
     case "$err" in *RC_FAIL*) false;; *) true;; esac'
+t_assert "run_weka_master: weka missing for the user (exit 127) still gets the escalated attempt" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    (source ./wekatester
+     WORK_DIR=$d; MASTER=m1
+     printf "priv sudo -n\n" > "$d/probe/m1"
+     run_host() { case "$2" in
+         ("sudo -n weka status") echo escalated;;
+         ("weka status") return 127;;
+     esac; }
+     run_weka_master "weka status" "$d/out") >/dev/null 2>&1
+    grep -q escalated "$d/out"'
 t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash -c '
     d=$(mktemp -d)
     printf "#!/bin/sh\nexit 1\n" > "$d/dzdo"
