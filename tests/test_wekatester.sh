@@ -2069,6 +2069,28 @@ t_assert "targets: host-less lines never assign a login" bash -c '
     echo "$out" | grep -q "^h1	-	-	-	-" || { echo "$out" >&2; false; }'
 
 # --- host files (-t): flag, file resolution, prompts, -C ownership ---
+t_assert "parse: -c claims paths, shipped names and existing sets without an ssh probe" bash -c '
+    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/realset
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     parse_args -c realset -d /mnt/x
+     [ "$CUSTOM_SET" = realset ] && [ -z "$C_CANDIDATE" ] && [ ${#HOSTS[@]} -eq 0 ]) &&
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     parse_args -c ./someplace/set -d /mnt/x
+     [ "$CUSTOM_SET" = ./someplace/set ] && [ -z "$C_CANDIDATE" ]) &&
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     parse_args -c smoke -d /mnt/x
+     [ "$CUSTOM_SET" = smoke ] && [ -z "$C_CANDIDATE" ]) &&
+    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
+     parse_args -c maybehost -d /mnt/x
+     [ -z "$CUSTOM_SET" ] && [ "$C_CANDIDATE" = maybehost ] && [ "${HOSTS[0]}" = maybehost ])'
+t_assert "parse: -t consumes an existing file whatever its name" bash -c '
+    d=$(mktemp -d); cd "$d"; touch myhosts
+    (source "$OLDPWD/wekatester"
+     parse_args -t myhosts h1
+     [ "$TARGETS_PATH" = myhosts ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source "$OLDPWD/wekatester"
+     parse_args -t notafile h1
+     [ -z "$TARGETS_PATH" ] && [ "${HOSTS[*]}" = "notafile h1" ])'
 t_assert "parse: -t path heuristic -- paths consumed, hostnames left alone" bash -c '
     (source ./wekatester; parse_args -t h1 h2
      [ "$TARGETS" = 1 ] && [ -z "$TARGETS_PATH" ] && [ "${HOSTS[*]}" = "h1 h2" ]) &&

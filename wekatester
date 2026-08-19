@@ -556,8 +556,12 @@ parse_args() {
             # set's hostlist.csv, else ./hostlist.csv (see resolve_targets_file).
             -t|--targets)
                 TARGETS=1
+                # the filesystem decides first: an existing file is a host
+                # file whatever it is named; then the path-shaped heuristics
                 case "${2:-}" in
+                    ("") ;;
                     (*/* | *.csv) TARGETS_PATH=$2; shift ;;
+                    (*) if [ -f "$2" ]; then TARGETS_PATH=$2; shift; fi ;;
                 esac
                 shift ;;
             --targets=*)
@@ -623,8 +627,23 @@ parse_args() {
                         die "-C takes one set name before --; got '$CUSTOM_SET' and '$1'"; }
                     CUSTOM_SET=$1
                 elif [ "$c_pending" -eq 1 ] && [ -z "$C_CANDIDATE" ]; then
-                    # Provisionally a client; preflight decides (see C_CANDIDATE).
-                    C_CANDIDATE=$1; HOSTS+=("$1")
+                    # The filesystem beats the network: a token with a path
+                    # separator, a shipped set name, or an existing set
+                    # directory can never be a hostname -- claim it as the
+                    # set outright. Probing such tokens over ssh printed
+                    # credential warnings on purely local runs. Only a
+                    # genuinely ambiguous bare word stays provisional for
+                    # preflight's ssh test (see C_CANDIDATE).
+                    c_claim=0
+                    case "$1" in (*/*) c_claim=1 ;; esac
+                    case " $SHIPPED_SETS " in (*" $1 "*) c_claim=1 ;; esac
+                    [ ! -d "$SCRIPT_DIR/fio-jobfiles/$1" ] || c_claim=1
+                    [ ! -d "./fio-jobfiles/$1" ] || c_claim=1
+                    if [ "$c_claim" -eq 1 ]; then
+                        CUSTOM_SET=$1
+                    else
+                        C_CANDIDATE=$1; HOSTS+=("$1")
+                    fi
                 else
                     HOSTS+=("$1")
                 fi
