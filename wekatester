@@ -1062,7 +1062,7 @@ CAL_BW_QDS="1 2 4 8 16 32 64 128"
 CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
 CAL_HYBRID_BW_QDS="4 8 16 32 64 128"
 CAL_HYBRID_IOPS_QDS="32 64 128 256"
-CAL_NR_LADDER="4 8 16 32 64"   # nrfiles A/B points vs the 2-per-job baseline
+CAL_NR_LADDER="1 2 4 8"   # nrfiles points; each rung runs at iodepth = 2 x nrfiles
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
 # slot BELOW the operator: CLI > host file > calibration > tuner. When no
@@ -1308,18 +1308,20 @@ GAINSEOF
 $gains
 GAINSEOF
             done
-            # The nrfiles ladder: log-spaced points at the same working set
-            # (each file proportionally smaller), one seeded rung per point
-            # at the knee, versus the 2-per-job baseline. EVIDENCE ONLY:
-            # deltas are logged and bundled, never recorded -- rewriting the
-            # operator's file geometry from a probe would change what they
-            # asked to test; a real winner is named with the exact host-file
-            # fields that would adopt it. First direction of each type.
+            # The nrfiles ladder: points 1, 2, 4, 8 files per job at the
+            # same working set (each file proportionally smaller), every
+            # rung at iodepth = 2 x nrfiles so per-file queue pressure stays
+            # proportional -- the comparison isolates file count, not queue
+            # shape. The nr=2 rung inside the ladder is the reference.
+            # EVIDENCE ONLY: deltas are logged and bundled, never recorded;
+            # a winner is named with the exact host-file fields (nr, fs, qd)
+            # that would adopt it. First direction of each type.
             if [ "$probeqd" -gt 0 ] && [ ! -f "$WORK_DIR/cal/nrprobe-$type" ]; then
                 : > "$WORK_DIR/cal/nrprobe-$type"
-                local nrn nrfsz nrtot nrbestn=2 nrbestpct=0 nrbestraw=0 nrraw nrpct
+                local nrn nrqd nrfsz nrtot nrbestn="" nrbestpct="" nrbestraw=-999999 nrraw nrpct nrref
                 if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
                 for nrn in $CAL_NR_LADDER; do
+                    nrqd=$((nrn * 2))
                     nrfsz="$((nrtot / nrn))M"
                     CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
                     for host in "${todo[@]}"; do
@@ -1335,14 +1337,14 @@ GAINSEOF
                     done
                     run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
                         || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
-                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$nrqd" "$WORK_DIR/cal" "${todo[@]}"
                     copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
                         || die "cannot copy the nrfiles rung to $MASTER"
                     cmd="'$FIO_BIN' --output-format=json --eta=never"
                     for host in "${todo[@]}"; do
-                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nr$nrn.job'"
+                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$nrqd-nr$nrn.job'"
                     done
-                    curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nr$nrn.json"
+                    curjson="$WORK_DIR/cal/res-$type-$dirn-qd$nrqd-nr$nrn.json"
                     run_host "$MASTER" "$cmd" > "$curjson" \
                         || die "nrfiles rung $type-$dirn nr=$nrn failed (output in $curjson)"
                     check_fio_errors "$curjson" measured \
@@ -1351,22 +1353,30 @@ GAINSEOF
                         || die "cannot compute the nrfiles rung values for $type-$dirn nr=$nrn"
                     while read -r h v g; do
                         [ -n "$h" ] || continue
-                        read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        nrraw=$(awk -v a="$v" -v b="$best" 'BEGIN{printf "%.4f", (a-b)*100/b}')
-                        nrpct=$(awk -v p="$nrraw" 'BEGIN{printf "%+.1f", p}')
-                        log "cal: $h $type-$dirn nrfiles $nrn vs 2: ${nrpct}% (evidence only, not recorded)"
-                        if awk -v p="$nrraw" -v bp="$nrbestraw" 'BEGIN{exit !(p > bp)}'; then
-                            nrbestn=$nrn; nrbestpct=$nrpct; nrbestraw=$nrraw
-                        fi
+                        printf '%s\n' "$v" > "$WORK_DIR/cal/nrval-$type.$h.$nrn"
                     done <<GAINSEOF
 $gains
 GAINSEOF
                 done
-                if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
-                    log "cal: $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn and ${type}_fs=$((nrtot / nrbestn))M in the host file"
-                else
-                    log "cal: $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
-                fi
+                for host in "${todo[@]}"; do
+                    nrref=$(cat "$WORK_DIR/cal/nrval-$type.$host.2") || continue
+                    nrbestn=""; nrbestpct=""; nrbestraw=-999999
+                    for nrn in $CAL_NR_LADDER; do
+                        [ "$nrn" -ne 2 ] || continue
+                        v=$(cat "$WORK_DIR/cal/nrval-$type.$host.$nrn") || continue
+                        nrraw=$(awk -v a="$v" -v b="$nrref" 'BEGIN{printf "%.4f", (a-b)*100/b}')
+                        nrpct=$(awk -v p="$nrraw" 'BEGIN{printf "%+.1f", p}')
+                        log "cal: $host $type-$dirn nrfiles $nrn (qd=$((nrn * 2))) vs 2: ${nrpct}% (evidence only, not recorded)"
+                        if awk -v p="$nrraw" -v bp="$nrbestraw" 'BEGIN{exit !(p > bp)}'; then
+                            nrbestn=$nrn; nrbestpct=$nrpct; nrbestraw=$nrraw
+                        fi
+                    done
+                    if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
+                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn, ${type}_fs=$((nrtot / nrbestn))M and ${type}_qd=$((nrbestn * 2)) in the host file"
+                    else
+                        log "cal: $host $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
+                    fi
+                done
             fi
             for host in "${todo[@]}"; do
                 read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
