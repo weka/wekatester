@@ -104,8 +104,7 @@ LOCAL_MODE=0
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "hybrid"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
-# The working-set floor itself lives in the tuner (WS_FLOOR) and is quoted only
-# from there, so bash and python cannot drift apart on the number.
+# The small-file working-set floor (WS_FLOOR) lives in the tuner python.
 
 # --- logging -----------------------------------------------------------------
 log()   { echo "$(date '+%H:%M:%S') $*"; }
@@ -977,6 +976,231 @@ for host in sorted(cur):
 PYEOF
 }
 
+# --- calibration (cal/hybrid): measured knees, not guessed depths -------------
+# Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
+# a formula rung (per-weka-core budgets pick the start, the ladder still
+# proves it), so a well-behaved client confirms in two or three steps.
+CAL_GAIN_PCT=10          # a rung must gain this % over the previous to count
+CAL_BW_QDS="1 2 4 8 16 32 64"
+CAL_IOPS_QDS="1 2 4 8 16 32 64 128"
+CAL_HYBRID_BW_QDS="4 8 16 32 64"
+CAL_HYBRID_IOPS_QDS="32 64 128"
+
+# Fill '-' geometry in targets.final from the measured knees, one precedence
+# slot BELOW the operator: CLI > host file > calibration > tuner. When no
+# host file is in play targets.final does not exist -- synthesize it with
+# every other field '-' so the knees ride the exact application path the
+# host file uses (apply_targets_geometry, and the -a writeback after it).
+# bw knee -> field 9 (bw_qd), iops knee -> field 17 (iops_qd).
+apply_cal_results() {
+    [ -s "$WORK_DIR/cal.results" ] || return 0
+    python3 - "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" <<'PYEOF' || die "cannot apply the calibration results"
+import os, sys
+
+res, final = sys.argv[1], sys.argv[2]
+knees = {}
+for line in open(res):
+    f = line.split()
+    if len(f) == 4:
+        knees[f[0]] = f[1:]
+
+rows, order = {}, []
+if os.path.exists(final):
+    for line in open(final):
+        f = line.rstrip("\n").split("\t")
+        rows[f[0]] = f
+        order.append(f[0])
+for host in sorted(knees):
+    bwq, ioq, nj = knees[host]
+    row = rows.get(host)
+    if row is None:
+        row = [host] + ["-"] * 16
+        rows[host] = row
+        order.append(host)
+    while len(row) < 17:
+        row.append("-")
+    if bwq != "-" and row[8] == "-":
+        row[8] = bwq
+    if ioq != "-" and row[16] == "-":
+        row[16] = ioq
+    if nj != "-":
+        if row[5] == "-":
+            row[5] = nj
+        if row[13] == "-":
+            row[13] = nj
+with open(final, "w") as fp:
+    for h in order:
+        fp.write("\t".join(rows[h]) + "\n")
+PYEOF
+}
+
+# The calibration engine. Per required ladder (write before read, so a write
+# ladder doubles as the read grid's seed), one fio --client invocation per
+# rung over every participating host AT ONCE -- the knee is each client's
+# ceiling UNDER CONTENTION, the condition the measured jobs run in. A host
+# whose rung gained less than CAL_GAIN_PCT freezes its knee at the previous
+# rung but KEEPS RUNNING until every host froze or the rungs ran out, so the
+# contention stays constant for the hosts still climbing. Knees land in
+# cal.results, flow into targets.final via apply_cal_results, and persist to
+# hostlist.csv through the existing -a writeback -- which is also the cache:
+# a host whose relevant qd column is already filled skips that type's ladder
+# entirely (-g forces a re-measure). Per type the recorded knee is the
+# DEEPER of the two directions: the measured jobs share one qd column, and
+# under-queuing the hungrier direction costs more than over-queuing the
+# other. numjobs stays at usable cores (the ladder varies depth only).
+calibrate() {
+    cal_mode || return 0
+    local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
+    ladders=$(cal_required "$capdir") || die "cannot inspect $capdir for calibration"
+    if [ -z "$ladders" ]; then
+        log "cal: nothing to calibrate in this set (latency-only, or no jobs)"
+        return 0
+    fi
+    echo
+    log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
+    local host i pids hs
+    pids=(); hs=()
+    mkdir -p "$WORK_DIR/cal"
+    run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
+        || die "cannot create $TARGET_DIR.cal on $MASTER"
+    for host in "${HOSTS[@]}"; do
+        run_host "$host" "mkdir -p '$(host_dir "$host")/$CAL_SCRATCH'" &
+        pids+=($!); hs+=("$host")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || die "cannot create the calibration scratch dir on ${hs[$i]}"
+    done
+
+    local type dirn fieldno todo have_write qds qd prevjson prevqd cmd f
+    local gains all h v g knee val human bwq ioq k
+    for type in bw iops; do
+        if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
+        todo=()
+        for host in "${HOSTS[@]}"; do
+            if [ "$REGEN_LAYOUT" -eq 0 ] \
+                    && [ -n "$(targets_field "$host" "$fieldno" "$WORK_DIR/targets.final")" ]; then
+                log "cal: $host: the host file already carries $type geometry -- reusing (re-measure with -g)"
+            else
+                todo+=("$host")
+            fi
+        done
+        [ ${#todo[@]} -gt 0 ] || continue
+        have_write=0
+        printf '%s\n' "$ladders" | grep -q "^$type write$" && have_write=1
+        for dirn in write read; do
+            printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
+            if [ "$dirn" = read ] && [ "$have_write" -eq 0 ]; then
+                # Seed: write the read grid ONCE, full files, unmeasured --
+                # a timed write pass could leave short files a read rung
+                # then trips over, so the seed strips the time_based trio.
+                stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
+                for host in "${todo[@]}"; do
+                    f="$WORK_DIR/cal/$host/cal-$type-write-qd1.job"
+                    grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f" > "$f.seed" \
+                        && mv "$f.seed" "$f" || die "cannot derive the seed job for $host"
+                done
+                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                    || die "cannot copy the calibration seed to $MASTER"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
+                for host in "${todo[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1.job'"
+                done
+                log "cal: seeding the $type read grid on ${#todo[@]} host(s)..."
+                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/seed.json" \
+                    || die "calibration seed failed (output in $WORK_DIR/cal/seed.json)"
+                check_fio_errors "$WORK_DIR/cal/seed.json" layout \
+                    || die "calibration seed errored on a host (output in $WORK_DIR/cal/seed.json)"
+            fi
+            case "$AUTO_LEVEL,$type" in
+                (cal,bw)     qds=$CAL_BW_QDS ;;
+                (cal,iops)   qds=$CAL_IOPS_QDS ;;
+                (hybrid,bw)  qds=$CAL_HYBRID_BW_QDS ;;
+                (*)          qds=$CAL_HYBRID_IOPS_QDS ;;
+            esac
+            prevjson=-; prevqd=0
+            for qd in $qds; do
+                stage_cal_step "$type" "$dirn" "$qd" "$WORK_DIR/cal" "${todo[@]}"
+                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                    || die "cannot copy calibration step files to $MASTER"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
+                for host in "${todo[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$qd.job'"
+                done
+                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/cur.json" \
+                    || die "calibration rung $type-$dirn qd=$qd failed (output in $WORK_DIR/cal/cur.json)"
+                check_fio_errors "$WORK_DIR/cal/cur.json" measured \
+                    || die "calibration rung $type-$dirn qd=$qd errored on a host (output in $WORK_DIR/cal/cur.json)"
+                gains=$(cal_gains "$prevjson" "$WORK_DIR/cal/cur.json" "$type") \
+                    || die "cannot compute calibration gains for $type-$dirn qd=$qd"
+                all=1
+                while read -r h v g; do
+                    [ -n "$h" ] || continue
+                    [ -f "$WORK_DIR/cal/knee-$type-$dirn.$h" ] && continue
+                    if [ "$g" -lt "$CAL_GAIN_PCT" ] && [ "$prevqd" -gt 0 ]; then
+                        printf '%s\n' "$prevqd" > "$WORK_DIR/cal/knee-$type-$dirn.$h"
+                    else
+                        printf '%s\n' "$v" > "$WORK_DIR/cal/val-$type-$dirn.$h"
+                        all=0
+                    fi
+                done <<GAINSEOF
+$gains
+GAINSEOF
+                [ "$all" -eq 1 ] && break
+                cp "$WORK_DIR/cal/cur.json" "$WORK_DIR/cal/prev.json"
+                prevjson="$WORK_DIR/cal/prev.json"; prevqd=$qd
+            done
+            for host in "${todo[@]}"; do
+                knee=$prevqd   # rungs ran out while still gaining
+                [ ! -f "$WORK_DIR/cal/knee-$type-$dirn.$host" ] \
+                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host")
+                printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
+                val=0
+                [ ! -f "$WORK_DIR/cal/val-$type-$dirn.$host" ] \
+                    || val=$(cat "$WORK_DIR/cal/val-$type-$dirn.$host")
+                if [ "$type" = bw ]; then
+                    human=$(awk -v v="$val" 'BEGIN{printf "%.1fGB/s", v/1e9}')
+                else
+                    human=$(awk -v v="$val" 'BEGIN{printf "%.0fk iops", v/1e3}')
+                fi
+                log "cal: $host $type-$dirn knee qd=$knee ($human)"
+            done
+        done
+    done
+
+    : > "$WORK_DIR/cal.results"
+    for host in "${HOSTS[@]}"; do
+        bwq=-; ioq=-
+        for dirn in read write; do
+            f="$WORK_DIR/cal/knee-bw-$dirn.$host"
+            if [ -f "$f" ]; then
+                k=$(cat "$f")
+                if [ "$bwq" = - ] || [ "$k" -gt "$bwq" ]; then bwq=$k; fi
+            fi
+            f="$WORK_DIR/cal/knee-iops-$dirn.$host"
+            if [ -f "$f" ]; then
+                k=$(cat "$f")
+                if [ "$ioq" = - ] || [ "$k" -gt "$ioq" ]; then ioq=$k; fi
+            fi
+        done
+        if [ "$bwq" != - ] || [ "$ioq" != - ]; then
+            printf '%s %s %s -\n' "$host" "$bwq" "$ioq" >> "$WORK_DIR/cal.results"
+        fi
+    done
+    apply_cal_results
+
+    pids=(); hs=()
+    for host in "${HOSTS[@]}"; do
+        run_host "$host" "rm -rf '$(host_dir "$host")/$CAL_SCRATCH'" &
+        pids+=($!); hs+=("$host")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" \
+            || log "WARNING: could not remove the calibration scratch on ${hs[$i]}" >&2
+    done
+    run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
+        || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
+}
+
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:
 # just the fio check -- there is no connection to test).
@@ -1227,7 +1451,7 @@ cleanup() {
             # only by the NEXT privileged run's pre-start sweep)
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
-            run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR'" &
+            run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
             pids+=($!)
         done
         # These pids only -- a bare `wait` also waits on the run-log tees,
@@ -2934,6 +3158,15 @@ dry_run_report() {
     local job f
     echo
     log "dry run: nothing was executed; details of what would have run:"
+    if cal_mode; then
+        local caldir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} call
+        call=$(cal_required "$caldir") || call=""
+        if [ -n "$call" ]; then
+            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- ladders need live fio servers, so a dry run only names them"
+        else
+            log "-a $AUTO_LEVEL: nothing to calibrate in this set"
+        fi
+    fi
     if [ -n "$SET_DIR_OVERRIDE" ]; then
         log "custom set files (edit these, then re-run without -n):"
         for f in "$SET_DIR_OVERRIDE"/[0-9]*; do
@@ -3958,6 +4191,7 @@ main() {
     fi
     start_fio_servers
     verify_fio_ports
+    calibrate
     stage_jobfiles
     check_capacity
     writeback_targets

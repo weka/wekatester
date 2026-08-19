@@ -158,9 +158,12 @@ of trusting the jobfiles' static values. Four levels:
   directly comparable.
 - `-a max` (default when the level is omitted) — each worker is tuned to its
   own capability: `numjobs` = that host's usable cores, deeper iodepth,
-  and iops/latency tests move to a shared small-file namespace sized from
-  the cluster's backend RAM (cache-defeat working set). Highest numbers;
-  hosts with different hardware run different settings.
+  and iops/latency tests move to a shared small-file namespace sized by a
+  plain 8GiB-per-host floor. (An earlier release sized this against backend
+  DRAM as a "cache-defeat working set"; the weka source disproved the
+  premise — backends never serve file data from RAM — so the floor is a
+  file-spread rule, not a cache bound.) Highest numbers; hosts with
+  different hardware run different settings.
 - `-a cal` — measures each client's own iodepth ceiling against this cluster
   instead of guessing it: a per-client iodepth ladder runs before staging,
   and the knees it finds are cached in `hostlist.csv`. The answer to "why
@@ -169,9 +172,24 @@ of trusting the jobfiles' static values. Four levels:
   rung instead of starting from scratch, so it confirms a good starting
   point rather than searching for one.
 
+How calibration works: before staging, the set is inspected for what it
+actually runs — bandwidth and/or iops ladders, read and/or write directions;
+latency is never calibrated (queue depth 1 by definition). Each ladder steps
+iodepth (cal: 1→64 bandwidth, 1→128 iops; hybrid starts mid-ladder), ~12s a
+rung, on ALL clients at once — the knee is each client's ceiling under
+contention, the condition the real jobs run in. A client freezes its knee at
+the last rung that gained it ≥10%, but keeps running so the contention stays
+constant for clients still climbing. Ladder files live in a scratch
+namespace (`.wekatester-cal/` under each destination), write ladders double
+as the read grid's seed, and the scratch is removed afterward. Knees flow
+into the run's geometry one precedence slot below the operator (CLI > host
+file > calibration > tuner) and persist to `hostlist.csv` via the `-a`
+writeback — which is also the cache: a host whose qd columns are already
+filled skips those ladders (`-g` re-measures). `-n` names the ladders a run
+would perform without executing them.
+
 Every staged jobfile records what auto derived for that host in header
-comments. Auto also warns when workers differ (core counts, weka cores) and
-when the backend RAM query fails.
+comments. Auto also warns when workers differ (core counts, weka cores).
 
 **Every run** is capacity-checked after staging, per host, against each
 host's own destination filesystem: the staged variants (auto-tuned,

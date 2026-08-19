@@ -2552,6 +2552,76 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
         *) echo "rc=$rc $err" >&2; false;;
     esac'
 
+# --- calibrate(): the ladder orchestrator ---
+# A run_host stub answers each rung with fabricated JSON whose per-rung values
+# walk 100%/90%/10%/0% gains: the knee must land at qd=4 (the last rung that
+# gained >= CAL_GAIN_PCT), and the scratch dirs must be created and removed.
+cal_json() {   # cal_json <bw_bytes> -> fio-style client_stats JSON on stdout
+    printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": 10, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1"
+}
+export -f cal_json
+t_assert "calibrate: knee lands at the last gaining rung, scratch created and removed" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh
+     source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*) echo "MK: $2" >> "$d/oplog";;
+         (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
+         (*qd1.job*)  cal_json 1000;;
+         (*qd2.job*)  cal_json 1900;;
+         (*qd4.job*)  cal_json 2100;;
+         (*qd8.job*)  cal_json 2110;;
+         (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
+     esac; }
+     calibrate) 2>&1 )
+    grep -q "^h1 4 - -$" "$d/cal.results" &&
+    case "$out" in *"cal: h1 bw-read knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
+    grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
+    grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
+t_assert "calibrate: a host-file-supplied qd skips that ladder; -g re-measures" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t-\n" > "$d/targets.final"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set
+     copy_to_master() { :; }
+     run_host() { return 0; }
+     calibrate) 2>&1 )
+    case "$out" in *"already carries bw geometry -- reusing"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ ! -s "$d/cal.results" ]'
+t_assert "calibrate: no-op below cal/hybrid" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     AUTO_LEVEL=max; WORK_DIR=$d
+     run_host() { echo "TOUCHED" >> "$d/oplog"; }
+     calibrate)
+    [ ! -f "$d/oplog" ]'
+t_assert "apply_cal_results: fills only dashes, operator values survive, synthesizes when no host file" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d
+     printf "h1 4 32 -\nh2 8 - -\n" > "$d/cal.results"
+     printf "h1\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
+     apply_cal_results)
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
+    b=$(awk -F"\t" "\$1==\"h2\" {print \$9, \$17}" "$d/targets.final")
+    [ "$a" = "4 64" ] && [ "$b" = "8 -" ] || { echo "a=$a b=$b" >&2; false; }
+    (source ./wekatester
+     WORK_DIR=$d; rm -f "$d/targets.final"
+     printf "h3 16 - -\n" > "$d/cal.results"
+     apply_cal_results)
+    c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
+    [ "$c" = "17 16" ]'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
