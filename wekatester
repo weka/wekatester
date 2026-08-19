@@ -1055,13 +1055,14 @@ PYEOF
 # Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
 # a formula rung (per-weka-core budgets pick the start, the ladder still
 # proves it), so a well-behaved client confirms in two or three steps.
-CAL_GAIN_PCT=5           # a rung must beat the BEST so far by this % to count
+CAL_GAIN_PCT=2           # a rung must beat the BEST so far by this % to count
 CAL_STOP_BELOW=2         # consecutive sub-threshold rungs before the ladder stops
 CAL_KNEE_PCT=95          # knee = shallowest qd within this % of the peak value
 CAL_BW_QDS="1 2 4 8 16 32 64 128"
 CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
 CAL_HYBRID_BW_QDS="4 8 16 32 64 128"
 CAL_HYBRID_IOPS_QDS="32 64 128 256"
+CAL_NR_LADDER="4 8 16 32 64"   # nrfiles A/B points vs the 2-per-job baseline
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
 # slot BELOW the operator: CLI > host file > calibration > tuner. When no
@@ -1307,51 +1308,64 @@ GAINSEOF
 $gains
 GAINSEOF
             done
-            # The nrfiles A/B: 64 files per job at the same working set
-            # (each file 32x smaller), one rung at the knee. EVIDENCE ONLY:
-            # the delta is logged and bundled, never recorded -- rewriting
-            # the operator's file geometry from a probe would change what
-            # they asked to test. Run on the first direction of each type.
+            # The nrfiles ladder: log-spaced points at the same working set
+            # (each file proportionally smaller), one seeded rung per point
+            # at the knee, versus the 2-per-job baseline. EVIDENCE ONLY:
+            # deltas are logged and bundled, never recorded -- rewriting the
+            # operator's file geometry from a probe would change what they
+            # asked to test; a real winner is named with the exact host-file
+            # fields that would adopt it. First direction of each type.
             if [ "$probeqd" -gt 0 ] && [ ! -f "$WORK_DIR/cal/nrprobe-$type" ]; then
                 : > "$WORK_DIR/cal/nrprobe-$type"
-                local nrfsz
-                if [ "$type" = bw ]; then nrfsz=32M; else nrfsz=8M; fi
-                CAL_NRFILES=64 CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
-                for host in "${todo[@]}"; do
-                    f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr64.job"
-                    { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
-                        && mv "$f.seed" "$f" || die "cannot derive the nrfiles seed for $host"
-                done
-                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy the nrfiles seed to $MASTER"
-                cmd="'$FIO_BIN' --output-format=json --eta=never"
-                for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr64.job'"
-                done
-                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr64-seed.json" \
-                    || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr64-seed.json)"
-                CAL_NRFILES=64 CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
-                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy the nrfiles rung to $MASTER"
-                cmd="'$FIO_BIN' --output-format=json --eta=never"
-                for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nr64.job'"
-                done
-                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nr64.json"
-                run_host "$MASTER" "$cmd" > "$curjson" \
-                    || die "nrfiles rung $type-$dirn failed (output in $curjson)"
-                check_fio_errors "$curjson" measured \
-                    || die "nrfiles rung $type-$dirn errored on a host (output in $curjson)"
-                gains=$(cal_gains - "$curjson" "$type") \
-                    || die "cannot compute the nrfiles rung values for $type-$dirn"
-                while read -r h v g; do
-                    [ -n "$h" ] || continue
-                    read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
-                    log "cal: $h $type-$dirn nrfiles 64 vs 2: $(awk -v a="$v" -v b="$best" \
-                        'BEGIN{printf "%+.1f%%", (a-b)*100/b}') (evidence only, not recorded)"
-                done <<GAINSEOF
+                local nrn nrfsz nrtot nrbestn=2 nrbestpct=0 nrpct
+                if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
+                for nrn in $CAL_NR_LADDER; do
+                    nrfsz="$((nrtot / nrn))M"
+                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
+                    for host in "${todo[@]}"; do
+                        f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr$nrn.job"
+                        { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
+                            && mv "$f.seed" "$f" || die "cannot derive the nrfiles seed for $host"
+                    done
+                    copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                        || die "cannot copy the nrfiles seed to $MASTER"
+                    cmd="'$FIO_BIN' --output-format=json --eta=never"
+                    for host in "${todo[@]}"; do
+                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr$nrn.job'"
+                    done
+                    run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
+                        || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
+                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+                    copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                        || die "cannot copy the nrfiles rung to $MASTER"
+                    cmd="'$FIO_BIN' --output-format=json --eta=never"
+                    for host in "${todo[@]}"; do
+                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nr$nrn.job'"
+                    done
+                    curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nr$nrn.json"
+                    run_host "$MASTER" "$cmd" > "$curjson" \
+                        || die "nrfiles rung $type-$dirn nr=$nrn failed (output in $curjson)"
+                    check_fio_errors "$curjson" measured \
+                        || die "nrfiles rung $type-$dirn nr=$nrn errored on a host (output in $curjson)"
+                    gains=$(cal_gains - "$curjson" "$type") \
+                        || die "cannot compute the nrfiles rung values for $type-$dirn nr=$nrn"
+                    while read -r h v g; do
+                        [ -n "$h" ] || continue
+                        read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
+                        nrpct=$(awk -v a="$v" -v b="$best" 'BEGIN{printf "%+.1f", (a-b)*100/b}')
+                        log "cal: $h $type-$dirn nrfiles $nrn vs 2: ${nrpct}% (evidence only, not recorded)"
+                        if awk -v p="$nrpct" -v bp="$nrbestpct" 'BEGIN{exit !(p+0 > bp+0)}'; then
+                            nrbestn=$nrn; nrbestpct=$nrpct
+                        fi
+                    done <<GAINSEOF
 $gains
 GAINSEOF
+                done
+                if awk -v p="$nrbestpct" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p+0 >= t+0)}'; then
+                    log "cal: $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn and ${type}_fs=$((nrtot / nrbestn))M in the host file"
+                else
+                    log "cal: $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
+                fi
             fi
             for host in "${todo[@]}"; do
                 read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
