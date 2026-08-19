@@ -2025,8 +2025,10 @@ for h in hosts:
         # them, minus weka's own.
         usable_iso = sorted(iso - weka)
         if usable_iso:
-            warn(f"{h}: isolcpus detected; pinning fio to isolated cpus "
-                 f"{fmt_cpulist(usable_iso)} (housekeeping cpus excluded)")
+            # expected behavior on an isolcpus box, so a note, not a warning
+            print(f"note: {h}: isolcpus detected; pinning fio to isolated "
+                  f"cpus {fmt_cpulist(usable_iso)} (housekeeping cpus "
+                  f"excluded)", file=sys.stderr)
             usable = usable_iso
         else:
             warn(f"{h}: isolcpus detected but weka owns every isolated cpu; "
