@@ -1209,14 +1209,22 @@ t_assert "parse: -a cal, -Ahybrid and --auto=cal set the level; cal_mode true on
 # iops write}, nothing else, empty when nothing needs calibrating. Asserted on
 # the whole pipe-joined output, never with grep, so a spurious extra ladder
 # (wasted measurement time) fails the test just like a missing one.
+# The exit code is pinned BEFORE the output is transformed: piping cal_required
+# straight into tr would discard its status, and a python traceback (rc 1, empty
+# stdout) would then be indistinguishable from the valid "nothing to calibrate"
+# answer -- the empty-output assertions would pass on a broken function. A
+# nonzero rc prints a marker instead, so those assertions fail on it.
 cal_set() {   # cal_set <jobfile-body>...; prints cal_required, newlines as |
-    local d body n=0
+    local d body out rc n=0
     d=$(mktemp -d)
     for body in "$@"; do
         n=$((n + 1)); printf '%s\n' "$body" > "$d/0${n}1-job.job"
     done
-    (source ./wekatester; cal_required "$d") | tr '\n' '|'
+    out=$( (source ./wekatester; cal_required "$d") ); rc=$?
     rm -rf "$d"
+    [ "$rc" -eq 0 ] || { echo "ERROR: cal_required exited $rc"; return "$rc"; }
+    [ -n "$out" ] || return 0   # a valid empty answer stays empty, not "|"
+    printf '%s\n' "$out" | tr '\n' '|'
 }
 t_assert "cal_required: bandwidth-read + iops-randrw + latency set" \
     test "$(cal_set '# report bandwidth
@@ -1286,7 +1294,10 @@ t_assert "cal_required: a directive with no rw= anywhere asks for nothing" \
 [bw]
 bs=1M')" = ""
 t_assert "cal_required: the shipped sets ask for the ladders they measure" bash -c '
-    r() { (source ./wekatester; cal_required "fio-jobfiles/$1") | tr "\n" "|"; }
+    r() { local out rc                     # rc pinned before transforming, as above
+          out=$( (source ./wekatester; cal_required "fio-jobfiles/$1") ); rc=$?
+          [ "$rc" -eq 0 ] || { echo "ERROR: cal_required exited $rc"; return "$rc"; }
+          printf "%s\n" "$out" | tr "\n" "|"; }
     [ "$(r default)"    = "bw read|bw write|iops read|iops write|" ] &&
     [ "$(r mixed)"      = "bw read|bw write|iops read|iops write|" ] &&
     [ "$(r smoke)"      = "bw read|" ] &&

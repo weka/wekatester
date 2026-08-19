@@ -659,17 +659,31 @@ cal_mode() { [ "$AUTO_LEVEL" = cal ] || [ "$AUTO_LEVEL" = hybrid ]; }
 # wasted measurement time on every client and a missing one silently falls
 # back to a guessed queue depth.
 #
-# Report type comes from the '# report' directive, classified exactly as the
-# tuner classifies the same file (see report_items in auto_tune):
+# Report type comes from the '# report' directive:
 #   - 'latency' anywhere in the directive wins the whole file and contributes
 #     nothing -- a latency job is qd=1/nj=1 by definition, so there is no knee
-#     to find ('# report iops latency' is a latency file).
+#     to find ('# report iops latency' is a latency file). Same rule the tuner
+#     applies to the same file (see report_items in auto_tune).
 #   - otherwise 'bandwidth' -> bw and 'iops' -> iops, and a directive naming
 #     both types contributes both.
-#   - NO directive at all -> counted as bandwidth. The summarizer's fallback
-#     reports every metric for such a file, so no single type is named; their
-#     shape (large sequential files, no bs=4k) is bandwidth-like, and the bw
-#     ladder is the one whose knee can inform them.
+#   - NO directive at all -> counted as bandwidth: the summarizer's fallback
+#     reports every metric for such a file, so no single type is named, and
+#     their shape (large sequential files, no bs=4k) is bandwidth-like.
+# This is NOT the tuner's classification, and deliberately so: it asks for a
+# superset of the ladders whose knees the tuner can currently apply, in two
+# cases.
+#   1. No directive: the tuner's report_items falls back to naming all three
+#      items, so latency wins there and the file is staged as a latency file
+#      (kind_key 'lat'). A bw knee measured for it is cached in hostlist.csv,
+#      not applied to that file at staging.
+#   2. '# report bandwidth iops': the tuner's precedence is latency > bw >
+#      iops, so it stages that file as bandwidth only, and apply_targets_
+#      geometry picks bw for it too -- the iops knee this asks for does not
+#      land on that file either.
+# Over-asking is the safe direction of that mismatch (a knee nobody applies
+# costs ~10s per step once; a knee never measured leaves a guessed queue depth
+# in place for the whole run), and the knee-application rule at staging
+# decides what actually lands -- see the wire-in.
 # Direction comes from each job section's effective rw= (the section's own
 # value, else [global]'s): read/randread -> read, write/randwrite -> write,
 # the mixed forms -> both. A file that names no rw= anywhere contributes no
