@@ -1452,8 +1452,8 @@ t_assert "stage_cal_step: the host with no resolved dir uses the global -d" \
     cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" directory=/mnt/weka/.wekatester-cal
 # No recorded cpu list: no pinning AND no policy. A cpus_allowed_policy with
 # nothing to split is a silent no-op today and a trap the day fio changes.
-t_assert "stage_cal_step: no recorded cpus means neither cpus line" \
-    cal_nolines "$CALFIX/cal/h2/cal-bw-read-qd8.job" '^cpus_allowed' '^cpus_allowed_policy'
+t_assert "stage_cal_step: no recorded cpus means the tuner usable set, split policy" \
+    cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" 'cpus_allowed=1,2,3' 'cpus_allowed_policy=split'
 t_assert "stage_cal_step: the per-host filename_format is host-prefixed and jobnum-keyed" \
     cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" 'filename_format=h2.cal.$jobnum.$filenum'
 t_assert "stage_cal_step: a write step creates its files on open" bash -c '
@@ -1887,9 +1887,52 @@ numjobs=2"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo 1073741824; echo 536870912; }
      sweep_layout_grid)
-    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -size 1073741824c -delete" "$d/oplog" &&
-    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.*\" ! -size 536870912c -delete" "$d/oplog" &&
+    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -size +1073741823c -delete" "$d/oplog" &&
+    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -size +536870911c -delete" "$d/oplog" &&
     [ "$(cat "$d/probe/h1.laidout")" = "1610612736" ]'
+t_assert "sweep: same-format sections cannot delete each other (exact singleton indices, size floors)" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DIRECTORY=/mnt/weka; DRY_RUN=0
+     mkdir -p "$d/jobs/h1" "$SET_DIR"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/mnt/weka
+filename_format=h1.\$filenum/\$jobnum
+[l1]
+filesize=1G
+nrfiles=502
+numjobs=44
+[l2]
+filesize=10G
+numjobs=44"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { echo "SWEEP: $2" >> "$d/oplog"; echo 0; echo 0; }
+     sweep_layout_grid)
+    grep -qF -- "-path \"/mnt/weka/h1.0/*\" ! -size +10737418239c -delete" "$d/oplog" &&
+    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -size +10737418239c" "$d/oplog" &&
+    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -size +1073741823c -delete" "$d/oplog"'
+t_assert "cal steps: no operator pin means the tuner usable set, never unpinned" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); DIRECTORY=/mnt/weka
+     printf "ncpus 8\nisolated 4-7\nweka_allowed 4\n" > "$d/probe/h1"
+     stage_cal_step bw read 8 "$d/cal" h1)
+    f=$d/cal/h1/cal-bw-read-qd8.job
+    grep -q "^cpus_allowed=5,6,7$" "$f" &&
+    grep -q "^cpus_allowed_policy=split$" "$f" &&
+    grep -q "^numjobs=3$" "$f"'
+t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; REGEN_LAYOUT=1
+     printf "h1 4 32 -\n" > "$d/cal.results"
+     printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
+     apply_cal_results)
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
+    [ "$a" = "4 32" ] || { echo "a=$a" >&2; false; }'
 t_assert "sweep: dry runs never mutate (no run_host at all)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

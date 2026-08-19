@@ -773,12 +773,12 @@ PYEOF
 #     fallback -- both branches exactly as the tuner has them.
 # Prints the COUNT, and fails loudly rather than printing 0: numjobs=0 is no
 # valid fio job, so a ladder sized from an unreadable probe must not run.
-usable_cores() {   # usable_cores <host>
+usable_cores() {   # usable_cores <host> [list] -> count, or the cpu list itself
     [ -f "$WORK_DIR/probe/$1" ] || {
         log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
         return 1
     }
-    python3 - "$WORK_DIR/probe/$1" <<'PYEOF' || return 1
+    python3 - "$WORK_DIR/probe/$1" "${2:-count}" <<'PYEOF' || return 1
 import sys
 
 path = sys.argv[1]
@@ -812,7 +812,10 @@ if iso:
         or usable
 if not usable:
     sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
-print(len(usable))
+if sys.argv[2] == "list":
+    print(",".join(str(c) for c in usable))
+else:
+    print(len(usable))
 PYEOF
 }
 
@@ -878,6 +881,14 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             || die "$host: cannot size the $type $dirn calibration ladder"
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        # no operator pin: use the tuner's own usable set (isolated minus
+        # weka, or everything minus weka) -- an unpinned ladder lands on the
+        # housekeeping cpus weka shares and measures THAT contention instead
+        # of the client's ceiling (seen live: 0.6GB/s knees on an 18GB/s box)
+        if [ -z "$cpus" ]; then
+            cpus=$(usable_cores "$host" list) \
+                || die "$host: cannot derive the calibration cpu set"
+        fi
         mkdir -p "$outdir/$host" || die "cannot create $outdir/$host"
         f="$outdir/$host/cal-$type-$dirn-qd$qd.job"
         {
@@ -994,10 +1005,12 @@ CAL_HYBRID_IOPS_QDS="32 64 128"
 # bw knee -> field 9 (bw_qd), iops knee -> field 17 (iops_qd).
 apply_cal_results() {
     [ -s "$WORK_DIR/cal.results" ] || return 0
-    python3 - "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" <<'PYEOF' || die "cannot apply the calibration results"
+    # -g forces a re-measure -- and a re-measure someone forced should WIN:
+    # its knees replace host-file qd values instead of only filling gaps
+    python3 - "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" <<'PYEOF' || die "cannot apply the calibration results"
 import os, sys
 
-res, final = sys.argv[1], sys.argv[2]
+res, final, force = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 knees = {}
 for line in open(res):
     f = line.split()
@@ -1019,9 +1032,9 @@ for host in sorted(knees):
         order.append(host)
     while len(row) < 17:
         row.append("-")
-    if bwq != "-" and row[8] == "-":
+    if bwq != "-" and (force or row[8] == "-"):
         row[8] = bwq
-    if ioq != "-" and row[16] == "-":
+    if ioq != "-" and (force or row[16] == "-"):
         row[16] = ioq
     if nj != "-":
         if row[5] == "-":
@@ -3766,7 +3779,16 @@ for name, sec in sections:
     size = parse_size(fsz)
     nr = int(get("nrfiles", "1"))
     nj = int(get("numjobs", "1"))
-    glob = re.sub(r"\$\w+", "*", fmt.replace("$jobname", name))
+    fmt = fmt.replace("$jobname", name)
+    # a singleton counter is an EXACT path component, not a wildcard: with
+    # nrfiles=1 the glob $filenum/* would sweep every sibling directory the
+    # namespace's OTHER sections own (seen live: two same-format sections,
+    # 1G x 502 dirs + 10G in dir 0, each deleting the other's files)
+    if nr == 1:
+        fmt = fmt.replace("$filenum", "0")
+    if nj == 1:
+        fmt = fmt.replace("$jobnum", "0")
+    glob = re.sub(r"\$\w+", "*", fmt)
     depth = 1 + glob.count("/")
     print(f"{size}\t{glob}\t{depth}\t{size * nr * nj}")
 PYEOF
@@ -3799,10 +3821,13 @@ sweep_layout_grid() {
         cmd=""
         while IFS="$(printf '\t')" read -r sz glob depth tot; do
             [ -n "$sz" ] || continue
-            # deviants die; survivors are counted (capped at the grid's own
-            # total, so stale extras beyond the grid cannot inflate credit)
-            cmd="$cmd find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -size ${sz}c -delete; \
-                 find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" -size ${sz}c \
+            # sufficiency, not equality: a file LARGER than the grid expects
+            # still serves every job (fio reads/writes its first N bytes),
+            # so only files SMALLER than expected are deviants. Overlapping
+            # same-format sections may each count a shared oversize file;
+            # the per-section cap keeps that overcredit at nrfiles x size.
+            cmd="$cmd find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -size +$((sz - 1))c -delete; \
+                 find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" -size +$((sz - 1))c \
                      | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
         done <<SPECEOF
 $spec
