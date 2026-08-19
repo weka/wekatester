@@ -184,7 +184,7 @@ t_assert "latency: numjobs/iodepth untouched, small files applied at max" bash -
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/021-lat.job"
     grep -q "^numjobs=1$" "$v" && grep -q "^iodepth=1$" "$v" &&
-    grep -q "^filesize=1G$" "$v" && grep -q "wt-small" "$v" &&
+    grep -q "^filesize=1G$" "$v" && ! grep -q "wt-small" "$v" &&
     grep -q "^file_service_type=random$" "$v"'
 t_assert "mixed report treats file as latency" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -246,7 +246,7 @@ t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     out=$( cap max 0 h1 h2 2>&1 )
-    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (wt-small): 5 jobs x 2 files x 1G
+    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (small-file floor): 5 jobs x 2 files x 1G
     # = 10GiB -- distinct namespaces, so the two sum to 60GiB
     case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" bash -c '
@@ -308,7 +308,7 @@ t_assert "cal sizes exactly like max: small-file namespace lands via stage_varia
      WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=cal
      stage_variants "$FIX/src") >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
-    grep -q "^filename_format=wt-small.\$jobnum.\$filenum$" "$v" &&
+    ! grep -q "wt-small" "$v" &&
     grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v" &&
     grep -q "^ioengine=io_uring$" "$v"'
 
@@ -864,14 +864,14 @@ t_assert "staging: a set with its own layout file is not regenerated" bash -c '
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
      stage_jobfiles >/dev/null
      grep -q "sha256=0000" "$WORK_DIR/set/000-wekatester-layout.job")'
-t_assert "tuner: pristine layout at max is re-derived per host (covers wt-small)" bash -c '
+t_assert "tuner: pristine layout at max is re-derived per host (tuned geometry)" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/000-wekatester-layout.job"
     grep -q "re-derived by wekatester auto\[max\]" "$v" &&
-    grep -q "^filename_format=wt-small.\$jobnum.\$filenum$" "$v" &&
+    ! grep -q "wt-small" "$v" && grep -q "^nrfiles=2$" "$v" &&
     grep -q "^cpus_allowed=3-7$" "$v"'
 t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -1456,19 +1456,21 @@ t_assert "stage_cal_step: no recorded cpus means the tuner usable set, split pol
     cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" 'cpus_allowed=1,2,3' 'cpus_allowed_policy=split'
 t_assert "stage_cal_step: the per-host filename_format is host-prefixed and jobnum-keyed" \
     cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" 'filename_format=h2.cal.$jobnum.$filenum'
-t_assert "stage_cal_step: a write step creates its files on open" bash -c '
+t_assert "stage_cal_step: a write step measures over existing files, never creating" bash -c '
     cal_staged bw write 2 h1 &&
     cal_lines "$CALFIX/cal/h1/cal-bw-write-qd2.job" \
-        "[cal-bw-write]" rw=write create_on_open=1 bs=1Mi filesize=1G iodepth=2'
+        "[cal-bw-write]" rw=write bs=1Mi filesize=1G iodepth=2 &&
+    cal_nolines "$CALFIX/cal/h1/cal-bw-write-qd2.job" "^create"'
 t_assert "stage_cal_step: an iops step is 4k random IO over small files" bash -c '
     cal_staged iops read 32 h1 &&
     cal_lines "$CALFIX/cal/h1/cal-iops-read-qd32.job" \
         "[cal-iops-read]" rw=randread bs=4k filesize=256M nrfiles=2 iodepth=32 &&
     cal_nolines "$CALFIX/cal/h1/cal-iops-read-qd32.job" "^create"'
-t_assert "stage_cal_step: an iops write step is randwrite" bash -c '
+t_assert "stage_cal_step: an iops write step is randwrite, no create options" bash -c '
     cal_staged iops write 1 h2 &&
     cal_lines "$CALFIX/cal/h2/cal-iops-write-qd1.job" \
-        rw=randwrite create_on_open=1 bs=4k filesize=256M'
+        rw=randwrite bs=4k filesize=256M &&
+    cal_nolines "$CALFIX/cal/h2/cal-iops-write-qd1.job" "^create"'
 t_assert "stage_cal_step: an unknown ladder type dies" \
     cal_step_fails "unknown ladder type" bogus read 8 h1
 t_assert "stage_cal_step: an unknown direction dies" \

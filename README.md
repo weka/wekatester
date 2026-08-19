@@ -158,8 +158,9 @@ of trusting the jobfiles' static values. Four levels:
   directly comparable.
 - `-a max` (default when the level is omitted) — each worker is tuned to its
   own capability: `numjobs` = that host's usable cores, deeper iodepth,
-  and iops/latency tests move to a shared small-file namespace sized by a
-  plain 8GiB-per-host floor. (An earlier release sized this against backend
+  and iops/latency files shrink to the small-file floor (8GiB per host)
+  IN PLACE -- the namespace stays the jobfile's own, so `-a` runs and
+  plain runs share one on-disk grid and reuse each other's files. (An earlier release sized this against backend
   DRAM as a "cache-defeat working set"; the weka source disproved the
   premise — backends never serve file data from RAM — so the floor is a
   file-spread rule, not a cache bound.) Highest numbers; hosts with

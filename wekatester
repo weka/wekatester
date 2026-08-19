@@ -912,7 +912,10 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             fi
             printf '[cal-%s-%s]\n' "$type" "$dirn"
             printf 'rw=%s\n' "$rw"
-            if [ "$dirn" = write ]; then printf 'create_on_open=1\n'; fi
+            # measured rungs NEVER create: a creating write rung measures
+            # weka's file-extend path, not steady-state writes (seen live:
+            # 0.7GB/s knees on an 18GB/s box), and its short leftovers then
+            # poison the read rungs. The seed pass owns creation.
         } > "$f" || die "cannot write the calibration step file $f"
     done
 }
@@ -1098,32 +1101,30 @@ calibrate() {
             fi
         done
         [ ${#todo[@]} -gt 0 ] || continue
-        have_write=0
-        printf '%s\n' "$ladders" | grep -q "^$type write$" && have_write=1
+        # Seed the scratch grid ONCE per type, full files, unmeasured --
+        # every measured rung (write included) then runs over complete
+        # existing files: steady-state IO, not file creation. The seed is
+        # a write-through create (create_on_open, untimed): it writes each
+        # file end to end exactly once.
+        stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
+        for host in "${todo[@]}"; do
+            f="$WORK_DIR/cal/$host/cal-$type-write-qd1.job"
+            { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
+                && mv "$f.seed" "$f" || die "cannot derive the seed job for $host"
+        done
+        copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+            || die "cannot copy the calibration seed to $MASTER"
+        cmd="'$FIO_BIN' --output-format=json --eta=never"
+        for host in "${todo[@]}"; do
+            cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1.job'"
+        done
+        log "cal: seeding the $type scratch grid on ${#todo[@]} host(s)..."
+        run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/seed.json" \
+            || die "calibration seed failed (output in $WORK_DIR/cal/seed.json)"
+        check_fio_errors "$WORK_DIR/cal/seed.json" layout \
+            || die "calibration seed errored on a host (output in $WORK_DIR/cal/seed.json)"
         for dirn in write read; do
             printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
-            if [ "$dirn" = read ] && [ "$have_write" -eq 0 ]; then
-                # Seed: write the read grid ONCE, full files, unmeasured --
-                # a timed write pass could leave short files a read rung
-                # then trips over, so the seed strips the time_based trio.
-                stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
-                for host in "${todo[@]}"; do
-                    f="$WORK_DIR/cal/$host/cal-$type-write-qd1.job"
-                    grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f" > "$f.seed" \
-                        && mv "$f.seed" "$f" || die "cannot derive the seed job for $host"
-                done
-                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy the calibration seed to $MASTER"
-                cmd="'$FIO_BIN' --output-format=json --eta=never"
-                for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1.job'"
-                done
-                log "cal: seeding the $type read grid on ${#todo[@]} host(s)..."
-                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/seed.json" \
-                    || die "calibration seed failed (output in $WORK_DIR/cal/seed.json)"
-                check_fio_errors "$WORK_DIR/cal/seed.json" layout \
-                    || die "calibration seed errored on a host (output in $WORK_DIR/cal/seed.json)"
-            fi
             case "$AUTO_LEVEL,$type" in
                 (cal,bw)     qds=$CAL_BW_QDS ;;
                 (cal,iops)   qds=$CAL_IOPS_QDS ;;
@@ -1375,7 +1376,7 @@ kill_fio_cmd() {   # kill_fio_cmd [priv]
     # as "sudo taskset -c ... fio --server ...".
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
-    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then ${priv}kill \$(cat '$FIO_PIDFILE') || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
         if pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
 }
@@ -1952,7 +1953,6 @@ SMALL_FILESIZE = "1G"; SMALL_BYTES = 2**30
 WS_FLOOR = 8 * 2**30
 IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64; LAT_NRFILES_CAP = 8
 ENGINE_ORDER = ["io_uring", "libaio", "psync"]
-SMALL_FORMAT = "wt-small.$jobnum.$filenum"
 
 def warn(msg): print(f"WARNING: {msg}", file=sys.stderr)
 
@@ -2109,7 +2109,7 @@ for h in hosts:
 def derive_layout_variant(h):
     """Re-derive layout sections from this host's already-tuned variants, so
     the layout covers what will actually run (the tuned numjobs, and at max
-    tier the wt-small namespace iops/latency files are redirected into).
+    tier the tuned iops/latency filesize and nrfiles).
     Twin of generate_layout in the bash layer -- keep the rules in sync:
     one section per pruned contributor, never one independent-max section,
     or the layout over-provisions by the cross-product of the divergences."""
@@ -2222,8 +2222,12 @@ for job in jobs:
                     out = override(out, "iodepth", str(depth))
 
         if tier == "max" and (is_iops or is_latency):
+            # The file NAMESPACE is deliberately left alone: -a runs and
+            # plain runs must share one grid, or alternating modes lays out
+            # two full grids that cannot credit each other (seen live:
+            # a 37-minute relayout right after a complete one, because the
+            # old wt-small redirect gave -a its own iops namespace).
             out = override(out, "filesize", SMALL_FILESIZE)
-            out = override(out, "filename_format", SMALL_FORMAT)
             # Per-host small-file working set is the floor, flat. It is a
             # file-spread rule (enough files that jobs do not all pound one
             # inode), NOT a cache bound: per the spec's "Working-set sizing
