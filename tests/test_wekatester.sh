@@ -1482,10 +1482,9 @@ t_assert "stage_cal_step: no hosts is a caller bug, not a silent no-op" \
 
 # --- cal_gains: per-client gain between two ladder steps ---
 # Grammar consumed verbatim by the orchestrator: "<host> <value> <gain_pct>",
-# one line per client in the CURRENT step, sorted. Value = read+write of the
-# LAST entry per host (the section that just ran, same rule as
-# check_fio_errors and the summarizer); the "All clients" aggregate and the
-# create-phase entries are not clients and must never be counted.
+# one line per client in the CURRENT step, sorted. Value = read+write SUMMED
+# over every cal-* job entry for the host (one entry per job in fio client
+# JSON); "All clients" aggregates and foreign sections never count.
 # rc is pinned BEFORE the output is transformed: piping cal_gains into tr
 # would discard its status and a python traceback would read as valid output.
 CG=$(mktemp -d)
@@ -1510,10 +1509,14 @@ cal_g_fails() {   # cal_g_fails <pattern> <cal_gains args>...
 export CG
 export -f cal_g cal_g_fails cal_json_fixture
 # First step: nothing to gain over, so every client reports the full 100 --
-# and the values prove read+write are summed from the LAST entry only
-# (h2 = 2133382994 + 100000000; the create entry's 99999999999 would show).
+# and the values prove only cal-* entries count (the fixture's "create"
+# entry carries a poison 99999999999 that would show in any sum).
 t_assert "cal_gains: the first step gains 100 and sums read+write per client" \
     test "$(cal_g - "$CG/cur.json" bw)" = "h1 1610612736 100|h2 2233382994 100|"
+t_assert "cal_gains: a multi-job step sums every job entry per host" bash -c '
+    cal_json_fixture "'"$CG"'/multi.json" "h1:1000000:10.0:0:0.0" "h1:2000000:20.0:0:0.0"
+    test "$(cal_g - "'"$CG"'/multi.json" bw)" = "h1 3000000 100|"'
+
 # 1.0 -> 1.5 GiB/s is a 50% step; h2's 4% is the freeze signal Task 5 acts on.
 t_assert "cal_gains: bw gains are percent over the previous step, per client" \
     test "$(cal_g "$CG/prev.json" "$CG/cur.json" bw)" = "h1 1610612736 50|h2 2233382994 4|"
@@ -2400,17 +2403,18 @@ t_assert "tuner: isolcpus pins usable cores to the isolated set minus weka" bash
     (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     grep -q "^cpus_allowed=4-7$" "$FIX/jobs/h1/011-bw.job"'
-t_assert "pinning: a mask mixing isolated and housekeeping cpus is fatal" bash -c '
+t_assert "pinning: a mixed isolated+housekeeping list is allowed with a note (split saves it)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
-    err=$( (source ./wekatester
+    out=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
         printf "taskset 0-3\nisolated 4-15\npriv sudo\n" > "$d/probe/h1"
         printf "h1\t-\t-\t0-15\t-\n" > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null )
-    case "$err" in
-        *"mix isolated and housekeeping"*"silently collapses"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
+        check_cpu_pinning) 2>&1 )
+    case "$out" in
+        *"span isolated and housekeeping"*"split affinity"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    [ "$(cat "$d/auth/h1.cpus")" = "0-15" ] && test ! -s "$d/auth/h1.priv"'
 t_assert "pinning: a pure-isolated request needs no escalator (self-affinable)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester

@@ -923,10 +923,13 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
 # "<host> <value> <gain_pct>" for every client in <cur>, sorted, where value
 # is read+write summed -- bytes/sec in bw mode, ios/sec in iops mode.
 #
-# WHICH entry counts is the rule check_fio_errors and the summarizer share:
-# fio's own log text precedes the JSON, the "All clients" aggregates are not
-# clients, and every job section appends another entry per host -- so the LAST
-# entry for a host is the section that just ran.
+# WHICH entries count: every job of the cal section, SUMMED per host. A cal
+# step is one section with numjobs jobs, and fio's client JSON carries one
+# entry per job -- the summarizer's last-entry-per-host rule (built to pick
+# a SECTION among several) silently kept 1 job of 28 here and reported
+# knees 28x low (seen live: 0.6GB/s "knees" that were 16GB/s aggregates).
+# Only entries named cal-* count, so aggregates ("All clients") and any
+# foreign section can never pollute the sum.
 #
 # prev "-" is the first step: nothing to gain over, so the gain is the whole
 # 100. Same answer for a client absent from the previous step (it is on its
@@ -960,15 +963,13 @@ def values(path):
     except ValueError as exc:
         sys.exit(f"ERROR: cal_gains: cannot parse fio JSON in {path}: {exc}")
     stats = [s for s in data.get("client_stats", [])
-             if s.get("jobname") != "All clients"]
+             if str(s.get("jobname", "")).startswith("cal-")]
     if not stats:
-        sys.exit(f"ERROR: cal_gains: {path} carries no per-client stats")
-    last = {}
-    for s in stats:
-        last[s.get("hostname", s.get("jobname", "?"))] = s
+        sys.exit(f"ERROR: cal_gains: {path} carries no cal job stats")
     out = {}
-    for host, s in last.items():
-        total = 0.0
+    for s in stats:
+        host = s.get("hostname", "?")
+        total = out.get(host, 0.0)
         for d in ("read", "write"):
             io = s.get(d) or {}
             total += float(io.get(KEY) or 0)
@@ -1826,9 +1827,12 @@ PYEOF
         local dedicated=${verdict%% *}; dedicated=${dedicated#dedicated=}
         case "$verdict" in
             *mixed*)
-                log "ERROR: $host: requested cpus_allowed: $req" >&2
-                log "ERROR: $host: isolated cpus (isolcpus): ${iso:-none}" >&2
-                die "$host: the requested cpus mix isolated and housekeeping cpus -- the kernel silently collapses such masks onto the housekeeping cpus; request a subset of the isolated set instead" ;;
+                # Safe since cpus_allowed_policy=split is stamped beside
+                # every cpu list: each job holds ONE cpu, and single-cpu
+                # affinity cannot collapse. The old whole-mask trap (a
+                # mixed RANGE collapsing onto housekeeping) needed shared
+                # masks, which no staged variant uses any more.
+                log "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
         esac
         case "$verdict" in
             *overlap*)
