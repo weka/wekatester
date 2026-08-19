@@ -165,6 +165,65 @@ editor_fixture() {   # $1 = exit status for the stub (default 0)
     EDITOR="$ED/stub-ed"; unset VISUAL
 }
 
+# --- calibration: probe facts + resolved targets + recorded cpus ---
+# Three hosts, each landing on a different rung of stage_cal_step's per-host
+# resolution:
+#   h1  resolved engine AND dir in targets.final, plus a recorded cpu list
+#       (8 cpus, weka owns 0/1/2 -> 5 usable; the 0,3-4 line is a wide
+#       utility-thread mask and must be ignored)
+#   h2  no targets.final line at all: engine comes from the proven-engine
+#       results (the FIRST ok line, io_uring having failed) and the dir from
+#       the global -d (4 cpus, weka owns 0 -> 3 usable)
+#   h3  no engine anywhere -> psync, no recorded cpus (2 cpus, no weka)
+cal_fixture() {
+    CALFIX=$(mktemp -d)
+    mkdir -p "$CALFIX/probe" "$CALFIX/auth" "$CALFIX/cal"
+    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$CALFIX/probe/h1"
+    printf 'ncpus 4\nweka_allowed 0\nengines libaio psync \n' > "$CALFIX/probe/h2"
+    printf 'ncpus 2\nengines psync \n' > "$CALFIX/probe/h3"
+    printf 'h1\t-\tio_uring\t-\t/data/h1\n' > "$CALFIX/targets.final"
+    printf 'h2 io_uring fail\nh2 libaio ok\nh2 psync ok\n' > "$CALFIX/engine.results"
+    printf '5-7\n' > "$CALFIX/auth/h1.cpus"
+}
+
+# --- calibration: one ladder step's fio client_stats -------------------------
+# Same shape as fio's client-mode output and the same traps: a create-phase
+# entry per host FIRST with absurd figures, an "All clients" aggregate that is
+# not a client, then the measured entry per host LAST -- the only entry
+# cal_gains may count. Picking up either of the others is unmistakable.
+cal_json_fixture() {   # cal_json_fixture <file> <host:rbw:riops:wbw:wiops>...
+    local out=$1 spec host rbw riops wbw wiops i
+    local e=()
+    shift
+    for spec in "$@"; do
+        host=${spec%%:*}
+        e+=("$(printf '    { "jobname": "create", "hostname": "%s", "error": 0,
+      "read":  { "bw_bytes": 0, "iops": 0.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }' "$host")")
+    done
+    e+=('    { "jobname": "All clients", "error": 0,
+      "read":  { "bw_bytes": 99999999999, "iops": 999999.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }')
+    for spec in "$@"; do
+        IFS=: read -r host rbw riops wbw wiops <<<"$spec"
+        e+=("$(printf '    { "jobname": "cal-step", "hostname": "%s", "error": 0,
+      "read":  { "bw_bytes": %s, "iops": %s },
+      "write": { "bw_bytes": %s, "iops": %s } }' \
+            "$host" "$rbw" "$riops" "$wbw" "$wiops")")
+    done
+    e+=('    { "jobname": "All clients", "error": 0,
+      "read":  { "bw_bytes": 99999999999, "iops": 999999.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }')
+    {
+        printf '{\n  "fio version": "fio-3.35",\n  "client_stats": [\n'
+        for i in $(seq 0 $(( ${#e[@]} - 1 )) ); do
+            [ "$i" -eq 0 ] || printf ',\n'
+            printf '%s' "${e[$i]}"
+        done
+        printf '\n  ]\n}\n'
+    } > "$out"
+}
+
 # --- a small on-disk workload set for generator/customize tests ---
 set_fixture() {   # creates $SETFIX with two jobfiles in distinct namespaces
     SETFIX=$(mktemp -d)

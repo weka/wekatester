@@ -759,6 +759,224 @@ for line in sorted(needed):
 PYEOF
 }
 
+# Usable cores for ONE host, by the tuner's own rule -- the same arithmetic
+# auto_tune's facts block does for its cpus_allowed/numjobs stamping, exposed
+# so a calibration ladder sizes numjobs identically (a divergence would make
+# "the knee arrived below full cores" a lie). Two rules, both lab-derived:
+#   - weka pins each dedicated io thread to exactly ONE cpu (a single-cpu task
+#     mask), while utility threads carry wide masks and float. Only single-cpu
+#     masks are dedicated cores; counting the wide ones collapses the union
+#     onto "all cpus" and leaves nothing usable.
+#   - with isolcpus in play, the isolated set minus weka's own is what the box
+#     set aside for exactly this work (an affinity mask MIXING isolated and
+#     housekeeping cpus silently collapses onto the housekeeping partition),
+#     and when weka owns every isolated cpu the housekeeping cpus are the
+#     fallback -- both branches exactly as the tuner has them.
+# Prints the COUNT, and fails loudly rather than printing 0: numjobs=0 is no
+# valid fio job, so a ladder sized from an unreadable probe must not run.
+usable_cores() {   # usable_cores <host>
+    [ -f "$WORK_DIR/probe/$1" ] || {
+        log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
+        return 1
+    }
+    python3 - "$WORK_DIR/probe/$1" <<'PYEOF' || return 1
+import sys
+
+path = sys.argv[1]
+
+def parse_cpulist(s):
+    cpus = set()
+    for part in s.split(","):
+        if "-" in part:
+            a, b = part.split("-"); cpus.update(range(int(a), int(b) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
+
+ncpus, weka, iso = 0, set(), set()
+for line in open(path):
+    f = line.split()
+    if len(f) < 2:
+        continue          # a bare 'isolated' line means no isolated cpus
+    if f[0] == "ncpus":
+        ncpus = int(f[1])
+    elif f[0] == "isolated":
+        iso = parse_cpulist(f[1])
+    elif f[0] == "weka_allowed":
+        cpuset = parse_cpulist(f[1])
+        if len(cpuset) == 1:      # single-cpu mask = a dedicated io thread
+            weka |= cpuset
+usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
+if iso:
+    usable = sorted(iso - weka) \
+        or sorted(set(range(ncpus)) - weka - iso) \
+        or usable
+if not usable:
+    sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
+print(len(usable))
+PYEOF
+}
+
+# The calibration scratch namespace, under each host's own destination dir.
+CAL_SCRATCH=".wekatester-cal"
+
+# One ladder step, staged per host as
+# <outdir>/<host>/cal-<type>-<dir>-qd<qd>.job -- deterministic, so the
+# orchestrator can name the file it needs without being told.
+#
+# The step file IS the measurement definition: 10s timed with a 2s ramp (long
+# enough for a queue-depth plateau to show, short enough that a six-rung
+# ladder costs about a minute), direct=1 so client caching cannot flatter the
+# number, and the whole grid on the host's usable cores -- a knee is only the
+# client's ceiling if it was measured under the contention the real jobs run
+# in. Geometry per type: bandwidth is 1MiB sequential IO over 1G files, iops
+# is 4k random IO over 256M files; both keep 2 files per job.
+#
+# Every host gets its OWN resolution -- dir, engine, cpu list, core count --
+# so a mixed cluster calibrates each client as it will actually run it:
+#   - engine: the resolved engine column first (which already merges -e and
+#     the host file), then the first PROVEN engine for that host in
+#     engine.results (test_engines tries $ENGINE first, so a pinned engine IS
+#     that first ok line), then psync -- the one engine every fio build has.
+#   - cpus: the recorded per-host list, always with cpus_allowed_policy=split
+#     beside it. isolcpus cores have no scheduler load balancing, so a RANGE
+#     without split parks every job on the cpu it forked on (seen live) --
+#     the same rule stamp_unique_names applies to the staged jobfiles.
+# A write step creates its files as it goes; a read step carries NO create
+# option at all -- its files come from the seed pass, or from the write ladder
+# of the same type, which writes the same names. The name format is
+# deliberately type-agnostic, and safe because cal_required orders its ladders
+# bw before iops: the 1G bandwidth files already exist when the iops steps
+# write 256M into them (the reverse order would leave a bw read short).
+# fio never mkdirs, so the caller creates the scratch dir on each host.
+stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host>...
+    local type=$1 dirn=$2 qd=$3 outdir=$4
+    shift 4
+    [ $# -gt 0 ] || die "stage_cal_step: no hosts given for the $type $dirn ladder"
+    case "$dirn" in
+        (read|write) ;;
+        (*) die "stage_cal_step: unknown ladder direction: $dirn (read|write)" ;;
+    esac
+    local bs fsz rw
+    case "$type" in
+        (bw)   bs=1Mi; fsz=1G;   rw=$dirn ;;
+        (iops) bs=4k;  fsz=256M; rw=rand$dirn ;;
+        (*) die "stage_cal_step: unknown ladder type: $type (bw|iops)" ;;
+    esac
+    case "$qd" in
+        (""|*[!0-9]*) die "stage_cal_step: iodepth is not a number: $qd" ;;
+    esac
+    local host hd eng nj cpus f
+    for host in "$@"; do
+        hd=$(host_dir "$host")
+        eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
+        if [ -z "$eng" ] && [ -f "$WORK_DIR/engine.results" ]; then
+            eng=$(awk -v h="$host" '$1 == h && $3 == "ok" {print $2; exit}' \
+                "$WORK_DIR/engine.results")
+        fi
+        [ -n "$eng" ] || eng=psync
+        nj=$(usable_cores "$host") \
+            || die "$host: cannot size the $type $dirn calibration ladder"
+        cpus=""
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        mkdir -p "$outdir/$host" || die "cannot create $outdir/$host"
+        f="$outdir/$host/cal-$type-$dirn-qd$qd.job"
+        {
+            printf '[global]\n'
+            printf 'directory=%s/%s\n' "$hd" "$CAL_SCRATCH"
+            printf 'unique_filename=0\n'
+            printf 'filename_format=%s.cal.$jobnum.$filenum\n' "$host"
+            printf 'ioengine=%s\n' "$eng"
+            printf 'direct=1\n'
+            printf 'bs=%s\n' "$bs"
+            printf 'filesize=%s\n' "$fsz"
+            printf 'nrfiles=2\n'
+            printf 'numjobs=%s\n' "$nj"
+            printf 'iodepth=%s\n' "$qd"
+            printf 'time_based=1\n'
+            printf 'runtime=10\n'
+            printf 'ramp_time=2\n'
+            if [ -n "$cpus" ]; then
+                printf 'cpus_allowed=%s\n' "$cpus"
+                printf 'cpus_allowed_policy=split\n'
+            fi
+            printf '[cal-%s-%s]\n' "$type" "$dirn"
+            printf 'rw=%s\n' "$rw"
+            if [ "$dirn" = write ]; then printf 'create_on_open=1\n'; fi
+        } > "$f" || die "cannot write the calibration step file $f"
+    done
+}
+
+# What did this ladder step buy over the previous one, per client? Prints
+# "<host> <value> <gain_pct>" for every client in <cur>, sorted, where value
+# is read+write summed -- bytes/sec in bw mode, ios/sec in iops mode.
+#
+# WHICH entry counts is the rule check_fio_errors and the summarizer share:
+# fio's own log text precedes the JSON, the "All clients" aggregates are not
+# clients, and every job section appends another entry per host -- so the LAST
+# entry for a host is the section that just ran.
+#
+# prev "-" is the first step: nothing to gain over, so the gain is the whole
+# 100. Same answer for a client absent from the previous step (it is on its
+# own first step) and for a previous value of zero (no baseline to divide by);
+# zero to zero is no gain at all. A negative gain is real data -- past
+# saturation a deeper queue costs throughput -- and is reported as it is.
+#
+# The gain is FLOORED to an integer: the orchestrator compares it against an
+# integer percent threshold in bash, and for an integer T, floor(g) >= T
+# exactly when g >= T, so flooring can never change a freeze decision --
+# whereas rounding would promote a 9.6% step into a 10% keeper.
+cal_gains() {   # cal_gains <prev.json|-> <cur.json> <bw|iops>
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, math, sys
+
+prev_path, cur_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+if mode not in ("bw", "iops"):
+    sys.exit(f"ERROR: cal_gains: unknown mode: {mode} (bw|iops)")
+KEY = "bw_bytes" if mode == "bw" else "iops"
+
+def values(path):
+    try:
+        raw = open(path).read()
+    except OSError as exc:
+        sys.exit(f"ERROR: cal_gains: cannot read {path}: {exc}")
+    start = raw.find("{")
+    if start < 0:
+        sys.exit(f"ERROR: cal_gains: no JSON in {path}")
+    try:
+        data = json.loads(raw[start:])
+    except ValueError as exc:
+        sys.exit(f"ERROR: cal_gains: cannot parse fio JSON in {path}: {exc}")
+    stats = [s for s in data.get("client_stats", [])
+             if s.get("jobname") != "All clients"]
+    if not stats:
+        sys.exit(f"ERROR: cal_gains: {path} carries no per-client stats")
+    last = {}
+    for s in stats:
+        last[s.get("hostname", s.get("jobname", "?"))] = s
+    out = {}
+    for host, s in last.items():
+        total = 0.0
+        for d in ("read", "write"):
+            io = s.get(d) or {}
+            total += float(io.get(KEY) or 0)
+        out[host] = total
+    return out
+
+cur = values(cur_path)
+prev = {} if prev_path == "-" else values(prev_path)
+
+for host in sorted(cur):
+    v = cur[host]
+    p = prev.get(host)
+    if p is None or p <= 0:
+        gain = 100.0 if v > 0 else 0.0
+    else:
+        gain = (v - p) / p * 100.0
+    print(f"{host} {int(v)} {int(math.floor(gain))}")
+PYEOF
+}
+
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:
 # just the fio check -- there is no connection to test).

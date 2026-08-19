@@ -1306,6 +1306,249 @@ t_assert "cal_required: a missing set directory is an error, not silence" bash -
     out=$( (source ./wekatester; cal_required /nonexistent/set) 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && case "$out" in *"cal_required"*"/nonexistent/set"*) true;; *) false;; esac'
 
+# --- usable_cores: the tuner's core arithmetic, callable from bash ---
+# The calibration ladder sizes numjobs from this, so it must answer exactly
+# what auto_tune's own facts block computes for the same probe file -- a
+# divergence would make "the knee arrived below full cores" a lie.
+uc() {   # uc <probe-file-content>; prints the count
+    local d out rc
+    d=$(mktemp -d) || return 1
+    mkdir -p "$d/probe"
+    printf '%s\n' "$1" > "$d/probe/h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) ); rc=$?
+    rm -rf "$d"
+    [ "$rc" -eq 0 ] || { echo "ERROR: usable_cores exited $rc"; return "$rc"; }
+    printf '%s' "$out"
+}
+uc_fails() {   # uc_fails <pattern> [probe-file-content]; empty = no probe file
+    local pat=$1 d err rc
+    d=$(mktemp -d) || return 1
+    mkdir -p "$d/probe"
+    [ -z "${2:-}" ] || printf '%s\n' "$2" > "$d/probe/h1"
+    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 >/dev/null ); rc=$?
+    rm -rf "$d"
+    [ "$rc" -ne 0 ] || { echo "usable_cores unexpectedly succeeded" >&2; return 1; }
+    case "$err" in (*$pat*) return 0 ;; esac
+    echo "$err" >&2; return 1
+}
+t_assert "usable_cores: weka's single-cpu masks are dedicated cores" \
+    test "$(uc 'ncpus 8
+weka_allowed 0
+weka_allowed 1
+weka_allowed 2')" = 5
+t_assert "usable_cores: a wide utility-thread mask owns nothing" \
+    test "$(uc 'ncpus 8
+weka_allowed 0,3-4
+weka_allowed 0-7')" = 8
+t_assert "usable_cores: no weka at all leaves every core usable" \
+    test "$(uc 'ncpus 4')" = 4
+# isolcpus: the isolated set minus weka's own is what the box set aside for
+# this work, exactly as the tuner narrows its cpus_allowed.
+t_assert "usable_cores: isolcpus narrows to the isolated set minus weka" \
+    test "$(uc 'ncpus 8
+isolated 4-7
+weka_allowed 4
+weka_allowed 0
+weka_allowed 1')" = 3
+t_assert "usable_cores: weka owning every isolated cpu falls back to housekeeping" \
+    test "$(uc 'ncpus 8
+isolated 4-7
+weka_allowed 4
+weka_allowed 5
+weka_allowed 6
+weka_allowed 7')" = 4
+# An empty answer is not a count: fio has no valid numjobs=0, so a probe that
+# cannot be read has to fail loudly rather than size a ladder at zero jobs.
+t_assert "usable_cores: an unreadable probe is an error, not a zero" \
+    uc_fails usable_cores
+t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
+    uc_fails "no usable cpus" 'engines psync '
+
+# --- stage_cal_step: one ladder step, staged per host ---
+# The step file is the whole measurement contract: geometry (bs/filesize/
+# nrfiles/numjobs/iodepth), the timing window, the scratch namespace, and the
+# per-host engine/cpu resolution. The bw-read file is compared VERBATIM so a
+# stray or missing line fails the test; the variants are asserted line-wise.
+cal_fixture
+cal_step() {   # cal_step <type> <dir> <qd> <host>...
+    (source ./wekatester
+     WORK_DIR=$CALFIX; AUTH_DIR="$CALFIX/auth"; DIRECTORY=/mnt/weka
+     stage_cal_step "$1" "$2" "$3" "$CALFIX/cal" "${@:4}")
+}
+cal_staged() {   # cal_staged <type> <dir> <qd> <host>...: stage, confirm names
+    local h
+    cal_step "$@" || return 1
+    for h in "${@:4}"; do
+        [ -f "$CALFIX/cal/$h/cal-$1-$2-qd$3.job" ] \
+            || { echo "missing: $CALFIX/cal/$h/cal-$1-$2-qd$3.job" >&2; return 1; }
+    done
+}
+cal_lines() {   # cal_lines <file> <expected line>...: every line present verbatim
+    local f=$1 l; shift
+    [ -f "$f" ] || { echo "no such step file: $f" >&2; return 1; }
+    for l in "$@"; do
+        grep -qxF "$l" "$f" || { echo "missing from $f: $l" >&2; return 1; }
+    done
+}
+# The file-exists check is the point of half this helper: "no line matches" is
+# vacuously true of a file that was never written.
+cal_nolines() {   # cal_nolines <file> <regex>...: no line matches any of them
+    local f=$1 p; shift
+    [ -f "$f" ] || { echo "no such step file: $f" >&2; return 1; }
+    for p in "$@"; do
+        ! grep -qE "$p" "$f" || { echo "unexpected in $f: $p" >&2; return 1; }
+    done
+}
+cal_step_fails() {   # cal_step_fails <pattern> <stage_cal_step args>...
+    local pat=$1 err rc; shift
+    err=$(cal_step "$@" 2>&1 >/dev/null); rc=$?
+    [ "$rc" -ne 0 ] || { echo "stage_cal_step $* unexpectedly succeeded" >&2; return 1; }
+    case "$err" in (*$pat*) return 0 ;; esac
+    echo "$err" >&2; return 1
+}
+# the multi-step assertions below run in `bash -c` subshells, which inherit
+# neither shell functions nor plain variables
+export CALFIX
+export -f cal_step cal_staged cal_lines cal_nolines
+t_assert "stage_cal_step: one deterministically named step file per host" \
+    cal_staged bw read 8 h1 h2 h3
+cat > "$CALFIX/expect-bw-read-h1" <<'EOF'
+[global]
+directory=/data/h1/.wekatester-cal
+unique_filename=0
+filename_format=h1.cal.$jobnum.$filenum
+ioengine=io_uring
+direct=1
+bs=1Mi
+filesize=1G
+nrfiles=2
+numjobs=5
+iodepth=8
+time_based=1
+runtime=10
+ramp_time=2
+cpus_allowed=5-7
+cpus_allowed_policy=split
+[cal-bw-read]
+rw=read
+EOF
+t_assert "stage_cal_step: the bw read step file is exactly this, no more" \
+    diff -u "$CALFIX/expect-bw-read-h1" "$CALFIX/cal/h1/cal-bw-read-qd8.job"
+# A read step measures files the seed pass (or the same type's write ladder)
+# already wrote: creating anything here would measure a write instead.
+t_assert "stage_cal_step: a read step carries no create options at all" \
+    cal_nolines "$CALFIX/cal/h1/cal-bw-read-qd8.job" '^create' 'create_on_open' 'create_only'
+t_assert "stage_cal_step: numjobs is that host's usable cores, not the master's" \
+    cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" numjobs=3
+t_assert "stage_cal_step: h3's usable cores size its own step" \
+    cal_lines "$CALFIX/cal/h3/cal-bw-read-qd8.job" numjobs=2
+# Engine resolution, all three rungs: resolved column, then the first PROVEN
+# engine for that host, then psync -- which every fio build has.
+t_assert "stage_cal_step: engine from the resolved column, the proven results, then psync" bash -c '
+    cal_lines "$CALFIX/cal/h1/cal-bw-read-qd8.job" ioengine=io_uring &&
+    cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" ioengine=libaio &&
+    cal_lines "$CALFIX/cal/h3/cal-bw-read-qd8.job" ioengine=psync'
+t_assert "stage_cal_step: the host with no resolved dir uses the global -d" \
+    cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" directory=/mnt/weka/.wekatester-cal
+# No recorded cpu list: no pinning AND no policy. A cpus_allowed_policy with
+# nothing to split is a silent no-op today and a trap the day fio changes.
+t_assert "stage_cal_step: no recorded cpus means neither cpus line" \
+    cal_nolines "$CALFIX/cal/h2/cal-bw-read-qd8.job" '^cpus_allowed' '^cpus_allowed_policy'
+t_assert "stage_cal_step: the per-host filename_format is host-prefixed and jobnum-keyed" \
+    cal_lines "$CALFIX/cal/h2/cal-bw-read-qd8.job" 'filename_format=h2.cal.$jobnum.$filenum'
+t_assert "stage_cal_step: a write step creates its files on open" bash -c '
+    cal_staged bw write 2 h1 &&
+    cal_lines "$CALFIX/cal/h1/cal-bw-write-qd2.job" \
+        "[cal-bw-write]" rw=write create_on_open=1 bs=1Mi filesize=1G iodepth=2'
+t_assert "stage_cal_step: an iops step is 4k random IO over small files" bash -c '
+    cal_staged iops read 32 h1 &&
+    cal_lines "$CALFIX/cal/h1/cal-iops-read-qd32.job" \
+        "[cal-iops-read]" rw=randread bs=4k filesize=256M nrfiles=2 iodepth=32 &&
+    cal_nolines "$CALFIX/cal/h1/cal-iops-read-qd32.job" "^create"'
+t_assert "stage_cal_step: an iops write step is randwrite" bash -c '
+    cal_staged iops write 1 h2 &&
+    cal_lines "$CALFIX/cal/h2/cal-iops-write-qd1.job" \
+        rw=randwrite create_on_open=1 bs=4k filesize=256M'
+t_assert "stage_cal_step: an unknown ladder type dies" \
+    cal_step_fails "unknown ladder type" bogus read 8 h1
+t_assert "stage_cal_step: an unknown direction dies" \
+    cal_step_fails "unknown ladder direction" bw sideways 8 h1
+t_assert "stage_cal_step: a non-numeric iodepth dies" \
+    cal_step_fails "iodepth" bw read qd8 h1
+t_assert "stage_cal_step: no hosts is a caller bug, not a silent no-op" \
+    cal_step_fails "no hosts" bw read 8
+
+# --- cal_gains: per-client gain between two ladder steps ---
+# Grammar consumed verbatim by the orchestrator: "<host> <value> <gain_pct>",
+# one line per client in the CURRENT step, sorted. Value = read+write of the
+# LAST entry per host (the section that just ran, same rule as
+# check_fio_errors and the summarizer); the "All clients" aggregate and the
+# create-phase entries are not clients and must never be counted.
+# rc is pinned BEFORE the output is transformed: piping cal_gains into tr
+# would discard its status and a python traceback would read as valid output.
+CG=$(mktemp -d)
+cal_json_fixture "$CG/prev.json" \
+    'h1:1073741824:1000.0:0:0.0' 'h2:2000000000:2000.0:147483648:500.0'
+cal_json_fixture "$CG/cur.json" \
+    'h1:1610612736:1100.0:0:0.0' 'h2:2133382994:2400.0:100000000:600.0'
+cal_g() {   # cal_g <prev|-> <cur> <bw|iops>; prints the lines, newlines as |
+    local out rc
+    out=$( (source ./wekatester; cal_gains "$1" "$2" "$3") ); rc=$?
+    [ "$rc" -eq 0 ] || { echo "ERROR: cal_gains exited $rc"; return "$rc"; }
+    [ -n "$out" ] || return 0
+    printf '%s\n' "$out" | tr '\n' '|'
+}
+cal_g_fails() {   # cal_g_fails <pattern> <cal_gains args>...
+    local pat=$1 err rc; shift
+    err=$( (source ./wekatester; cal_gains "$@") 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "cal_gains $* unexpectedly succeeded" >&2; return 1; }
+    case "$err" in (*$pat*) return 0 ;; esac
+    echo "$err" >&2; return 1
+}
+export CG
+export -f cal_g cal_g_fails cal_json_fixture
+# First step: nothing to gain over, so every client reports the full 100 --
+# and the values prove read+write are summed from the LAST entry only
+# (h2 = 2133382994 + 100000000; the create entry's 99999999999 would show).
+t_assert "cal_gains: the first step gains 100 and sums read+write per client" \
+    test "$(cal_g - "$CG/cur.json" bw)" = "h1 1610612736 100|h2 2233382994 100|"
+# 1.0 -> 1.5 GiB/s is a 50% step; h2's 4% is the freeze signal Task 5 acts on.
+t_assert "cal_gains: bw gains are percent over the previous step, per client" \
+    test "$(cal_g "$CG/prev.json" "$CG/cur.json" bw)" = "h1 1610612736 50|h2 2233382994 4|"
+# Same two files, iops mode: different metric, different answer. h1's exact
+# 10% is the boundary case -- it must survive as 10, not round to 9 or 11.
+t_assert "cal_gains: iops mode counts ios, not bytes" \
+    test "$(cal_g "$CG/prev.json" "$CG/cur.json" iops)" = "h1 1100 10|h2 3000 20|"
+t_assert "cal_gains: fio's log text before the JSON is skipped" bash -c '
+    { printf "client <h1>: connected\nfio: terse output\n"; cat "'"$CG"'/cur.json"; } \
+        > "'"$CG"'/noisy.json"
+    test "$(cal_g - "'"$CG"'/noisy.json" bw)" = "h1 1610612736 100|h2 2233382994 100|"'
+# A client that moved nothing last step has no baseline to gain over, so any
+# measurement at all is the whole gain; still nothing measured is no gain.
+t_assert "cal_gains: a zero previous step gains 100, zero-to-zero gains 0" bash -c '
+    cal_json_fixture "'"$CG"'/zero.json" "h1:0:0.0:0:0.0" "h2:0:0.0:0:0.0"
+    [ "$(cal_g "'"$CG"'/zero.json" "'"$CG"'/cur.json" bw)" = "h1 1610612736 100|h2 2233382994 100|" ] &&
+    [ "$(cal_g "'"$CG"'/zero.json" "'"$CG"'/zero.json" bw)" = "h1 0 0|h2 0 0|" ]'
+# A ladder step can regress once the cluster is saturated. That is real data,
+# reported as it is -- and it freezes the knee just as a small gain does.
+t_assert "cal_gains: a slower step reports a negative gain" \
+    test "$(cal_g "$CG/cur.json" "$CG/prev.json" bw)" = "h1 1073741824 -34|h2 2147483648 -4|"
+# A client that only appears in the current step has no previous value: it is
+# on its first measured step, so it gains 100 rather than crashing the parse.
+t_assert "cal_gains: a client absent from the previous step is on its first step" bash -c '
+    cal_json_fixture "'"$CG"'/one.json" "h1:1073741824:1000.0:0:0.0"
+    test "$(cal_g "'"$CG"'/one.json" "'"$CG"'/cur.json" bw)" = "h1 1610612736 50|h2 2233382994 100|"'
+t_assert "cal_gains: unparsable output is an error naming the file" bash -c '
+    printf "no json here at all\n" > "'"$CG"'/bad.json"
+    cal_g_fails bad.json - "'"$CG"'/bad.json" bw'
+t_assert "cal_gains: a results file with no client stats is an error" bash -c '
+    printf "{\"client_stats\": [{\"jobname\": \"All clients\"}]}\n" > "'"$CG"'/agg.json"
+    cal_g_fails agg.json - "'"$CG"'/agg.json" bw'
+t_assert "cal_gains: an unknown mode is an error" \
+    cal_g_fails "unknown mode" - "$CG/cur.json" latency
+t_assert "cal_gains: a missing previous file is an error, not a silent 100" \
+    cal_g_fails nosuch "$CG/nosuch.json" "$CG/cur.json" bw
+
 # --- -u/--unlink: a final generated job removes what the layout created ---
 t_assert "parse: -u, -U and --unlink arm the unlink job; default off" bash -c '
     (source ./wekatester; parse_args h1;          [ "$UNLINK" = 0 ]) &&
