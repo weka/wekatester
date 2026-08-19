@@ -1055,7 +1055,7 @@ PYEOF
 # Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
 # a formula rung (per-weka-core budgets pick the start, the ladder still
 # proves it), so a well-behaved client confirms in two or three steps.
-CAL_GAIN_PCT=2           # a rung must beat the BEST so far by this % to count
+CAL_GAIN_PCT=1           # a rung must beat the BEST so far by this % to count
 CAL_STOP_BELOW=2         # consecutive sub-threshold rungs before the ladder stops
 CAL_KNEE_PCT=95          # knee = shallowest qd within this % of the peak value
 CAL_BW_QDS="1 2 4 8 16 32 64 128"
@@ -1317,7 +1317,7 @@ GAINSEOF
             # fields that would adopt it. First direction of each type.
             if [ "$probeqd" -gt 0 ] && [ ! -f "$WORK_DIR/cal/nrprobe-$type" ]; then
                 : > "$WORK_DIR/cal/nrprobe-$type"
-                local nrn nrfsz nrtot nrbestn=2 nrbestpct=0 nrpct
+                local nrn nrfsz nrtot nrbestn=2 nrbestpct=0 nrbestraw=0 nrraw nrpct
                 if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
                 for nrn in $CAL_NR_LADDER; do
                     nrfsz="$((nrtot / nrn))M"
@@ -1352,16 +1352,17 @@ GAINSEOF
                     while read -r h v g; do
                         [ -n "$h" ] || continue
                         read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        nrpct=$(awk -v a="$v" -v b="$best" 'BEGIN{printf "%+.1f", (a-b)*100/b}')
+                        nrraw=$(awk -v a="$v" -v b="$best" 'BEGIN{printf "%.4f", (a-b)*100/b}')
+                        nrpct=$(awk -v p="$nrraw" 'BEGIN{printf "%+.1f", p}')
                         log "cal: $h $type-$dirn nrfiles $nrn vs 2: ${nrpct}% (evidence only, not recorded)"
-                        if awk -v p="$nrpct" -v bp="$nrbestpct" 'BEGIN{exit !(p+0 > bp+0)}'; then
-                            nrbestn=$nrn; nrbestpct=$nrpct
+                        if awk -v p="$nrraw" -v bp="$nrbestraw" 'BEGIN{exit !(p > bp)}'; then
+                            nrbestn=$nrn; nrbestpct=$nrpct; nrbestraw=$nrraw
                         fi
                     done <<GAINSEOF
 $gains
 GAINSEOF
                 done
-                if awk -v p="$nrbestpct" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p+0 >= t+0)}'; then
+                if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
                     log "cal: $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn and ${type}_fs=$((nrtot / nrbestn))M in the host file"
                 else
                     log "cal: $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"

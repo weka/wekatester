@@ -2619,8 +2619,8 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
          (*njhalfx.job*) cal_json 2000;;
-         (*nj2x.job*) cal_json 2140;;
-         (*-nr*.job*) cal_json 2140;;
+         (*nj2x.job*) cal_json 2118;;
+         (*-nr*.job*) cal_json 2118;;
          (*qd1.job*)  cal_json 1000;;
          (*qd2.job*)  cal_json 1900;;
          (*qd4.job*)  cal_json 2100;;
@@ -2631,9 +2631,9 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      calibrate) 2>&1 )
     grep -q "^h1 4 - - -$" "$d/cal.results" &&
     case "$out" in *"cal: h1 bw-read peak "*"knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"nrfiles 4 vs 2: +1.9% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"nrfiles 64 vs 2: +1.9% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"cal: bw: nrfiles 2 stands (best challenger 4 at +1.9%)"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"nrfiles 4 vs 2: +0.9% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"nrfiles 64 vs 2: +0.9% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"cal: bw: nrfiles 2 stands (best challenger 4 at +0.9%)"*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
@@ -2651,7 +2651,7 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
          (*mkdir*|*rm\ -rf*) return 0;;
          (*njhalfx.job*) cal_json 2000;;
          (*nj2x.job*) cal_json 2400;;
-         (*nj4x.job*) cal_json 2430;;
+         (*nj4x.job*) cal_json 2420;;
          (*-nr*.job*) cal_json 2600;;
          (*qd1.job*)  cal_json 1000;;
          (*qd2.job*)  cal_json 1900;;
