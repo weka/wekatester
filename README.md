@@ -71,6 +71,8 @@ attaching is the way to pass a value that starts with a dash.
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
+  -x, --duration secs     run every measured job for this many seconds
+                          (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun)
   -s file        summarize an existing results .json -- or every job in a run
@@ -175,14 +177,19 @@ of trusting the jobfiles' static values. Four levels:
 
 How calibration works: before staging, the set is inspected for what it
 actually runs — bandwidth and/or iops ladders, read and/or write directions;
-latency is never calibrated (queue depth 1 by definition). Each ladder steps
-iodepth (cal: 1→64 bandwidth, 1→128 iops; hybrid starts mid-ladder), ~12s a
-rung, on ALL clients at once — the knee is each client's ceiling under
-contention, the condition the real jobs run in. A client freezes its knee at
-the last rung that gained it ≥10%, but keeps running so the contention stays
-constant for clients still climbing. Ladder files live in a scratch
-namespace (`.wekatester-cal/` under each destination), write ladders double
-as the read grid's seed, and the scratch is removed afterward. Knees flow
+latency has no queue to ladder, so its FLOOR is measured instead (one QD1
+rung per direction, reported and bundled, never cached). Each ladder steps
+iodepth (cal: 1→128 bandwidth, 1→256 iops; hybrid starts mid-ladder), ~12s a
+rung, on ALL clients at once — the values found are each client's ceiling
+under contention, the condition the real jobs run in. The ladder hunts the
+peak: a rung counts only if it beats the best seen so far by ≥5%, and only
+two consecutive misses end the climb, so a single flat rung cannot hide a
+later gain. After the ladder, one probe doubles `numjobs` at the best queue
+depth — if oversubscription beats the peak, the doubled job count is
+recorded too. The reported knee is the shallowest queue depth within 95% of
+the peak. The scratch grid (`.wekatester-cal/` under each destination) is
+seeded in full before any measured rung — creation is never measured — and
+removed afterward. Knees flow
 into the run's geometry one precedence slot below the operator (CLI > host
 file > calibration > tuner) and persist to `hostlist.csv` via the `-a`
 writeback — which is also the cache: a host whose qd columns are already

@@ -1239,21 +1239,21 @@ rw=randrw' '# report latency
 [global]
 bs=4k
 [lat]
-rw=randread')" = "bw read|iops read|iops write|"
+rw=randread')" = "bw read|iops read|iops write|lat read|"
 t_assert "cal_required: a bw-write-only set needs one ladder" \
     test "$(cal_set '# report bandwidth
 [bw]
 rw=write')" = "bw write|"
-t_assert "cal_required: a latency-only set needs nothing" \
+t_assert "cal_required: a latency-only set asks for its floor rung, no ladder" \
     test "$(cal_set '# report latency
 [lat]
-rw=randread')" = ""
+rw=randread')" = "lat read|"
 # latency anywhere in the directive wins, exactly as the tuner classifies it:
-# such a file is measured at qd=1, so it asks for no ladder.
-t_assert "cal_required: '# report iops latency' contributes nothing" \
+# such a file is measured at qd=1 -- no ladder, only the floor rung.
+t_assert "cal_required: '# report iops latency' asks only for the latency floor" \
     test "$(cal_set '# report iops latency
 [io]
-rw=randwrite')" = ""
+rw=randwrite')" = "lat write|"
 # No directive: the summarizer reports everything for such a file and its
 # large sequential shape is bandwidth-like, so it counts as bandwidth.
 t_assert "cal_required: a file with no report directive counts as bandwidth" \
@@ -1298,9 +1298,9 @@ t_assert "cal_required: the shipped sets ask for the ladders they measure" bash 
           out=$( (source ./wekatester; cal_required "fio-jobfiles/$1") ); rc=$?
           [ "$rc" -eq 0 ] || { echo "ERROR: cal_required exited $rc"; return "$rc"; }
           printf "%s\n" "$out" | tr "\n" "|"; }
-    [ "$(r default)"    = "bw read|bw write|iops read|iops write|" ] &&
-    [ "$(r mixed)"      = "bw read|bw write|iops read|iops write|" ] &&
-    [ "$(r smoke)"      = "bw read|" ] &&
+    [ "$(r default)"    = "bw read|bw write|iops read|iops write|lat read|lat write|" ] &&
+    [ "$(r mixed)"      = "bw read|bw write|iops read|iops write|lat read|lat write|" ] &&
+    [ "$(r smoke)"      = "bw read|lat write|" ] &&
     [ "$(r wekawithin)" = "bw read|bw write|" ]'
 t_assert "cal_required: a missing set directory is an error, not silence" bash -c '
     out=$( (source ./wekatester; cal_required /nonexistent/set) 2>&1 ); rc=$?
@@ -1933,7 +1933,7 @@ t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bas
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; REGEN_LAYOUT=1
-     printf "h1 4 32 -\n" > "$d/cal.results"
+     printf "h1 4 32 - -\n" > "$d/cal.results"
      printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
      apply_cal_results)
     a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
@@ -2618,18 +2618,64 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
+         (*nj2x.job*) cal_json 2150;;
          (*qd1.job*)  cal_json 1000;;
          (*qd2.job*)  cal_json 1900;;
          (*qd4.job*)  cal_json 2100;;
          (*qd8.job*)  cal_json 2110;;
+         (*qd16.job*) cal_json 2115;;
          (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
      esac; }
      calibrate) 2>&1 )
-    grep -q "^h1 4 - -$" "$d/cal.results" &&
-    case "$out" in *"cal: h1 bw-read knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "^h1 4 - - -$" "$d/cal.results" &&
+    case "$out" in *"cal: h1 bw-read peak "*"knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
+t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    (source ./tests/helpers.sh
+     source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*) return 0;;
+         (*nj2x.job*) cal_json 2400;;
+         (*qd1.job*)  cal_json 1000;;
+         (*qd2.job*)  cal_json 1900;;
+         (*qd4.job*)  cal_json 2100;;
+         (*qd8.job*)  cal_json 2110;;
+         (*qd16.job*) cal_json 2115;;
+         (*) return 1;;
+     esac; }
+     calibrate) >/dev/null 2>&1
+    grep -q "^h1 4 - 8 -$" "$d/cal.results" &&
+    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd4-nj2x.job"'
+t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
+    (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
+    (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&
+    (source ./wekatester; parse_args --duration=90 h1; [ "$DURATION" = 90 ]) &&
+    (source ./wekatester; parse_args -X 30 h1;         [ "$DURATION" = 30 ]) &&
+    ! (source ./wekatester; parse_args -x 0 h1)  2>/dev/null;
+    a=$?; ! (source ./wekatester; parse_args -x abc h1) 2>/dev/null; b=$?
+    [ "$a" -eq 0 ] && [ "$b" -eq 0 ]'
+t_assert "-x stamps runtime+time_based on measured variants, never the layout" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    d=$(mktemp -d)
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; DURATION=77
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles) >/dev/null || exit 1
+    v="$d/target/localhost/011-smoke-readbw.job"
+    l="$d/target/localhost/000-wekatester-layout.job"
+    grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&
+    ! grep -q "^runtime=77$" "$l"'
 t_assert "calibrate: a host-file-supplied qd skips that ladder; -g re-measures" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
@@ -2654,7 +2700,7 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d
-     printf "h1 4 32 -\nh2 8 - -\n" > "$d/cal.results"
+     printf "h1 4 32 - -\nh2 8 - - -\n" > "$d/cal.results"
      printf "h1\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
      apply_cal_results)
     a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
@@ -2662,7 +2708,7 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     [ "$a" = "4 64" ] && [ "$b" = "8 -" ] || { echo "a=$a b=$b" >&2; false; }
     (source ./wekatester
      WORK_DIR=$d; rm -f "$d/targets.final"
-     printf "h3 16 - -\n" > "$d/cal.results"
+     printf "h3 16 - - -\n" > "$d/cal.results"
      apply_cal_results)
     c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
     [ "$c" = "17 16" ]'

@@ -29,6 +29,7 @@ TARGETS=0                       # -t given: a host file is in play
 TARGETS_PATH=""                 # -t's explicit path ("" = bare -t, resolve later)
 TARGETS_FILE=""                 # the resolved host file actually in use
 ENGINE=""                       # -e: force this fio ioengine everywhere
+DURATION=""                     # -x: one runtime (seconds) for every measured job
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
@@ -418,6 +419,8 @@ attaching is the way to pass a value that starts with a dash.
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
+  -x, --duration secs     run every measured job for this many seconds
+                          (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun)
   -s file        summarize an existing results .json -- or every job in a run
@@ -570,6 +573,24 @@ parse_args() {
                 [ -n "$TARGETS_PATH" ] || { usage >&2; die "option --targets requires a value"; }
                 shift ;;
             -t?*) TARGETS=1; opt_val "$opt" -t; TARGETS_PATH=$OPT_VAL; shift ;;
+            -x|--duration)
+                DURATION=${2:-}
+                case "$DURATION" in
+                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
+                esac
+                shift 2 ;;
+            --duration=*)
+                DURATION=${opt#--duration=}
+                case "$DURATION" in
+                    (""|*[!0-9]*|0) usage >&2; die "option --duration needs a duration in whole seconds" ;;
+                esac
+                shift ;;
+            -x?*)
+                opt_val "$opt" -x; DURATION=$OPT_VAL
+                case "$DURATION" in
+                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
+                esac
+                shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -763,7 +784,12 @@ for f in sorted(os.listdir(src)):
     if f == NAME or any(l.startswith(MARKER) for l in lines[:3]):
         continue   # a layout job measures nothing
     items = report_items(lines)
-    if "latency" in items: continue
+    if "latency" in items:
+        # latency has no queue to ladder, but its FLOOR is measured: one
+        # QD1 rung per direction the file uses (reported, never cached)
+        for d in directions(lines):
+            needed.add(f"lat {d}")
+        continue
     types = []
     if "bandwidth" in items or not items: types.append("bw")
     if "iops" in items: types.append("iops")
@@ -881,7 +907,8 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
     case "$type" in
         (bw)   bs=1Mi; fsz=1G;   rw=$dirn ;;
         (iops) bs=4k;  fsz=256M; rw=rand$dirn ;;
-        (*) die "stage_cal_step: unknown ladder type: $type (bw|iops)" ;;
+        (lat)  bs=4k;  fsz=64M;  rw=rand$dirn ;;
+        (*) die "stage_cal_step: unknown ladder type: $type (bw|iops|lat)" ;;
     esac
     case "$qd" in
         (""|*[!0-9]*) die "stage_cal_step: iodepth is not a number: $qd" ;;
@@ -895,8 +922,15 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
                 "$WORK_DIR/engine.results")
         fi
         [ -n "$eng" ] || eng=psync
-        nj=$(usable_cores "$host") \
-            || die "$host: cannot size the $type $dirn calibration ladder"
+        if [ "$type" = lat ]; then
+            nj=1   # latency is a single QD1 stream by definition
+        else
+            nj=$(usable_cores "$host") \
+                || die "$host: cannot size the $type $dirn calibration ladder"
+            # the oversubscription probe: one rung at a numjobs multiple,
+            # hunting throughput past the per-core job count
+            [ -z "${CAL_NJ_MULT:-}" ] || nj=$((nj * CAL_NJ_MULT))
+        fi
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         # no operator pin: use the tuner's own usable set (isolated minus
@@ -908,7 +942,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
                 || die "$host: cannot derive the calibration cpu set"
         fi
         mkdir -p "$outdir/$host" || die "cannot create $outdir/$host"
-        f="$outdir/$host/cal-$type-$dirn-qd$qd.job"
+        f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NJ_MULT:+-nj${CAL_NJ_MULT}x}.job"
         {
             printf '[global]\n'
             printf 'directory=%s/%s\n' "$hd" "$CAL_SCRATCH"
@@ -1013,11 +1047,13 @@ PYEOF
 # Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
 # a formula rung (per-weka-core budgets pick the start, the ladder still
 # proves it), so a well-behaved client confirms in two or three steps.
-CAL_GAIN_PCT=10          # a rung must gain this % over the previous to count
-CAL_BW_QDS="1 2 4 8 16 32 64"
-CAL_IOPS_QDS="1 2 4 8 16 32 64 128"
-CAL_HYBRID_BW_QDS="4 8 16 32 64"
-CAL_HYBRID_IOPS_QDS="32 64 128"
+CAL_GAIN_PCT=5           # a rung must beat the BEST so far by this % to count
+CAL_STOP_BELOW=2         # consecutive sub-threshold rungs before the ladder stops
+CAL_KNEE_PCT=95          # knee = shallowest qd within this % of the peak value
+CAL_BW_QDS="1 2 4 8 16 32 64 128"
+CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
+CAL_HYBRID_BW_QDS="4 8 16 32 64 128"
+CAL_HYBRID_IOPS_QDS="32 64 128 256"
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
 # slot BELOW the operator: CLI > host file > calibration > tuner. When no
@@ -1036,7 +1072,7 @@ res, final, force = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 knees = {}
 for line in open(res):
     f = line.split()
-    if len(f) == 4:
+    if len(f) == 5:
         knees[f[0]] = f[1:]
 
 rows, order = {}, []
@@ -1046,7 +1082,7 @@ if os.path.exists(final):
         rows[f[0]] = f
         order.append(f[0])
 for host in sorted(knees):
-    bwq, ioq, nj = knees[host]
+    bwq, ioq, bwnj, ionj = knees[host]
     row = rows.get(host)
     if row is None:
         row = [host] + ["-"] * 16
@@ -1058,14 +1094,32 @@ for host in sorted(knees):
         row[8] = bwq
     if ioq != "-" and (force or row[16] == "-"):
         row[16] = ioq
-    if nj != "-":
-        if row[5] == "-":
-            row[5] = nj
-        if row[13] == "-":
-            row[13] = nj
+    if bwnj != "-" and (force or row[5] == "-"):
+        row[5] = bwnj
+    if ionj != "-" and (force or row[13] == "-"):
+        row[13] = ionj
 with open(final, "w") as fp:
     for h in order:
         fp.write("\t".join(rows[h]) + "\n")
+PYEOF
+}
+
+# Mean latency of the single cal-lat job per host, in whole microseconds.
+cal_lat_floor() {   # cal_lat_floor <json> <read|write> -> "<host> <mean_us>" lines
+    python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+
+raw = open(sys.argv[1]).read()
+start = raw.find("{")
+if start < 0:
+    sys.exit(f"ERROR: cal_lat_floor: no JSON in {sys.argv[1]}")
+data = json.loads(raw[start:])
+for s in data.get("client_stats", []):
+    if not str(s.get("jobname", "")).startswith("cal-lat"):
+        continue
+    io = s.get(sys.argv[2]) or {}
+    lat = (io.get("lat_ns") or {}).get("mean") or 0
+    print(f"{s.get('hostname', '?')} {int(lat / 1000)}")
 PYEOF
 }
 
@@ -1088,9 +1142,10 @@ calibrate() {
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
     ladders=$(cal_required "$capdir") || die "cannot inspect $capdir for calibration"
     if [ -z "$ladders" ]; then
-        log "cal: nothing to calibrate in this set (latency-only, or no jobs)"
+        log "cal: nothing to calibrate in this set (no measurable jobs)"
         return 0
     fi
+    local ladders_all=$ladders
     echo
     log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
     local host i pids hs
@@ -1107,7 +1162,7 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
-    local gains all h v g knee val human bwq ioq k
+    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
         todo=()
@@ -1150,7 +1205,16 @@ calibrate() {
                 (hybrid,bw)  qds=$CAL_HYBRID_BW_QDS ;;
                 (*)          qds=$CAL_HYBRID_IOPS_QDS ;;
             esac
-            prevjson=-; prevqd=0
+            # Peak-hunting ladder: a rung must beat the BEST seen so far by
+            # CAL_GAIN_PCT to count, and only CAL_STOP_BELOW consecutive
+            # misses end the climb -- a single flat rung cannot hide a
+            # later gain. The reported knee is the shallowest qd within
+            # CAL_KNEE_PCT of the peak: the peak's value at the cheapest
+            # queue that essentially delivers it.
+            for host in "${todo[@]}"; do
+                rm -f "$WORK_DIR/cal/best-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/hist-$type-$dirn.$host"
+            done
             for qd in $qds; do
                 stage_cal_step "$type" "$dirn" "$qd" "$WORK_DIR/cal" "${todo[@]}"
                 copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
@@ -1164,46 +1228,130 @@ calibrate() {
                     || die "calibration rung $type-$dirn qd=$qd failed (output in $curjson)"
                 check_fio_errors "$curjson" measured \
                     || die "calibration rung $type-$dirn qd=$qd errored on a host (output in $curjson)"
-                gains=$(cal_gains "$prevjson" "$curjson" "$type") \
-                    || die "cannot compute calibration gains for $type-$dirn qd=$qd"
-                debug "cal: $type-$dirn qd=$qd per-host [host value gain%]: $(printf '%s' "$gains" | tr '\n' ' ')"
+                gains=$(cal_gains - "$curjson" "$type") \
+                    || die "cannot compute calibration values for $type-$dirn qd=$qd"
+                debug "cal: $type-$dirn qd=$qd per-host [host value]: $(printf '%s' "$gains" | tr '\n' ' ')"
                 all=1
                 while read -r h v g; do
                     [ -n "$h" ] || continue
-                    [ -f "$WORK_DIR/cal/knee-$type-$dirn.$h" ] && continue
-                    if [ "$g" -lt "$CAL_GAIN_PCT" ] && [ "$prevqd" -gt 0 ]; then
-                        printf '%s\n' "$prevqd" > "$WORK_DIR/cal/knee-$type-$dirn.$h"
-                    else
-                        printf '%s\n' "$v" > "$WORK_DIR/cal/val-$type-$dirn.$h"
+                    printf '%s %s\n' "$qd" "$v" >> "$WORK_DIR/cal/hist-$type-$dirn.$h"
+                    best=0; below=0
+                    [ ! -f "$WORK_DIR/cal/best-$type-$dirn.$h" ] \
+                        || read -r best _bq below < "$WORK_DIR/cal/best-$type-$dirn.$h"
+                    [ "$below" -ge "$CAL_STOP_BELOW" ] && continue
+                    if [ "$best" -eq 0 ] \
+                            || [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
+                        printf '%s %s 0\n' "$v" "$qd" > "$WORK_DIR/cal/best-$type-$dirn.$h"
                         all=0
+                    else
+                        below=$((below + 1))
+                        printf '%s %s %s\n' "$best" "$_bq" "$below" > "$WORK_DIR/cal/best-$type-$dirn.$h"
+                        [ "$below" -ge "$CAL_STOP_BELOW" ] || all=0
                     fi
                 done <<GAINSEOF
 $gains
 GAINSEOF
                 [ "$all" -eq 1 ] && break
-                prevjson=$curjson; prevqd=$qd
             done
+            # the oversubscription probe: one rung at numjobs x2 on the
+            # deepest best qd -- if doubling the jobs beats the peak by the
+            # same threshold, the doubled job count is the real limit
+            probeqd=0
             for host in "${todo[@]}"; do
-                knee=$prevqd   # rungs ran out while still gaining
-                [ ! -f "$WORK_DIR/cal/knee-$type-$dirn.$host" ] \
-                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host")
+                read -r _bv bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                [ "$bq" -le "$probeqd" ] || probeqd=$bq
+            done
+            if [ "$probeqd" -gt 0 ]; then
+                CAL_NJ_MULT=2 stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                    || die "cannot copy the oversubscription probe to $MASTER"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
+                for host in "${todo[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nj2x.job'"
+                done
+                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nj2x.json"
+                run_host "$MASTER" "$cmd" > "$curjson" \
+                    || die "calibration nj probe $type-$dirn failed (output in $curjson)"
+                check_fio_errors "$curjson" measured \
+                    || die "calibration nj probe $type-$dirn errored on a host (output in $curjson)"
+                gains=$(cal_gains - "$curjson" "$type") \
+                    || die "cannot compute the nj probe values for $type-$dirn"
+                while read -r h v g; do
+                    [ -n "$h" ] || continue
+                    read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
+                    if [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
+                        nj=$(usable_cores "$h") || continue
+                        printf '%s\n' "$((nj * 2))" > "$WORK_DIR/cal/nj-$type.$h"
+                        printf '%s %s 0\n' "$v" "$_bq" > "$WORK_DIR/cal/best-$type-$dirn.$h"
+                        log "cal: $h $type-$dirn gains from numjobs x2 ($((nj * 2)) jobs) -- recording it"
+                    fi
+                done <<GAINSEOF
+$gains
+GAINSEOF
+            fi
+            for host in "${todo[@]}"; do
+                read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                knee=$(awk -v b="$best" -v pct="$CAL_KNEE_PCT" \
+                    '$2 * 100 >= b * pct {print $1; exit}' \
+                    "$WORK_DIR/cal/hist-$type-$dirn.$host")
+                [ -n "$knee" ] || knee=$bq
                 printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
-                val=0
-                [ ! -f "$WORK_DIR/cal/val-$type-$dirn.$host" ] \
-                    || val=$(cat "$WORK_DIR/cal/val-$type-$dirn.$host")
                 if [ "$type" = bw ]; then
-                    human=$(awk -v v="$val" 'BEGIN{printf "%.1fGB/s", v/1e9}')
+                    human=$(awk -v v="$best" 'BEGIN{printf "%.1fGB/s", v/1e9}')
                 else
-                    human=$(awk -v v="$val" 'BEGIN{printf "%.0fk iops", v/1e3}')
+                    human=$(awk -v v="$best" 'BEGIN{printf "%.0fk iops", v/1e3}')
                 fi
-                log "cal: $host $type-$dirn knee qd=$knee ($human)"
+                log "cal: $host $type-$dirn peak $human @ qd=$bq, knee qd=$knee"
             done
         done
     done
 
+    # Latency floors: nothing to ladder (a latency test is one QD1 stream
+    # by definition), so the upper limit IS the floor -- one short rung per
+    # direction, reported and bundled, never written back.
+    local latjson
+    for dirn in write read; do
+        printf '%s\n' "$ladders_all" | grep -q "^lat $dirn$" || continue
+        if [ "$dirn" = write ] || ! printf '%s\n' "$ladders_all" | grep -q "^lat write$"; then
+            stage_cal_step lat write 1 "$WORK_DIR/cal" "${HOSTS[@]}"
+            for host in "${HOSTS[@]}"; do
+                f="$WORK_DIR/cal/$host/cal-lat-write-qd1.job"
+                { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
+                    && mv "$f.seed" "$f" || die "cannot derive the latency seed for $host"
+            done
+            copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                || die "cannot copy the latency seed to $MASTER"
+            cmd="'$FIO_BIN' --output-format=json --eta=never"
+            for host in "${HOSTS[@]}"; do
+                cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-lat-write-qd1.job'"
+            done
+            run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-lat-seed.json" \
+                || die "latency seed failed (output in $WORK_DIR/cal/res-lat-seed.json)"
+        fi
+        stage_cal_step lat "$dirn" 1 "$WORK_DIR/cal" "${HOSTS[@]}"
+        copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+            || die "cannot copy the latency rung to $MASTER"
+        cmd="'$FIO_BIN' --output-format=json --eta=never"
+        for host in "${HOSTS[@]}"; do
+            cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-lat-$dirn-qd1.job'"
+        done
+        latjson="$WORK_DIR/cal/res-lat-$dirn-qd1.json"
+        run_host "$MASTER" "$cmd" > "$latjson" \
+            || die "latency floor rung failed (output in $latjson)"
+        check_fio_errors "$latjson" measured \
+            || die "latency floor rung errored on a host (output in $latjson)"
+        while read -r h v; do
+            [ -n "$h" ] || continue
+            log "cal: $h lat-$dirn floor ${v}us"
+        done <<LATEOF
+$(cal_lat_floor "$latjson" "$dirn")
+LATEOF
+    done
+
     : > "$WORK_DIR/cal.results"
+    local bwnj ionj
     for host in "${HOSTS[@]}"; do
-        bwq=-; ioq=-
+        bwq=-; ioq=-; bwnj=-; ionj=-
         for dirn in read write; do
             f="$WORK_DIR/cal/knee-bw-$dirn.$host"
             if [ -f "$f" ]; then
@@ -1216,8 +1364,10 @@ GAINSEOF
                 if [ "$ioq" = - ] || [ "$k" -gt "$ioq" ]; then ioq=$k; fi
             fi
         done
+        [ ! -s "$WORK_DIR/cal/nj-bw.$host" ] || bwnj=$(cat "$WORK_DIR/cal/nj-bw.$host")
+        [ ! -s "$WORK_DIR/cal/nj-iops.$host" ] || ionj=$(cat "$WORK_DIR/cal/nj-iops.$host")
         if [ "$bwq" != - ] || [ "$ioq" != - ]; then
-            printf '%s %s %s -\n' "$host" "$bwq" "$ioq" >> "$WORK_DIR/cal.results"
+            printf '%s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" >> "$WORK_DIR/cal.results"
         fi
     done
     apply_cal_results
@@ -3560,6 +3710,16 @@ stage_jobfiles() {
         # everything derived from it below (rebuild and unlink variants).
         for v in "$WORK_DIR"/jobs/*/*; do
             [ -f "$v" ] && override_variant_key "$v" ioengine "$ENGINE"
+        done
+    fi
+    if [ -n "$DURATION" ]; then
+        # one duration for every MEASURED job; layout and unlink keep their
+        # own timing -- they run to completion, not to a clock
+        for v in "$WORK_DIR"/jobs/*/*; do
+            [ -f "$v" ] || continue
+            is_layout_file "$v" && continue
+            override_variant_key "$v" runtime "$DURATION"
+            override_variant_key "$v" time_based 1
         done
     fi
     # after every per-host override, before the derived variants inherit it
