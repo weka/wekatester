@@ -651,6 +651,100 @@ parse_args() {
 # scratch, hybrid seeded from a formula rung); safe/max/off never do.
 cal_mode() { [ "$AUTO_LEVEL" = cal ] || [ "$AUTO_LEVEL" = hybrid ]; }
 
+# Set inspection: which iodepth ladders does a jobfile set actually need?
+# Prints unique sorted lines from exactly {bw read, bw write, iops read,
+# iops write} -- nothing else ever -- and prints NOTHING when the set needs no
+# calibration. That grammar is a contract: the calibration engine and the
+# dry-run report both consume these lines verbatim, so an extra ladder is
+# wasted measurement time on every client and a missing one silently falls
+# back to a guessed queue depth.
+#
+# Report type comes from the '# report' directive, classified exactly as the
+# tuner classifies the same file (see report_items in auto_tune):
+#   - 'latency' anywhere in the directive wins the whole file and contributes
+#     nothing -- a latency job is qd=1/nj=1 by definition, so there is no knee
+#     to find ('# report iops latency' is a latency file).
+#   - otherwise 'bandwidth' -> bw and 'iops' -> iops, and a directive naming
+#     both types contributes both.
+#   - NO directive at all -> counted as bandwidth. The summarizer's fallback
+#     reports every metric for such a file, so no single type is named; their
+#     shape (large sequential files, no bs=4k) is bandwidth-like, and the bw
+#     ladder is the one whose knee can inform them.
+# Direction comes from each job section's effective rw= (the section's own
+# value, else [global]'s): read/randread -> read, write/randwrite -> write,
+# the mixed forms -> both. A file that names no rw= anywhere contributes no
+# direction, hence no ladder.
+cal_required() {   # cal_required <setdir>
+    python3 - "$1" <<'PYEOF' || return 1
+import os, re, sys
+
+src = sys.argv[1]
+if not os.path.isdir(src):
+    sys.exit(f"ERROR: cal_required: not a jobfile set directory: {src}")
+
+# Layout-job rule, same as is_layout_file/generate_layout -- keep in sync.
+MARKER = "# wekatester-layout: generated"
+NAME = "000-wekatester-layout.job"
+
+# fio spells the option rw= or readwrite=; trim-only mixes are not calibrated.
+DIRECTIONS = {"read": ("read",), "randread": ("read",),
+              "write": ("write",), "randwrite": ("write",),
+              "rw": ("read", "write"), "randrw": ("read", "write"),
+              "readwrite": ("read", "write"), "randreadwrite": ("read", "write")}
+
+def report_items(lines):
+    """Directive items, by the same rule as report_directive() in the bash
+    layer: whitespace after 'report' is required, so a prose comment is not a
+    directive and a bare '# report' names nothing. Several directive lines
+    accumulate. Empty list = the file carries no directive."""
+    items = []
+    for line in lines:
+        m = re.match(r"^#\s*report\s+(.*)", line)
+        if m: items += m.group(1).split()
+    return items
+
+def directions(lines):
+    """Every direction the file's job sections exercise. [global] supplies the
+    fallback for sections that do not set rw= themselves."""
+    glob, sections, cur = "", [], None
+    for line in lines:
+        m = re.match(r"^\[(.+)\]\s*$", line)
+        if m:
+            # [global] is not a job: its rw= is the fallback, not a section.
+            cur = None if m.group(1).strip() == "global" else {"rw": ""}
+            if cur is not None: sections.append(cur)
+            continue
+        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
+        if not m: continue
+        if cur is None: glob = m.group(1)
+        else: cur["rw"] = m.group(1)
+    out = set()
+    for s in sections or [{"rw": ""}]:   # no sections: [global] is the job
+        out.update(DIRECTIONS.get((s["rw"] or glob).lower(), ()))
+    return out
+
+needed = set()
+for f in sorted(os.listdir(src)):
+    if not re.match(r"^[0-9]", f): continue
+    path = os.path.join(src, f)
+    if not os.path.isfile(path): continue
+    lines = open(path).read().splitlines()
+    if f == NAME or any(l.startswith(MARKER) for l in lines[:3]):
+        continue   # a layout job measures nothing
+    items = report_items(lines)
+    if "latency" in items: continue
+    types = []
+    if "bandwidth" in items or not items: types.append("bw")
+    if "iops" in items: types.append("iops")
+    for t in types:
+        for d in directions(lines):
+            needed.add(f"{t} {d}")
+
+for line in sorted(needed):
+    print(line)
+PYEOF
+}
+
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:
 # just the fio check -- there is no connection to test).

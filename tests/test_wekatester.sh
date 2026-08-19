@@ -1203,6 +1203,98 @@ t_assert "parse: -a cal, -Ahybrid and --auto=cal set the level; cal_mode true on
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
+# --- cal_required: which ladders does this set need ---
+# The output grammar is a contract shared with the calibration engine and the
+# dry-run report: unique sorted lines from {bw read, bw write, iops read,
+# iops write}, nothing else, empty when nothing needs calibrating. Asserted on
+# the whole pipe-joined output, never with grep, so a spurious extra ladder
+# (wasted measurement time) fails the test just like a missing one.
+cal_set() {   # cal_set <jobfile-body>...; prints cal_required, newlines as |
+    local d body n=0
+    d=$(mktemp -d)
+    for body in "$@"; do
+        n=$((n + 1)); printf '%s\n' "$body" > "$d/0${n}1-job.job"
+    done
+    (source ./wekatester; cal_required "$d") | tr '\n' '|'
+    rm -rf "$d"
+}
+t_assert "cal_required: bandwidth-read + iops-randrw + latency set" \
+    test "$(cal_set '# report bandwidth
+[global]
+directory=/mnt/weka
+[bw]
+rw=read' '# report iops
+[global]
+bs=4k
+[io]
+rw=randrw' '# report latency
+[global]
+bs=4k
+[lat]
+rw=randread')" = "bw read|iops read|iops write|"
+t_assert "cal_required: a bw-write-only set needs one ladder" \
+    test "$(cal_set '# report bandwidth
+[bw]
+rw=write')" = "bw write|"
+t_assert "cal_required: a latency-only set needs nothing" \
+    test "$(cal_set '# report latency
+[lat]
+rw=randread')" = ""
+# latency anywhere in the directive wins, exactly as the tuner classifies it:
+# such a file is measured at qd=1, so it asks for no ladder.
+t_assert "cal_required: '# report iops latency' contributes nothing" \
+    test "$(cal_set '# report iops latency
+[io]
+rw=randwrite')" = ""
+# No directive: the summarizer reports everything for such a file and its
+# large sequential shape is bandwidth-like, so it counts as bandwidth.
+t_assert "cal_required: a file with no report directive counts as bandwidth" \
+    test "$(cal_set '[global]
+bs=1M
+[seq]
+rw=write')" = "bw write|"
+t_assert "cal_required: one directive naming two types asks for both" \
+    test "$(cal_set '# report bandwidth iops
+[both]
+rw=read')" = "bw read|iops read|"
+# Section rw= with the [global] value as the fallback: the un-annotated
+# section still contributes the global direction.
+t_assert "cal_required: section rw= wins, [global] rw= is the fallback" \
+    test "$(cal_set '# report iops
+[global]
+rw=randread
+[inherits]
+bs=4k
+[overrides]
+rw=randwrite')" = "iops read|iops write|"
+# A prose comment is not a directive (bare "# report" matches nothing either),
+# so such a file falls into the no-directive case rather than being skipped.
+t_assert "cal_required: '# reporting notes' is not a directive" \
+    test "$(cal_set '# reporting notes: nothing to see
+# report
+[seq]
+rw=read')" = "bw read|"
+t_assert "cal_required: layout jobs are skipped, real jobs are not" \
+    test "$(cal_set '# wekatester-layout: generated sha256=abc
+[layout-1]
+create_only=1
+rw=write' '# report bandwidth
+[bw]
+rw=read')" = "bw read|"
+t_assert "cal_required: a directive with no rw= anywhere asks for nothing" \
+    test "$(cal_set '# report bandwidth
+[bw]
+bs=1M')" = ""
+t_assert "cal_required: the shipped sets ask for the ladders they measure" bash -c '
+    r() { (source ./wekatester; cal_required "fio-jobfiles/$1") | tr "\n" "|"; }
+    [ "$(r default)"    = "bw read|bw write|iops read|iops write|" ] &&
+    [ "$(r mixed)"      = "bw read|bw write|iops read|iops write|" ] &&
+    [ "$(r smoke)"      = "bw read|" ] &&
+    [ "$(r wekawithin)" = "bw read|bw write|" ]'
+t_assert "cal_required: a missing set directory is an error, not silence" bash -c '
+    out=$( (source ./wekatester; cal_required /nonexistent/set) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$out" in *"cal_required"*"/nonexistent/set"*) true;; *) false;; esac'
+
 # --- -u/--unlink: a final generated job removes what the layout created ---
 t_assert "parse: -u, -U and --unlink arm the unlink job; default off" bash -c '
     (source ./wekatester; parse_args h1;          [ "$UNLINK" = 0 ]) &&
