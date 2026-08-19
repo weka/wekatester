@@ -2173,9 +2173,13 @@ t_assert "engines: test_engines returns while unrelated background children live
         WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; AUTO_LEVEL=max
         DIRECTORY=$d/dest; FIO_BIN=$stub/fio
         printf \"engines libaio\\n\" > \"$d/probe/localhost\"
-        sleep 300 &
+        sleep 300 & DECOY=\$!
         test_engines >/dev/null 2>&1
-        echo TE_RETURNED" | grep -q TE_RETURNED'
+        echo TE_RETURNED
+        # reap the decoy: an orphaned sleep holds the suite stderr/stdout
+        # fds, and a PIPED suite run then waits ~5 minutes for EOF after
+        # the last test (seen live as a zero-CPU stall)
+        kill \$DECOY" | grep -q TE_RETURNED'
 t_assert "engines: an enghelp-missing candidate fails without burning a job" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     (source ./wekatester
