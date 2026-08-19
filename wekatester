@@ -102,7 +102,7 @@ AUTH_DIR=""          # $WORK_DIR/auth: per-host winning-credential state
 LOCAL_MODE=0
 
 # Auto mode: derive system-specific fio options
-AUTO_LEVEL=""    # "", "safe", or "max"
+AUTO_LEVEL=""    # "", "safe", "max", "cal", or "hybrid"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 # The working-set floor itself lives in the tuner (WS_FLOOR) and is quoted only
 # from there, so bash and python cannot drift apart on the number.
@@ -369,7 +369,7 @@ edit_jobfile() {   # edit_jobfile <path>
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|hybrid]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        ${0##*/} -s results.json
@@ -389,8 +389,11 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max]   derive system-specific fio options from the workers
+  -a, --auto [safe|max|cal|hybrid]
+                          derive system-specific fio options from the workers
                           (default level when omitted: max)
+                          cal: measure a per-client iodepth ladder before staging
+                          hybrid: same ladder, seeded from a formula rung
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -575,19 +578,19 @@ parse_args() {
                 # case-insensitively too -- and only consumed when it really is
                 # one, otherwise it is the first server name.
                 arg=$(lower "${2:-}")
-                case "$arg" in safe|max) AUTO_LEVEL=$arg; shift ;; esac
+                case "$arg" in safe|max|cal|hybrid) AUTO_LEVEL=$arg; shift ;; esac
                 shift ;;
             --auto=*)
                 AUTO_LEVEL=$(lower "${opt#--auto=}")
-                case "$AUTO_LEVEL" in safe|max) ;; *)
-                    usage >&2; die "unknown auto level: ${opt#--auto=} (safe|max)" ;;
+                case "$AUTO_LEVEL" in safe|max|cal|hybrid) ;; *)
+                    usage >&2; die "unknown auto level: ${opt#--auto=} (safe|max|cal|hybrid)" ;;
                 esac
                 shift ;;
             -a?*)
                 opt_val "$opt" -a
                 AUTO_LEVEL=$(lower "$OPT_VAL")
-                case "$AUTO_LEVEL" in safe|max) ;; *)
-                    usage >&2; die "unknown auto level: $OPT_VAL (safe|max)" ;;
+                case "$AUTO_LEVEL" in safe|max|cal|hybrid) ;; *)
+                    usage >&2; die "unknown auto level: $OPT_VAL (safe|max|cal|hybrid)" ;;
                 esac
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
@@ -643,6 +646,10 @@ parse_args() {
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
     fi
 }
+
+# Calibrated levels run a measured iodepth ladder before staging (cal from
+# scratch, hybrid seeded from a formula rung); safe/max/off never do.
+cal_mode() { [ "$AUTO_LEVEL" = cal ] || [ "$AUTO_LEVEL" = hybrid ]; }
 
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:

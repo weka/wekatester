@@ -1171,9 +1171,23 @@ t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" b
     (source ./wekatester; parse_args -a=MAX h1; [ "$AUTO_LEVEL" = max ]) &&
     err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >/dev/null )
     case "$err" in
-        *"unknown auto level: bogus (safe|max)"*) true;;
+        *"unknown auto level: bogus (safe|max|cal|hybrid)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+t_assert "parse: -a cal, -Ahybrid and --auto=cal set the level; cal_mode true only for cal/hybrid" bash -c '
+    (source ./wekatester; parse_args -a cal h1;    [ "$AUTO_LEVEL" = cal ]) &&
+    (source ./wekatester; parse_args -Ahybrid h1;  [ "$AUTO_LEVEL" = hybrid ]) &&
+    (source ./wekatester; parse_args --auto=cal h1; [ "$AUTO_LEVEL" = cal ]) &&
+    err=$( (source ./wekatester; parse_args -acalx h1) 2>&1 >/dev/null )
+    case "$err" in
+        *"unknown auto level: calx (safe|max|cal|hybrid)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
+    (source ./wekatester; AUTO_LEVEL=cal;    cal_mode) &&
+    (source ./wekatester; AUTO_LEVEL=hybrid; cal_mode) &&
+    ! (source ./wekatester; AUTO_LEVEL=safe; cal_mode) &&
+    ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
+    ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
 # --- -u/--unlink: a final generated job removes what the layout created ---
 t_assert "parse: -u, -U and --unlink arm the unlink job; default off" bash -c '

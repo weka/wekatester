@@ -20,7 +20,7 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|hybrid]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
        wekatester -s results.json
@@ -40,8 +40,11 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max]   derive system-specific fio options from the workers
+  -a, --auto [safe|max|cal|hybrid]
+                          derive system-specific fio options from the workers
                           (default level when omitted: max)
+                          cal: measure a per-client iodepth ladder before staging
+                          hybrid: same ladder, seeded from a formula rung
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -147,7 +150,7 @@ A generated layout job carries a `# wekatester-layout: generated sha256=...` mar
 
 # Auto mode
 `-a` / `--auto` derives system-specific fio options from the workers instead
-of trusting the jobfiles' static values. Two levels:
+of trusting the jobfiles' static values. Four levels:
 
 - `-a safe` — uniform and conservative: `numjobs` = the smallest usable core
   count across workers, ioengine fixed only if a worker lacks the one in the
@@ -158,6 +161,13 @@ of trusting the jobfiles' static values. Two levels:
   and iops/latency tests move to a shared small-file namespace sized from
   the cluster's backend RAM (cache-defeat working set). Highest numbers;
   hosts with different hardware run different settings.
+- `-a cal` — measures each client's own iodepth ceiling against this cluster
+  instead of guessing it: a per-client iodepth ladder runs before staging,
+  and the knees it finds are cached in `hostlist.csv`. The answer to "why
+  these numbers" becomes "measured on your clients against this cluster."
+- `-a hybrid` — the same ladder as `cal`, but seeded from a formula-derived
+  rung instead of starting from scratch, so it confirms a good starting
+  point rather than searching for one.
 
 Every staged jobfile records what auto derived for that host in header
 comments. Auto also warns when workers differ (core counts, weka cores) and
