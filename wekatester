@@ -1087,7 +1087,7 @@ calibrate() {
         wait "${pids[$i]}" || die "cannot create the calibration scratch dir on ${hs[$i]}"
     done
 
-    local type dirn fieldno todo have_write qds qd prevjson prevqd cmd f
+    local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
     local gains all h v g knee val human bwq ioq k
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
@@ -1119,10 +1119,10 @@ calibrate() {
             cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1.job'"
         done
         log "cal: seeding the $type scratch grid on ${#todo[@]} host(s)..."
-        run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/seed.json" \
-            || die "calibration seed failed (output in $WORK_DIR/cal/seed.json)"
-        check_fio_errors "$WORK_DIR/cal/seed.json" layout \
-            || die "calibration seed errored on a host (output in $WORK_DIR/cal/seed.json)"
+        run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-seed.json" \
+            || die "calibration seed failed (output in $WORK_DIR/cal/res-$type-seed.json)"
+        check_fio_errors "$WORK_DIR/cal/res-$type-seed.json" layout \
+            || die "calibration seed errored on a host (output in $WORK_DIR/cal/res-$type-seed.json)"
         for dirn in write read; do
             printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
             case "$AUTO_LEVEL,$type" in
@@ -1140,12 +1140,14 @@ calibrate() {
                 for host in "${todo[@]}"; do
                     cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$qd.job'"
                 done
-                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/cur.json" \
-                    || die "calibration rung $type-$dirn qd=$qd failed (output in $WORK_DIR/cal/cur.json)"
-                check_fio_errors "$WORK_DIR/cal/cur.json" measured \
-                    || die "calibration rung $type-$dirn qd=$qd errored on a host (output in $WORK_DIR/cal/cur.json)"
-                gains=$(cal_gains "$prevjson" "$WORK_DIR/cal/cur.json" "$type") \
+                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$qd.json"
+                run_host "$MASTER" "$cmd" > "$curjson" \
+                    || die "calibration rung $type-$dirn qd=$qd failed (output in $curjson)"
+                check_fio_errors "$curjson" measured \
+                    || die "calibration rung $type-$dirn qd=$qd errored on a host (output in $curjson)"
+                gains=$(cal_gains "$prevjson" "$curjson" "$type") \
                     || die "cannot compute calibration gains for $type-$dirn qd=$qd"
+                debug "cal: $type-$dirn qd=$qd per-host [host value gain%]: $(printf '%s' "$gains" | tr '\n' ' ')"
                 all=1
                 while read -r h v g; do
                     [ -n "$h" ] || continue
@@ -1160,8 +1162,7 @@ calibrate() {
 $gains
 GAINSEOF
                 [ "$all" -eq 1 ] && break
-                cp "$WORK_DIR/cal/cur.json" "$WORK_DIR/cal/prev.json"
-                prevjson="$WORK_DIR/cal/prev.json"; prevqd=$qd
+                prevjson=$curjson; prevqd=$qd
             done
             for host in "${todo[@]}"; do
                 knee=$prevqd   # rungs ran out while still gaining
@@ -1201,6 +1202,15 @@ GAINSEOF
         fi
     done
     apply_cal_results
+
+    # the evidence outlives the workdir: step jobfiles and every rung's raw
+    # JSON land in the run bundle (results/<stamp>.tgz -> cal/)
+    if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
+        mkdir -p "$RUN_DIR/cal" \
+            && cp -R "$WORK_DIR/cal/." "$RUN_DIR/cal/" \
+            && cp "$WORK_DIR/cal.results" "$RUN_DIR/cal/cal.results" \
+            || log "WARNING: could not snapshot the calibration artifacts into $RUN_DIR/cal" >&2
+    fi
 
     pids=(); hs=()
     for host in "${HOSTS[@]}"; do
