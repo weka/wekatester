@@ -1639,7 +1639,7 @@ t_assert "override_variant_key: replaces, inserts into [global], or creates it" 
     grep -q "^ioengine=xyzeng$" "$d/a" && ! grep -q libaio "$d/a" &&
     grep -q "^ioengine=xyzeng$" "$d/b" &&
     head -2 "$d/c" | grep -q "^\[global\]$" && grep -q "^ioengine=xyzeng$" "$d/c"'
-t_assert "-e stamps every staged variant, and the rebuild variant inherits it" bash -c '
+t_assert "-e stamps every staged variant, the generated layout included" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)
     (WEKATESTER_TARGET_DIR="$d/target"
@@ -1650,7 +1650,7 @@ t_assert "-e stamps every staged variant, and the rebuild variant inherits it" b
      stage_jobfiles) >/dev/null || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
-    grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-relayout.job"'
+    grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-layout.job"'
 
 # --- deterministic filenames: unique_filename=0 + <host>. prefix ---
 # fio client mode invents its own filename prefix (version-dependent) unless
@@ -1691,7 +1691,7 @@ t_assert "stamping: pinned hosts get cpus_allowed filled and policy=split, expli
     ! grep -q "4-15" "$b" && ! grep -q "policy=split" "$b" &&
     grep -q "^cpus_allowed=5-9$" "$c" && grep -q "^cpus_allowed_policy=split$" "$c" &&
     ! grep -q "cpus_allowed" "$e"'
-t_assert "stamping: staged variants and the rebuild variant carry it end to end" bash -c '
+t_assert "stamping: staged variants and the generated layout carry it end to end" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)
     (WEKATESTER_TARGET_DIR="$d/target"
@@ -1701,7 +1701,7 @@ t_assert "stamping: staged variants and the rebuild variant carry it end to end"
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
      stage_jobfiles) >/dev/null || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
-    r="$d/target/localhost/000-wekatester-relayout.job"
+    r="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^unique_filename=0$" "$v" &&
     grep -q "^filename_format=localhost\." "$v" &&
     grep -q "^unique_filename=0$" "$r" &&
@@ -1803,30 +1803,7 @@ EOF
     [ "$(grep -c "^h2 " "$d/log")" -eq 4 ] &&
     [ "$(grep -c "^h5 " "$d/log")" -eq 4 ]'
 
-# --- partial-layout healing: rebuild variant + completion markers ---
-# fio ftruncates a file to FULL SIZE before writing its layout, so an
-# interrupted layout leaves size-complete holes that create_only trusts
-# forever (verified against fio 3.42). The rebuild variant writes through.
-t_assert "rebuild variant: rw=write + create_on_open replace create_only, geometry kept" bash -c '
-    d=$(mktemp -d)
-    (source ./wekatester
-     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1)
-     mkdir -p "$d/jobs/h1" "$SET_DIR"
-     printf "%s\n" "# wekatester-layout: generated sha256=abc" "[global]" "directory=/mnt/weka" \
-         "[layout-1]" "create_only=1" "blocksize=1Mi" "filesize=10G" "numjobs=16" \
-         > "$d/jobs/h1/000-wekatester-layout.job"
-     cp "$d/jobs/h1/000-wekatester-layout.job" "$SET_DIR/000-wekatester-layout.job"
-     JOBFILES=(000-wekatester-layout.job)
-     stage_rebuild_variants
-     r=$d/jobs/h1/000-wekatester-relayout.job
-     # same sections, same geometry; only the layout mode changes (the
-     # directory grid comes from ensure_layout_dirs, never from fio)
-     grep -q "^\[layout-1\]$" "$r" && ! grep -q "\.dirs" "$r" &&
-     grep -q "^rw=write$" "$r" && grep -q "^create_on_open=1$" "$r" &&
-     ! grep -q "^create_only=1$" "$r" &&
-     grep -q "^filesize=10G$" "$r" && grep -q "^blocksize=1Mi$" "$r" &&
-     ! grep -q "wekatester-layout: generated" "$r" &&
-     [ "$(grep -c "^numjobs=16$" "$r")" -eq 1 ])'
+# --- layout grid: evidence-driven healing (sweep) ---
 t_assert "ensure_layout_dirs: \$filenum grid dirs are pre-created, flat names derive nothing" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -1868,83 +1845,75 @@ t_assert "cleanup: a privileged host gets a privileged fio kill, an unprivileged
     grep -q "^h1: .*sudo kill" "$d/oplog" &&
     grep -q "^h2: if \[ -f" "$d/oplog" &&
     ! grep -q "^h2: .*sudo" "$d/oplog"'
-t_assert "geometry hash: host order and cpu steering do not matter, the grid does" bash -c '
+t_assert "run_jobs: layout is timed create_only -- no markers, no rebuild selection" bash -c '
     d=$(mktemp -d)
-    (source ./wekatester
-     WORK_DIR=$d; mkdir -p "$d/jobs/h1" "$d/jobs/h2"
-     printf "[global]\ncpus_allowed=0-3\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
-     printf "[global]\ncpus_allowed=0-7\n[l]\nfilesize=10G\nnumjobs=8\n"  > "$d/jobs/h2/000-wekatester-layout.job"
-     JOBFILES=(000-wekatester-layout.job)
-     HOSTS=(h1 h2); a=$(layout_geometry_hash)
-     HOSTS=(h2 h1); b=$(layout_geometry_hash)
-     sed -i.bak "s/cpus_allowed=0-3/cpus_allowed=4-9/" "$d/jobs/h1/000-wekatester-layout.job"
-     HOSTS=(h1 h2); c=$(layout_geometry_hash)
-     sed -i.bak "s/numjobs=16/numjobs=32/" "$d/jobs/h1/000-wekatester-layout.job"
-     HOSTS=(h1 h2); e=$(layout_geometry_hash)
-     [ "$a" = "$b" ] && [ "$a" = "$c" ] && [ "$a" != "$e" ])'
-run_jobs_marker_case() {   # run_jobs_marker_case <marker-present-rc>; prints output, oplog in $d/oplog
-    d=$(mktemp -d)
-    (source ./wekatester
+    out=$( (source ./wekatester
      WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1); MASTER=h1
      FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
      mkdir -p "$d/jobs/h1" "$SET_DIR" "$RUN_DIR"
      printf "[global]\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
-     printf "[global]\n[l]\nrw=write\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-relayout.job"
      printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
      printf "{ \"client_stats\": [ { \"jobname\": \"l\", \"hostname\": \"h1\", \"error\": 0, \"read\": {\"total_ios\":0}, \"write\": {\"total_ios\":0} } ] }\n" > "$d/r.json"
      JOBFILES=(000-wekatester-layout.job)
-     MARKER_RC=$1
      run_host() { case "$2" in
-         ("[ -f "*) return "$MARKER_RC";;
-         ("rm -f "*) echo "RM: $2" >> "$WORK_DIR/oplog";;
-         (*printf*)  echo "MARK: $2" >> "$WORK_DIR/oplog";;
-         (*)         echo "FIO: $2" >> "$WORK_DIR/oplog"; cat "$WORK_DIR/r.json";;
+         (*rm\ -f*|*printf*) echo "MARKER_OP: $2" >> "$WORK_DIR/oplog";;
+         (*mkdir*) echo "MK: $2" >> "$WORK_DIR/oplog";;
+         (*) echo "FIO: $2" >> "$WORK_DIR/oplog"; cat "$WORK_DIR/r.json";;
      esac; }
-     run_jobs) 2>&1
-    echo "OPLOG_DIR=$d"
-}
-export -f run_jobs_marker_case
-t_assert "layout marker present: create_only path, marker cleared then rewritten" bash -c '
-    source ./tests/helpers.sh
-    out=$(run_jobs_marker_case 0)
-    d=${out##*OPLOG_DIR=}
-    case "$out" in *"rebuilding every file"*) echo "$out" >&2; false;; *) true;; esac &&
+     run_jobs) 2>&1 )
+    case "$out" in *"layout: complete in "*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "FIO: .*000-wekatester-layout.job" "$d/oplog" &&
-    ! grep -q "relayout" "$d/oplog" &&
-    grep -q "^RM: rm -f ./mnt/weka/.wekatester-layout-" "$d/oplog" &&
-    mline=$(grep -n "^MARK:" "$d/oplog" | head -1 | cut -d: -f1) &&
-    fline=$(grep -n "^FIO:" "$d/oplog" | head -1 | cut -d: -f1) &&
-    [ "$mline" -gt "$fline" ]'
-t_assert "layout marker missing: rebuild variant runs and says why" bash -c '
-    source ./tests/helpers.sh
-    out=$(run_jobs_marker_case 1)
-    d=${out##*OPLOG_DIR=}
-    case "$out" in
-        *"no completion marker"*"rebuilding every file with full writes"*) true;;
-        *) echo "$out" >&2; false;;
-    esac &&
-    grep -q "FIO: .*000-wekatester-relayout.job" "$d/oplog" &&
-    grep -q "^MARK: " "$d/oplog"'
-t_assert "unlink job removes its geometry marker after the grid is gone" bash -c '
+    ! grep -q "MARKER_OP" "$d/oplog" &&
+    ! grep -q "relayout" "$d/oplog"'
+t_assert "sweep: deviants deleted per namespace, matching bytes credited (capped)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
-     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1); MASTER=h1
-     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
-     mkdir -p "$d/jobs/h1" "$SET_DIR" "$RUN_DIR"
-     printf "[global]\n[l]\nfilesize=10G\nnumjobs=16\n" > "$d/jobs/h1/000-wekatester-layout.job"
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DIRECTORY=/mnt/weka; DRY_RUN=0
+     mkdir -p "$d/jobs/h1" "$SET_DIR"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/mnt/weka
+[l1]
+filename_format=h1.\$filenum/\$jobnum
+filesize=1G
+nrfiles=2
+numjobs=4
+[l2]
+filename_format=h1.wt.\$jobnum.\$filenum
+filesize=512M
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo 1073741824; echo 536870912; }
+     sweep_layout_grid)
+    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -size 1073741824c -delete" "$d/oplog" &&
+    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.*\" ! -size 536870912c -delete" "$d/oplog" &&
+    [ "$(cat "$d/probe/h1.laidout")" = "1610612736" ]'
+t_assert "sweep: dry runs never mutate (no run_host at all)" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1
+     mkdir -p "$SET_DIR"
      printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
-     printf "{ \"client_stats\": [ { \"jobname\": \"l\", \"hostname\": \"h1\", \"error\": 0, \"read\": {\"total_ios\":0}, \"write\": {\"total_ios\":0} } ] }\n" > "$d/r.json"
-     JOBFILES=(000-wekatester-layout.job 999-wekatester-unlink.job)
-     run_host() { case "$2" in
-         ("[ -f "*) return 0;;
-         ("rm -f "*) echo "RM: $2" >> "$WORK_DIR/oplog";;
-         (*printf*)  echo "MARK: $2" >> "$WORK_DIR/oplog";;
-         (*)         cat "$WORK_DIR/r.json";;
-     esac; }
-     run_jobs >/dev/null
-     # layout branch: clear + rewrite (1 RM, 1 MARK); unlink branch: 1 more RM
-     [ "$(grep -c "^RM: " "$WORK_DIR/oplog")" -eq 2 ] &&
-     [ "$(grep -c "^MARK: " "$WORK_DIR/oplog")" -eq 1 ])'
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { echo TOUCHED >> "$d/oplog"; }
+     sweep_layout_grid)
+    [ ! -f "$d/oplog" ]'
+t_assert "capacity: swept bytes are credited against the requirement" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    d=$(mktemp -d)
+    printf "42949672960" > "$FIX/probe/h1.laidout"
+    out=$( (source ./wekatester
+        WORK_DIR=$FIX; HOSTS=(h1); IGNORE_CAPACITY=0
+        WEKATESTER_PROMPT_TTY=/dev/null
+        auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 >/dev/null 2>&1
+        run_host() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 209715200 0 209715200 1%% /mnt/weka\n"; }
+        check_capacity) 2>&1 )
+    case "$out" in
+        *"already laid out"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 
 # The probe runs no weka CLI at all under -a: the DRAM ceiling it fed is
 # retired (see the corrected "Working-set sizing (max tier)" spec section),
