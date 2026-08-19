@@ -719,7 +719,7 @@ cal_mode() { [ "$AUTO_LEVEL" = cal ] || [ "$AUTO_LEVEL" = hybrid ]; }
 #      geometry picks bw for it too -- the iops knee this asks for does not
 #      land on that file either.
 # Over-asking is the safe direction of that mismatch (a knee nobody applies
-# costs ~10s per step once; a knee never measured leaves a guessed queue depth
+# costs ~30s per step once; a knee never measured leaves a guessed queue depth
 # in place for the whole run), and the knee-application rule at staging
 # decides what actually lands -- see the wire-in.
 # Direction comes from each job section's effective rw= (the section's own
@@ -870,9 +870,9 @@ CAL_SCRATCH=".wekatester-cal"
 # <outdir>/<host>/cal-<type>-<dir>-qd<qd>.job -- deterministic, so the
 # orchestrator can name the file it needs without being told.
 #
-# The step file IS the measurement definition: 10s timed with a 2s ramp (long
-# enough for a queue-depth plateau to show, short enough that a six-rung
-# ladder costs about a minute), direct=1 so client caching cannot flatter the
+# The step file IS the measurement definition: 30s timed with a 2s ramp --
+# long enough that the 1% win threshold reads signal rather than run-to-run
+# variance -- and direct=1 so client caching cannot flatter the
 # number, and the whole grid on the host's usable cores -- a knee is only the
 # client's ceiling if it was measured under the contention the real jobs run
 # in. Geometry per type: bandwidth is 1MiB sequential IO over 1G files, iops
@@ -964,7 +964,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             printf 'numjobs=%s\n' "$nj"
             printf 'iodepth=%s\n' "$qd"
             printf 'time_based=1\n'
-            printf 'runtime=10\n'
+            printf 'runtime=30\n'
             printf 'ramp_time=2\n'
             if [ -n "$cpus" ]; then
                 printf 'cpus_allowed=%s\n' "$cpus"

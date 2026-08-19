@@ -179,8 +179,9 @@ How calibration works: before staging, the set is inspected for what it
 actually runs — bandwidth and/or iops ladders, read and/or write directions;
 latency has no queue to ladder, so its FLOOR is measured instead (one QD1
 rung per direction, reported and bundled, never cached). Each ladder steps
-iodepth (cal: 1→128 bandwidth, 1→256 iops; hybrid starts mid-ladder), ~12s a
-rung, on ALL clients at once — the values found are each client's ceiling
+iodepth (cal: 1→128 bandwidth, 1→256 iops; hybrid starts mid-ladder), ~32s a
+rung (30s measured after a 2s ramp — long enough that the 1% threshold reads
+signal, not variance), on ALL clients at once — the values found are each client's ceiling
 under contention, the condition the real jobs run in. The ladder hunts the
 peak: a rung counts only if it beats the best seen so far by ≥1%, and only
 two consecutive misses end the climb, so a single flat rung cannot hide a
