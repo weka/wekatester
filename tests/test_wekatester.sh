@@ -196,7 +196,7 @@ t_assert "max: iops iodepth and nrfiles derived" bash -c '
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
-    # ws = WS_FLOOR = 8GiB, 5 usable cores -> nrfiles = max(2, ceil(8/5)) = 2
+    # IOPS_NRFILES: two 1G files per job, stated directly
     grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v"'
 t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -246,7 +246,7 @@ t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     out=$( cap max 0 h1 h2 2>&1 )
-    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (small-file floor): 5 jobs x 2 files x 1G
+    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (2 files/job): 5 jobs x 2 files x 1G
     # = 10GiB -- distinct namespaces, so the two sum to 60GiB
     case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" bash -c '
@@ -398,7 +398,7 @@ t_assert "max: small-file redirect rewrites size= to nrfiles x 1G" bash -c '
     printf "# report iops\n[global]\nfilesize=10G\nsize=40G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/031-iops.job"
-    # nrfiles = 2 at the 8GiB floor, so size= is rewritten to 2 x 1G
+    # nrfiles = 2 (IOPS_NRFILES), so size= is rewritten to 2 x 1G
     grep -q "^nrfiles=2$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^size=2G$" "$v"'
 t_assert "max: latency size= follows the capped nrfiles" bash -c '
     source ./tests/helpers.sh; tuner_fixture

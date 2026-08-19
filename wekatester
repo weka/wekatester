@@ -104,7 +104,6 @@ LOCAL_MODE=0
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "hybrid"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
-# The small-file working-set floor (WS_FLOOR) lives in the tuner python.
 
 # --- logging -----------------------------------------------------------------
 log()   { echo "$(date '+%H:%M:%S') $*"; }
@@ -1959,9 +1958,10 @@ if targets_path != "-" and os.path.exists(targets_path):
 def target(h, key):
     return TARGETS.get(h, {}).get(key, "")
 
-SMALL_FILESIZE = "1G"; SMALL_BYTES = 2**30
-WS_FLOOR = 8 * 2**30
-IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64; LAT_NRFILES_CAP = 8
+SMALL_FILESIZE = "1G"
+IOPS_NRFILES = 2   # per job: enough that no job pounds a single inode
+LAT_NRFILES = 8    # the one QD1 latency job still walks a small spread
+IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64
 ENGINE_ORDER = ["io_uring", "libaio", "psync"]
 
 def warn(msg): print(f"WARNING: {msg}", file=sys.stderr)
@@ -2238,20 +2238,19 @@ for job in jobs:
             # a 37-minute relayout right after a complete one, because the
             # old wt-small redirect gave -a its own iops namespace).
             out = override(out, "filesize", SMALL_FILESIZE)
-            # Per-host small-file working set is the floor, flat. It is a
-            # file-spread rule (enough files that jobs do not all pound one
-            # inode), NOT a cache bound: per the spec's "Working-set sizing
-            # (max tier) -- CORRECTED 2026-08-18", weka backends hold no user
-            # data in RAM (fs/exports/types.d BlockOrigin has no RAM member),
-            # so the DRAM ceiling this used to scale by was measuring nothing.
-            ws = WS_FLOOR
-            eff_jobs = usable_n if is_iops else 1
-            nr = max(2, math.ceil(ws / (max(eff_jobs, 1) * SMALL_BYTES)))
+            # File spread, stated directly: two 1G files per job so no job
+            # pounds a single inode; the one-job latency test gets 8 so its
+            # QD1 stream still walks a small spread. NOT a cache bound --
+            # per the spec's "Working-set sizing (max tier) -- CORRECTED
+            # 2026-08-18", weka backends hold no user data in RAM. (The old
+            # 8GiB "working set floor" was an inherited guess this max(2,..)
+            # arithmetic always dominated anyway; it is gone.)
             if is_latency:
-                nr = min(LAT_NRFILES_CAP, nr)
+                nr = LAT_NRFILES
                 out = override(out, "nrfiles", str(nr))
                 out = override(out, "file_service_type", "random")
             else:
+                nr = IOPS_NRFILES
                 out = override(out, "nrfiles", str(nr))
             # fio divides size= across nrfiles, so a size= left over from the
             # original large-file layout would resize the 1G files right back

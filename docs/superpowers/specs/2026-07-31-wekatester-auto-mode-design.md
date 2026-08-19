@@ -276,10 +276,11 @@ layout/marker/write-through machinery eliminates those independently.
 
 Corrected model:
 
-- per-host small-file working set `ws = WS_FLOOR` (8 GiB) — a practical
-  floor for job/file spread, not a cache bound
-- `nrfiles(iops) = max(2, ceil(ws / (numjobs × 1 GiB)))`
-- `nrfiles(latency) = min(8, max(2, ceil(ws / 1 GiB)))`
+- file spread stated directly (amended 2026-08-19): `nrfiles(iops) = 2`
+  per job — enough that no job pounds a single inode — and
+  `nrfiles(latency) = 8` for the one QD1 job. The interim 8 GiB
+  "working set floor" was an inherited guess whose `max(2, …)`
+  arithmetic always dominated; it is deleted.
 - no weka CLI query, no DRAM parse, no COMPUTE-role filter
 
 Constants: `SMALL_FILESIZE=1G`, `WS_FLOOR=8G`, `IOPS_OUTSTANDING=64×cores`,
