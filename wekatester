@@ -2679,9 +2679,17 @@ apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
 }
 
 stage_variants() {
-    local srcdir=$1 job base host hd heng geo_changed
+    local srcdir=$1 job base host hd heng geo_changed tuner_tier
     if [ -n "$AUTO_LEVEL" ]; then
-        auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" \
+        # The calibration engine (tasks 3-6) will layer measured knees on top
+        # of max's rules; until it exists, cal/hybrid must size EXACTLY like
+        # max -- the tuner python only knows safe/max, on purpose, so a new
+        # tier can never silently fall through its tier=="max" checks as an
+        # unrecognized value (engine forcing, small-file namespace) missing
+        # both its own handling and max's.
+        tuner_tier=$AUTO_LEVEL
+        cal_mode && tuner_tier=max
+        auto_tune "$srcdir" "$WORK_DIR" "$tuner_tier" "$DIRECTORY" \
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi

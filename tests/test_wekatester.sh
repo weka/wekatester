@@ -297,6 +297,20 @@ t_assert "auto staging with override stages every host" bash -c '
     { test -f "$FIX/jobs/h1/011-bw.job" ||
       { echo "coordinator h1 not staged: argument shift?" >&2; false; }; } &&
     test -f "$FIX/jobs/h2/011-bw.job"'
+# The calibration engine does not exist yet (tasks 3-6), so cal/hybrid must
+# size EXACTLY like max in the meantime: stage_variants normalizes the tier
+# it hands to auto_tune, rather than the tuner python learning a third value
+# that would silently miss max-gated rules (engine forcing, small-file ns).
+t_assert "cal sizes exactly like max: small-file namespace lands via stage_variants" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    (source ./wekatester
+     WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=cal
+     stage_variants "$FIX/src") >/dev/null 2>&1
+    v="$FIX/jobs/h1/031-iops.job"
+    grep -q "^filename_format=wt-small.\$jobnum.\$filenum$" "$v" &&
+    grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v" &&
+    grep -q "^ioengine=io_uring$" "$v"'
 
 # --- signal handling: INT/TERM must end the run, not just clean up ---
 # Regression: `trap cleanup EXIT INT TERM` ran cleanup and then CONTINUED at the
