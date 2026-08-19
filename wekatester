@@ -1403,7 +1403,9 @@ start_fio_servers() {
             || log "NOTE: $host: fio runs as root (no runuser drop-back) -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2
     done
     [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
-    sleep 2   # let the listeners settle before the first coordinator connect
+    # let the listeners settle before the first coordinator connect; the
+    # override exists for the test suite, whose stubbed servers need no settling
+    sleep "${WEKATESTER_SETTLE:-2}"
     debug "fio servers running on all hosts"
 }
 

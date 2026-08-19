@@ -2158,7 +2158,7 @@ t_assert "engines: a HANGING test job is killed by the timeout and recorded as f
      DIRECTORY=$d/dest; FIO_BIN=$stub/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
      printf ",,hangeng,,,,,\n" > "$d/t.csv"
      printf "engines hangeng libaio\n" > "$d/probe/localhost"
-     WEKATESTER_ENGINE_TEST_TIMEOUT=2 test_engines) >/dev/null 2>&1
+     WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) >/dev/null 2>&1
     took=$(( $(date +%s) - start ))
     grep -qx "localhost hangeng fail" "$d/engine.results" &&
     [ "$took" -lt 60 ]'
@@ -2254,6 +2254,7 @@ t_assert "server launch: priv pins via taskset but fio drops to the login user" 
     printf "8-9\n" > "$d/auth/h3.cpus"
     (source ./wekatester
      WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2 h3); FIO_BIN=fio
+     WEKATESTER_SETTLE=0
      run_host() { echo "LAUNCH[$1]: $2"; }
      start_fio_servers) >/dev/null 2>&1
     grep -q "sudo -n runuser -u .* -- true" "$d/launch.h1" &&
