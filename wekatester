@@ -903,13 +903,17 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
         (read|write) ;;
         (*) die "stage_cal_step: unknown ladder direction: $dirn (read|write)" ;;
     esac
-    local bs fsz rw
+    local bs fsz rw nrf
     case "$type" in
         (bw)   bs=1Mi; fsz=1G;   rw=$dirn ;;
         (iops) bs=4k;  fsz=256M; rw=rand$dirn ;;
         (lat)  bs=4k;  fsz=64M;  rw=rand$dirn ;;
         (*) die "stage_cal_step: unknown ladder type: $type (bw|iops|lat)" ;;
     esac
+    # the nrfiles A/B probe holds the working set constant: more files,
+    # each proportionally smaller
+    nrf=${CAL_NRFILES:-2}
+    [ -z "${CAL_FILESIZE:-}" ] || fsz=$CAL_FILESIZE
     case "$qd" in
         (""|*[!0-9]*) die "stage_cal_step: iodepth is not a number: $qd" ;;
     esac
@@ -927,9 +931,13 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
         else
             nj=$(usable_cores "$host") \
                 || die "$host: cannot size the $type $dirn calibration ladder"
-            # the oversubscription probe: one rung at a numjobs multiple,
-            # hunting throughput past the per-core job count
-            [ -z "${CAL_NJ_MULT:-}" ] || nj=$((nj * CAL_NJ_MULT))
+            # the numjobs ladder: rungs at a multiple (or half) of the
+            # per-core job count, hunting the true job-count optimum
+            case "${CAL_NJ_MULT:-}" in
+                ("") ;;
+                (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
+                (*) nj=$((nj * CAL_NJ_MULT)) ;;
+            esac
         fi
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
@@ -942,7 +950,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
                 || die "$host: cannot derive the calibration cpu set"
         fi
         mkdir -p "$outdir/$host" || die "cannot create $outdir/$host"
-        f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NJ_MULT:+-nj${CAL_NJ_MULT}x}.job"
+        f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NJ_MULT:+-nj${CAL_NJ_MULT}x}${CAL_NRFILES:+-nr${CAL_NRFILES}}.job"
         {
             printf '[global]\n'
             printf 'directory=%s/%s\n' "$hd" "$CAL_SCRATCH"
@@ -952,7 +960,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             printf 'direct=1\n'
             printf 'bs=%s\n' "$bs"
             printf 'filesize=%s\n' "$fsz"
-            printf 'nrfiles=2\n'
+            printf 'nrfiles=%s\n' "$nrf"
             printf 'numjobs=%s\n' "$nj"
             printf 'iodepth=%s\n' "$qd"
             printf 'time_based=1\n'
@@ -1162,7 +1170,7 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
-    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq
+    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq mult won2x nrfsz
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
         todo=()
@@ -1253,38 +1261,94 @@ $gains
 GAINSEOF
                 [ "$all" -eq 1 ] && break
             done
-            # the oversubscription probe: one rung at numjobs x2 on the
-            # deepest best qd -- if doubling the jobs beats the peak by the
-            # same threshold, the doubled job count is the real limit
+            # The numjobs ladder: rungs at half, x2, and (only when x2 won
+            # somewhere) x4 the per-core job count, each on the deepest best
+            # qd. A rung that beats a host's peak by the threshold records
+            # that host's winning job count -- undersubscription included.
             probeqd=0
             for host in "${todo[@]}"; do
                 read -r _bv bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
                 [ "$bq" -le "$probeqd" ] || probeqd=$bq
             done
-            if [ "$probeqd" -gt 0 ]; then
-                CAL_NJ_MULT=2 stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+            local mult won2x=0
+            for mult in half 2 4; do
+                [ "$probeqd" -gt 0 ] || break
+                if [ "$mult" = 4 ] && [ "$won2x" -eq 0 ]; then
+                    continue   # x4 only chases a proven x2 gain
+                fi
+                CAL_NJ_MULT=$mult stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
                 copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy the oversubscription probe to $MASTER"
+                    || die "cannot copy the numjobs rung to $MASTER"
                 cmd="'$FIO_BIN' --output-format=json --eta=never"
                 for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nj2x.job'"
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nj${mult}x.job'"
                 done
-                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nj2x.json"
+                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nj${mult}x.json"
                 run_host "$MASTER" "$cmd" > "$curjson" \
-                    || die "calibration nj probe $type-$dirn failed (output in $curjson)"
+                    || die "calibration numjobs rung $type-$dirn nj=${mult}x failed (output in $curjson)"
                 check_fio_errors "$curjson" measured \
-                    || die "calibration nj probe $type-$dirn errored on a host (output in $curjson)"
+                    || die "calibration numjobs rung $type-$dirn nj=${mult}x errored on a host (output in $curjson)"
                 gains=$(cal_gains - "$curjson" "$type") \
-                    || die "cannot compute the nj probe values for $type-$dirn"
+                    || die "cannot compute the numjobs rung values for $type-$dirn"
                 while read -r h v g; do
                     [ -n "$h" ] || continue
                     read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
                     if [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
                         nj=$(usable_cores "$h") || continue
-                        printf '%s\n' "$((nj * 2))" > "$WORK_DIR/cal/nj-$type.$h"
+                        case "$mult" in
+                            (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
+                            (*)    nj=$((nj * mult)); [ "$mult" -ne 2 ] || won2x=1 ;;
+                        esac
+                        printf '%s\n' "$nj" > "$WORK_DIR/cal/nj-$type.$h"
                         printf '%s %s 0\n' "$v" "$_bq" > "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        log "cal: $h $type-$dirn gains from numjobs x2 ($((nj * 2)) jobs) -- recording it"
+                        log "cal: $h $type-$dirn gains at numjobs ${mult}x ($nj jobs) -- recording it"
                     fi
+                done <<GAINSEOF
+$gains
+GAINSEOF
+            done
+            # The nrfiles A/B: 64 files per job at the same working set
+            # (each file 32x smaller), one rung at the knee. EVIDENCE ONLY:
+            # the delta is logged and bundled, never recorded -- rewriting
+            # the operator's file geometry from a probe would change what
+            # they asked to test. Run on the first direction of each type.
+            if [ "$probeqd" -gt 0 ] && [ ! -f "$WORK_DIR/cal/nrprobe-$type" ]; then
+                : > "$WORK_DIR/cal/nrprobe-$type"
+                local nrfsz
+                if [ "$type" = bw ]; then nrfsz=32M; else nrfsz=8M; fi
+                CAL_NRFILES=64 CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
+                for host in "${todo[@]}"; do
+                    f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr64.job"
+                    { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
+                        && mv "$f.seed" "$f" || die "cannot derive the nrfiles seed for $host"
+                done
+                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                    || die "cannot copy the nrfiles seed to $MASTER"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
+                for host in "${todo[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr64.job'"
+                done
+                run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr64-seed.json" \
+                    || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr64-seed.json)"
+                CAL_NRFILES=64 CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                    || die "cannot copy the nrfiles rung to $MASTER"
+                cmd="'$FIO_BIN' --output-format=json --eta=never"
+                for host in "${todo[@]}"; do
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nr64.job'"
+                done
+                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nr64.json"
+                run_host "$MASTER" "$cmd" > "$curjson" \
+                    || die "nrfiles rung $type-$dirn failed (output in $curjson)"
+                check_fio_errors "$curjson" measured \
+                    || die "nrfiles rung $type-$dirn errored on a host (output in $curjson)"
+                gains=$(cal_gains - "$curjson" "$type") \
+                    || die "cannot compute the nrfiles rung values for $type-$dirn"
+                while read -r h v g; do
+                    [ -n "$h" ] || continue
+                    read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
+                    log "cal: $h $type-$dirn nrfiles 64 vs 2: $(awk -v a="$v" -v b="$best" \
+                        'BEGIN{printf "%+.1f%%", (a-b)*100/b}') (evidence only, not recorded)"
                 done <<GAINSEOF
 $gains
 GAINSEOF

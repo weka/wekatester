@@ -184,10 +184,14 @@ rung, on ALL clients at once — the values found are each client's ceiling
 under contention, the condition the real jobs run in. The ladder hunts the
 peak: a rung counts only if it beats the best seen so far by ≥5%, and only
 two consecutive misses end the climb, so a single flat rung cannot hide a
-later gain. After the ladder, one probe doubles `numjobs` at the best queue
-depth — if oversubscription beats the peak, the doubled job count is
-recorded too. The reported knee is the shallowest queue depth within 95% of
-the peak. The scratch grid (`.wekatester-cal/` under each destination) is
+later gain. After the qd ladder, a numjobs ladder tries half, double, and
+(chasing a proven double) quadruple the per-core job count at the best
+queue depth — a win records that host's job count, undersubscription
+included. One more rung A/B-tests nrfiles (64 files per job at the same
+working set, versus the baseline 2): the delta is logged and bundled as
+evidence but never recorded, since rewriting your file geometry from a
+probe would change what you asked to test. The reported knee is the
+shallowest queue depth within 95% of the peak. The scratch grid (`.wekatester-cal/` under each destination) is
 seeded in full before any measured rung — creation is never measured — and
 removed afterward. Knees flow
 into the run's geometry one precedence slot below the operator (CLI > host

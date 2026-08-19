@@ -2618,7 +2618,9 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
+         (*njhalfx.job*) cal_json 2000;;
          (*nj2x.job*) cal_json 2150;;
+         (*nr64.job*) cal_json 2150;;
          (*qd1.job*)  cal_json 1000;;
          (*qd2.job*)  cal_json 1900;;
          (*qd4.job*)  cal_json 2100;;
@@ -2629,6 +2631,7 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      calibrate) 2>&1 )
     grep -q "^h1 4 - - -$" "$d/cal.results" &&
     case "$out" in *"cal: h1 bw-read peak "*"knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"nrfiles 64 vs 2: +2.4% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
@@ -2644,7 +2647,10 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*) return 0;;
+         (*njhalfx.job*) cal_json 2000;;
          (*nj2x.job*) cal_json 2400;;
+         (*nj4x.job*) cal_json 2450;;
+         (*nr64.job*) cal_json 2150;;
          (*qd1.job*)  cal_json 1000;;
          (*qd2.job*)  cal_json 1900;;
          (*qd4.job*)  cal_json 2100;;
@@ -2654,7 +2660,9 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
      esac; }
      calibrate) >/dev/null 2>&1
     grep -q "^h1 4 - 8 -$" "$d/cal.results" &&
-    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd4-nj2x.job"'
+    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd4-nj2x.job" &&
+    grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd4-nj4x.job" &&
+    grep -q "^nrfiles=64$" "$d/cal/h1/cal-bw-read-qd4-nr64.job"'
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
     (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&
