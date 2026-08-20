@@ -3866,23 +3866,40 @@ start_run_log() {
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
-# Per-host system context for the bundle: kernel cmdline, mounts, cpu and
-# pci inventory, memory. A run's numbers are only interpretable against the
-# box they ran on (isolcpus changes, mount options, NIC layout, RAM), so
-# every run captures them -- one ssh per host, one file per item, under
-# sysinfo/<host>/ in the run directory. A missing tool or unreadable proc
-# file records "not available" instead of failing the run.
+# Per-host system context for the bundle, one file per item under
+# sysinfo/<host>/ in the run directory. A run's numbers are only
+# interpretable against the box they ran on -- every item below has been
+# needed after the fact during a real investigation: kernel cmdline and the
+# live isolated set (isolcpus), mounts and df (mount modes, capacity),
+# lscpu/numactl (topology), lspci and ip (NIC inventory), free/meminfo
+# (RAM, hugepages), uname/os-release (kernel/distro), uptime (load at run
+# start), fio --version (3.28 vs 3.42 behavior differences bit twice), and
+# weka local ps (client container and version). A missing tool or
+# unreadable file records "not available" instead of failing the run.
 snapshot_sysinfo() {
     local host i pids=() hs=() cmd
-    cmd='for it in cmdline mounts lscpu lspci free; do
+    cmd='for it in cmdline mounts meminfo isolated os-release uname uptime df ip lscpu lspci numactl free; do
         echo "=== WEKATESTER_SYSINFO $it ==="
         case $it in
-            (cmdline|mounts)
+            (cmdline|mounts|meminfo)
                 if [ -r "/proc/$it" ]; then cat "/proc/$it"; else echo "not available"; fi ;;
+            (isolated)
+                if [ -r /sys/devices/system/cpu/isolated ]; then cat /sys/devices/system/cpu/isolated; else echo "not available"; fi ;;
+            (os-release)
+                if [ -r /etc/os-release ]; then cat /etc/os-release; else echo "not available"; fi ;;
+            (uname)   uname -a ;;
+            (uptime)  if command -v uptime  >/dev/null; then uptime;            else echo "not available"; fi ;;
+            (df)      if command -v df      >/dev/null; then df -kP;            else echo "not available"; fi ;;
+            (ip)      if command -v ip      >/dev/null; then ip -o addr;        else echo "not available"; fi ;;
+            (numactl) if command -v numactl >/dev/null; then numactl --hardware; else echo "not available"; fi ;;
             (*)
                 if command -v "$it" >/dev/null; then "$it"; else echo "$it: not available"; fi ;;
         esac
     done'
+    cmd="$cmd; echo '=== WEKATESTER_SYSINFO fio ==='; \
+        '$FIO_BIN' --version 2>&1 || echo 'not available'; \
+        echo '=== WEKATESTER_SYSINFO weka ==='; \
+        if command -v weka >/dev/null; then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
         pids+=($!); hs+=("$host")

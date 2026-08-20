@@ -2735,15 +2735,19 @@ t_assert "sysinfo: one file per item per host, missing tools say so" bash -c '
      run_host() { printf "%s\n" \
          "=== WEKATESTER_SYSINFO cmdline ===" "BOOT_IMAGE=vmlinuz isolcpus=4-55" \
          "=== WEKATESTER_SYSINFO mounts ===" "wekafs /mnt/weka wekafs rw 0 0" \
+         "=== WEKATESTER_SYSINFO uname ===" "Linux isca224 4.18.0" \
          "=== WEKATESTER_SYSINFO lscpu ===" "CPU(s): 56" \
          "=== WEKATESTER_SYSINFO lspci ===" "lspci: not available" \
-         "=== WEKATESTER_SYSINFO free ===" "Mem: 512G"; }
+         "=== WEKATESTER_SYSINFO free ===" "Mem: 512G" \
+         "=== WEKATESTER_SYSINFO fio ===" "fio-3.28"; }
      snapshot_sysinfo)
     grep -q "isolcpus=4-55" "$d/out/sysinfo/h1/cmdline" &&
     grep -q "wekafs" "$d/out/sysinfo/h1/mounts" &&
+    grep -q "Linux isca224" "$d/out/sysinfo/h1/uname" &&
     grep -q "CPU(s): 56" "$d/out/sysinfo/h1/lscpu" &&
     grep -q "not available" "$d/out/sysinfo/h1/lspci" &&
-    grep -q "Mem: 512G" "$d/out/sysinfo/h1/free"'
+    grep -q "Mem: 512G" "$d/out/sysinfo/h1/free" &&
+    grep -q "fio-3.28" "$d/out/sysinfo/h1/fio"'
 
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
