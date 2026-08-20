@@ -192,12 +192,12 @@ outstanding is the saturation axis, so this isolates the job-count effect;
 a win records the (numjobs, iodepth) pair, undersubscription included.
 Every seed is followed by a short settle so its write backlog destages
 before the first measured rung. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
-set, each rung at iodepth = 2 × nrfiles so per-file queue pressure stays
-proportional, the nr=2 rung as the reference) then samples the file-count
+set, every rung pinned at the knee queue depth so equal queue pressure
+isolates file count, the nr=2 rung as the reference) then samples the file-count
 curve: every delta is logged and bundled as evidence but never recorded,
 since rewriting your file geometry from a probe would change what you
 asked to test — a point that beats the reference by ≥1% is named with the
-exact host-file fields (nr, fs, qd) that would adopt it. The reported knee is the
+exact host-file fields (nr, fs) that would adopt it. The reported knee is the
 shallowest queue depth within 95% of the peak. The scratch grid (`.wekatester-cal/` under each destination) is
 seeded in full before any measured rung — creation is never measured — and
 removed afterward. Knees flow
