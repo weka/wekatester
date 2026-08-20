@@ -2163,24 +2163,49 @@ for mask in sys.argv[3].split():
     cpus = expand(mask)
     if len(cpus) == 1:
         weka |= cpus
+def fmt(cpus):
+    out, i = [], 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else f"{cpus[i]}-{cpus[j]}")
+        i = j + 1
+    return ",".join(out)
+
+# the EFFECTIVE set is the request minus weka's dedicated cores: the host
+# file keeps the operator's list as written, execution never touches
+# weka's own cpus
+eff = sorted(req - weka)
 flags = []
 if iso and (req & iso) and (req - iso):
     # a mask mixing isolated and housekeeping cpus silently collapses onto
     # the housekeeping partition -- worse than failing, it runs WRONG
     flags.append("mixed")
+if not eff:
+    flags.append("allweka")
 # isolated cpus are self-affinable (fio sets its own per-job affinity there
 # without privilege); only cpus outside BOTH the mask and the isolated set
 # genuinely need an escalator
-if cur and not req <= (cur | iso):
+elif cur and not set(eff) <= (cur | iso):
     flags.append("outside")
 if req & weka:
     flags.append("overlap")
-print(("dedicated=" + (",".join(map(str, sorted(weka))) or "none")), " ".join(flags) or "ok")
+print("dedicated=" + (",".join(map(str, sorted(weka))) or "none"),
+      "effective=" + (fmt(eff) or "none"),
+      " ".join(flags) or "ok")
 PYEOF
 )
-        local dedicated=${verdict%% *}; dedicated=${dedicated#dedicated=}
-        case "$verdict" in
-            *mixed*)
+        local dedicated effective vflags
+        set -- $verdict
+        dedicated=${1#dedicated=}; effective=${2#effective=}; shift 2
+        vflags="$*"
+        case "$vflags" in
+            (*allweka*)
+                die "$host: every requested cpu ($req) is a weka dedicated core -- nothing left to run fio on" ;;
+        esac
+        case "$vflags" in
+            (*mixed*)
                 # Safe since cpus_allowed_policy=split is stamped beside
                 # every cpu list: each job holds ONE cpu, and single-cpu
                 # affinity cannot collapse. The old whole-mask trap (a
@@ -2188,38 +2213,32 @@ PYEOF
                 # masks, which no staged variant uses any more.
                 log "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
         esac
-        case "$verdict" in
-            *overlap*)
-                if [ -n "$priv" ]; then
-                    log "WARNING: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); proceeding under $priv taskset as asked" >&2
-                else
-                    log "ERROR: $host: requested cpus_allowed: $req" >&2
-                    log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
-                    log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
-                    die "$host: requested cpus overlap weka's cores and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
-                fi ;;
+        case "$vflags" in
+            (*overlap*)
+                # the host file keeps the operator's list AS WRITTEN;
+                # execution simply never touches weka's own cores
+                log "note: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
-        case "$verdict" in
-            *outside*)
+        case "$vflags" in
+            (*outside*)
                 if [ -z "$priv" ]; then
-                    log "ERROR: $host: requested cpus_allowed: $req" >&2
-                    log "ERROR: $host: current taskset:       ${cur:-unknown}" >&2
-                    log "ERROR: $host: weka dedicated cores:  $dedicated" >&2
-                    die "$host: requested cpus are outside the current taskset and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
+                    log "ERROR: $host: effective cpus_allowed: $effective (requested: $req)" >&2
+                    log "ERROR: $host: current taskset:        ${cur:-unknown}" >&2
+                    log "ERROR: $host: weka dedicated cores:   $dedicated" >&2
+                    die "$host: the effective cpus are outside the current taskset and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
                 fi ;;
         esac
-        # record the launch decision: escalate ONLY where the verdict says
-        # the mask cannot be self-applied (outside) or the operator chose
-        # weka-overlapping cpus (overlap). A self-affinable request runs as
+        # record the launch decision: escalate ONLY where the effective mask
+        # cannot be self-applied (outside). A self-affinable request runs as
         # the login user even when an escalator exists -- privileges are
         # as-needed, never just because they are available.
         local need_priv=0
-        case "$verdict" in *outside*|*overlap*) need_priv=1 ;; esac
+        case "$vflags" in (*outside*) need_priv=1 ;; esac
         if [ -n "$priv" ] && [ "$need_priv" -eq 1 ]; then
             printf '%s\n' "$priv" > "$AUTH_DIR/$host.priv"
         fi
-        printf '%s\n' "$req" > "$AUTH_DIR/$host.cpus"
-        debug "$host: fio server will run ${priv:+$([ "$need_priv" -eq 1 ] && printf 'under %s ' "$priv")}taskset -c $req"
+        printf '%s\n' "$effective" > "$AUTH_DIR/$host.cpus"
+        debug "$host: fio server will run ${priv:+$([ "$need_priv" -eq 1 ] && printf 'under %s ' "$priv")}taskset -c $effective"
     done
 }
 
@@ -3090,12 +3109,10 @@ writeback_targets() {
     local wb="$TARGETS_FILE" mode=fill
     [ -n "$wb" ] || { [ -n "$SET_DIR_OVERRIDE" ] && wb="$SET_DIR_OVERRIDE/hostlist.csv"; }
     [ -n "$wb" ] && [ -f "$wb" ] || return 0
-    if [ "$REGEN_LAYOUT" -eq 1 ] && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        require_interactive "-a -g"
-        if confirm_timed 0 no "-g: overwrite existing host-file values with the newly derived ones? [y = overwrite, n = fill missing only]"; then
-            mode=overwrite
-        fi
-    fi
+    # -g means the derived and measured values WIN -- no prompt. The three
+    # columns the operator owns outright (host, login, allowed_cpus) are
+    # protected inside the merge below regardless of mode.
+    [ "$REGEN_LAYOUT" -eq 0 ] || mode=overwrite
     # file-only resolution (no CLI merge): what does the FILE itself provide?
     resolve_targets phase2 "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
         > "$WORK_DIR/targets.fileonly" 2>/dev/null || : > "$WORK_DIR/targets.fileonly"
@@ -3165,6 +3182,9 @@ for host in hosts:
     have = fileonly.get(host, {})
     want = dict(have)
     for k, v in derived.get(host, {}).items():
+        if k in ("login", "cpus") and k in have:
+            continue   # identity, credentials and the operator's cpu list
+                       # are never overwritten, -g included
         if mode == "overwrite" or k not in have:
             want[k] = v
     if want and want != have:

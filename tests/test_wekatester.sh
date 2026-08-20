@@ -2289,24 +2289,24 @@ t_assert "pinning: cpus outside the taskset with no escalator dies showing all t
         printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >/dev/null )
     case "$err" in
-        *"requested cpus_allowed: 4-7"*"current taskset:       0-3"*"weka dedicated cores:  8,9"*"outside the current taskset"*) true;;
+        *"effective cpus_allowed: 4-7 (requested: 4-7)"*"current taskset:        0-3"*"weka dedicated cores:   8,9"*"outside the current taskset"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "pinning: overlap with weka cores dies without priv, warns and proceeds with it" bash -c '
+t_assert "pinning: full weka overlap dies; partial runs on the remainder, file untouched" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
         printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >/dev/null )
-    case "$err" in (*"overlap weka'\''s cores and no passwordless"*) true;; (*) echo "$err" >&2; exit 1;; esac
-    err2=$( (source ./wekatester
+    case "$err" in (*"every requested cpu (8,10) is a weka dedicated core"*) true;; (*) echo "$err" >&2; exit 1;; esac
+    out2=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
         printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\npriv sudo\n" > "$d/probe/h1"
-        printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null )
-    case "$err2" in (*"WARNING"*"overlap weka'\''s dedicated cores (8,10)"*"proceeding under sudo"*) true;; (*) echo "$err2" >&2; exit 1;; esac
-    [ "$(cat "$d/auth/h1.priv")" = sudo ] && [ "$(cat "$d/auth/h1.cpus")" = "8,10" ]'
+        printf "h1\t-\t-\t8,10,12\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 )
+    case "$out2" in (*"note"*"overlap weka'\''s dedicated cores (8,10)"*"executing on the remainder (12)"*) true;; (*) echo "$out2" >&2; exit 1;; esac
+    test ! -s "$d/auth/h1.priv" && [ "$(cat "$d/auth/h1.cpus")" = "12" ]'
 t_assert "pinning: an in-mask request with no escalator records cpus and proceeds" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
@@ -2400,14 +2400,13 @@ t_assert "writeback: nothing to record leaves the file untouched" bash -c '
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
      writeback_targets) >/dev/null
     [ "$(cat "$f")" = "$before" ]'
-t_assert "writeback: -g interactive overwrite replaces file values with derived ones" bash -c '
+t_assert "writeback: -g overwrites without a prompt, but never login or allowed_cpus" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
-    printf "h1,,psync,9-11,,,,\n" > "$f"
-    printf "y" | (source ./wekatester
+    printf "h1,opc,psync,9-11,,,,\n" > "$f"
+    (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
-     PROMPT_IN_FD=0; PROMPT_OUT_FD=1
      writeback_targets) >/dev/null
-    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,4/1G/8/32"'
+    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,4/1G/8/32"'
 t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     d=$(wb_fixture); mkdir "$d/set"
     (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null
