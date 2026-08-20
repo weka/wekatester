@@ -1933,7 +1933,7 @@ t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bas
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; REGEN_LAYOUT=1
-     printf "h1 4 32 - -\n" > "$d/cal.results"
+     printf "h1 4 32 - - - - - -\n" > "$d/cal.results"
      printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
      apply_cal_results)
     a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
@@ -2629,7 +2629,7 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
          (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
      esac; }
      calibrate) 2>&1 )
-    grep -q "^h1 4 - - -$" "$d/cal.results" &&
+    grep -q "^h1 4 - - - - - - -$" "$d/cal.results" &&
     case "$out" in *"cal: h1 bw-read peak "*"knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
     case "$out" in *"nrfiles 1 (qd=4) vs 2: +0.0% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
     case "$out" in *"nrfiles 8 (qd=4) vs 2: +0.0% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
@@ -2661,7 +2661,7 @@ t_assert "calibrate: the best cross-direction numjobs candidate is adopted with 
          (*) return 1;;
      esac; }
      calibrate) >/dev/null 2>&1
-    grep -q "^h1 1 - 16 -$" "$d/cal.results" &&
+    grep -q "^h1 1 - 16 - - - - -$" "$d/cal.results" &&
     grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nj2x.job" &&
     grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd1-nj4x.job" &&
     grep -q "^nrfiles=8$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
@@ -2714,15 +2714,15 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d
-     printf "h1 4 32 - -\nh2 8 - - -\n" > "$d/cal.results"
+     printf "h1 4 32 - - - - 8 64M\nh2 8 - - - 1 2048M - -\n" > "$d/cal.results"
      printf "h1\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
      apply_cal_results)
-    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
-    b=$(awk -F"\t" "\$1==\"h2\" {print \$9, \$17}" "$d/targets.final")
-    [ "$a" = "4 64" ] && [ "$b" = "8 -" ] || { echo "a=$a b=$b" >&2; false; }
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17, \$15, \$16}" "$d/targets.final")
+    b=$(awk -F"\t" "\$1==\"h2\" {print \$9, \$17, \$7, \$8}" "$d/targets.final")
+    [ "$a" = "4 64 64M 8" ] && [ "$b" = "8 - 2048M 1" ] || { echo "a=$a b=$b" >&2; false; }
     (source ./wekatester
      WORK_DIR=$d; rm -f "$d/targets.final"
-     printf "h3 16 - - -\n" > "$d/cal.results"
+     printf "h3 16 - - - - - - -\n" > "$d/cal.results"
      apply_cal_results)
     c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
     [ "$c" = "17 16" ]'

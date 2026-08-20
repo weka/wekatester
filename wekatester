@@ -1086,7 +1086,7 @@ res, final, force = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 knees = {}
 for line in open(res):
     f = line.split()
-    if len(f) == 5:
+    if len(f) == 9:
         knees[f[0]] = f[1:]
 
 rows, order = {}, []
@@ -1096,7 +1096,7 @@ if os.path.exists(final):
         rows[f[0]] = f
         order.append(f[0])
 for host in sorted(knees):
-    bwq, ioq, bwnj, ionj = knees[host]
+    bwq, ioq, bwnj, ionj, bwnr, bwfs, ionr, iofs = knees[host]
     row = rows.get(host)
     if row is None:
         row = [host] + ["-"] * 16
@@ -1112,6 +1112,14 @@ for host in sorted(knees):
         row[5] = bwnj
     if ionj != "-" and (force or row[13] == "-"):
         row[13] = ionj
+    if bwfs != "-" and (force or row[6] == "-"):
+        row[6] = bwfs
+    if bwnr != "-" and (force or row[7] == "-"):
+        row[7] = bwnr
+    if iofs != "-" and (force or row[14] == "-"):
+        row[14] = iofs
+    if ionr != "-" and (force or row[15] == "-"):
+        row[15] = ionr
 with open(final, "w") as fp:
     for h in order:
         fp.write("\t".join(rows[h]) + "\n")
@@ -1414,7 +1422,9 @@ GAINSEOF
                         fi
                     done
                     if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
-                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn and ${type}_fs=$((nrtot / nrbestn))M in the host file"
+                        printf '%s %sM\n' "$nrbestn" "$((nrtot / nrbestn))" \
+                            > "$WORK_DIR/cal/nrwin-$type.$host"
+                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- recording ${type}_nr=$nrbestn, ${type}_fs=$((nrtot / nrbestn))M (fills empty host-file fields; -g overwrites)"
                     else
                         log "cal: $host $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
                     fi
@@ -1515,9 +1525,9 @@ LATEOF
     done
 
     : > "$WORK_DIR/cal.results"
-    local bwnj ionj
+    local bwnj ionj bwnr bwfs ionr iofs
     for host in "${HOSTS[@]}"; do
-        bwq=-; ioq=-; bwnj=-; ionj=-
+        bwq=-; ioq=-; bwnj=-; ionj=-; bwnr=-; bwfs=-; ionr=-; iofs=-
         for dirn in read write; do
             f="$WORK_DIR/cal/knee-bw-$dirn.$host"
             if [ -f "$f" ]; then
@@ -1532,8 +1542,11 @@ LATEOF
         done
         [ ! -s "$WORK_DIR/cal/nj-bw.$host" ] || read -r bwnj _ < "$WORK_DIR/cal/nj-bw.$host"
         [ ! -s "$WORK_DIR/cal/nj-iops.$host" ] || read -r ionj _ < "$WORK_DIR/cal/nj-iops.$host"
+        [ ! -s "$WORK_DIR/cal/nrwin-bw.$host" ] || read -r bwnr bwfs < "$WORK_DIR/cal/nrwin-bw.$host"
+        [ ! -s "$WORK_DIR/cal/nrwin-iops.$host" ] || read -r ionr iofs < "$WORK_DIR/cal/nrwin-iops.$host"
         if [ "$bwq" != - ] || [ "$ioq" != - ]; then
-            printf '%s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" >> "$WORK_DIR/cal.results"
+            printf '%s %s %s %s %s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" \
+                "$bwnr" "$bwfs" "$ionr" "$iofs" >> "$WORK_DIR/cal.results"
         fi
     done
     apply_cal_results
