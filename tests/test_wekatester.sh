@@ -2749,6 +2749,33 @@ t_assert "sysinfo: one file per item per host, missing tools say so" bash -c '
     grep -q "Mem: 512G" "$d/out/sysinfo/h1/free" &&
     grep -q "fio-3.28" "$d/out/sysinfo/h1/fio"'
 
+t_assert "pressure: start and end land as labeled files, end pulls the sar slice" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/out"
+    (source ./wekatester
+     WORK_DIR=$d; RUN_DIR=$d/out; HOSTS=(h1); RUN_STAMP=20260820-003501
+     run_host() { case "$2" in
+         (*sar*) printf "%s\n" \
+             "=== WEKATESTER_SYSINFO pressure-cpu ===" "some avg10=0.15" \
+             "=== WEKATESTER_SYSINFO loadavg ===" "1.20 1.10 0.90" \
+             "=== WEKATESTER_SYSINFO sar ===" "00:35:01 CPU %user";;
+         (*) printf "%s\n" \
+             "=== WEKATESTER_SYSINFO pressure-cpu ===" "some avg10=0.05" \
+             "=== WEKATESTER_SYSINFO loadavg ===" "0.50 0.40 0.30";;
+     esac; }
+     snapshot_pressure start
+     snapshot_pressure end)
+    grep -q "avg10=0.05" "$d/out/sysinfo/h1/pressure-cpu-start" &&
+    grep -q "0.50 0.40" "$d/out/sysinfo/h1/loadavg-start" &&
+    grep -q "avg10=0.15" "$d/out/sysinfo/h1/pressure-cpu-end" &&
+    grep -q "00:35:01 CPU" "$d/out/sysinfo/h1/sar-end"'
+t_assert "pressure: no run dir means no capture, no error" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; RUN_DIR=""; HOSTS=(h1)
+     run_host() { echo TOUCHED >> "$d/oplog"; }
+     snapshot_pressure start)
+    [ ! -f "$d/oplog" ]'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
