@@ -261,7 +261,9 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 
 - `results_<jobname>.json` — the raw fio JSON, one file per job, written as each job completes;
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
-- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth).
+- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth);
+- `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` (kernel command line — isolcpus and friends), `mounts`, `lscpu`, `lspci`, `free`. A host missing a tool records `not available` instead of failing the run;
+- `cal/` — on `-a cal`/`-a hybrid` runs, every calibration rung's jobfile and raw JSON plus `cal.results`.
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 

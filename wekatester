@@ -3866,6 +3866,41 @@ start_run_log() {
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
+# Per-host system context for the bundle: kernel cmdline, mounts, cpu and
+# pci inventory, memory. A run's numbers are only interpretable against the
+# box they ran on (isolcpus changes, mount options, NIC layout, RAM), so
+# every run captures them -- one ssh per host, one file per item, under
+# sysinfo/<host>/ in the run directory. A missing tool or unreadable proc
+# file records "not available" instead of failing the run.
+snapshot_sysinfo() {
+    local host i pids=() hs=() cmd
+    cmd='for it in cmdline mounts lscpu lspci free; do
+        echo "=== WEKATESTER_SYSINFO $it ==="
+        case $it in
+            (cmdline|mounts)
+                if [ -r "/proc/$it" ]; then cat "/proc/$it"; else echo "not available"; fi ;;
+            (*)
+                if command -v "$it" >/dev/null; then "$it"; else echo "$it: not available"; fi ;;
+        esac
+    done'
+    for host in "${HOSTS[@]}"; do
+        ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
+        pids+=($!); hs+=("$host")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || log "WARNING: could not capture system info on ${hs[$i]}" >&2
+    done
+    for host in "${HOSTS[@]}"; do
+        [ -s "$WORK_DIR/sysinfo.$host" ] || continue
+        mkdir -p "$RUN_DIR/sysinfo/$host" \
+            || { log "WARNING: cannot create $RUN_DIR/sysinfo/$host" >&2; continue; }
+        awk -v dir="$RUN_DIR/sysinfo/$host" '
+            /^=== WEKATESTER_SYSINFO / { out = dir "/" $3; next }
+            out { print > out }
+        ' "$WORK_DIR/sysinfo.$host"
+    done
+}
+
 # The bundle must show what actually ran: the per-host staged variants. The
 # source set may not exist by the time anyone reads the bundle (-C temp sets
 # are removed after a clean run), and auto mode rewrites geometry per host at
@@ -4502,6 +4537,7 @@ main() {
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     start_run_log
+    snapshot_sysinfo
     if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
         probe_workers
         test_engines
