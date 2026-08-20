@@ -1323,11 +1323,30 @@ GAINSEOF
 $gains
 GAINSEOF
             done
+            for host in "${todo[@]}"; do
+                read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                knee=$(awk -v b="$best" -v pct="$CAL_KNEE_PCT" \
+                    '$2 * 100 >= b * pct {print $1; exit}' \
+                    "$WORK_DIR/cal/hist-$type-$dirn.$host")
+                [ -n "$knee" ] || knee=$bq
+                # a numjobs win is a (nj, qd) pair: its qd IS the knee
+                [ ! -s "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride" ] \
+                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride")
+                printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
+                if [ "$type" = bw ]; then
+                    human=$(awk -v v="$best" 'BEGIN{printf "%.1fGB/s", v/1e9}')
+                else
+                    human=$(awk -v v="$best" 'BEGIN{printf "%.0fk iops", v/1e3}')
+                fi
+                log "cal: $host $type-$dirn peak $human @ qd=$bq, knee qd=$knee"
+            done
             # The nrfiles ladder: points 1, 2, 4, 8 files per job at the
             # same working set (each file proportionally smaller), every
-            # rung at iodepth = 2 x nrfiles so per-file queue pressure stays
-            # proportional -- the comparison isolates file count, not queue
-            # shape. The nr=2 rung inside the ladder is the reference.
+            # rung PINNED AT THE KNEE QD (Frank's ruling; the earlier
+            # qd = 2 x nrfiles shape made the iops curve reproduce the qd
+            # ladder -- queue depth dominates so completely that file count
+            # was invisible). Equal queue isolates file count. The nr=2
+            # rung inside the ladder is the reference.
             # EVIDENCE ONLY: deltas are logged and bundled, never recorded;
             # a winner is named with the exact host-file fields (nr, fs, qd)
             # that would adopt it. First direction of each type.
@@ -1335,8 +1354,12 @@ GAINSEOF
                 : > "$WORK_DIR/cal/nrprobe-$type"
                 local nrn nrqd nrfsz nrtot nrbestn="" nrbestpct="" nrbestraw=-999999 nrraw nrpct nrref
                 if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
+                nrqd=0
+                for host in "${todo[@]}"; do
+                    k=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host")
+                    [ "$k" -le "$nrqd" ] || nrqd=$k
+                done
                 for nrn in $CAL_NR_LADDER; do
-                    nrqd=$((nrn * 2))
                     nrfsz="$((nrtot / nrn))M"
                     CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
                     for host in "${todo[@]}"; do
@@ -1382,35 +1405,18 @@ GAINSEOF
                         v=$(cat "$WORK_DIR/cal/nrval-$type.$host.$nrn") || continue
                         nrraw=$(awk -v a="$v" -v b="$nrref" 'BEGIN{printf "%.4f", (a-b)*100/b}')
                         nrpct=$(awk -v p="$nrraw" 'BEGIN{printf "%+.1f", p}')
-                        log "cal: $host $type-$dirn nrfiles $nrn (qd=$((nrn * 2))) vs 2: ${nrpct}% (evidence only, not recorded)"
+                        log "cal: $host $type-$dirn nrfiles $nrn (qd=$nrqd) vs 2: ${nrpct}% (evidence only, not recorded)"
                         if awk -v p="$nrraw" -v bp="$nrbestraw" 'BEGIN{exit !(p > bp)}'; then
                             nrbestn=$nrn; nrbestpct=$nrpct; nrbestraw=$nrraw
                         fi
                     done
                     if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
-                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn, ${type}_fs=$((nrtot / nrbestn))M and ${type}_qd=$((nrbestn * 2)) in the host file"
+                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- to adopt it set ${type}_nr=$nrbestn and ${type}_fs=$((nrtot / nrbestn))M in the host file"
                     else
                         log "cal: $host $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
                     fi
                 done
             fi
-            for host in "${todo[@]}"; do
-                read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
-                knee=$(awk -v b="$best" -v pct="$CAL_KNEE_PCT" \
-                    '$2 * 100 >= b * pct {print $1; exit}' \
-                    "$WORK_DIR/cal/hist-$type-$dirn.$host")
-                [ -n "$knee" ] || knee=$bq
-                # a numjobs win is a (nj, qd) pair: its qd IS the knee
-                [ ! -s "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride" ] \
-                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride")
-                printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
-                if [ "$type" = bw ]; then
-                    human=$(awk -v v="$best" 'BEGIN{printf "%.1fGB/s", v/1e9}')
-                else
-                    human=$(awk -v v="$best" 'BEGIN{printf "%.0fk iops", v/1e3}')
-                fi
-                log "cal: $host $type-$dirn peak $human @ qd=$bq, knee qd=$knee"
-            done
         done
     done
 
