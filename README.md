@@ -189,7 +189,11 @@ later gain. After the qd ladder, a numjobs ladder moves jobs and queue depth
 in opposite directions at constant total outstanding IO (double jobs at
 half qd, half jobs at double qd, quadruple chasing a proven double) —
 outstanding is the saturation axis, so this isolates the job-count effect;
-a win records the (numjobs, iodepth) pair, undersubscription included.
+a multiplier is adopted only when it wins ≥1% in some laddered direction
+AND regresses no more than 2% in any other — a one-direction win recorded
+type-wide once cost a measured 3GiB/s in the other direction. The best
+qualifying candidate's (numjobs, iodepth) pair is recorded,
+undersubscription included.
 Every seed is followed by a short settle so its write backlog destages
 before the first measured rung. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
 set, every rung pinned at the knee queue depth so equal queue pressure

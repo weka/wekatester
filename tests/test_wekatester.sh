@@ -2637,7 +2637,7 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
-t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" bash -c '
+t_assert "calibrate: the best cross-direction numjobs candidate is adopted with its qd" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     (source ./tests/helpers.sh
@@ -2661,14 +2661,14 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
          (*) return 1;;
      esac; }
      calibrate) >/dev/null 2>&1
-    grep -q "^h1 2 - 8 -$" "$d/cal.results" &&
+    grep -q "^h1 1 - 16 -$" "$d/cal.results" &&
     grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nj2x.job" &&
     grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd1-nj4x.job" &&
-    grep -q "^nrfiles=8$" "$d/cal/h1/cal-bw-read-qd2-nr8.job" &&
-    grep -q "^iodepth=2$" "$d/cal/h1/cal-bw-read-qd2-nr8.job" &&
-    grep -q "^filesize=256M$" "$d/cal/h1/cal-bw-read-qd2-nr8.job" &&
-    grep -q "^nrfiles=1$" "$d/cal/h1/cal-bw-read-qd2-nr1.job" &&
-    grep -q "^filesize=2048M$" "$d/cal/h1/cal-bw-read-qd2-nr1.job"'
+    grep -q "^nrfiles=8$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
+    grep -q "^iodepth=4$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
+    grep -q "^filesize=256M$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
+    grep -q "^nrfiles=1$" "$d/cal/h1/cal-bw-read-qd4-nr1.job" &&
+    grep -q "^filesize=2048M$" "$d/cal/h1/cal-bw-read-qd4-nr1.job"'
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
     (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&

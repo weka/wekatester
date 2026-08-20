@@ -1176,7 +1176,7 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
-    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq mult won2x nrfsz
+    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq mult won2x nrfsz ok
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
         todo=()
@@ -1189,6 +1189,7 @@ calibrate() {
             fi
         done
         [ ${#todo[@]} -gt 0 ] || continue
+        printf '%s\n' "$ladders" | grep -q "^$type " || continue
         # Seed the scratch grid ONCE per type, full files, unmeasured --
         # every measured rung (write included) then runs over complete
         # existing files: steady-state IO, not file creation. The seed is
@@ -1308,16 +1309,18 @@ GAINSEOF
                 while read -r h v g; do
                     [ -n "$h" ] || continue
                     read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
+                    nj=$(usable_cores "$h") || continue
+                    case "$mult" in
+                        (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
+                        (*)    nj=$((nj * mult)) ;;
+                    esac
+                    # a candidate, not a decision: adoption is judged across
+                    # BOTH directions after the ladders (see below)
+                    printf '%s %s %s %s\n' "$v" "$njqd" "$nj" "$best" \
+                        > "$WORK_DIR/cal/njcand-$type-$dirn-$mult.$h"
                     if [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
-                        nj=$(usable_cores "$h") || continue
-                        case "$mult" in
-                            (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
-                            (*)    nj=$((nj * mult)); [ "$mult" -ne 2 ] || won2x=1 ;;
-                        esac
-                        printf '%s %s\n' "$nj" "$njqd" > "$WORK_DIR/cal/nj-$type.$h"
-                        printf '%s %s 0\n' "$v" "$njqd" > "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        printf '%s\n' "$njqd" > "$WORK_DIR/cal/knee-$type-$dirn.$h.njoverride"
-                        log "cal: $h $type-$dirn gains at numjobs ${mult}x ($nj jobs @ qd=$njqd, same outstanding) -- recording the pair"
+                        [ "$mult" != 2 ] || won2x=1
+                        log "cal: $h $type-$dirn numjobs ${mult}x wins its direction ($nj jobs @ qd=$njqd, same outstanding)"
                     fi
                 done <<GAINSEOF
 $gains
@@ -1416,6 +1419,54 @@ GAINSEOF
                         log "cal: $host $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
                     fi
                 done
+            fi
+        done
+        # numjobs adoption is decided ACROSS directions: a pair that wins one
+        # direction can wreck the other (seen live: bw-read's half-jobs win,
+        # recorded type-wide, dropped measured bw-write by 3GiB/s -- whose
+        # own half rung had LOST by 14%). A multiplier is adopted only if it
+        # wins >= the threshold in some laddered direction and regresses no
+        # more than twice the threshold in any other; the winning direction's
+        # (nj, qd) pair lands in the CSV and its qd becomes that direction's
+        # knee.
+        local njdirs d2 cv cq cn cb cg bestmult bestgain bestnjv bestqdv bestdirn
+        njdirs=""
+        for dirn in write read; do
+            printf '%s\n' "$ladders_all" | grep -q "^$type $dirn$" && njdirs="$njdirs $dirn"
+        done
+        for host in "${todo[@]}"; do
+            bestmult=""; bestgain=0; bestnjv=0; bestqdv=0; bestdirn=""
+            for mult in half 2 4; do
+                ok=1; cg=0
+                for d2 in $njdirs; do
+                    f="$WORK_DIR/cal/njcand-$type-$d2-$mult.$host"
+                    [ -s "$f" ] || { ok=0; break; }   # rung never ran: no verdict
+                    read -r cv cq cn cb < "$f"
+                    [ "$cb" -gt 0 ] || { ok=0; break; }
+                    g=$(( (cv - cb) * 100 / cb ))
+                    if [ "$g" -lt "$((0 - 2 * CAL_GAIN_PCT))" ]; then
+                        ok=0; break   # wrecks this direction
+                    fi
+                    if [ "$g" -ge "$CAL_GAIN_PCT" ] && [ "$g" -gt "$cg" ]; then
+                        cg=$g
+                        read -r cv cq cn cb < "$WORK_DIR/cal/njcand-$type-$d2-$mult.$host"
+                        bestnjv=$cn; bestqdv=$cq; bestdirn=$d2
+                    fi
+                done
+                if [ "$ok" -eq 1 ] && [ "$cg" -ge "$CAL_GAIN_PCT" ] && [ "$cg" -gt "$bestgain" ]; then
+                    bestgain=$cg; bestmult=$mult
+                    printf '%s %s\n' "$bestnjv" "$bestqdv" > "$WORK_DIR/cal/nj-$type.$host.cand"
+                    printf '%s %s\n' "$bestqdv" "$bestdirn" > "$WORK_DIR/cal/nj-$type.$host.kq"
+                fi
+            done
+            if [ -n "$bestmult" ]; then
+                mv "$WORK_DIR/cal/nj-$type.$host.cand" "$WORK_DIR/cal/nj-$type.$host"
+                read -r cq d2 < "$WORK_DIR/cal/nj-$type.$host.kq"
+                printf '%s\n' "$cq" > "$WORK_DIR/cal/knee-$type-$d2.$host"
+                read -r cn _ < "$WORK_DIR/cal/nj-$type.$host"
+                log "cal: $host $type: adopting numjobs ${bestmult}x ($cn jobs @ qd=$cq, +${bestgain}% in $d2, no direction wrecked)"
+            else
+                rm -f "$WORK_DIR/cal/nj-$type.$host.cand" "$WORK_DIR/cal/nj-$type.$host.kq"
             fi
         done
     done
