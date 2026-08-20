@@ -185,10 +185,13 @@ signal, not variance), on ALL clients at once — the values found are each clie
 under contention, the condition the real jobs run in. The ladder hunts the
 peak: a rung counts only if it beats the best seen so far by ≥1%, and only
 two consecutive misses end the climb, so a single flat rung cannot hide a
-later gain. After the qd ladder, a numjobs ladder tries half, double, and
-(chasing a proven double) quadruple the per-core job count at the best
-queue depth — a win records that host's job count, undersubscription
-included. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
+later gain. After the qd ladder, a numjobs ladder moves jobs and queue depth
+in opposite directions at constant total outstanding IO (double jobs at
+half qd, half jobs at double qd, quadruple chasing a proven double) —
+outstanding is the saturation axis, so this isolates the job-count effect;
+a win records the (numjobs, iodepth) pair, undersubscription included.
+Every seed is followed by a short settle so its write backlog destages
+before the first measured rung. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
 set, each rung at iodepth = 2 × nrfiles so per-file queue pressure stays
 proportional, the nr=2 rung as the reference) then samples the file-count
 curve: every delta is logged and bundled as evidence but never recorded,

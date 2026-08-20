@@ -2612,7 +2612,7 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2644,7 +2644,7 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
      source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2661,9 +2661,9 @@ t_assert "calibrate: an oversubscription win records numjobs x2 in cal.results" 
          (*) return 1;;
      esac; }
      calibrate) >/dev/null 2>&1
-    grep -q "^h1 4 - 8 -$" "$d/cal.results" &&
-    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd4-nj2x.job" &&
-    grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd4-nj4x.job" &&
+    grep -q "^h1 2 - 8 -$" "$d/cal.results" &&
+    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nj2x.job" &&
+    grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd1-nj4x.job" &&
     grep -q "^nrfiles=8$" "$d/cal/h1/cal-bw-read-qd16-nr8.job" &&
     grep -q "^iodepth=16$" "$d/cal/h1/cal-bw-read-qd16-nr8.job" &&
     grep -q "^filesize=256M$" "$d/cal/h1/cal-bw-read-qd16-nr8.job" &&

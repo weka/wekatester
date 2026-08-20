@@ -1057,6 +1057,11 @@ PYEOF
 # proves it), so a well-behaved client confirms in two or three steps.
 CAL_GAIN_PCT=1           # a rung must beat the BEST so far by this % to count
 CAL_STOP_BELOW=2         # consecutive sub-threshold rungs before the ladder stops
+CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed before measuring: the seed's
+                         # write backlog destages under the first rung
+                         # otherwise (seen live: bw-write qd1 reads ~15% low
+                         # in every run, while bw-read qd1 -- measured after
+                         # the backlog drained -- does not)
 CAL_KNEE_PCT=95          # knee = shallowest qd within this % of the peak value
 CAL_BW_QDS="1 2 4 8 16 32 64 128"
 CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
@@ -1206,6 +1211,7 @@ calibrate() {
             || die "calibration seed failed (output in $WORK_DIR/cal/res-$type-seed.json)"
         check_fio_errors "$WORK_DIR/cal/res-$type-seed.json" layout \
             || die "calibration seed errored on a host (output in $WORK_DIR/cal/res-$type-seed.json)"
+        sleep "$CAL_SETTLE"   # let the seed's write backlog destage
         for dirn in write read; do
             printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
             case "$AUTO_LEVEL,$type" in
@@ -1262,29 +1268,37 @@ $gains
 GAINSEOF
                 [ "$all" -eq 1 ] && break
             done
-            # The numjobs ladder: rungs at half, x2, and (only when x2 won
-            # somewhere) x4 the per-core job count, each on the deepest best
-            # qd. A rung that beats a host's peak by the threshold records
-            # that host's winning job count -- undersubscription included.
+            # The numjobs ladder at CONSTANT OUTSTANDING IO: total
+            # outstanding (jobs x qd) is the saturation axis, so each rung
+            # moves jobs one way and qd the other -- x2 jobs at half qd,
+            # half jobs at double qd, x4 at quarter (only chasing a proven
+            # x2 win). Field evidence (isca224): 56 jobs x qd16 beat
+            # 28 x qd32 by 10% at the same 896 outstanding, while 56 x qd32
+            # (doubled outstanding) collapsed. A winning rung records its
+            # (nj, qd) PAIR: nj without its qd pairs the job count with
+            # whatever depth the knee chose, which may be the collapse.
             probeqd=0
             for host in "${todo[@]}"; do
                 read -r _bv bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
                 [ "$bq" -le "$probeqd" ] || probeqd=$bq
             done
-            local mult won2x=0
+            local mult won2x=0 njqd
             for mult in half 2 4; do
                 [ "$probeqd" -gt 0 ] || break
-                if [ "$mult" = 4 ] && [ "$won2x" -eq 0 ]; then
-                    continue   # x4 only chases a proven x2 gain
-                fi
-                CAL_NJ_MULT=$mult stage_cal_step "$type" "$dirn" "$probeqd" "$WORK_DIR/cal" "${todo[@]}"
+                case "$mult" in
+                    (half) njqd=$((probeqd * 2)) ;;
+                    (2)    njqd=$((probeqd / 2)); [ "$njqd" -ge 1 ] || njqd=1 ;;
+                    (4)    [ "$won2x" -eq 1 ] || continue
+                           njqd=$((probeqd / 4)); [ "$njqd" -ge 1 ] || njqd=1 ;;
+                esac
+                CAL_NJ_MULT=$mult stage_cal_step "$type" "$dirn" "$njqd" "$WORK_DIR/cal" "${todo[@]}"
                 copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
                     || die "cannot copy the numjobs rung to $MASTER"
                 cmd="'$FIO_BIN' --output-format=json --eta=never"
                 for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$probeqd-nj${mult}x.job'"
+                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$njqd-nj${mult}x.job'"
                 done
-                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$probeqd-nj${mult}x.json"
+                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$njqd-nj${mult}x.json"
                 run_host "$MASTER" "$cmd" > "$curjson" \
                     || die "calibration numjobs rung $type-$dirn nj=${mult}x failed (output in $curjson)"
                 check_fio_errors "$curjson" measured \
@@ -1300,9 +1314,10 @@ GAINSEOF
                             (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
                             (*)    nj=$((nj * mult)); [ "$mult" -ne 2 ] || won2x=1 ;;
                         esac
-                        printf '%s\n' "$nj" > "$WORK_DIR/cal/nj-$type.$h"
-                        printf '%s %s 0\n' "$v" "$_bq" > "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        log "cal: $h $type-$dirn gains at numjobs ${mult}x ($nj jobs) -- recording it"
+                        printf '%s %s\n' "$nj" "$njqd" > "$WORK_DIR/cal/nj-$type.$h"
+                        printf '%s %s 0\n' "$v" "$njqd" > "$WORK_DIR/cal/best-$type-$dirn.$h"
+                        printf '%s\n' "$njqd" > "$WORK_DIR/cal/knee-$type-$dirn.$h.njoverride"
+                        log "cal: $h $type-$dirn gains at numjobs ${mult}x ($nj jobs @ qd=$njqd, same outstanding) -- recording the pair"
                     fi
                 done <<GAINSEOF
 $gains
@@ -1337,6 +1352,7 @@ GAINSEOF
                     done
                     run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
                         || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
+                    sleep "$CAL_SETTLE"
                     CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$nrqd" "$WORK_DIR/cal" "${todo[@]}"
                     copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
                         || die "cannot copy the nrfiles rung to $MASTER"
@@ -1384,6 +1400,9 @@ GAINSEOF
                     '$2 * 100 >= b * pct {print $1; exit}' \
                     "$WORK_DIR/cal/hist-$type-$dirn.$host")
                 [ -n "$knee" ] || knee=$bq
+                # a numjobs win is a (nj, qd) pair: its qd IS the knee
+                [ ! -s "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride" ] \
+                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride")
                 printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
                 if [ "$type" = bw ]; then
                     human=$(awk -v v="$best" 'BEGIN{printf "%.1fGB/s", v/1e9}')
@@ -1416,6 +1435,7 @@ GAINSEOF
             done
             run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-lat-seed.json" \
                 || die "latency seed failed (output in $WORK_DIR/cal/res-lat-seed.json)"
+            sleep "$CAL_SETTLE"   # a latency floor after a write backlog is not a floor
         fi
         stage_cal_step lat "$dirn" 1 "$WORK_DIR/cal" "${HOSTS[@]}"
         copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
@@ -1453,8 +1473,8 @@ LATEOF
                 if [ "$ioq" = - ] || [ "$k" -gt "$ioq" ]; then ioq=$k; fi
             fi
         done
-        [ ! -s "$WORK_DIR/cal/nj-bw.$host" ] || bwnj=$(cat "$WORK_DIR/cal/nj-bw.$host")
-        [ ! -s "$WORK_DIR/cal/nj-iops.$host" ] || ionj=$(cat "$WORK_DIR/cal/nj-iops.$host")
+        [ ! -s "$WORK_DIR/cal/nj-bw.$host" ] || read -r bwnj _ < "$WORK_DIR/cal/nj-bw.$host"
+        [ ! -s "$WORK_DIR/cal/nj-iops.$host" ] || read -r ionj _ < "$WORK_DIR/cal/nj-iops.$host"
         if [ "$bwq" != - ] || [ "$ioq" != - ]; then
             printf '%s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" >> "$WORK_DIR/cal.results"
         fi
