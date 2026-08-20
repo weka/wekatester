@@ -198,10 +198,10 @@ Every seed is followed by a short settle so its write backlog destages
 before the first measured rung. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
 set, every rung pinned at the knee queue depth so equal queue pressure
 isolates file count, the nr=2 rung as the reference) then samples the file-count
-curve: every delta is logged and bundled as evidence but never recorded,
-since rewriting your file geometry from a probe would change what you
-asked to test — a point that beats the reference by ≥1% is named with the
-exact host-file fields (nr, fs) that would adopt it. The reported knee is the
+curve: every delta is logged and bundled, and a point that beats the
+reference by ≥1% records its (nr, fs) into the host file under the same
+rules as the knees — filling empty fields only, overwriting under `-g` —
+so a geometry you authored yourself still wins over calibration. The reported knee is the
 shallowest queue depth within 95% of the peak. The scratch grid (`.wekatester-cal/` under each destination) is
 seeded in full before any measured rung — creation is never measured — and
 removed afterward. Knees flow
