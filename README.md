@@ -44,8 +44,8 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max|cal|hybrid]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
-                          cal: measure a per-client iodepth ladder before staging
-                          hybrid: same ladder, seeded from a formula rung
+                          cal: measure a per-client nrfiles x iodepth grid before staging
+                          hybrid: same grid, seeded from a formula rung
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -180,41 +180,45 @@ of trusting the jobfiles' static values. Four levels:
   point rather than searching for one.
 
 How calibration works: before staging, the set is inspected for what it
-actually runs — bandwidth and/or iops ladders, read and/or write directions;
+actually runs — bandwidth and/or iops grids, read and/or write directions;
 latency has no queue to ladder, so its FLOOR is measured instead (one QD1
-rung per direction, reported and bundled, never cached). Each ladder steps
-iodepth (cal: 1→128 bandwidth, 1→256 iops; hybrid starts mid-ladder), ~32s a
-rung (30s measured after a 2s ramp — long enough that the 1% threshold reads
-signal, not variance), on ALL clients at once — the values found are each client's ceiling
-under contention, the condition the real jobs run in. The ladder hunts the
-peak: a rung counts only if it beats the best seen so far by ≥1%, and only
-two consecutive misses end the climb, so a single flat rung cannot hide a
-later gain. After the qd ladder, a numjobs ladder moves jobs and queue depth
-in opposite directions at constant total outstanding IO (double jobs at
-half qd, half jobs at double qd, quadruple chasing a proven double) —
-outstanding is the saturation axis, so this isolates the job-count effect;
-a multiplier is adopted only when it wins ≥1% in some laddered direction
-AND regresses no more than 2% in any other — a one-direction win recorded
-type-wide once cost a measured 3GiB/s in the other direction. The best
-qualifying candidate's (numjobs, iodepth) pair is recorded,
-undersubscription included.
-Every seed is followed by a short settle so its write backlog destages
-before the first measured rung. An nrfiles ladder (1, 2, 4, 8 files per job at the same working
-set, every rung pinned at the knee queue depth so equal queue pressure
-isolates file count, the nr=2 rung as the reference) then samples the file-count
-curve: every delta is logged and bundled, and a point that beats the
-reference by ≥1% records its (nr, fs) into the host file under the same
-rules as the knees — filling empty fields only, overwriting under `-g` —
-so a geometry you authored yourself still wins over calibration. Under
-`-g` everything derived overwrites the host file except the three columns
-the operator owns outright: host, login, and allowed_cpus. The reported knee is the
-shallowest queue depth within 95% of the peak. The scratch grid (`.wekatester-cal/` under each destination) is
-seeded in full before any measured rung — creation is never measured — and
-removed afterward. Knees flow
-into the run's geometry one precedence slot below the operator (CLI > host
-file > calibration > tuner) and persist to `hostlist.csv` via the `-a`
-writeback — which is also the cache: a host whose qd columns are already
-filled skips those ladders (`-g` re-measures). `-n` names the ladders a run
+rung per direction, reported and bundled, never cached).
+
+Calibration measures a **grid of (nrfiles × iodepth) cells**, not one axis at
+a time. The pair is what the host file records, and only a measured pair can
+be trusted — with per-axis ladders the recorded tuple was never itself run,
+and in the field it landed 3–17% below the peaks its own axes had reported.
+Rows are 1, 2, 4 and 8 files per job at the same working set (each file
+proportionally smaller, so the comparison is file count and not capacity),
+and each row's queue depths are capped at **2 × nrfiles** — a queue deeper
+than twice the file count measures the queue, not the layout. So nr=1 runs
+qd 1–2, nr=2 runs 1–4, nr=4 runs 1–8, nr=8 runs 1–16. The iops nr=2 row is
+the one exception: it ignores the cap and runs the full deep ladder (to
+qd 256), so a deep-queue peak stays discoverable. `numjobs` is not an axis —
+it is the host's usable cores throughout.
+
+Every cell runs ~32s (30s measured after a 2s ramp) on ALL clients at once,
+so every number is that client's ceiling under contention, the condition the
+real jobs run in; and every cell is measured in BOTH laddered directions.
+Each type then takes ONE verdict: the **cheapest cell — shallowest queue
+first, then fewest files — that still delivers 98% of the best in every
+measured direction**. Requiring both directions means a geometry that suits
+read cannot be recorded over one that wrecks write. If no cell clears the bar
+in both, the cell with the best worst-direction ratio wins and the shortfall
+is logged as a warning. Every seed is followed by a short settle so its write
+backlog destages before the first measured cell.
+
+The winning cell's (nrfiles, filesize, iodepth) is recorded into the host
+file under the usual rules — filling empty fields only, overwriting under
+`-g` — so a geometry you authored yourself still wins over calibration. Under
+`-g` everything derived overwrites the host file except the three columns the
+operator owns outright: host, login, and allowed_cpus. The scratch grid
+(`.wekatester-cal/` under each destination) is seeded in full per row before
+any measured cell — creation is never measured — and removed afterward.
+Results flow into the run's geometry one precedence slot below the operator
+(CLI > host file > calibration > tuner) and persist to `hostlist.csv` via the
+`-a` writeback — which is also the cache: a host whose qd columns are already
+filled skips that type's grid (`-g` re-measures). `-n` names the grids a run
 would perform without executing them.
 
 Every staged jobfile records what auto derived for that host in header

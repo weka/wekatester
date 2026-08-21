@@ -2675,7 +2675,7 @@ cal_json() {   # cal_json <bw_bytes> -> fio-style client_stats JSON on stdout
     printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": 10, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1"
 }
 export -f cal_json
-t_assert "calibrate: knee lands at the last gaining rung, scratch created and removed" bash -c '
+t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in both directions" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh
@@ -2685,29 +2685,28 @@ t_assert "calibrate: knee lands at the last gaining rung, scratch created and re
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
+     # nr=4/qd=2 is the cheapest cell within 98% of the 2100 peak; nr=8/qd=16
+     # is fractionally faster but far more expensive, and must NOT win.
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
-         (*njhalfx.job*) cal_json 2000;;
-         (*nj2x.job*) cal_json 2118;;
-         (*-nr*.job*) cal_json 2118;;
-         (*qd1.job*)  cal_json 1000;;
-         (*qd2.job*)  cal_json 1900;;
-         (*qd4.job*)  cal_json 2100;;
-         (*qd8.job*)  cal_json 2110;;
-         (*qd16.job*) cal_json 2115;;
+         (*qd16-nr8.job*) cal_json 2100;;
+         (*qd2-nr4.job*)  cal_json 2090;;
+         (*-nr*.job*)     cal_json 1000;;
          (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
      esac; }
      calibrate) 2>&1 )
-    grep -q "^h1 4 - - - - - - -$" "$d/cal.results" &&
-    case "$out" in *"cal: h1 bw-read peak "*"knee qd=4"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"nrfiles 1 (qd=4) vs 2: +0.0% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"nrfiles 8 (qd=4) vs 2: +0.0% (evidence only"*) true;; *) echo "$out" >&2; false;; esac &&
-    case "$out" in *"cal: h1 bw: nrfiles 2 stands (best challenger 1 at +0.0%)"*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in
+        *"grid picks nrfiles=4 qd=2 fs=512M"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    grep -q "^h1 2 - - - 4 512M - -$" "$d/cal.results" &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
-    grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8.job"'
-t_assert "calibrate: the best cross-direction numjobs candidate is adopted with its qd" bash -c '
+    grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd2-nr4.job"'
+# The 2 x nrfiles cap is the whole point of the grid shape: a row must never
+# be asked for a queue deeper than twice its file count.
+t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     (source ./tests/helpers.sh
@@ -2718,27 +2717,36 @@ t_assert "calibrate: the best cross-direction numjobs candidate is adopted with 
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*) return 0;;
-         (*njhalfx.job*) cal_json 2000;;
-         (*nj2x.job*) cal_json 2400;;
-         (*nj4x.job*) cal_json 2420;;
-         (*-nr*.job*) cal_json 2600;;
-         (*qd1.job*)  cal_json 1000;;
-         (*qd2.job*)  cal_json 1900;;
-         (*qd4.job*)  cal_json 2100;;
-         (*qd8.job*)  cal_json 2110;;
-         (*qd16.job*) cal_json 2115;;
-         (*) return 1;;
-     esac; }
+         (*mkdir*|*rm\ -rf*) :;;
+         (*) echo "$2" >> "$d/cells";;
+     esac; cal_json 1000; }
      calibrate) >/dev/null 2>&1
-    grep -q "^h1 1 - 16 - - - - -$" "$d/cal.results" &&
-    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nj2x.job" &&
-    grep -q "^numjobs=16$" "$d/cal/h1/cal-bw-read-qd1-nj4x.job" &&
-    grep -q "^nrfiles=8$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
-    grep -q "^iodepth=4$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
-    grep -q "^filesize=256M$" "$d/cal/h1/cal-bw-read-qd4-nr8.job" &&
-    grep -q "^nrfiles=1$" "$d/cal/h1/cal-bw-read-qd4-nr1.job" &&
-    grep -q "^filesize=2048M$" "$d/cal/h1/cal-bw-read-qd4-nr1.job"'
+    # every cell that was staged, as nr/qd pairs
+    got=$(grep -o "qd[0-9]*-nr[0-9]*" "$d/cells" | sort -u | sed "s/qd//;s/-nr/ /" | awk "{print \$2\"/\"\$1}" | sort -n -t/ -k1 -k2 | tr "\n" " ")
+    [ "$got" = "1/1 1/2 2/1 2/2 2/4 4/1 4/2 4/4 4/8 8/1 8/2 8/4 8/8 8/16 " ] ||
+        { echo "cells staged: $got" >&2; false; }'
+# iops keeps the deep ladder on its nr=2 row so a deep-queue peak stays
+# findable (saving-calf: iops read peaked at qd=256); every other row is
+# still capped at 2 x nrfiles.
+t_assert "calibrate: the iops nr=2 row runs the deep qd ladder, other rows stay capped" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
+    (source ./tests/helpers.sh
+     source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*) :;;
+         (*) echo "$2" >> "$d/cells";;
+     esac; cal_json 1000; }
+     calibrate) >/dev/null 2>&1
+    nr2=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
+    nr4=$(grep -o "qd[0-9]*-nr4\." "$d/cells" | sed "s/qd//;s/-nr4.//" | sort -un | tr "\n" " ")
+    [ "$nr2" = "1 2 4 8 16 32 64 128 256 " ] || { echo "nr2 qds: $nr2" >&2; false; } &&
+    [ "$nr4" = "1 2 4 8 " ] || { echo "nr4 qds: $nr4" >&2; false; }'
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
     (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&

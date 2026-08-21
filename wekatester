@@ -392,8 +392,8 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max|cal|hybrid]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
-                          cal: measure a per-client iodepth ladder before staging
-                          hybrid: same ladder, seeded from a formula rung
+                          cal: measure a per-client nrfiles x iodepth grid before staging
+                          hybrid: same grid, seeded from a formula rung
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -1057,19 +1057,23 @@ PYEOF
 # Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
 # a formula rung (per-weka-core budgets pick the start, the ladder still
 # proves it), so a well-behaved client confirms in two or three steps.
-CAL_GAIN_PCT=1           # a rung must beat the BEST so far by this % to count
-CAL_STOP_BELOW=2         # consecutive sub-threshold rungs before the ladder stops
 CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed before measuring: the seed's
                          # write backlog destages under the first rung
                          # otherwise (seen live: bw-write qd1 reads ~15% low
                          # in every run, while bw-read qd1 -- measured after
                          # the backlog drained -- does not)
-CAL_KNEE_PCT=95          # knee = shallowest qd within this % of the peak value
+CAL_KNEE_PCT=98          # winning cell = cheapest within this % of the peak,
+                         # in EVERY measured direction
 CAL_BW_QDS="1 2 4 8 16 32 64 128"
 CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
 CAL_HYBRID_BW_QDS="4 8 16 32 64 128"
 CAL_HYBRID_IOPS_QDS="32 64 128 256"
-CAL_NR_LADDER="1 2 4 8"   # nrfiles points; each rung runs at iodepth = 2 x nrfiles
+CAL_NR_LADDER="1 2 4 8"   # nrfiles rows of the grid
+CAL_GRID_QDS="1 2 4 8 16" # qd points per row, capped at 2 x nrfiles: a queue
+                          # deeper than twice the file count measures the
+                          # queue, not the layout. The iops nr=2 row ignores
+                          # the cap and runs CAL_IOPS_QDS so a deep-queue
+                          # peak stays discoverable.
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
 # slot BELOW the operator: CLI > host file > calibration > tuner. When no
@@ -1147,20 +1151,28 @@ for s in data.get("client_stats", []):
 PYEOF
 }
 
-# The calibration engine. Per required ladder (write before read, so a write
-# ladder doubles as the read grid's seed), one fio --client invocation per
-# rung over every participating host AT ONCE -- the knee is each client's
-# ceiling UNDER CONTENTION, the condition the measured jobs run in. A host
-# whose rung gained less than CAL_GAIN_PCT freezes its knee at the previous
-# rung but KEEPS RUNNING until every host froze or the rungs ran out, so the
-# contention stays constant for the hosts still climbing. Knees land in
-# cal.results, flow into targets.final via apply_cal_results, and persist to
-# hostlist.csv through the existing -a writeback -- which is also the cache:
-# a host whose relevant qd column is already filled skips that type's ladder
-# entirely (-g forces a re-measure). Per type the recorded knee is the
-# DEEPER of the two directions: the measured jobs share one qd column, and
-# under-queuing the hungrier direction costs more than over-queuing the
-# other. numjobs stays at usable cores (the ladder varies depth only).
+# The calibration engine. Per type it measures a GRID of (nrfiles x iodepth)
+# cells rather than sweeping each axis with the other frozen, because the
+# host file records the pair and only a measured pair can be trusted: with
+# per-axis ladders the recorded tuple was never itself run, and on
+# saving-calf it landed 3-17% below the peaks its own axes had reported.
+# qd is capped at 2 x nrfiles per row (deeper queues measure the queue, not
+# the layout); the iops nr=2 row ignores the cap and runs the full deep
+# ladder so a deep-queue peak stays findable. numjobs is not an axis -- it
+# is the host's usable cores throughout.
+#
+# One fio --client invocation per cell over every participating host AT
+# ONCE, so every number is that client's ceiling UNDER CONTENTION, the
+# condition the measured jobs run in. Every cell is measured in both
+# laddered directions and the type takes ONE verdict: the cheapest cell
+# (shallowest queue, then fewest files) still delivering CAL_KNEE_PCT of
+# the best in EVERY direction, so a geometry that suits read cannot be
+# recorded over one that wrecks write.
+#
+# Winners land in cal.results, flow into targets.final via
+# apply_cal_results, and persist to hostlist.csv through the existing -a
+# writeback -- which is also the cache: a host whose relevant qd column is
+# already filled skips that type's grid entirely (-g forces a re-measure).
 calibrate() {
     cal_mode || return 0
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
@@ -1186,7 +1198,7 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
-    local gains all h v g knee human bwq ioq k best below bq probeqd nj _bv _bl _bq mult won2x nrfsz ok
+    local gains h v g human bwq ioq k nj ok gridpick short
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
         todo=()
@@ -1200,285 +1212,157 @@ calibrate() {
         done
         [ ${#todo[@]} -gt 0 ] || continue
         printf '%s\n' "$ladders" | grep -q "^$type " || continue
-        # Seed the scratch grid ONCE per type, full files, unmeasured --
-        # every measured rung (write included) then runs over complete
-        # existing files: steady-state IO, not file creation. The seed is
-        # a write-through create (create_on_open, untimed): it writes each
-        # file end to end exactly once.
-        stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
+        # The (nrfiles x iodepth) GRID. Both axes move together instead of
+        # each being swept with the other frozen, because the pair is what
+        # the host file records and a per-axis winner pair was never
+        # actually run (saving-calf: the recorded tuple landed 3-17% under
+        # the peaks its own axes had measured). numjobs is NOT an axis --
+        # it is pinned to the host's usable cores. Its ladder was removed
+        # after the field data showed nothing to keep: the bw adoption
+        # changed no measured result (the client NIC caps bw regardless of
+        # geometry), and the iops adoption was one unreplicated rung.
+        #
+        # qd is capped at 2 x nrfiles: a queue deeper than twice the file
+        # count is measuring the queue, not the layout (Frank's rule).
+        # nr=1 -> qd 1,2   nr=2 -> qd 1,2,4   nr=4 -> qd 1,2,4,8   nr=8 -> +16
+        # For iops the nr=2 row IGNORES the cap and runs the full deep qd
+        # ladder, so a deep-queue peak (saving-calf: 639k iops at qd=256)
+        # stays discoverable.
+        #
+        # Every cell is measured in BOTH laddered directions and the type
+        # gets ONE verdict, so the single qd the host file carries per type
+        # is chosen with read and write both on the table.
+        local nrn nrqd nrfsz nrtot gridqds deepqds
+        if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
+        case "$AUTO_LEVEL,$type" in
+            (cal,bw)     deepqds=$CAL_BW_QDS ;;
+            (cal,iops)   deepqds=$CAL_IOPS_QDS ;;
+            (hybrid,bw)  deepqds=$CAL_HYBRID_BW_QDS ;;
+            (*)          deepqds=$CAL_HYBRID_IOPS_QDS ;;
+        esac
         for host in "${todo[@]}"; do
-            f="$WORK_DIR/cal/$host/cal-$type-write-qd1.job"
-            { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
-                && mv "$f.seed" "$f" || die "cannot derive the seed job for $host"
+            rm -f "$WORK_DIR/cal/grid-$type.$host"
         done
-        copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-            || die "cannot copy the calibration seed to $MASTER"
-        cmd="'$FIO_BIN' --output-format=json --eta=never"
-        for host in "${todo[@]}"; do
-            cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1.job'"
-        done
-        log "cal: seeding the $type scratch grid on ${#todo[@]} host(s)..."
-        run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-seed.json" \
-            || die "calibration seed failed (output in $WORK_DIR/cal/res-$type-seed.json)"
-        check_fio_errors "$WORK_DIR/cal/res-$type-seed.json" layout \
-            || die "calibration seed errored on a host (output in $WORK_DIR/cal/res-$type-seed.json)"
-        sleep "$CAL_SETTLE"   # let the seed's write backlog destage
-        for dirn in write read; do
-            printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
-            case "$AUTO_LEVEL,$type" in
-                (cal,bw)     qds=$CAL_BW_QDS ;;
-                (cal,iops)   qds=$CAL_IOPS_QDS ;;
-                (hybrid,bw)  qds=$CAL_HYBRID_BW_QDS ;;
-                (*)          qds=$CAL_HYBRID_IOPS_QDS ;;
-            esac
-            # Peak-hunting ladder: a rung must beat the BEST seen so far by
-            # CAL_GAIN_PCT to count, and only CAL_STOP_BELOW consecutive
-            # misses end the climb -- a single flat rung cannot hide a
-            # later gain. The reported knee is the shallowest qd within
-            # CAL_KNEE_PCT of the peak: the peak's value at the cheapest
-            # queue that essentially delivers it.
-            for host in "${todo[@]}"; do
-                rm -f "$WORK_DIR/cal/best-$type-$dirn.$host" \
-                      "$WORK_DIR/cal/hist-$type-$dirn.$host"
-            done
-            for qd in $qds; do
-                stage_cal_step "$type" "$dirn" "$qd" "$WORK_DIR/cal" "${todo[@]}"
-                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy calibration step files to $MASTER"
-                cmd="'$FIO_BIN' --output-format=json --eta=never"
-                for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$qd.job'"
+        for nrn in $CAL_NR_LADDER; do
+            nrfsz="$((nrtot / nrn))M"
+            # qd list for this row: the grid points within 2 x nrfiles,
+            # except the iops nr=2 row which carries the deep ladder.
+            if [ "$type" = iops ] && [ "$nrn" -eq 2 ]; then
+                gridqds=$deepqds
+            else
+                gridqds=""
+                for qd in $CAL_GRID_QDS; do
+                    [ "$qd" -le $((2 * nrn)) ] && gridqds="$gridqds $qd"
                 done
-                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$qd.json"
-                run_host "$MASTER" "$cmd" > "$curjson" \
-                    || die "calibration rung $type-$dirn qd=$qd failed (output in $curjson)"
-                check_fio_errors "$curjson" measured \
-                    || die "calibration rung $type-$dirn qd=$qd errored on a host (output in $curjson)"
-                gains=$(cal_gains - "$curjson" "$type") \
-                    || die "cannot compute calibration values for $type-$dirn qd=$qd"
-                debug "cal: $type-$dirn qd=$qd per-host [host value]: $(printf '%s' "$gains" | tr '\n' ' ')"
-                all=1
-                while read -r h v g; do
-                    [ -n "$h" ] || continue
-                    printf '%s %s\n' "$qd" "$v" >> "$WORK_DIR/cal/hist-$type-$dirn.$h"
-                    best=0; below=0
-                    [ ! -f "$WORK_DIR/cal/best-$type-$dirn.$h" ] \
-                        || read -r best _bq below < "$WORK_DIR/cal/best-$type-$dirn.$h"
-                    [ "$below" -ge "$CAL_STOP_BELOW" ] && continue
-                    if [ "$best" -eq 0 ] \
-                            || [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
-                        printf '%s %s 0\n' "$v" "$qd" > "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        all=0
-                    else
-                        below=$((below + 1))
-                        printf '%s %s %s\n' "$best" "$_bq" "$below" > "$WORK_DIR/cal/best-$type-$dirn.$h"
-                        [ "$below" -ge "$CAL_STOP_BELOW" ] || all=0
-                    fi
-                done <<GAINSEOF
-$gains
-GAINSEOF
-                [ "$all" -eq 1 ] && break
-            done
-            # The numjobs ladder at CONSTANT OUTSTANDING IO: total
-            # outstanding (jobs x qd) is the saturation axis, so each rung
-            # moves jobs one way and qd the other -- x2 jobs at half qd,
-            # half jobs at double qd, x4 at quarter (only chasing a proven
-            # x2 win). Field evidence (isca224): 56 jobs x qd16 beat
-            # 28 x qd32 by 10% at the same 896 outstanding, while 56 x qd32
-            # (doubled outstanding) collapsed. A winning rung records its
-            # (nj, qd) PAIR: nj without its qd pairs the job count with
-            # whatever depth the knee chose, which may be the collapse.
-            probeqd=0
+            fi
+            [ -n "$gridqds" ] || continue
+            # Seed this row's scratch grid: the working set is held constant
+            # across rows (more files, each proportionally smaller), so the
+            # comparison is file count, not capacity.
+            CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz \
+                stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
             for host in "${todo[@]}"; do
-                read -r _bv bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
-                [ "$bq" -le "$probeqd" ] || probeqd=$bq
+                f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr$nrn.job"
+                { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
+                    && mv "$f.seed" "$f" || die "cannot derive the nr=$nrn seed for $host"
             done
-            local mult won2x=0 njqd
-            for mult in half 2 4; do
-                [ "$probeqd" -gt 0 ] || break
-                case "$mult" in
-                    (half) njqd=$((probeqd * 2)) ;;
-                    (2)    njqd=$((probeqd / 2)); [ "$njqd" -ge 1 ] || njqd=1 ;;
-                    (4)    [ "$won2x" -eq 1 ] || continue
-                           njqd=$((probeqd / 4)); [ "$njqd" -ge 1 ] || njqd=1 ;;
-                esac
-                CAL_NJ_MULT=$mult stage_cal_step "$type" "$dirn" "$njqd" "$WORK_DIR/cal" "${todo[@]}"
-                copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                    || die "cannot copy the numjobs rung to $MASTER"
-                cmd="'$FIO_BIN' --output-format=json --eta=never"
-                for host in "${todo[@]}"; do
-                    cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$njqd-nj${mult}x.job'"
-                done
-                curjson="$WORK_DIR/cal/res-$type-$dirn-qd$njqd-nj${mult}x.json"
-                run_host "$MASTER" "$cmd" > "$curjson" \
-                    || die "calibration numjobs rung $type-$dirn nj=${mult}x failed (output in $curjson)"
-                check_fio_errors "$curjson" measured \
-                    || die "calibration numjobs rung $type-$dirn nj=${mult}x errored on a host (output in $curjson)"
-                gains=$(cal_gains - "$curjson" "$type") \
-                    || die "cannot compute the numjobs rung values for $type-$dirn"
-                while read -r h v g; do
-                    [ -n "$h" ] || continue
-                    read -r best _bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$h"
-                    nj=$(usable_cores "$h") || continue
-                    case "$mult" in
-                        (half) nj=$((nj / 2)); [ "$nj" -ge 1 ] || nj=1 ;;
-                        (*)    nj=$((nj * mult)) ;;
-                    esac
-                    # a candidate, not a decision: adoption is judged across
-                    # BOTH directions after the ladders (see below)
-                    printf '%s %s %s %s\n' "$v" "$njqd" "$nj" "$best" \
-                        > "$WORK_DIR/cal/njcand-$type-$dirn-$mult.$h"
-                    if [ $((v * 100)) -ge $((best * (100 + CAL_GAIN_PCT))) ]; then
-                        [ "$mult" != 2 ] || won2x=1
-                        log "cal: $h $type-$dirn numjobs ${mult}x wins its direction ($nj jobs @ qd=$njqd, same outstanding)"
-                    fi
-                done <<GAINSEOF
-$gains
-GAINSEOF
-            done
+            copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+                || die "cannot copy the nr=$nrn seed to $MASTER"
+            cmd="'$FIO_BIN' --output-format=json --eta=never"
             for host in "${todo[@]}"; do
-                read -r best bq _bl < "$WORK_DIR/cal/best-$type-$dirn.$host"
-                knee=$(awk -v b="$best" -v pct="$CAL_KNEE_PCT" \
-                    '$2 * 100 >= b * pct {print $1; exit}' \
-                    "$WORK_DIR/cal/hist-$type-$dirn.$host")
-                [ -n "$knee" ] || knee=$bq
-                # a numjobs win is a (nj, qd) pair: its qd IS the knee
-                [ ! -s "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride" ] \
-                    || knee=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host.njoverride")
-                printf '%s\n' "$knee" > "$WORK_DIR/cal/knee-$type-$dirn.$host"
-                if [ "$type" = bw ]; then
-                    human=$(awk -v v="$best" 'BEGIN{printf "%.1fGB/s", v/1e9}')
-                else
-                    human=$(awk -v v="$best" 'BEGIN{printf "%.0fk iops", v/1e3}')
-                fi
-                log "cal: $host $type-$dirn peak $human @ qd=$bq, knee qd=$knee"
+                cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr$nrn.job'"
             done
-            # The nrfiles ladder: points 1, 2, 4, 8 files per job at the
-            # same working set (each file proportionally smaller), every
-            # rung PINNED AT THE KNEE QD (Frank's ruling; the earlier
-            # qd = 2 x nrfiles shape made the iops curve reproduce the qd
-            # ladder -- queue depth dominates so completely that file count
-            # was invisible). Equal queue isolates file count. The nr=2
-            # rung inside the ladder is the reference.
-            # EVIDENCE ONLY: deltas are logged and bundled, never recorded;
-            # a winner is named with the exact host-file fields (nr, fs, qd)
-            # that would adopt it. First direction of each type.
-            if [ "$probeqd" -gt 0 ] && [ ! -f "$WORK_DIR/cal/nrprobe-$type" ]; then
-                : > "$WORK_DIR/cal/nrprobe-$type"
-                local nrn nrqd nrfsz nrtot nrbestn="" nrbestpct="" nrbestraw=-999999 nrraw nrpct nrref
-                if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
-                nrqd=0
-                for host in "${todo[@]}"; do
-                    k=$(cat "$WORK_DIR/cal/knee-$type-$dirn.$host")
-                    [ "$k" -le "$nrqd" ] || nrqd=$k
-                done
-                for nrn in $CAL_NR_LADDER; do
-                    nrfsz="$((nrtot / nrn))M"
-                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
-                    for host in "${todo[@]}"; do
-                        f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr$nrn.job"
-                        { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
-                            && mv "$f.seed" "$f" || die "cannot derive the nrfiles seed for $host"
-                    done
+            log "cal: seeding the $type grid at nrfiles=$nrn on ${#todo[@]} host(s)..."
+            run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
+                || die "grid seed nr=$nrn failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
+            check_fio_errors "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" layout \
+                || die "grid seed nr=$nrn errored on a host"
+            sleep "$CAL_SETTLE"   # let the seed's write backlog destage
+            for qd in $gridqds; do
+                for dirn in write read; do
+                    printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
+                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz \
+                        stage_cal_step "$type" "$dirn" "$qd" "$WORK_DIR/cal" "${todo[@]}"
                     copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                        || die "cannot copy the nrfiles seed to $MASTER"
+                        || die "cannot copy grid cell files to $MASTER"
                     cmd="'$FIO_BIN' --output-format=json --eta=never"
                     for host in "${todo[@]}"; do
-                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr$nrn.job'"
+                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$qd-nr$nrn.job'"
                     done
-                    run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
-                        || die "nrfiles seed failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
-                    sleep "$CAL_SETTLE"
-                    CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz stage_cal_step "$type" "$dirn" "$nrqd" "$WORK_DIR/cal" "${todo[@]}"
-                    copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                        || die "cannot copy the nrfiles rung to $MASTER"
-                    cmd="'$FIO_BIN' --output-format=json --eta=never"
-                    for host in "${todo[@]}"; do
-                        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-$dirn-qd$nrqd-nr$nrn.job'"
-                    done
-                    curjson="$WORK_DIR/cal/res-$type-$dirn-qd$nrqd-nr$nrn.json"
+                    curjson="$WORK_DIR/cal/res-$type-$dirn-qd$qd-nr$nrn.json"
                     run_host "$MASTER" "$cmd" > "$curjson" \
-                        || die "nrfiles rung $type-$dirn nr=$nrn failed (output in $curjson)"
+                        || die "grid cell $type-$dirn nr=$nrn qd=$qd failed (output in $curjson)"
                     check_fio_errors "$curjson" measured \
-                        || die "nrfiles rung $type-$dirn nr=$nrn errored on a host (output in $curjson)"
+                        || die "grid cell $type-$dirn nr=$nrn qd=$qd errored on a host (output in $curjson)"
                     gains=$(cal_gains - "$curjson" "$type") \
-                        || die "cannot compute the nrfiles rung values for $type-$dirn nr=$nrn"
+                        || die "cannot compute grid values for $type-$dirn nr=$nrn qd=$qd"
+                    debug "cal: $type-$dirn nr=$nrn qd=$qd per-host [host value]: $(printf '%s' "$gains" | tr '\n' ' ')"
                     while read -r h v g; do
                         [ -n "$h" ] || continue
-                        printf '%s\n' "$v" > "$WORK_DIR/cal/nrval-$type.$h.$nrn"
+                        printf '%s %s %s %s\n' "$dirn" "$nrn" "$qd" "$v" \
+                            >> "$WORK_DIR/cal/grid-$type.$h"
                     done <<GAINSEOF
 $gains
 GAINSEOF
                 done
-                for host in "${todo[@]}"; do
-                    nrref=$(cat "$WORK_DIR/cal/nrval-$type.$host.2") || continue
-                    nrbestn=""; nrbestpct=""; nrbestraw=-999999
-                    for nrn in $CAL_NR_LADDER; do
-                        [ "$nrn" -ne 2 ] || continue
-                        v=$(cat "$WORK_DIR/cal/nrval-$type.$host.$nrn") || continue
-                        nrraw=$(awk -v a="$v" -v b="$nrref" 'BEGIN{printf "%.4f", (a-b)*100/b}')
-                        nrpct=$(awk -v p="$nrraw" 'BEGIN{printf "%+.1f", p}')
-                        log "cal: $host $type-$dirn nrfiles $nrn (qd=$nrqd) vs 2: ${nrpct}% (evidence only, not recorded)"
-                        if awk -v p="$nrraw" -v bp="$nrbestraw" 'BEGIN{exit !(p > bp)}'; then
-                            nrbestn=$nrn; nrbestpct=$nrpct; nrbestraw=$nrraw
-                        fi
-                    done
-                    if awk -v p="$nrbestraw" -v t="$CAL_GAIN_PCT" 'BEGIN{exit !(p >= t)}'; then
-                        printf '%s %sM\n' "$nrbestn" "$((nrtot / nrbestn))" \
-                            > "$WORK_DIR/cal/nrwin-$type.$host"
-                        log "cal: $host $type: nrfiles $nrbestn beats 2 by ${nrbestpct}% -- recording ${type}_nr=$nrbestn, ${type}_fs=$((nrtot / nrbestn))M (fills empty host-file fields; -g overwrites)"
-                    else
-                        log "cal: $host $type: nrfiles 2 stands (best challenger $nrbestn at ${nrbestpct}%)"
-                    fi
-                done
-            fi
-        done
-        # numjobs adoption is decided ACROSS directions: a pair that wins one
-        # direction can wreck the other (seen live: bw-read's half-jobs win,
-        # recorded type-wide, dropped measured bw-write by 3GiB/s -- whose
-        # own half rung had LOST by 14%). A multiplier is adopted only if it
-        # wins >= the threshold in some laddered direction and regresses no
-        # more than twice the threshold in any other; the winning direction's
-        # (nj, qd) pair lands in the CSV and its qd becomes that direction's
-        # knee.
-        local njdirs d2 cv cq cn cb cg bestmult bestgain bestnjv bestqdv bestdirn
-        njdirs=""
-        for dirn in write read; do
-            printf '%s\n' "$ladders_all" | grep -q "^$type $dirn$" && njdirs="$njdirs $dirn"
-        done
-        for host in "${todo[@]}"; do
-            bestmult=""; bestgain=0; bestnjv=0; bestqdv=0; bestdirn=""
-            for mult in half 2 4; do
-                ok=1; cg=0
-                for d2 in $njdirs; do
-                    f="$WORK_DIR/cal/njcand-$type-$d2-$mult.$host"
-                    [ -s "$f" ] || { ok=0; break; }   # rung never ran: no verdict
-                    read -r cv cq cn cb < "$f"
-                    [ "$cb" -gt 0 ] || { ok=0; break; }
-                    g=$(( (cv - cb) * 100 / cb ))
-                    if [ "$g" -lt "$((0 - 2 * CAL_GAIN_PCT))" ]; then
-                        ok=0; break   # wrecks this direction
-                    fi
-                    if [ "$g" -ge "$CAL_GAIN_PCT" ] && [ "$g" -gt "$cg" ]; then
-                        cg=$g
-                        read -r cv cq cn cb < "$WORK_DIR/cal/njcand-$type-$d2-$mult.$host"
-                        bestnjv=$cn; bestqdv=$cq; bestdirn=$d2
-                    fi
-                done
-                if [ "$ok" -eq 1 ] && [ "$cg" -ge "$CAL_GAIN_PCT" ] && [ "$cg" -gt "$bestgain" ]; then
-                    bestgain=$cg; bestmult=$mult
-                    printf '%s %s\n' "$bestnjv" "$bestqdv" > "$WORK_DIR/cal/nj-$type.$host.cand"
-                    printf '%s %s\n' "$bestqdv" "$bestdirn" > "$WORK_DIR/cal/nj-$type.$host.kq"
-                fi
             done
-            if [ -n "$bestmult" ]; then
-                mv "$WORK_DIR/cal/nj-$type.$host.cand" "$WORK_DIR/cal/nj-$type.$host"
-                read -r cq d2 < "$WORK_DIR/cal/nj-$type.$host.kq"
-                printf '%s\n' "$cq" > "$WORK_DIR/cal/knee-$type-$d2.$host"
-                read -r cn _ < "$WORK_DIR/cal/nj-$type.$host"
-                log "cal: $host $type: adopting numjobs ${bestmult}x ($cn jobs @ qd=$cq, +${bestgain}% in $d2, no direction wrecked)"
+        done
+        # Verdict, per host: the CHEAPEST cell that still delivers
+        # CAL_KNEE_PCT of the best in EVERY measured direction -- cheapest
+        # meaning the shallowest queue first, then the fewest files, since
+        # queue depth is what costs latency. A cell has to be good for read
+        # AND write to win, so one direction cannot drag the type onto a
+        # geometry that wrecks the other. If nothing clears the bar in both
+        # (the directions disagree outright), the cell with the best
+        # worst-direction ratio wins and the shortfall is logged.
+        for host in "${todo[@]}"; do
+            [ -s "$WORK_DIR/cal/grid-$type.$host" ] || continue
+            gridpick=$(python3 - "$WORK_DIR/cal/grid-$type.$host" "$CAL_KNEE_PCT" <<'PYEOF'
+import sys
+from collections import defaultdict
+
+path, knee_pct = sys.argv[1], int(sys.argv[2])
+cells, peak = defaultdict(dict), defaultdict(int)
+for line in open(path):
+    f = line.split()
+    if len(f) != 4:
+        continue
+    dirn, nr, qd, v = f[0], int(f[1]), int(f[2]), int(f[3])
+    cells[(nr, qd)][dirn] = v
+    if v > peak[dirn]:
+        peak[dirn] = v
+dirs = sorted(peak)
+if not dirs or not cells:
+    sys.exit("ERROR: no grid cells")
+
+def ratios(c):
+    # a direction with no measurement for this cell cannot vouch for it
+    return [cells[c].get(d, 0) / peak[d] if peak[d] else 1.0 for d in dirs]
+
+# cheapest = shallowest queue, then fewest files
+order = sorted(cells, key=lambda c: (c[1], c[0]))
+ok = [c for c in order if all(r >= knee_pct / 100 for r in ratios(c))]
+if ok:
+    nr, qd = ok[0]
+    short = ""
+else:
+    nr, qd = max(order, key=lambda c: min(ratios(c)))
+    short = "%d" % round(min(ratios((nr, qd))) * 100)
+best = max(cells, key=lambda c: min(ratios(c)))
+print(nr, qd, short or "-",
+      " ".join("%s=%d%%" % (d, round(cells[(nr, qd)].get(d, 0) * 100 / peak[d]))
+               for d in dirs),
+      "peakcell=%d/%d" % (best[0], best[1]))
+PYEOF
+            ) || die "$host: cannot pick the $type grid winner"
+            set -- $gridpick
+            nrn=$1; nrqd=$2; short=$3; shift 3
+            nrfsz="$((nrtot / nrn))M"
+            printf '%s %s %s\n' "$nrqd" "$nrn" "$nrfsz" > "$WORK_DIR/cal/gridwin-$type.$host"
+            if [ "$short" = "-" ]; then
+                log "cal: $host $type: grid picks nrfiles=$nrn qd=$nrqd fs=$nrfsz (cheapest cell within ${CAL_KNEE_PCT}% of peak in every direction: $*)"
             else
-                rm -f "$WORK_DIR/cal/nj-$type.$host.cand" "$WORK_DIR/cal/nj-$type.$host.kq"
+                log "cal: $host $type: WARNING no cell reaches ${CAL_KNEE_PCT}% in both directions; taking nrfiles=$nrn qd=$nrqd fs=$nrfsz at ${short}% of its worst direction ($*)"
             fi
         done
     done
@@ -1526,26 +1410,18 @@ $(cal_lat_floor "$latjson" "$dirn")
 LATEOF
     done
 
+    # One winning CELL per type, and it was actually measured as a pair --
+    # the (nrfiles, qd) the host file records is the geometry that produced
+    # the number, not two per-axis winners glued together. numjobs stays a
+    # dash: it is always the host's usable cores, which the tuner derives.
     : > "$WORK_DIR/cal.results"
     local bwnj ionj bwnr bwfs ionr iofs
     for host in "${HOSTS[@]}"; do
         bwq=-; ioq=-; bwnj=-; ionj=-; bwnr=-; bwfs=-; ionr=-; iofs=-
-        for dirn in read write; do
-            f="$WORK_DIR/cal/knee-bw-$dirn.$host"
-            if [ -f "$f" ]; then
-                k=$(cat "$f")
-                if [ "$bwq" = - ] || [ "$k" -gt "$bwq" ]; then bwq=$k; fi
-            fi
-            f="$WORK_DIR/cal/knee-iops-$dirn.$host"
-            if [ -f "$f" ]; then
-                k=$(cat "$f")
-                if [ "$ioq" = - ] || [ "$k" -gt "$ioq" ]; then ioq=$k; fi
-            fi
-        done
-        [ ! -s "$WORK_DIR/cal/nj-bw.$host" ] || read -r bwnj _ < "$WORK_DIR/cal/nj-bw.$host"
-        [ ! -s "$WORK_DIR/cal/nj-iops.$host" ] || read -r ionj _ < "$WORK_DIR/cal/nj-iops.$host"
-        [ ! -s "$WORK_DIR/cal/nrwin-bw.$host" ] || read -r bwnr bwfs < "$WORK_DIR/cal/nrwin-bw.$host"
-        [ ! -s "$WORK_DIR/cal/nrwin-iops.$host" ] || read -r ionr iofs < "$WORK_DIR/cal/nrwin-iops.$host"
+        [ ! -s "$WORK_DIR/cal/gridwin-bw.$host" ] \
+            || read -r bwq bwnr bwfs < "$WORK_DIR/cal/gridwin-bw.$host"
+        [ ! -s "$WORK_DIR/cal/gridwin-iops.$host" ] \
+            || read -r ioq ionr iofs < "$WORK_DIR/cal/gridwin-iops.$host"
         if [ "$bwq" != - ] || [ "$ioq" != - ]; then
             printf '%s %s %s %s %s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" \
                 "$bwnr" "$bwfs" "$ionr" "$iofs" >> "$WORK_DIR/cal.results"
