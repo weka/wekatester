@@ -2827,6 +2827,24 @@ t_assert "pressure: no run dir means no capture, no error" bash -c '
      snapshot_pressure start)
     [ ! -f "$d/oplog" ]'
 
+# --- -h documents every option the parser accepts ---
+# Drift here is silent: an option added to parse_args works but is invisible,
+# which is how -x/--duration shipped undocumented in the synopsis.
+t_assert "help: every parsed option appears in -h" bash -c '
+    h=$(./wekatester -h)
+    miss=""
+    for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -c -v -h \
+             --output --engine --password --targets --duration --unlink \
+             --auto --ignore-capacity --identity --customize --version --help; do
+        case "$h" in
+            *"$o"*) ;;
+            *) miss="$miss $o";;
+        esac
+    done
+    [ -z "$miss" ] || { echo "not documented in -h:$miss" >&2; false; }'
+t_assert "help: --help is accepted and prints the same text as -h" bash -c '
+    diff <(./wekatester -h) <(./wekatester --help)'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh

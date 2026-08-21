@@ -22,7 +22,8 @@ wekatester uses fio's native client/server mode:
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|hybrid]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h] [--] [server ...]
+                  [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [--] [server ...]
        wekatester -s results.json
        wekatester --version
 
@@ -77,9 +78,9 @@ attaching is the way to pass a value that starts with a dash.
                  that uses them (a failed run keeps them for the rerun)
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
-  -v             increase output verbosity (repeatable)
+  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
   --version      display version number and exit
-  -h             show this help and exit
+  -h, --help     show this help and exit
   --             everything after this is a server name
 
 With no server given, the test runs on the local host -- no ssh required.
