@@ -2689,9 +2689,11 @@ t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in bot
      # is fractionally faster but far more expensive, and must NOT win.
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
+         (*find*) return 0;;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
          (*qd16-nr8.job*) cal_json 2100;;
          (*qd2-nr4.job*)  cal_json 2090;;
+         (*cal-seed.job*) cal_json 1000;;
          (*-nr*.job*)     cal_json 1000;;
          (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
      esac; }
@@ -2702,10 +2704,79 @@ t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in bot
     esac &&
     grep -q "^h1 2 - - - 4 512M - -$" "$d/cal.results" &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
-    grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
+    ! grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
+    case "$out" in *"keeping the scratch grid"*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd2-nr4.job"'
 # The 2 x nrfiles cap is the whole point of the grid shape: a row must never
 # be asked for a queue deeper than twice its file count.
+# The grid needs file f at the LARGEST size any row asks of it, so one seed
+# covers every row and both types: 2048M for file 0 down to 256M for 4-7,
+# 5120M per job where per-row seeding wrote 10240M.
+t_assert "cal_seed_sizes: the union is the largest size any row asks per file" bash -c '
+    out=$( (source ./wekatester; cal_seed_sizes "bw read
+bw write
+iops read") | tr "\n" " " )
+    [ "$out" = "0 2048 1 1024 2 512 3 512 4 256 5 256 6 256 7 256 " ] ||
+        { echo "$out" >&2; false; }'
+t_assert "cal_seed_sizes: iops alone needs a quarter of the bw working set" bash -c '
+    out=$( (source ./wekatester; cal_seed_sizes "iops read") | tr "\n" " " )
+    [ "$out" = "0 512 1 256 2 128 3 128 4 64 5 64 6 64 7 64 " ] ||
+        { echo "$out" >&2; false; }'
+# Incremental: a file already at or above the needed size is left alone, so a
+# warm scratch seeds nothing and a cold one seeds exactly the shortfall.
+t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the union" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal"
+    printf "ncpus 4\n" > "$d/probe/h1"      # -> 4 usable cores, so 4 jobs
+    # cold: nothing exists
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; DIRECTORY=/mnt/weka
+     TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in (*find*) return 0;; esac
+         echo "$2" >> "$d/ran"; printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
+     cal_seed_grid h1) >/dev/null 2>&1
+    # 4 jobs x 8 filenums = 32 sections, and the sizes are the union
+    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 32 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
+    grep -q "^filesize=2048M$" "$d/cal/h1/cal-seed.job" &&
+    grep -q "^filesize=256M$" "$d/cal/h1/cal-seed.job" || exit 1
+    # warm: every file already present and big enough -> no fio invocation
+    rm -f "$d/ran"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; DIRECTORY=/mnt/weka
+     TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*find*) for j in 0 1 2 3; do for f in 0 1 2 3 4 5 6 7; do
+                      echo "h1.cal.$j.$f 2147483648"; done; done; return 0;;
+     esac; echo "$2" >> "$d/ran"; }
+     cal_seed_grid h1) >/dev/null 2>&1
+    [ ! -f "$d/ran" ] || { echo "warm scratch still ran: $(cat "$d/ran")" >&2; exit 1; }
+    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 0 ]'
+
+# The scratch is the expensive part of a calibration, so it survives the run
+# for the next one to reuse -- unless -u, which removes data files by contract.
+t_assert "calibrate: -u removes the scratch grid, the default keeps it" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    run_one() {   # run_one <unlink> -> the oplog
+        rm -rf "$d/oplog" "$d/cal"
+        (source ./tests/helpers.sh; source ./wekatester
+         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; UNLINK=$1
+         printf "ncpus 4\n" > "$d/probe/h1"
+         copy_to_master() { :; }
+         run_host() { case "$2" in
+             (*find*) return 0;;
+             (*rm\ -rf*) echo "RM: $2" >> "$d/oplog"; return 0;;
+         esac; cal_json 1000; }
+         calibrate) >/dev/null 2>&1
+    }
+    run_one 0; grep -q "wekatester-cal" "$d/oplog" 2>/dev/null && { echo "default removed it" >&2; exit 1; }
+    run_one 1; grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog"'
+
 t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
@@ -2717,7 +2788,7 @@ t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*) :;;
+         (*mkdir*|*rm\ -rf*|*find*) :;;
          (*) echo "$2" >> "$d/cells";;
      esac; cal_json 1000; }
      calibrate) >/dev/null 2>&1
@@ -2739,7 +2810,7 @@ t_assert "calibrate: the iops nr=2 row runs the deep qd ladder, other rows stay 
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*) :;;
+         (*mkdir*|*rm\ -rf*|*find*) :;;
          (*) echo "$2" >> "$d/cells";;
      esac; cal_json 1000; }
      calibrate) >/dev/null 2>&1

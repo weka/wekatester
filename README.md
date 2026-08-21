@@ -78,7 +78,9 @@ attaching is the way to pass a value that starts with a dash.
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
-                 that uses them (a failed run keeps them for the rerun)
+                 that uses them (a failed run keeps them for the rerun), and
+                 the calibration scratch grid, which is otherwise kept so the
+                 next calibration can reuse it
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
@@ -213,6 +215,19 @@ read cannot be recorded over one that wrecks write. If no cell clears the bar
 in both, the cell with the best worst-direction ratio wins and the shortfall
 is logged as a warning. Every seed is followed by a short settle so its write
 backlog destages before the first measured cell.
+
+**The scratch grid is seeded once, incrementally, and kept.** Every cell reads
+`<host>.cal.<job>.<filenum>`; rows differ only in how many of those files they
+touch and how much of each they use, so the grid needs file *f* sized to the
+largest any row asks of it — 2048M for file 0 down to 256M for files 4–7 with
+the default ladder. That union is 5120M per job where per-row seeding wrote
+10240M, because per-row seeding re-created the same filenames at four sizes
+per type and then did it again for the other type; iops now needs no seed of
+its own, since every file it wants already exists and is larger. A file
+already at or above the size the grid needs is left alone (size is a
+sufficient test — laid-out files cannot be sparse on weka), so the scratch
+survives the run and the *next* calibration on that host seeds nothing at
+all. `-u` removes it, exactly as it removes the workload's own data files.
 
 The winning cell's (nrfiles, filesize, iodepth) is recorded into the host
 file under the usual rules — filling empty fields only, overwriting under

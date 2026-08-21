@@ -426,7 +426,9 @@ attaching is the way to pass a value that starts with a dash.
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
-                 that uses them (a failed run keeps them for the rerun)
+                 that uses them (a failed run keeps them for the rerun), and
+                 the calibration scratch grid, which is otherwise kept so the
+                 next calibration can reuse it
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
@@ -1182,6 +1184,121 @@ for s in data.get("client_stats", []):
 PYEOF
 }
 
+# The union file requirement across the whole grid. Every measured cell reads
+# <host>.cal.<jobnum>.<filenum>; rows differ only in how MANY of those files
+# they touch and how much of each they use (fio's filesize caps a job at a
+# prefix of a larger file). So the grid needs, per job, file f sized to the
+# LARGEST filesize any row asks of it -- with the default ladder that is
+# 2048M for file 0, 1024M for file 1, 512M for 2-3, 256M for 4-7.
+#
+# Seeding that union writes 5120M per job where per-row seeding wrote 10240M,
+# because per-row seeding re-created the same filenames at four different
+# sizes per type and then did it again for the other type. iops needs nothing
+# of its own: every file it wants already exists, larger, from the bw rows.
+cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
+    python3 - "$1" "$CAL_NR_LADDER" <<'PYEOF' || return 1
+import sys
+ladders, nrl = sys.argv[1], sys.argv[2].split()
+types = {l.split()[0] for l in ladders.splitlines() if l.strip()}
+total = {"bw": 2048, "iops": 512}          # MiB of working set per job, per type
+need = {}
+for t in types & set(total):
+    for nr in (int(n) for n in nrl):
+        fsz = total[t] // nr
+        for f in range(nr):
+            need[f] = max(need.get(f, 0), fsz)
+if not need:
+    sys.exit(1)
+for f in sorted(need):
+    print(f, need[f])
+PYEOF
+}
+
+# One seed pass for the whole grid, incremental: a file that already exists at
+# or above the size the grid needs is left alone, so a re-run against a warm
+# scratch seeds nothing at all. Size is a sufficient test here for the same
+# reason it is for the main layout -- laid-out files cannot be sparse on weka.
+cal_seed_grid() {   # cal_seed_grid <host>...
+    local sizes host hd nj eng cpus listing f cmd want missing nfiles nmib
+    sizes=$(cal_seed_sizes "$ladders") || die "cannot compute the calibration seed plan"
+    missing=0
+    for host in "$@"; do
+        hd=$(host_dir "$host")
+        nj=$(usable_cores "$host") || die "$host: cannot size the calibration seed"
+        eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
+        if [ -z "$eng" ] && [ -f "$WORK_DIR/engine.results" ]; then
+            eng=$(awk -v h="$host" '$1 == h && $3 == "ok" {print $2; exit}' \
+                "$WORK_DIR/engine.results")
+        fi
+        [ -n "$eng" ] || eng=psync
+        cpus=""
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        [ -n "$cpus" ] || cpus=$(usable_cores "$host" list) || cpus=""
+        listing=$(run_host "$host" \
+            "find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n' 2>/dev/null || true") \
+            || die "$host: cannot inspect the calibration scratch"
+        mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
+        # the listing goes in a file, not a pipe: "python3 - <<EOF" already
+        # takes its stdin from the heredoc that carries the script
+        printf '%s\n' "$listing" > "$WORK_DIR/cal/$host/scratch.list"
+        want=$(python3 - "$host" "$nj" "$sizes" \
+                   "$hd/$CAL_SCRATCH" "$eng" "$cpus" \
+                   "$WORK_DIR/cal/$host/cal-seed.job" \
+                   "$WORK_DIR/cal/$host/scratch.list" <<'PYEOF'
+import sys
+host, nj, sizes_raw, directory, eng, cpus, outpath, listpath = sys.argv[1:9]
+need = {}
+for line in sizes_raw.splitlines():
+    f, mib = line.split()
+    need[int(f)] = int(mib)
+have = {}
+for line in open(listpath):
+    p = line.split()
+    if len(p) == 2 and p[1].isdigit():
+        have[p[0]] = int(p[1])
+todo, mib_total = [], 0
+for j in range(int(nj)):
+    for f, mib in sorted(need.items()):
+        name = "%s.cal.%d.%d" % (host, j, f)
+        if have.get(name, 0) >= mib * 1024 * 1024:
+            continue          # already big enough: a cell just uses a prefix
+        todo.append((j, f, name, mib))
+        mib_total += mib
+out = ["[global]", "directory=%s" % directory, "unique_filename=0",
+       "ioengine=%s" % eng, "direct=1", "bs=1Mi", "rw=write",
+       "create_on_open=1", "nrfiles=1"]
+if cpus:
+    out += ["cpus_allowed=%s" % cpus, "cpus_allowed_policy=split"]
+for j, f, name, mib in todo:
+    out += ["[seed-%d-%d]" % (j, f), "filename=%s" % name, "filesize=%dM" % mib]
+with open(outpath, "w") as fh:
+    fh.write("\n".join(out) + "\n")
+print(len(todo), mib_total)
+PYEOF
+              ) || die "$host: cannot build the calibration seed"
+        # NB: no "set --" here -- it would clobber the host list in "$@"
+        nfiles=${want%% *}; nmib=${want##* }
+        [ "${nfiles:-0}" -eq 0 ] || missing=$((missing + 1))
+        debug "cal: $host: seed needs ${nfiles:-0} file(s), ${nmib:-0} MiB"
+    done
+    if [ "$missing" -eq 0 ]; then
+        log "cal: the scratch grid on every host already satisfies the grid -- no seeding needed"
+        return 0
+    fi
+    copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
+        || die "cannot copy the calibration seed to $MASTER"
+    cmd="'$FIO_BIN' --output-format=json --eta=never"
+    for host in "$@"; do
+        cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-seed.job'"
+    done
+    log "cal: seeding the scratch grid on $# host(s)..."
+    run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-seed.json" \
+        || die "calibration seed failed (output in $WORK_DIR/cal/res-seed.json)"
+    check_fio_errors "$WORK_DIR/cal/res-seed.json" layout \
+        || die "calibration seed errored on a host (output in $WORK_DIR/cal/res-seed.json)"
+    sleep "$CAL_SETTLE"   # let the seed's write backlog destage
+}
+
 # The calibration engine. Per type it measures a GRID of (nrfiles x iodepth)
 # cells rather than sweeping each axis with the other frozen, because the
 # host file records the pair and only a measured pair can be trusted: with
@@ -1229,6 +1346,21 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd prevjson prevqd curjson cmd f
+    # One seed for the whole grid, before any measuring: every host that needs
+    # at least one type calibrated gets the union file set created once.
+    local seedhosts=()
+    for host in "${HOSTS[@]}"; do
+        for type in bw iops; do
+            printf '%s\n' "$ladders" | grep -q "^$type " || continue
+            if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
+            if [ "$REGEN_LAYOUT" -ne 0 ] \
+                    || [ -z "$(targets_field "$host" "$fieldno" "$WORK_DIR/targets.final")" ]; then
+                seedhosts+=("$host"); break
+            fi
+        done
+    done
+    [ ${#seedhosts[@]} -eq 0 ] || cal_seed_grid "${seedhosts[@]}"
+
     local gains h v g human bwq ioq k nj ok gridpick short
     for type in bw iops; do
         if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
@@ -1287,28 +1419,8 @@ calibrate() {
                 done
             fi
             [ -n "$gridqds" ] || continue
-            # Seed this row's scratch grid: the working set is held constant
-            # across rows (more files, each proportionally smaller), so the
-            # comparison is file count, not capacity.
-            CAL_NRFILES=$nrn CAL_FILESIZE=$nrfsz \
-                stage_cal_step "$type" write 1 "$WORK_DIR/cal" "${todo[@]}"
-            for host in "${todo[@]}"; do
-                f="$WORK_DIR/cal/$host/cal-$type-write-qd1-nr$nrn.job"
-                { grep -v '^time_based=\|^runtime=\|^ramp_time=' "$f"; echo 'create_on_open=1'; } > "$f.seed" \
-                    && mv "$f.seed" "$f" || die "cannot derive the nr=$nrn seed for $host"
-            done
-            copy_to_master "$WORK_DIR/cal/"* "$TARGET_DIR.cal/" \
-                || die "cannot copy the nr=$nrn seed to $MASTER"
-            cmd="'$FIO_BIN' --output-format=json --eta=never"
-            for host in "${todo[@]}"; do
-                cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-$type-write-qd1-nr$nrn.job'"
-            done
-            log "cal: seeding the $type grid at nrfiles=$nrn on ${#todo[@]} host(s)..."
-            run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" \
-                || die "grid seed nr=$nrn failed (output in $WORK_DIR/cal/res-$type-nr$nrn-seed.json)"
-            check_fio_errors "$WORK_DIR/cal/res-$type-nr$nrn-seed.json" layout \
-                || die "grid seed nr=$nrn errored on a host"
-            sleep "$CAL_SETTLE"   # let the seed's write backlog destage
+            # No per-row seeding: cal_seed_grid already created every file the
+            # whole grid needs, each at the largest size any row asks of it.
             for qd in $gridqds; do
                 for dirn in write read; do
                     printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
@@ -1469,15 +1581,23 @@ LATEOF
             || log "WARNING: could not snapshot the calibration artifacts into $RUN_DIR/cal" >&2
     fi
 
+    # The scratch is KEPT by default so the next calibration seeds nothing:
+    # cal_seed_grid validates by size, and re-creating the grid is the single
+    # most expensive part of a run. -u removes it, exactly as it removes the
+    # workload's own data files.
     pids=(); hs=()
-    for host in "${HOSTS[@]}"; do
-        run_host "$host" "rm -rf '$(host_dir "$host")/$CAL_SCRATCH'" &
-        pids+=($!); hs+=("$host")
-    done
-    for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" \
-            || log "WARNING: could not remove the calibration scratch on ${hs[$i]}" >&2
-    done
+    if [ "$UNLINK" -eq 1 ]; then
+        for host in "${HOSTS[@]}"; do
+            run_host "$host" "rm -rf '$(host_dir "$host")/$CAL_SCRATCH'" &
+            pids+=($!); hs+=("$host")
+        done
+        for i in "${!pids[@]}"; do
+            wait "${pids[$i]}" \
+                || log "WARNING: could not remove the calibration scratch on ${hs[$i]}" >&2
+        done
+    else
+        log "cal: keeping the scratch grid ($CAL_SCRATCH under each destination) so the next calibration reuses it; -u removes it"
+    fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
 }
