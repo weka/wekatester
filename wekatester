@@ -1992,14 +1992,18 @@ establish_connections() {
 # Remote fact-gathering snippet. Dumb by design: emits raw lines, all
 # interpretation happens locally in the tuner.
 probe_remote_cmd() {
-    # weka pins its dedicated io threads per-thread, not per-process: the
-    # process-level mask (/proc/<pid>/status) is just whatever the main
-    # thread has, so it must be read per-task instead (/proc/<pid>/task/*/status),
-    # deduped remotely -- interpretation of which masks are dedicated vs.
-    # floating utility threads happens locally in the tuner.
+    # One wekanode PROCESS per weka node, each pinned to the one core it
+    # owns: its process-level mask (/proc/<pid>/status, i.e. the main
+    # thread's) IS that core, and the MANAGEMENT node -- which owns no core
+    # -- carries a wide mask instead. Read per-process, never per-task: a
+    # node's auxiliary threads are pinned to single cpus too, and counting
+    # those invents cores weka does not own. Measured on isca224: per-task
+    # scanning reported 4-27 where weka's own core_id list is 14-27, and
+    # those ten phantom cores were then excluded from every fio job.
+    # Interpretation of dedicated vs. floating masks happens in the tuner.
     printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || echo 0)\"; \
-        for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/task/*/status; done \
+        for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \

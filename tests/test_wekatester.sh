@@ -2448,6 +2448,34 @@ t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
         *"no pinned cores detected"*) echo "$out" >&2; false;;
         *) grep -q "^cpus_allowed=0-7$" "$FIX/jobs/h1/011-bw.job";;
     esac'
+# Field regression (isca224, 2026-08-21): weka owned cores 14-27 by its own
+# core_id list, but the probe scanned /proc/<pid>/task/*/status and unioned
+# every single-cpu THREAD mask, reporting 4-27 -- so an operator asking for
+# 4-13,28-55 silently lost 4-13 to ten cores weka does not own. The probe
+# reads per-process masks now; one wekanode process owns one core.
+t_assert "pinning: only the cores weka's node processes own are excluded (isca224)" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    { printf "ncpus 56\nwekanode 15\ntaskset 0-55\nisolated 4-55\n"
+      printf "weka_allowed 0-3\n"
+      for c in $(seq 14 27); do printf "weka_allowed %s\n" "$c"; done; } > "$d/probe/h1"
+    printf "h1\t-\t-\t4-13,28-55\t-\n" > "$d/targets.final"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        check_cpu_pinning) 2>&1 )
+    case "$out" in *overlap*|*"executing on the remainder"*) echo "$out" >&2; false;; *) true;; esac &&
+    [ "$(cat "$d/auth/h1.cpus")" = "4-13,28-55" ]'
+t_assert "usable_cores: a node's auxiliary threads are not extra weka cores (isca224)" \
+    test "$(uc "ncpus 56
+weka_allowed 0-3
+$(for c in $(seq 14 27); do printf 'weka_allowed %s\n' "$c"; done)")" = 42
+# The regression was in WHERE the probe looks, so pin that down directly.
+t_assert "probe: weka cpu masks come from the process, not its threads" bash -c '
+    out=$(source ./wekatester; probe_remote_cmd)
+    case "$out" in
+        *"task/*/status"*) echo "probe still scans per-task: $out" >&2; false;;
+        *"/proc/\$p/status"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 t_assert "pinning: a mixed isolated+housekeeping list is allowed with a note (split saves it)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     out=$( (source ./wekatester
