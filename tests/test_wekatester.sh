@@ -1658,6 +1658,25 @@ t_assert "-e stamps every staged variant, the generated layout included" bash -c
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
     grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-layout.job"'
 
+# --- engine ranking: a tie goes to io_uring, never to read order ---
+# max() over a dict returns the first maximum in INSERTION order, so with one
+# io_uring job and one libaio job the winner used to be whichever jobfile the
+# scan happened to reach first.
+t_assert "layout: an engine tie is broken by ENGINE_ORDER, not jobfile read order" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src"
+    # libaio sorts first by filename, so read order favours it
+    printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
+    printf "# report iops\n[global]\nioengine=io_uring\nfilesize=1G\nnumjobs=1\n[b]\nrw=randread\n" > "$d/src/031-b.job"
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    grep -q "^ioengine=io_uring$" "$d/src/000-wekatester-layout.job"'
+t_assert "layout: a genuine majority still wins over ENGINE_ORDER" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src"
+    printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
+    printf "# report iops\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[b]\nrw=randread\n" > "$d/src/031-b.job"
+    printf "# report latency\n[global]\nioengine=io_uring\nfilesize=1G\nnumjobs=1\n[c]\nrw=randread\n" > "$d/src/021-c.job"
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    grep -q "^ioengine=libaio$" "$d/src/000-wekatester-layout.job"'
+
 # --- deterministic filenames: unique_filename=0 + <host>. prefix ---
 # fio client mode invents its own filename prefix (version-dependent) unless
 # unique_filename=0; wekatester needs exact paths for the dir grid, capacity,

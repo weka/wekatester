@@ -2352,6 +2352,16 @@ LAT_NRFILES = 8    # the one QD1 latency job still walks a small spread
 IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64
 ENGINE_ORDER = ["io_uring", "libaio", "psync"]
 
+def pick_engine(tally):
+    # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
+    # libaio over psync -- instead of to whichever jobfile happened to be
+    # read first, which is what plain max() over a dict gives you. Same
+    # order decides the no-engine-declared fallback.
+    if not tally:
+        return ENGINE_ORDER[0]
+    rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
+    return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
+
 def warn(msg): print(f"WARNING: {msg}", file=sys.stderr)
 
 _warned = set()
@@ -2545,7 +2555,7 @@ def derive_layout_variant(h):
                 kept.append(a)
         return kept
 
-    best = max(engines, key=lambda e: engines[e]) if engines else "libaio"
+    best = pick_engine(engines)
     out = [f"# re-derived by wekatester auto[{label}] from this host's tuned variants",
            "[global]", f"directory={directory}",
            f"cpus_allowed={fmt_cpulist(facts[h]['usable'])}",
@@ -2864,6 +2874,17 @@ import hashlib, os, re, sys
 src, outdir = sys.argv[1], sys.argv[2]
 MARKER = "# wekatester-layout: generated"
 NAME = "000-wekatester-layout.job"
+ENGINE_ORDER = ["io_uring", "libaio", "psync"]
+
+def pick_engine(tally):
+    # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
+    # libaio over psync -- instead of to whichever jobfile happened to be
+    # read first, which is what plain max() over a dict gives you. Same
+    # order decides the no-engine-declared fallback.
+    if not tally:
+        return ENGINE_ORDER[0]
+    rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
+    return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
 
 def parse_size(s):
     m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
@@ -2945,7 +2966,7 @@ body.append("# Edit freely: an edited layout job is preserved (regenerate with -
 body.append("[global]")
 body.append(f"directory={directory or '/mnt/weka'}")
 body.append("create_serialize=0")
-best_engine = max(engines, key=lambda e: engines[e]) if engines else "libaio"
+best_engine = pick_engine(engines)
 body.append(f"ioengine={best_engine}")
 n = 0
 for key in sorted(namespaces):
