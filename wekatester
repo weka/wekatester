@@ -942,10 +942,11 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
         fi
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        # no operator pin: use the tuner's own usable set (isolated minus
-        # weka, or everything minus weka) -- an unpinned ladder lands on the
-        # housekeeping cpus weka shares and measures THAT contention instead
-        # of the client's ceiling (seen live: 0.6GB/s knees on an 18GB/s box)
+        # no operator pin: use the tuner's own usable set (every cpu except
+        # the cores weka's node processes are pinned to) -- an unpinned
+        # ladder is free to land anywhere, including weka's own cores, and
+        # measures THAT contention instead of the client's ceiling (seen
+        # live: 0.6GB/s knees on an 18GB/s box)
         if [ -z "$cpus" ]; then
             cpus=$(usable_cores "$host" list) \
                 || die "$host: cannot derive the calibration cpu set"
