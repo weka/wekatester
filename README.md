@@ -20,7 +20,7 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|hybrid]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|hybrid[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -41,11 +41,14 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max|cal|hybrid]
+  -a, --auto [safe|max|cal|hybrid[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: measure a per-client nrfiles x iodepth grid before staging
                           hybrid: same grid, seeded from a formula rung
+                          :secs shortens each grid cell from the 30s default
+                          (cal:15); it does not change how long the measured
+                          jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -197,7 +200,10 @@ the one exception: it ignores the cap and runs the full deep ladder (to
 qd 256), so a deep-queue peak stays discoverable. `numjobs` is not an axis —
 it is the host's usable cores throughout.
 
-Every cell runs ~32s (30s measured after a 2s ramp) on ALL clients at once,
+Every cell runs ~32s by default (30s measured after a 2s ramp) on ALL
+clients at once — `-a cal:15` shortens the measured part, trading
+resolution for wall clock, which matters because the verdict compares
+cells whose differences can be a few percent —
 so every number is that client's ceiling under contention, the condition the
 real jobs run in; and every cell is measured in BOTH laddered directions.
 Each type then takes ONE verdict: the **cheapest cell — shallowest queue

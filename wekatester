@@ -368,7 +368,7 @@ edit_jobfile() {   # edit_jobfile <path>
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|hybrid]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|hybrid[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -389,11 +389,14 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max|cal|hybrid]
+  -a, --auto [safe|max|cal|hybrid[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: measure a per-client nrfiles x iodepth grid before staging
                           hybrid: same grid, seeded from a formula rung
+                          :secs shortens each grid cell from the 30s default
+                          (cal:15); it does not change how long the measured
+                          jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -484,6 +487,33 @@ normalize_opt() {   # normalize_opt <token>
         -?*)     printf '%s%s' "$(lower "${1:0:2}")" "${1:2}" ;;
         *)       printf '%s' "$1" ;;
     esac
+}
+
+# -a takes a level and, for the measuring levels, an optional per-cell
+# duration: "cal:15" runs each grid cell for 15 measured seconds instead of
+# the 30s default. This is the CALIBRATION cell length; -x/--duration sets
+# how long the measured jobs run, and the two are independent.
+set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
+    local raw=$1 flag=$2 lvl secs
+    lvl=$(lower "${raw%%:*}")
+    case "$lvl" in
+        (safe|max|cal|hybrid) ;;
+        (*) usage >&2; die "unknown auto level: ${raw} (safe|max|cal|hybrid)" ;;
+    esac
+    if [ "$raw" != "${raw%%:*}" ]; then
+        secs=${raw#*:}
+        case "$lvl" in
+            (cal|hybrid) ;;
+            (*) usage >&2
+                die "$flag: a cell duration applies only to cal or hybrid, not $lvl" ;;
+        esac
+        case "$secs" in
+            (""|*[!0-9]*|0) usage >&2
+                die "$flag: the cell duration must be whole seconds > 0, got: $secs" ;;
+        esac
+        CAL_RUNTIME=$secs
+    fi
+    AUTO_LEVEL=$lvl
 }
 
 parse_args() {
@@ -600,22 +630,19 @@ parse_args() {
                 AUTO_LEVEL="max"
                 # The level is a keyword, not a value, so it is matched
                 # case-insensitively too -- and only consumed when it really is
-                # one, otherwise it is the first server name.
+                # one, otherwise it is the first server name. A ":secs" suffix
+                # rides along with the keyword.
                 arg=$(lower "${2:-}")
-                case "$arg" in safe|max|cal|hybrid) AUTO_LEVEL=$arg; shift ;; esac
+                case "${arg%%:*}" in
+                    (safe|max|cal|hybrid) set_auto_level "$2" "$1"; shift ;;
+                esac
                 shift ;;
             --auto=*)
-                AUTO_LEVEL=$(lower "${opt#--auto=}")
-                case "$AUTO_LEVEL" in safe|max|cal|hybrid) ;; *)
-                    usage >&2; die "unknown auto level: ${opt#--auto=} (safe|max|cal|hybrid)" ;;
-                esac
+                set_auto_level "${opt#--auto=}" --auto
                 shift ;;
             -a?*)
                 opt_val "$opt" -a
-                AUTO_LEVEL=$(lower "$OPT_VAL")
-                case "$AUTO_LEVEL" in safe|max|cal|hybrid) ;; *)
-                    usage >&2; die "unknown auto level: $OPT_VAL (safe|max|cal|hybrid)" ;;
-                esac
+                set_auto_level "$OPT_VAL" -a
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             # -i is repeatable and each value may be a comma list of
@@ -966,7 +993,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             printf 'numjobs=%s\n' "$nj"
             printf 'iodepth=%s\n' "$qd"
             printf 'time_based=1\n'
-            printf 'runtime=30\n'
+            printf 'runtime=%s\n' "$CAL_RUNTIME"
             printf 'ramp_time=2\n'
             if [ -n "$cpus" ]; then
                 printf 'cpus_allowed=%s\n' "$cpus"
@@ -1057,6 +1084,10 @@ PYEOF
 # Ladder rungs per tier. cal searches from the bottom; hybrid starts at half
 # a formula rung (per-weka-core budgets pick the start, the ladder still
 # proves it), so a well-behaved client confirms in two or three steps.
+CAL_RUNTIME=${CAL_RUNTIME:-30}  # measured seconds per grid cell (plus a 2s
+                         # ramp). "-a cal:15" sets this per run; shorter cells
+                         # trade resolution for wall clock, and the verdict
+                         # compares cells whose differences can be small.
 CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed before measuring: the seed's
                          # write backlog destages under the first rung
                          # otherwise (seen live: bw-write qd1 reads ~15% low

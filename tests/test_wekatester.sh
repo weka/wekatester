@@ -2747,6 +2747,36 @@ t_assert "calibrate: the iops nr=2 row runs the deep qd ladder, other rows stay 
     nr4=$(grep -o "qd[0-9]*-nr4\." "$d/cells" | sed "s/qd//;s/-nr4.//" | sort -un | tr "\n" " ")
     [ "$nr2" = "1 2 4 8 16 32 64 128 256 " ] || { echo "nr2 qds: $nr2" >&2; false; } &&
     [ "$nr4" = "1 2 4 8 " ] || { echo "nr4 qds: $nr4" >&2; false; }'
+# -a cal:15 sets the CALIBRATION cell length; -x sets the measured jobs.
+t_assert "parse: -a cal:15 sets the cell duration in all three spellings" bash -c '
+    for form in "-a cal:15" "-acal:15" "--auto=cal:15"; do
+        out=$( (source ./wekatester; parse_args $form h1
+                echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
+        [ "$out" = "cal 15" ] || { echo "$form -> $out" >&2; exit 1; }
+    done
+    out=$( (source ./wekatester; parse_args -a hybrid:5 h1; echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
+    [ "$out" = "hybrid 5" ] || { echo "hybrid:5 -> $out" >&2; exit 1; }
+    # bare level keeps the default
+    out=$( (source ./wekatester; parse_args -a cal h1; echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
+    [ "$out" = "cal 30" ] || { echo "bare cal -> $out" >&2; exit 1; }'
+t_assert "parse: a cell duration is rejected on non-measuring levels and on junk" bash -c '
+    for bad in "max:15" "safe:15" "cal:0" "cal:abc" "cal:"; do
+        if (source ./wekatester; parse_args -a "$bad" h1) >/dev/null 2>&1; then
+            echo "accepted $bad" >&2; exit 1
+        fi
+    done
+    # a server name that merely contains a colon is still a server, not a level
+    out=$( (source ./wekatester; parse_args -a host:1 2>/dev/null; echo "$AUTO_LEVEL") 2>&1 | tail -1 )
+    [ "$out" = max ] || { echo "host:1 -> $out" >&2; exit 1; }'
+t_assert "cal: the cell duration reaches the staged grid jobfile" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); DIRECTORY=/mnt/weka; CAL_RUNTIME=15
+     printf "ncpus 8\n" > "$d/probe/h1"
+     stage_cal_step bw read 4 "$d/cal" h1)
+    grep -q "^runtime=15$" "$d/cal/h1/cal-bw-read-qd4.job" &&
+    grep -q "^ramp_time=2$" "$d/cal/h1/cal-bw-read-qd4.job"'
+
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
     (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&
