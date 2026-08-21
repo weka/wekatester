@@ -805,16 +805,20 @@ PYEOF
 # Usable cores for ONE host, by the tuner's own rule -- the same arithmetic
 # auto_tune's facts block does for its cpus_allowed/numjobs stamping, exposed
 # so a calibration ladder sizes numjobs identically (a divergence would make
-# "the knee arrived below full cores" a lie). Two rules, both lab-derived:
+# "the knee arrived below full cores" a lie). ONE rule: everything except the
+# cpus weka has pinned.
 #   - weka pins each dedicated io thread to exactly ONE cpu (a single-cpu task
 #     mask), while utility threads carry wide masks and float. Only single-cpu
 #     masks are dedicated cores; counting the wide ones collapses the union
 #     onto "all cpus" and leaves nothing usable.
-#   - with isolcpus in play, the isolated set minus weka's own is what the box
-#     set aside for exactly this work (an affinity mask MIXING isolated and
-#     housekeeping cpus silently collapses onto the housekeeping partition),
-#     and when weka owns every isolated cpu the housekeeping cpus are the
-#     fallback -- both branches exactly as the tuner has them.
+#   - isolcpus does NOT narrow the set. It used to: fio was pinned to the
+#     isolated cpus minus weka's, on the theory that the isolated partition
+#     was set aside for exactly this work. Measured on saving-calf
+#     (2026-08-20), that theory cost throughput -- isolating cpus was 4-7%
+#     WORSE on write iops at every housekeeping-core count tried, and the
+#     widest mask won, because what fio wants is the largest number of
+#     distinct physical cores. A mask spanning both partitions is safe:
+#     cpus_allowed_policy=split gives every job its own cpu.
 # Prints the COUNT, and fails loudly rather than printing 0: numjobs=0 is no
 # valid fio job, so a ladder sized from an unreadable probe must not run.
 usable_cores() {   # usable_cores <host> [list] -> count, or the cpu list itself
@@ -850,10 +854,6 @@ for line in open(path):
         if len(cpuset) == 1:      # single-cpu mask = a dedicated io thread
             weka |= cpuset
 usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
-if iso:
-    usable = sorted(iso - weka) \
-        or sorted(set(range(ncpus)) - weka - iso) \
-        or usable
 if not usable:
     sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
 if sys.argv[2] == "list":
@@ -1998,6 +1998,7 @@ probe_remote_cmd() {
     # deduped remotely -- interpretation of which masks are dedicated vs.
     # floating utility threads happens locally in the tuner.
     printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
+        echo \"wekanode \$(pgrep -xc wekanode || echo 0)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/task/*/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
@@ -2380,11 +2381,12 @@ def parse_size(s):
 # --- probe facts ---
 facts = {}
 for h in hosts:
-    ncpus, weka, engines, iso = 0, set(), [], set()
+    ncpus, weka, engines, iso, nodes = 0, set(), [], set(), 0
     for line in open(os.path.join(work, "probe", h)):
         f = line.split()
         if not f: continue
         if f[0] == "ncpus": ncpus = int(f[1])
+        elif f[0] == "wekanode": nodes = int(f[1])
         elif f[0] == "isolated" and len(f) > 1:
             iso = parse_cpulist(f[1])
         elif f[0] == "weka_allowed":
@@ -2397,24 +2399,24 @@ for h in hosts:
             if len(cpuset) == 1:
                 weka |= cpuset
         elif f[0] == "engines": engines = f[1:]
+    # Everything except the cpus weka pinned. isolcpus deliberately does NOT
+    # narrow this: on saving-calf (2026-08-20) isolating cpus measured 4-7%
+    # worse on write iops than the stock kernel at every housekeeping-core
+    # count, and the widest mask won -- fio wants distinct physical cores,
+    # and cpus_allowed_policy=split keeps each job on its own cpu even when
+    # the mask spans both partitions.
     usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
-    if iso:
-        # isolcpus: an affinity mask MIXING isolated and housekeeping cpus
-        # silently collapses onto the housekeeping partition (seen live:
-        # every fio worker crammed onto the 4 shared cpus). The isolated
-        # cpus are what the box set aside for exactly this work: pin to
-        # them, minus weka's own.
-        usable_iso = sorted(iso - weka)
-        if usable_iso:
-            # expected behavior on an isolcpus box, so a note, not a warning
-            print(f"note: {h}: isolcpus detected; pinning fio to isolated "
-                  f"cpus {fmt_cpulist(usable_iso)} (housekeeping cpus "
-                  f"excluded)", file=sys.stderr)
-            usable = usable_iso
-        else:
-            warn(f"{h}: isolcpus detected but weka owns every isolated cpu; "
-                 f"falling back to the housekeeping cpus")
-            usable = sorted(set(range(ncpus)) - weka - iso) or usable
+    if nodes and not weka:
+        # the pin detection is the only thing keeping fio off weka's cores;
+        # if weka is running and none were found, say so rather than
+        # silently handing fio the whole machine
+        warn(f"{h}: {nodes} wekanode process(es) running but no pinned cores "
+             f"detected -- fio will be allowed on every cpu, including "
+             f"weka's; check that this weka pins its io threads")
+    if iso and (set(usable) & iso) and (set(usable) - iso):
+        print(f"note: {h}: fio cpus {fmt_cpulist(usable)} span isolated and "
+              f"housekeeping cpus; per-job split affinity keeps each job on "
+              f"its own cpu", file=sys.stderr)
     facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable,
                 "engines": engines, "isolated": sorted(iso)}
 

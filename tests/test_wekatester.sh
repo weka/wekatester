@@ -1342,15 +1342,16 @@ weka_allowed 0,3-4
 weka_allowed 0-7')" = 8
 t_assert "usable_cores: no weka at all leaves every core usable" \
     test "$(uc 'ncpus 4')" = 4
-# isolcpus: the isolated set minus weka's own is what the box set aside for
-# this work, exactly as the tuner narrows its cpus_allowed.
-t_assert "usable_cores: isolcpus narrows to the isolated set minus weka" \
+# isolcpus does NOT narrow the set: weka's pinned cores are the only thing
+# subtracted (saving-calf 2026-08-20 -- isolating cost 4-7% write iops and the
+# widest mask won; split affinity makes a cross-partition mask safe).
+t_assert "usable_cores: isolcpus does not narrow the set" \
     test "$(uc 'ncpus 8
 isolated 4-7
 weka_allowed 4
 weka_allowed 0
-weka_allowed 1')" = 3
-t_assert "usable_cores: weka owning every isolated cpu falls back to housekeeping" \
+weka_allowed 1')" = 5
+t_assert "usable_cores: weka owning every isolated cpu just leaves the rest" \
     test "$(uc 'ncpus 8
 isolated 4-7
 weka_allowed 4
@@ -1926,9 +1927,9 @@ t_assert "cal steps: no operator pin means the tuner usable set, never unpinned"
      printf "ncpus 8\nisolated 4-7\nweka_allowed 4\n" > "$d/probe/h1"
      stage_cal_step bw read 8 "$d/cal" h1)
     f=$d/cal/h1/cal-bw-read-qd8.job
-    grep -q "^cpus_allowed=5,6,7$" "$f" &&
+    grep -q "^cpus_allowed=0,1,2,3,5,6,7$" "$f" &&
     grep -q "^cpus_allowed_policy=split$" "$f" &&
-    grep -q "^numjobs=3$" "$f"'
+    grep -q "^numjobs=7$" "$f"'
 t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -2417,13 +2418,36 @@ t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
 
 # --- isolcpus awareness (field: isca224, isolcpus=domain,4-55) ---
-t_assert "tuner: isolcpus pins usable cores to the isolated set minus weka" bash -c '
+t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "isolated 4-7\n" >> "$FIX/probe/h1"
     printf "isolated 4-7\n" >> "$FIX/probe/h2"
-    (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^cpus_allowed=4-7$" "$FIX/jobs/h1/011-bw.job"'
+    out=$( (source ./wekatester
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    grep -q "^cpus_allowed=3-7$" "$FIX/jobs/h1/011-bw.job" &&
+    case "$out" in *"span isolated and housekeeping"*) true;; *) echo "$out" >&2; false;; esac'
+# The pin detection is now the ONLY thing keeping fio off weka's cores, so a
+# detection that comes back empty while weka is running has to be audible.
+t_assert "tuner: weka running with no pinned cores found warns loudly" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    out=$( (source ./wekatester
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    case "$out" in
+        *"wekanode process(es) running but no pinned cores detected"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    out=$( (source ./wekatester
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    case "$out" in
+        *"no pinned cores detected"*) echo "$out" >&2; false;;
+        *) grep -q "^cpus_allowed=0-7$" "$FIX/jobs/h1/011-bw.job";;
+    esac'
 t_assert "pinning: a mixed isolated+housekeeping list is allowed with a note (split saves it)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     out=$( (source ./wekatester

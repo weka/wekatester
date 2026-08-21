@@ -159,7 +159,10 @@ of trusting the jobfiles' static values. Four levels:
   jobfile, and fio pinned away from weka's cores (`cpus_allowed`). Hosts stay
   directly comparable.
 - `-a max` (default when the level is omitted) — each worker is tuned to its
-  own capability: `numjobs` = that host's usable cores, deeper iodepth,
+  own capability: `numjobs` = that host's usable cores (every cpu except the
+  ones weka has pinned — `isolcpus` does not narrow it further, because the
+  widest mask measured fastest and `cpus_allowed_policy=split` keeps each job
+  on its own cpu), deeper iodepth,
   and iops/latency files shrink to 1G with a small per-job spread (2
   files per job; the single latency job gets 8) IN PLACE -- the namespace stays the jobfile's own, so `-a` runs and
   plain runs share one on-disk grid and reuse each other's files. (An earlier release sized this against backend
