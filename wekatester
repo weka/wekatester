@@ -1264,9 +1264,11 @@ for j in range(int(nj)):
             continue          # already big enough: a cell just uses a prefix
         todo.append((j, f, name, mib))
         mib_total += mib
+# fallocate=none: see generate_layout. The incremental skip below trusts
+# size, which is only sound if a partial write leaves a short file.
 out = ["[global]", "directory=%s" % directory, "unique_filename=0",
        "ioengine=%s" % eng, "direct=1", "bs=1Mi", "rw=write",
-       "create_on_open=1", "nrfiles=1"]
+       "fallocate=none", "create_on_open=1", "nrfiles=1"]
 if cpus:
     out += ["cpus_allowed=%s" % cpus, "cpus_allowed_policy=split"]
 for j, f, name, mib in todo:
@@ -2586,7 +2588,7 @@ def derive_layout_variant(h):
     out = [f"# re-derived by wekatester auto[{label}] from this host's tuned variants",
            "[global]", f"directory={directory}",
            f"cpus_allowed={fmt_cpulist(facts[h]['usable'])}",
-           "create_serialize=0", f"ioengine={best}"]
+           "create_serialize=0", "fallocate=none", f"ioengine={best}"]
     n = 0
     for key in sorted(namespaces):
         ns = namespaces[key]
@@ -2992,6 +2994,13 @@ body.append("# all files exist on all machines before any measured test starts."
 body.append("# Edit freely: an edited layout job is preserved (regenerate with -g).")
 body.append("[global]")
 body.append(f"directory={directory or '/mnt/weka'}")
+# fallocate=none is what makes the layout sweep's size test sound. fio
+# defaults to fallocate=native on Linux, which gives a file its full
+# st_size instantly and only then writes the data -- so a layout killed
+# part way leaves a full-size file full of zeros, which the sweep credits
+# as complete and never rewrites. Without preallocation an interrupted
+# create leaves a SHORT file, which the sweep deletes and recreates.
+body.append("fallocate=none")
 body.append("create_serialize=0")
 best_engine = pick_engine(engines)
 body.append(f"ioengine={best_engine}")
@@ -4359,10 +4368,17 @@ PYEOF
 # sweep stats what actually exists: per namespace, one find deletes every
 # file whose SIZE deviates from the grid spec and one find counts the bytes
 # that match, so create_only then writes exactly what is missing and the
-# capacity check credits what already exists. Size is the whole test: on
-# weka, laid-out files cannot be sparse (fio's create paths write through
-# and weka materializes what they write), so a size-complete file is a
-# complete file. Runs before the capacity check; a dry run never mutates,
+# capacity check credits what already exists.
+#
+# Size is the whole test, and that is only sound because the layout job
+# sets fallocate=none. fio defaults to fallocate=native on Linux, which
+# gives a file its full st_size before any data is written -- a layout
+# killed part way then leaves a full-size file of zeros that this sweep
+# credits as complete and never rewrites, and the run measures reads of
+# nothing. With preallocation off, a partial create leaves a SHORT file,
+# which fails the size test and is deleted. A set that ships its OWN
+# layout job keeps it (only -g regenerates), so a hand-written layout job
+# wants fallocate=none too. Runs before the capacity check; a dry run never mutates,
 # so it skips the sweep and prices the full grid.
 sweep_layout_grid() {
     [ "$DRY_RUN" -eq 0 ] || return 0

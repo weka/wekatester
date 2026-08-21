@@ -1658,6 +1658,27 @@ t_assert "-e stamps every staged variant, the generated layout included" bash -c
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
     grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-layout.job"'
 
+# fio defaults to fallocate=native on Linux: full st_size first, data after.
+# An interrupted layout would then leave a full-size file of zeros that the
+# layout sweep credits as complete, and the run measures reads of nothing.
+t_assert "layout: the generated layout job disables preallocation" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src"
+    printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    grep -q "^fallocate=none$" "$d/src/000-wekatester-layout.job"'
+t_assert "cal: the calibration seed disables preallocation" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal"
+    printf "ncpus 4\n" > "$d/probe/h1"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; DIRECTORY=/mnt/weka
+     TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in (*find*) return 0;; esac
+         printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
+     cal_seed_grid h1) >/dev/null 2>&1
+    grep -q "^fallocate=none$" "$d/cal/h1/cal-seed.job"'
+
 # --- engine ranking: a tie goes to io_uring, never to read order ---
 # max() over a dict returns the first maximum in INSERTION order, so with one
 # io_uring job and one libaio job the winner used to be whichever jobfile the
