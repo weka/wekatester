@@ -20,7 +20,7 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|hybrid[:secs]]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -41,11 +41,10 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max|cal|hybrid[:secs]]
+  -a, --auto [safe|max|cal[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: measure a per-client nrfiles x iodepth grid before staging
-                          hybrid: same grid, seeded from a formula rung
                           :secs shortens each grid cell from the 30s default
                           (cal:15); it does not change how long the measured
                           jobs run -- that is -x/--duration
@@ -180,9 +179,6 @@ of trusting the jobfiles' static values. Four levels:
   instead of guessing it: a per-client iodepth ladder runs before staging,
   and the knees it finds are cached in `hostlist.csv`. The answer to "why
   these numbers" becomes "measured on your clients against this cluster."
-- `-a hybrid` — the same ladder as `cal`, but seeded from a formula-derived
-  rung instead of starting from scratch, so it confirms a good starting
-  point rather than searching for one.
 
 How calibration works: before staging, the set is inspected for what it
 actually runs — bandwidth and/or iops grids, read and/or write directions;
@@ -203,18 +199,35 @@ qd 256), so a deep-queue peak stays discoverable. `numjobs` is not an axis —
 it is the host's usable cores throughout.
 
 Every cell runs ~32s by default (30s measured after a 2s ramp) on ALL
-clients at once — `-a cal:15` shortens the measured part, trading
-resolution for wall clock, which matters because the verdict compares
-cells whose differences can be a few percent —
-so every number is that client's ceiling under contention, the condition the
-real jobs run in; and every cell is measured in BOTH laddered directions.
-Each type then takes ONE verdict: the **cheapest cell — shallowest queue
-first, then fewest files — that still delivers 98% of the best in every
-measured direction**. Requiring both directions means a geometry that suits
-read cannot be recorded over one that wrecks write. If no cell clears the bar
-in both, the cell with the best worst-direction ratio wins and the shortfall
-is logged as a warning. Every seed is followed by a short settle so its write
-backlog destages before the first measured cell.
+clients at once, so every number is that client's ceiling under contention —
+the condition the real jobs run in. `-a cal:15` shortens the measured part.
+Within a row, **direction is the outer loop**: all of a row's writes, one
+settle, then all of its reads, so a read never lands straight on top of a
+write of the same files.
+
+Before the grid, one cell (`nr=2/qd=4`) is **measured three times per
+direction** to find the spread this box actually has. That matters because
+the verdict compares every cell against the best cell, and the best of
+twenty-odd noisy samples is biased high — on a flat surface a fixed band
+would admit nothing and the tie-break would degenerate into picking the
+luckiest cell. The acceptance band is therefore `max(CAL_KNEE_PCT, 100 − 2 ×
+spread)` per direction: a quiet channel keeps its tight band, a noisy one
+opens up and the **cheapest indistinguishable** cell wins, which is what the
+knee rule meant all along. The measured spread is printed with the verdict,
+alongside the winner's and the peak's absolute throughput — so a grid that
+measured nothing at all is visible as a number, not just as a ratio.
+
+Each type then takes ONE verdict: the cheapest cell — shallowest queue first,
+then fewest files — that clears the band in every measured direction.
+Requiring both directions means a geometry that suits read cannot be recorded
+over one that wrecks write. If no cell clears it in both, the cell with the
+best worst-direction ratio wins and the shortfall is logged as a warning.
+
+The iops **deep queue ladder is earned, not automatic**: nine extra queue
+depths in both directions is roughly 45% of the iops budget, so it runs only
+when the capped grid's best cell sits at the deepest queue tried — that is,
+when the curve has not turned over yet and there may be more above it. When
+iops peaks inside the cap, those cells are skipped.
 
 **The scratch grid is seeded once, incrementally, and kept.** Every cell reads
 `<host>.cal.<job>.<filenum>`; rows differ only in how many of those files they
@@ -301,7 +314,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth);
 - `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`), plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, and `sar-end` (the sysstat log slice covering the run window, when the box keeps one). A host missing a tool records `not available` instead of failing the run;
-- `cal/` — on `-a cal`/`-a hybrid` runs, every calibration rung's jobfile and raw JSON plus `cal.results`.
+- `cal/` — on `-a cal` runs, every calibration cell's jobfile and raw JSON plus `cal.results`.
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 

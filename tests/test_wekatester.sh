@@ -297,7 +297,7 @@ t_assert "auto staging with override stages every host" bash -c '
     { test -f "$FIX/jobs/h1/011-bw.job" ||
       { echo "coordinator h1 not staged: argument shift?" >&2; false; }; } &&
     test -f "$FIX/jobs/h2/011-bw.job"'
-# The calibration engine does not exist yet (tasks 3-6), so cal/hybrid must
+# The calibration engine does not exist yet (tasks 3-6), so cal must
 # size EXACTLY like max in the meantime: stage_variants normalizes the tier
 # it hands to auto_tune, rather than the tuner python learning a third value
 # that would silently miss max-gated rules (engine forcing, small-file ns).
@@ -1185,20 +1185,20 @@ t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" b
     (source ./wekatester; parse_args -a=MAX h1; [ "$AUTO_LEVEL" = max ]) &&
     err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >/dev/null )
     case "$err" in
-        *"unknown auto level: bogus (safe|max|cal|hybrid)"*) true;;
+        *"unknown auto level: bogus (safe|max|cal)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "parse: -a cal, -Ahybrid and --auto=cal set the level; cal_mode true only for cal/hybrid" bash -c '
+t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal" bash -c '
     (source ./wekatester; parse_args -a cal h1;    [ "$AUTO_LEVEL" = cal ]) &&
-    (source ./wekatester; parse_args -Ahybrid h1;  [ "$AUTO_LEVEL" = hybrid ]) &&
+    (source ./wekatester; parse_args -ACAL h1;     [ "$AUTO_LEVEL" = cal ]) &&
     (source ./wekatester; parse_args --auto=cal h1; [ "$AUTO_LEVEL" = cal ]) &&
     err=$( (source ./wekatester; parse_args -acalx h1) 2>&1 >/dev/null )
     case "$err" in
-        *"unknown auto level: calx (safe|max|cal|hybrid)"*) true;;
+        *"unknown auto level: calx (safe|max|cal)"*) true;;
         *) echo "$err" >&2; false;;
     esac &&
+    ! (source ./wekatester; parse_args -ahybrid h1) 2>/dev/null &&
     (source ./wekatester; AUTO_LEVEL=cal;    cal_mode) &&
-    (source ./wekatester; AUTO_LEVEL=hybrid; cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=safe; cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
@@ -1674,7 +1674,8 @@ t_assert "cal: the calibration seed disables preallocation" bash -c '
      TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
      ladders="bw read"
      copy_to_master() { :; }
-     run_host() { case "$2" in (*find*) return 0;; esac
+     run_host() { case "$2" in (*find*) return 0;;
+         (*df*) echo 99999999; return 0;; esac
          printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_grid h1) >/dev/null 2>&1
     grep -q "^fallocate=none$" "$d/cal/h1/cal-seed.job"'
@@ -2692,8 +2693,10 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
 # A run_host stub answers each rung with fabricated JSON whose per-rung values
 # walk 100%/90%/10%/0% gains: the knee must land at qd=4 (the last rung that
 # gained >= CAL_GAIN_PCT), and the scratch dirs must be created and removed.
-cal_json() {   # cal_json <bw_bytes> -> fio-style client_stats JSON on stdout
-    printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": 10, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1"
+cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
+    # the value lands in BOTH bw_bytes and iops so the same helper drives a
+    # bw-mode grid (cal_gains keys on bw_bytes) and an iops-mode one (iops)
+    printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1" "$1"
 }
 export -f cal_json
 t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in both directions" bash -c '
@@ -2711,6 +2714,7 @@ t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in bot
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
          (*qd16-nr8.job*) cal_json 2100;;
          (*qd2-nr4.job*)  cal_json 2090;;
@@ -2754,7 +2758,8 @@ t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the unio
      TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
      ladders="bw read"
      copy_to_master() { :; }
-     run_host() { case "$2" in (*find*) return 0;; esac
+     run_host() { case "$2" in (*find*) return 0;;
+         (*df*) echo 99999999; return 0;; esac
          echo "$2" >> "$d/ran"; printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_grid h1) >/dev/null 2>&1
     # 4 jobs x 8 filenums = 32 sections, and the sizes are the union
@@ -2769,6 +2774,7 @@ t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the unio
      ladders="bw read"
      copy_to_master() { :; }
      run_host() { case "$2" in
+         (*df*) echo 99999999; return 0;;
          (*find*) for j in 0 1 2 3; do for f in 0 1 2 3 4 5 6 7; do
                       echo "h1.cal.$j.$f 2147483648"; done; done; return 0;;
      esac; echo "$2" >> "$d/ran"; }
@@ -2791,6 +2797,7 @@ t_assert "calibrate: -u removes the scratch grid, the default keeps it" bash -c 
          copy_to_master() { :; }
          run_host() { case "$2" in
              (*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
              (*rm\ -rf*) echo "RM: $2" >> "$d/oplog"; return 0;;
          esac; cal_json 1000; }
          calibrate) >/dev/null 2>&1
@@ -2810,6 +2817,7 @@ t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) :;;
+         (*df*) echo 99999999; return 0;;
          (*) echo "$2" >> "$d/cells";;
      esac; cal_json 1000; }
      calibrate) >/dev/null 2>&1
@@ -2817,57 +2825,97 @@ t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
     got=$(grep -o "qd[0-9]*-nr[0-9]*" "$d/cells" | sort -u | sed "s/qd//;s/-nr/ /" | awk "{print \$2\"/\"\$1}" | sort -n -t/ -k1 -k2 | tr "\n" " ")
     [ "$got" = "1/1 1/2 2/1 2/2 2/4 4/1 4/2 4/4 4/8 8/1 8/2 8/4 8/8 8/16 " ] ||
         { echo "cells staged: $got" >&2; false; }'
-# iops keeps the deep ladder on its nr=2 row so a deep-queue peak stays
-# findable (saving-calf: iops read peaked at qd=256); every other row is
-# still capped at 2 x nrfiles.
-t_assert "calibrate: the iops nr=2 row runs the deep qd ladder, other rows stay capped" bash -c '
+# The band must follow the box's measured spread. With a noisy probe the
+# cheapest cell wins even though it is well under the peak; under a fixed 98%
+# band only the peak cell itself would have qualified, which is how a grid
+# ends up chasing its own variance.
+t_assert "calibrate: a noisy probe widens the band so the cheapest cell wins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
-    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
-    (source ./tests/helpers.sh
-     source ./wekatester
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*|*find*) :;;
-         (*) echo "$2" >> "$d/cells";;
-     esac; cal_json 1000; }
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
+     esac
+     case "$2" in
+         (*qd4-nr2.job*)  # the probe cell: three very different answers
+             n=$(cat "$d/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$d/n"
+             case "$n" in (1) cal_json 1000;; (2) cal_json 1400;; (*) cal_json 1200;; esac;;
+         (*qd16-nr8.job*) cal_json 1500;;   # the peak, and the most expensive cell
+         (*qd1-nr1.job*)  cal_json 1300;;   # 87% of peak, and the cheapest cell
+         (*)              cal_json 900;;
+     esac; }
+     calibrate) 2>&1 )
+    # a fixed 98% band would have forced 8/16; the measured spread admits 1/1
+    case "$out" in
+        *"grid picks nrfiles=1 qd=1"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+# The deep qd ladder is EARNED, not automatic: 9 extra qds x 2 directions is
+# ~45% of the iops budget, so it runs only when the capped grid's best cell
+# sits at the deepest queue tried -- i.e. the curve has not turned over.
+t_assert "calibrate: the iops deep row is skipped when the curve turns over inside the cap" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
+     esac; echo "$2" >> "$d/cells"
+     # qd=1 is best, so the curve turned over immediately
+     case "$2" in (*qd1-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
      calibrate) >/dev/null 2>&1
     nr2=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
-    nr4=$(grep -o "qd[0-9]*-nr4\." "$d/cells" | sed "s/qd//;s/-nr4.//" | sort -un | tr "\n" " ")
-    [ "$nr2" = "1 2 4 8 16 32 64 128 256 " ] || { echo "nr2 qds: $nr2" >&2; false; } &&
-    [ "$nr4" = "1 2 4 8 " ] || { echo "nr4 qds: $nr4" >&2; false; }'
-# -a cal:15 sets the CALIBRATION cell length; -x sets the measured jobs.
-t_assert "parse: -a cal:15 sets the cell duration in all three spellings" bash -c '
-    for form in "-a cal:15" "-acal:15" "--auto=cal:15"; do
-        out=$( (source ./wekatester; parse_args $form h1
-                echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
-        [ "$out" = "cal 15" ] || { echo "$form -> $out" >&2; exit 1; }
-    done
-    out=$( (source ./wekatester; parse_args -a hybrid:5 h1; echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
-    [ "$out" = "hybrid 5" ] || { echo "hybrid:5 -> $out" >&2; exit 1; }
-    # bare level keeps the default
-    out=$( (source ./wekatester; parse_args -a cal h1; echo "$AUTO_LEVEL $CAL_RUNTIME") 2>&1 | tail -1 )
-    [ "$out" = "cal 30" ] || { echo "bare cal -> $out" >&2; exit 1; }'
-t_assert "parse: a cell duration is rejected on non-measuring levels and on junk" bash -c '
-    for bad in "max:15" "safe:15" "cal:0" "cal:abc" "cal:"; do
-        if (source ./wekatester; parse_args -a "$bad" h1) >/dev/null 2>&1; then
-            echo "accepted $bad" >&2; exit 1
-        fi
-    done
-    # a server name that merely contains a colon is still a server, not a level
-    out=$( (source ./wekatester; parse_args -a host:1 2>/dev/null; echo "$AUTO_LEVEL") 2>&1 | tail -1 )
-    [ "$out" = max ] || { echo "host:1 -> $out" >&2; exit 1; }'
-t_assert "cal: the cell duration reaches the staged grid jobfile" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
-    (source ./wekatester
-     WORK_DIR=$d; HOSTS=(h1); DIRECTORY=/mnt/weka; CAL_RUNTIME=15
-     printf "ncpus 8\n" > "$d/probe/h1"
-     stage_cal_step bw read 4 "$d/cal" h1)
-    grep -q "^runtime=15$" "$d/cal/h1/cal-bw-read-qd4.job" &&
-    grep -q "^ramp_time=2$" "$d/cal/h1/cal-bw-read-qd4.job"'
+    [ "$nr2" = "1 2 4 " ] || { echo "nr2 qds: $nr2" >&2; false; }'
+t_assert "calibrate: the iops deep row runs when the best cell sits at the cap" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
+     esac; echo "$2" >> "$d/cells"
+     # qd=16 (the deepest the cap allows) is best, so keep climbing
+     case "$2" in (*qd16-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
+     calibrate) 2>&1 )
+    nr2=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
+    [ "$nr2" = "1 2 4 32 64 128 256 " ] || { echo "nr2 qds: $nr2" >&2; exit 1; }
+    case "$out" in *"extending the nr=2 row"*) true;; *) echo "$out" >&2; false;; esac'
+# The verdict must report real numbers, not just ratios: a grid that measured
+# nothing (reads of a hollow layout) looks identical in percentage terms.
+t_assert "calibrate: the verdict logs absolute values and the measured noise" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
+     esac; cal_json 1073741824; }
+     calibrate) 2>&1 )
+    case "$out" in
+        *"read 1.00GiB/s"*"noise 0.0%"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
@@ -2890,20 +2938,34 @@ t_assert "-x stamps runtime+time_based on measured variants, never the layout" b
     l="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&
     ! grep -q "^runtime=77$" "$l"'
-t_assert "calibrate: a host-file-supplied qd skips that ladder; -g re-measures" bash -c '
+# A COMPLETE recorded tuple (fs, nr, qd) skips the grid; a partial one does
+# not, because the grid records the three together and half of them is not a
+# geometry anyone measured.
+t_assert "calibrate: a complete host-file tuple skips that grid, a partial one does not" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
-    printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t-\n" > "$d/targets.final"
-    out=$( (source ./wekatester
-     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
-     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set
-     copy_to_master() { :; }
-     run_host() { return 0; }
-     calibrate) 2>&1 )
+    run_cal() {   # run_cal <targets.final row>
+        printf "%b\n" "$1" > "$d/targets.final"
+        rm -f "$d/cal.results"
+        (source ./wekatester
+         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+         SET_DIR_OVERRIDE=$d/set
+         copy_to_master() { :; }
+         run_host() { return 0; }
+         calibrate) 2>&1
+    }
+    # fs=1G nr=2 qd=8 -> complete, skipped
+    out=$(run_cal "h1\t-\t-\t-\t-\t-\t1G\t2\t8\t-\t-\t-\t-\t-\t-\t-\t-")
     case "$out" in *"already carries bw geometry -- reusing"*) true;; *) echo "$out" >&2; false;; esac &&
-    [ ! -s "$d/cal.results" ]'
-t_assert "calibrate: no-op below cal/hybrid" bash -c '
+    [ ! -s "$d/cal.results" ] &&
+    # qd alone -> incomplete, must NOT be treated as cached
+    out=$(run_cal "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t-")
+    case "$out" in
+        *"already carries bw geometry -- reusing"*) echo "$out" >&2; false;;
+        *) true;;
+    esac'
+t_assert "calibrate: no-op below cal" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
      AUTO_LEVEL=max; WORK_DIR=$d
