@@ -3189,6 +3189,10 @@ host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth:nj/fs/nr/qd,l
 # hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
 # Example:  client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,1///1,12/1G/56/64
 # Example:  ,,io_uring,,,,,        (io_uring for every host that supports it)
+# A host may be written as <name>/<machine-id>; the id is ignored when the
+# row is read and only ever added by wekatester itself, to name a machine it
+# is recording for the first time. Plain hostnames are equally valid, and a
+# row you wrote keeps the spelling you gave it.
 CSVEOF
     log "created host file $1"
 }
@@ -3218,6 +3222,67 @@ custom_set_probe_dir() {
 # opens the fresh template), never a stray ./hostlist.csv. Without -C,
 # nothing anywhere creates ./hostlist.csv with the usual confirmation.
 # Without -t no file is ever used (except a -C set's own, always honored).
+# --- host identity: what the host FILE calls a machine ------------------------
+# Internally a host is an ADDRESS: what ssh connects to, what fio is handed as
+# --client=, a path component under $WORK_DIR, and the prefix of every data
+# file on the worker. None of that may contain a slash, and in local mode it
+# has to stay "localhost" so fio keeps talking to a loopback server.
+#
+# The host FILE wants something else: "localhost" identifies nothing, and a
+# bare hostname collides the moment two labs share a file. So an
+# automatically written row carries <name>/<machine-id> -- the name is the
+# address (or the real short hostname in local mode), the id is the machine.
+# Rows a person wrote are left exactly as written; the id is never required.
+#
+# Reading, the id is stripped and the name mapped back to an address, so
+# nothing downstream ever sees it.
+
+# Machine id, cached per host. product_uuid is the mainboard's and survives a
+# reinstall, but is root-only on most kernels; machine-id is world-readable
+# and survives everything except a reimage. Either identifies the box far
+# better than "localhost"; neither is required.
+host_machine_id() {   # host_machine_id <host>
+    local host=$1 cache="$WORK_DIR/ident/$1.id"
+    [ -d "$WORK_DIR/ident" ] || mkdir -p "$WORK_DIR/ident"
+    if [ ! -f "$cache" ]; then
+        run_host "$host" "cat /sys/class/dmi/id/product_uuid 2>/dev/null \
+            || cat /etc/machine-id 2>/dev/null || true" 2>/dev/null \
+            | tr -d '[:space:]' | tr 'A-Z' 'a-z' > "$cache" || : > "$cache"
+    fi
+    cat "$cache"
+}
+
+# The name this host should be called in the host file. Local mode is the
+# whole point: the address is "localhost", the name is what the box calls
+# itself.
+host_ident_name() {   # host_ident_name <host>
+    local host=$1 n
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        n=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+        printf '%s' "${n:-$host}"
+    else
+        printf '%s' "$host"
+    fi
+}
+
+# "<name>/<machine-id>", or just the name when no id could be read.
+host_identity() {   # host_identity <host>
+    local n id
+    n=$(host_ident_name "$1"); id=$(host_machine_id "$1")
+    [ -n "$id" ] && printf '%s/%s' "$n" "$id" || printf '%s' "$n"
+}
+
+# name=address pairs for the CSV readers, so a row written as
+# "isca224/<id>" resolves to the address the run actually uses.
+host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
+    local h n out=""
+    for h in "$@"; do
+        n=$(host_ident_name "$h")
+        [ "$n" = "$h" ] || out="$out${out:+,}$n=$h"
+    done
+    printf '%s' "$out"
+}
+
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
     local candidate cdir
@@ -3290,11 +3355,26 @@ writeback_targets() {
     # file-only resolution (no CLI merge): what does the FILE itself provide?
     resolve_targets phase2 "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
         > "$WORK_DIR/targets.fileonly" 2>/dev/null || : > "$WORK_DIR/targets.fileonly"
+    local h ident=""
+    for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
+    WEKATESTER_HOST_IDENT=$ident \
     python3 - "$wb" "$mode" "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "host file writeback failed ($wb)"
 import csv, os, re, sys
 
 wb, mode, work = sys.argv[1:4]
 hosts = sys.argv[4:]
+
+def _kv(name):
+    return dict(kv.split("=", 1)
+                for kv in os.environ.get(name, "").split(",") if "=" in kv)
+
+ALIAS = _kv("WEKATESTER_HOST_ALIAS")     # name in the file -> address we use
+IDENT = _kv("WEKATESTER_HOST_IDENT")     # address -> "<name>/<machine-id>"
+
+def host_addr(cell):
+    name = cell.split("/", 1)[0].strip()
+    return ALIAS.get(name, name)
 FIELDS = ("login", "engine", "cpus", "dir",
           "bw_nj", "bw_fs", "bw_nr", "bw_qd",
           "lat_nj", "lat_fs", "lat_nr", "lat_qd",
@@ -3370,14 +3450,18 @@ if not updates:
 
 # comment out superseded host lines, then append the new ones
 lines = open(wb).read().splitlines()
-out = []
+out, seen_cell = [], {}
 for line in lines:
     try:
         row = next(csv.reader([line]))
     except StopIteration:
         row = []
     h = row[0].strip() if row else ""
-    if h and not h.startswith("#") and h.lower() != "host" and h in updates:
+    addr = host_addr(h) if h else ""
+    if h and not h.startswith("#") and h.lower() != "host" and addr in updates:
+        # a row the operator already wrote keeps its own spelling of the host,
+        # machine-id or not -- automation only names a machine it is adding
+        seen_cell.setdefault(addr, h)
         out.append("# superseded by -a: " + line)
     else:
         out.append(line)
@@ -3393,7 +3477,8 @@ for host in hosts:
     if host not in updates:
         continue
     want = updates[host]
-    w.writerow([host, want.get("login", ""), want.get("engine", ""),
+    cell = seen_cell.get(host) or IDENT.get(host, host)
+    w.writerow([cell, want.get("login", ""), want.get("engine", ""),
                 want.get("cpus", ""), want.get("dir", ""),
                 geom(want, "bw"), geom(want, "lat"), geom(want, "iops")])
 with open(wb, "w") as fp:
@@ -3425,8 +3510,8 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
 }
 
 resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
-    python3 - "$@" <<'PYEOF'
-import csv, sys
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") python3 - "$@" <<'PYEOF'
+import csv, os, sys
 
 phase, path, cli_engine, cli_dir, results = sys.argv[1:6]
 hosts = sys.argv[6:]
@@ -3435,6 +3520,18 @@ FIELDS = ("login", "engine", "cpus", "dir",
           "bw_nj", "bw_fs", "bw_nr", "bw_qd",
           "lat_nj", "lat_fs", "lat_nr", "lat_qd",
           "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+
+def host_addr(cell):
+    """A host cell may be '<name>/<machine-id>' and may name the box by
+    something other than the address this run uses (local mode calls it
+    localhost). Strip the id, then map the name onto the address."""
+    name = cell.split("/", 1)[0].strip()
+    return ALIAS.get(name, name)
+
+ALIAS = dict(
+    kv.split("=", 1)
+    for kv in os.environ.get("WEKATESTER_HOST_ALIAS", "").split(",") if "=" in kv
+)
 
 def warn(msg):
     print(f"WARNING: {msg}", file=sys.stderr)
@@ -3476,7 +3573,8 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
     if lineno == 1 and row[0].strip().lower() == "host":
         continue   # header
     row = [c.strip() for c in (row + [""] * 8)[:8]]
-    host, login, engine, cpus, ddir = row[0], row[1], row[2], row[3], row[4]
+    host_cell = row[0]
+    host, login, engine, cpus, ddir = host_addr(host_cell), row[1], row[2], row[3], row[4]
     fields = {}
     if engine:
         fields["engine"] = engine
@@ -3490,9 +3588,18 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         if login:
             fields["login"] = login
         if host in host_lines:
+            prev_line, prev_cell = host_lines[host]
+            extra = ""
+            if prev_cell != host_cell:
+                # two spellings of one machine -- most likely the same short
+                # name carrying different machine-ids, which the run cannot
+                # tell apart because both resolve to the same address
+                extra = (f"; '{prev_cell}' and '{host_cell}' both resolve to "
+                         f"'{host}' -- keep the row for this machine and drop "
+                         f"the other")
             die(f"{path}:{lineno}: duplicate definition for host '{host}' "
-                f"(first at line {host_lines[host]})")
-        host_lines[host] = lineno
+                f"(first at line {prev_line}){extra}")
+        host_lines[host] = (lineno, host_cell)
         entries.append({"lineno": lineno, "host": host, "sel_login": "",
                         "sel_engine": "", "fields": fields, "nsel": 3})
     else:

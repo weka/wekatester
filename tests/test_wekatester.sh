@@ -3056,6 +3056,64 @@ t_assert "help: every parsed option appears in -h" bash -c '
 t_assert "help: --help is accepted and prints the same text as -h" bash -c '
     diff <(./wekatester -h) <(./wekatester --help)'
 
+# --- host identity: the file names the machine, not "localhost" -------------
+# "localhost" identifies nothing and collides the moment a host file is shared,
+# so a row automation ADDS carries <short hostname>/<machine-id>. Internally
+# the host stays an address: no slash ever reaches a path, a --client=, or a
+# data-file prefix.
+t_assert "identity: an auto-added local row is named for the machine, not localhost" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/ident" "$d/jobs/localhost"
+    echo "deadbeefcafe0000deadbeefcafe0000" > "$d/ident/localhost.id"
+    printf "# report bandwidth\n[global]\nioengine=libaio\nnumjobs=4\nfilesize=1G\ndirectory=/mnt/weka\n[a]\nrw=read\niodepth=8\n" > "$d/jobs/localhost/011-bw.job"
+    (source ./wekatester
+     hostname() { echo testbox; }
+     LOCAL_MODE=1; HOSTS=(localhost); WORK_DIR=$d; AUTO_LEVEL=cal; REGEN_LAYOUT=0
+     TARGETS_FILE=$d/hostlist.csv
+     write_targets_template "$d/hostlist.csv"
+     writeback_targets) >/dev/null 2>&1
+    grep -q "^testbox/deadbeefcafe0000deadbeefcafe0000," "$d/hostlist.csv" ||
+        { echo "--- host file ---"; grep -av "^#" "$d/hostlist.csv" >&2; false; }'
+# A row a person wrote keeps their spelling; automation only names what it adds.
+t_assert "identity: an existing row keeps the operator spelling on update" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/ident" "$d/jobs/localhost"
+    echo "deadbeefcafe0000deadbeefcafe0000" > "$d/ident/localhost.id"
+    printf "# report bandwidth\n[global]\nioengine=libaio\nnumjobs=4\nfilesize=1G\ndirectory=/mnt/weka\n[a]\nrw=read\niodepth=8\n" > "$d/jobs/localhost/011-bw.job"
+    (source ./wekatester
+     hostname() { echo testbox; }
+     LOCAL_MODE=1; HOSTS=(localhost); WORK_DIR=$d; AUTO_LEVEL=cal; REGEN_LAYOUT=0
+     TARGETS_FILE=$d/hostlist.csv
+     write_targets_template "$d/hostlist.csv"
+     printf "localhost,,,,/mnt/weka,,,\n" >> "$d/hostlist.csv"
+     writeback_targets) >/dev/null 2>&1
+    grep -q "^localhost," "$d/hostlist.csv" &&
+    ! grep -q "^testbox/" "$d/hostlist.csv"'
+# Reading it back: the id is stripped and the name maps to the address in use.
+t_assert "identity: a name/machine-id row resolves to the address the run uses" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/ident"
+    echo "deadbeefcafe0000deadbeefcafe0000" > "$d/ident/localhost.id"
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth,latency,iops\n" > "$d/hl.csv"
+    printf "testbox/deadbeefcafe0000deadbeefcafe0000,bob,libaio,,/mnt/other,,,\n" >> "$d/hl.csv"
+    out=$( (source ./wekatester
+      hostname() { echo testbox; }
+      LOCAL_MODE=1; WORK_DIR=$d
+      resolve_targets phase1 "$d/hl.csv" - - - localhost) 2>&1 )
+    # first field is the address, and the row was applied to it
+    case "$out" in
+        localhost*bob*libaio*/mnt/other*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+
+t_assert "identity: two spellings of one machine are a legible duplicate" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth,latency,iops\n" > "$d/hl.csv"
+    printf "node1/aaaa,,,,/mnt/weka,,,\nnode1/bbbb,,,,/mnt/weka,,,\n" >> "$d/hl.csv"
+    err=$( (source ./wekatester; WORK_DIR=$d
+            resolve_targets phase1 "$d/hl.csv" - - - node1) 2>&1 >/dev/null )
+    case "$err" in
+        *"both resolve to"*"node1"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+
 # --- README stays in sync with the real help output ---
 t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
