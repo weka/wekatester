@@ -1197,7 +1197,11 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
         *"unknown auto level: calx (safe|max|cal)"*) true;;
         *) echo "$err" >&2; false;;
     esac &&
-    ! (source ./wekatester; parse_args -ahybrid h1) 2>/dev/null &&
+    err=$( (source ./wekatester; parse_args -ahybrid h1) 2>&1 >/dev/null )
+    case "$err" in
+        *"unknown auto level: hybrid"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
     (source ./wekatester; AUTO_LEVEL=cal;    cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=safe; cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
@@ -1481,79 +1485,58 @@ t_assert "stage_cal_step: a non-numeric iodepth dies" \
 t_assert "stage_cal_step: no hosts is a caller bug, not a silent no-op" \
     cal_step_fails "no hosts" bw read 8
 
-# --- cal_gains: per-client gain between two ladder steps ---
-# Grammar consumed verbatim by the orchestrator: "<host> <value> <gain_pct>",
-# one line per client in the CURRENT step, sorted. Value = read+write SUMMED
-# over every cal-* job entry for the host (one entry per job in fio client
-# JSON); "All clients" aggregates and foreign sections never count.
-# rc is pinned BEFORE the output is transformed: piping cal_gains into tr
+# --- cal_values: per-client rung values from fio client JSON ---
+# Grammar consumed verbatim by the orchestrator: "<host> <value>", one line
+# per client in the step, sorted. Value = read+write SUMMED over every cal-*
+# job entry for the host (one entry per job in fio client JSON); "All
+# clients" aggregates and foreign sections never count. (The percent-gain
+# column and the previous-step argument went with the grid: the noise-aware
+# climb compares raw values in the orchestrator.)
+# rc is pinned BEFORE the output is transformed: piping cal_values into tr
 # would discard its status and a python traceback would read as valid output.
 CG=$(mktemp -d)
-cal_json_fixture "$CG/prev.json" \
-    'h1:1073741824:1000.0:0:0.0' 'h2:2000000000:2000.0:147483648:500.0'
 cal_json_fixture "$CG/cur.json" \
     'h1:1610612736:1100.0:0:0.0' 'h2:2133382994:2400.0:100000000:600.0'
-cal_g() {   # cal_g <prev|-> <cur> <bw|iops>; prints the lines, newlines as |
+cal_g() {   # cal_g <cur> <bw|iops>; prints the lines, newlines as |
     local out rc
-    out=$( (source ./wekatester; cal_gains "$1" "$2" "$3") ); rc=$?
-    [ "$rc" -eq 0 ] || { echo "ERROR: cal_gains exited $rc"; return "$rc"; }
+    out=$( (source ./wekatester; cal_values "$1" "$2") ); rc=$?
+    [ "$rc" -eq 0 ] || { echo "ERROR: cal_values exited $rc"; return "$rc"; }
     [ -n "$out" ] || return 0
     printf '%s\n' "$out" | tr '\n' '|'
 }
-cal_g_fails() {   # cal_g_fails <pattern> <cal_gains args>...
+cal_g_fails() {   # cal_g_fails <pattern> <cal_values args>...
     local pat=$1 err rc; shift
-    err=$( (source ./wekatester; cal_gains "$@") 2>&1 >/dev/null ); rc=$?
-    [ "$rc" -ne 0 ] || { echo "cal_gains $* unexpectedly succeeded" >&2; return 1; }
+    err=$( (source ./wekatester; cal_values "$@") 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "cal_values $* unexpectedly succeeded" >&2; return 1; }
     case "$err" in (*$pat*) return 0 ;; esac
     echo "$err" >&2; return 1
 }
 export CG
 export -f cal_g cal_g_fails cal_json_fixture
-# First step: nothing to gain over, so every client reports the full 100 --
-# and the values prove only cal-* entries count (the fixture's "create"
-# entry carries a poison 99999999999 that would show in any sum).
-t_assert "cal_gains: the first step gains 100 and sums read+write per client" \
-    test "$(cal_g - "$CG/cur.json" bw)" = "h1 1610612736 100|h2 2233382994 100|"
-t_assert "cal_gains: a multi-job step sums every job entry per host" bash -c '
+# The values prove only cal-* entries count (the fixture's "create" entry
+# carries a poison 99999999999 that would show in any sum).
+t_assert "cal_values: read+write summed per client, only cal-* entries" \
+    test "$(cal_g "$CG/cur.json" bw)" = "h1 1610612736|h2 2233382994|"
+t_assert "cal_values: a multi-job step sums every job entry per host" bash -c '
     cal_json_fixture "'"$CG"'/multi.json" "h1:1000000:10.0:0:0.0" "h1:2000000:20.0:0:0.0"
-    test "$(cal_g - "'"$CG"'/multi.json" bw)" = "h1 3000000 100|"'
-
-# 1.0 -> 1.5 GiB/s is a 50% step; h2's 4% is the freeze signal Task 5 acts on.
-t_assert "cal_gains: bw gains are percent over the previous step, per client" \
-    test "$(cal_g "$CG/prev.json" "$CG/cur.json" bw)" = "h1 1610612736 50|h2 2233382994 4|"
-# Same two files, iops mode: different metric, different answer. h1's exact
-# 10% is the boundary case -- it must survive as 10, not round to 9 or 11.
-t_assert "cal_gains: iops mode counts ios, not bytes" \
-    test "$(cal_g "$CG/prev.json" "$CG/cur.json" iops)" = "h1 1100 10|h2 3000 20|"
-t_assert "cal_gains: fio's log text before the JSON is skipped" bash -c '
+    test "$(cal_g "'"$CG"'/multi.json" bw)" = "h1 3000000|"'
+# Same file, iops mode: different metric, different answer.
+t_assert "cal_values: iops mode counts ios, not bytes" \
+    test "$(cal_g "$CG/cur.json" iops)" = "h1 1100|h2 3000|"
+t_assert "cal_values: fio's log text before the JSON is skipped" bash -c '
     { printf "client <h1>: connected\nfio: terse output\n"; cat "'"$CG"'/cur.json"; } \
         > "'"$CG"'/noisy.json"
-    test "$(cal_g - "'"$CG"'/noisy.json" bw)" = "h1 1610612736 100|h2 2233382994 100|"'
-# A client that moved nothing last step has no baseline to gain over, so any
-# measurement at all is the whole gain; still nothing measured is no gain.
-t_assert "cal_gains: a zero previous step gains 100, zero-to-zero gains 0" bash -c '
-    cal_json_fixture "'"$CG"'/zero.json" "h1:0:0.0:0:0.0" "h2:0:0.0:0:0.0"
-    [ "$(cal_g "'"$CG"'/zero.json" "'"$CG"'/cur.json" bw)" = "h1 1610612736 100|h2 2233382994 100|" ] &&
-    [ "$(cal_g "'"$CG"'/zero.json" "'"$CG"'/zero.json" bw)" = "h1 0 0|h2 0 0|" ]'
-# A ladder step can regress once the cluster is saturated. That is real data,
-# reported as it is -- and it freezes the knee just as a small gain does.
-t_assert "cal_gains: a slower step reports a negative gain" \
-    test "$(cal_g "$CG/cur.json" "$CG/prev.json" bw)" = "h1 1073741824 -34|h2 2147483648 -4|"
-# A client that only appears in the current step has no previous value: it is
-# on its first measured step, so it gains 100 rather than crashing the parse.
-t_assert "cal_gains: a client absent from the previous step is on its first step" bash -c '
-    cal_json_fixture "'"$CG"'/one.json" "h1:1073741824:1000.0:0:0.0"
-    test "$(cal_g "'"$CG"'/one.json" "'"$CG"'/cur.json" bw)" = "h1 1610612736 50|h2 2233382994 100|"'
-t_assert "cal_gains: unparsable output is an error naming the file" bash -c '
+    test "$(cal_g "'"$CG"'/noisy.json" bw)" = "h1 1610612736|h2 2233382994|"'
+t_assert "cal_values: unparsable output is an error naming the file" bash -c '
     printf "no json here at all\n" > "'"$CG"'/bad.json"
-    cal_g_fails bad.json - "'"$CG"'/bad.json" bw'
-t_assert "cal_gains: a results file with no client stats is an error" bash -c '
+    cal_g_fails bad.json "'"$CG"'/bad.json" bw'
+t_assert "cal_values: a results file with no client stats is an error" bash -c '
     printf "{\"client_stats\": [{\"jobname\": \"All clients\"}]}\n" > "'"$CG"'/agg.json"
-    cal_g_fails agg.json - "'"$CG"'/agg.json" bw'
-t_assert "cal_gains: an unknown mode is an error" \
-    cal_g_fails "unknown mode" - "$CG/cur.json" latency
-t_assert "cal_gains: a missing previous file is an error, not a silent 100" \
-    cal_g_fails nosuch "$CG/nosuch.json" "$CG/cur.json" bw
+    cal_g_fails agg.json "'"$CG"'/agg.json" bw'
+t_assert "cal_values: an unknown mode is an error" \
+    cal_g_fails "unknown mode" "$CG/cur.json" latency
+t_assert "cal_values: a missing results file is an error" \
+    cal_g_fails nosuch "$CG/nosuch.json" bw
 
 # --- -u/--unlink: a final generated job removes what the layout created ---
 t_assert "parse: -u, -U and --unlink arm the unlink job; default off" bash -c '
@@ -1934,8 +1917,8 @@ numjobs=2"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo 1073741824; echo 536870912; }
      sweep_layout_grid)
-    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -size +1073741823c -delete" "$d/oplog" &&
-    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -size +536870911c -delete" "$d/oplog" &&
+    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +1073741823c -delete" "$d/oplog" &&
+    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +536870911c -delete" "$d/oplog" &&
     [ "$(cat "$d/probe/h1.laidout")" = "1610612736" ]'
 t_assert "sweep: same-format sections cannot delete each other (exact singleton indices, size floors)" bash -c '
     d=$(mktemp -d)
@@ -1958,9 +1941,9 @@ numjobs=44"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { echo "SWEEP: $2" >> "$d/oplog"; echo 0; echo 0; }
      sweep_layout_grid)
-    grep -qF -- "-path \"/mnt/weka/h1.0/*\" ! -size +10737418239c -delete" "$d/oplog" &&
-    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -size +10737418239c" "$d/oplog" &&
-    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -size +1073741823c -delete" "$d/oplog"'
+    grep -qF -- "-path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +10737418239c -delete" "$d/oplog" &&
+    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +10737418239c" "$d/oplog" &&
+    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +1073741823c -delete" "$d/oplog"'
 t_assert "cal steps: no operator pin means the tuner usable set, never unpinned" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
     (source ./wekatester
@@ -2702,12 +2685,14 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
     esac'
 
 # --- calibrate(): the ladder orchestrator ---
-# A run_host stub answers each rung with fabricated JSON whose per-rung values
-# walk 100%/90%/10%/0% gains: the knee must land at qd=4 (the last rung that
-# gained >= CAL_GAIN_PCT), and the scratch dirs must be created and removed.
+# A run_host stub answers each rung with fabricated JSON. What the block
+# covers: a noise floor of three CAL_NOISE_QD samples whose spread widens the
+# CAL_KNEE_PCT band, a climb that stops after CAL_STOP_BELOW rungs fail to
+# beat the best by more than that noise, per-(type,direction) tuples in
+# cal.results, and a scratch that is kept unless -u.
 cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
     # the value lands in BOTH bw_bytes and iops so the same helper drives a
-    # bw-mode grid (cal_gains keys on bw_bytes) and an iops-mode one (iops)
+    # bw-mode ladder (cal_values keys on bw_bytes) and an iops-mode one (iops)
     printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1" "$1"
 }
 export -f cal_json
@@ -2817,7 +2802,10 @@ t_assert "calibrate: -u removes the calibration scratch, the default keeps it" b
          esac; cal_json 1000; }
          calibrate) >/dev/null 2>&1
     }
-    run_one 0; grep -q "wekatester-cal" "$d/oplog" 2>/dev/null && { echo "default removed it" >&2; exit 1; }
+    run_one 0
+    if [ -f "$d/oplog" ] && grep -q "wekatester-cal" "$d/oplog"; then
+        echo "default removed it" >&2; exit 1
+    fi
     run_one 1; grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog"'
 
 # The ladder stops after CAL_STOP_BELOW rungs that fail to beat the best by
@@ -3048,16 +3036,17 @@ t_assert "pressure: no run dir means no capture, no error" bash -c '
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,
 # which is how -x/--duration shipped undocumented in the synopsis.
-t_assert "help: every parsed option appears in -h" bash -c '
+t_assert "help: every parsed option appears in -h as its own token" bash -c '
+    # Word-boundary matching, not substring: "-c" must not pass because
+    # "--ignore-capacity" contains it, and a short option must not pass on
+    # the strength of its long form alone.
     h=$(./wekatester -h)
     miss=""
-    for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -c -v -h \
+    for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -C -v -h \
              --output --engine --password --targets --duration --unlink \
              --auto --ignore-capacity --identity --customize --version --help; do
-        case "$h" in
-            *"$o"*) ;;
-            *) miss="$miss $o";;
-        esac
+        printf "%s\n" "$h" | grep -qE -- "(^|[[:space:][(])${o}([^-A-Za-z0-9]|$)" ||
+            miss="$miss $o"
     done
     [ -z "$miss" ] || { echo "not documented in -h:$miss" >&2; false; }'
 t_assert "help: --help is accepted and prints the same text as -h" bash -c '
