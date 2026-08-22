@@ -1427,7 +1427,7 @@ direct=1
 bs=1Mi
 filesize=1G
 nrfiles=2
-numjobs=5
+numjobs=3
 iodepth=8
 time_based=1
 runtime=30
@@ -1658,7 +1658,7 @@ t_assert "cal: the calibration seed disables preallocation" bash -c '
      ladders="bw read"
      copy_to_master() { :; }
      run_host() { case "$2" in (*find*) return 0;;
-         (*df*) echo 99999999; return 0;; esac
+         (*df*) echo "wekafs 999999999 99999999"; return 0;; esac
          printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_scratch h1) >/dev/null 2>&1
     grep -q "^fallocate=none$" "$d/cal/h1/cal-seed.job"'
@@ -2427,7 +2427,7 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
      writeback_targets) >/dev/null
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
-    tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,4/1G/8/32,$" &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,$" &&
     (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >/dev/null)'
 t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
@@ -2443,7 +2443,7 @@ t_assert "writeback: -g overwrites without a prompt, but never login or allowed_
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
      writeback_targets) >/dev/null
-    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,4/1G/8/32,$"'
+    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$"'
 t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     d=$(wb_fixture); mkdir "$d/set"
     (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null
@@ -2452,6 +2452,21 @@ t_assert "writeback: -C set owns the target when -t was not given" bash -c '
      FAST_TRACK=1
      writeback_targets) >/dev/null
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
+# A mixed-direction file stages ONE direction's tuple, but both directions
+# were measured; the writeback must record each measured knee into its own
+# slot, never the staged tuple into both.
+t_assert "writeback: measured knees land per direction; a mixed file cannot copy one over the other" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/auth"
+    printf "ubuntu\n" > "$d/auth/h1.user"
+    printf "# report bandwidth\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1024M\nnrfiles=2\niodepth=32\nrw=rw\n" > "$d/jobs/h1/011-b.job"
+    : > "$d/engine.results"
+    printf "h1 32 2 1024M 4 2 1024M - - - - - -\n" > "$d/cal.results"
+    f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,/1024M/2/32,/1024M/2/4,,,,$" ||
+        { tail -1 "$f" >&2; false; }'
 
 # --- isolcpus awareness (field: isca224, isolcpus=domain,4-55) ---
 t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" bash -c '
@@ -2500,6 +2515,14 @@ t_assert "pinning: only the cores weka's node processes own are excluded (isca22
         check_cpu_pinning) 2>&1 )
     case "$out" in *overlap*|*"executing on the remainder"*) echo "$out" >&2; false;; *) true;; esac &&
     [ "$(cat "$d/auth/h1.cpus")" = "4-13,28-55" ]'
+t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
+    (source ./wekatester; WORK_DIR=$d
+     [ "$(usable_cores h1)" = 6 ] &&
+     [ "$(usable_cores h1 count "0-3")" = 3 ] &&
+     [ "$(usable_cores h1 list "0-3")" = "0,1,3" ] &&
+     [ "$(usable_cores h1 count "2,5")" = 2 ])'
 t_assert "usable_cores: a node's auxiliary threads are not extra weka cores (isca224)" \
     test "$(uc "ncpus 56
 weka_allowed 0-3
@@ -2712,7 +2735,7 @@ t_assert "calibrate: the knee is the shallowest qd within the noise-widened band
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
          (*cal-seed.job*) cal_json 1000;;
          (*qd1-nr2.job*)  cal_json 1000;;
@@ -2761,7 +2784,7 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
      TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
      ladders="bw read"
      copy_to_master() { :; }
-     run_host() { case "$2" in (*find*) return 0;; (*df*) echo 99999999; return 0;; esac
+     run_host() { case "$2" in (*find*) return 0;; (*df*) echo "wekafs 999999999 99999999"; return 0;; esac
          echo "$2" >> "$d/ran"; printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_scratch h1) >/dev/null 2>&1
     # 4 jobs x 2 filenums = 8 sections, each at the 1024M union size
@@ -2775,7 +2798,7 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
      ladders="bw read"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
          (*find*) for j in 0 1 2 3; do for f in 0 1; do
                       echo "h1.cal.$j.$f 2147483648"; done; done; return 0;;
      esac; echo "$2" >> "$d/ran"; }
@@ -2784,6 +2807,43 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
     [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 0 ]'
 # The scratch is the expensive part of a calibration, so it survives the run
 # for the next one to reuse -- unless -u, which removes data files by contract.
+# Each host individually fits, but they share one filesystem: the guard
+# must sum the group and compare against the SHARED free space.
+t_assert "cal_seed_scratch: shared-filesystem seeds are summed against the shared free space" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
+    printf "ncpus 2\n" > "$d/probe/h1"; printf "ncpus 2\n" > "$d/probe/h2"
+    out=$( (source ./wekatester
+     WORK_DIR=$d; MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+     DIRECTORY=/mnt/weka; AUTH_DIR=""
+     ladders="bw read"
+     copy_to_master() { :; }
+     # per host: 2 jobs x 2 files x 1024M = 4096MiB, exactly the free space
+     run_host() { case "$2" in
+         (*df*) echo "wekafs 999999 4096"; return 0;;
+         (*) return 0;;
+     esac; }
+     cal_seed_scratch h1 h2) 2>&1 )
+    case "$out" in
+        *"need=8192MiB avail=4096MiB on h1 h2"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    # a host-local source (/dev/*) is never grouped: the same shape passes
+    out=$( (source ./wekatester
+     WORK_DIR=$d; MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+     DIRECTORY=/mnt/weka; AUTH_DIR=""
+     ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*df*) echo "/dev/nvme0n1 999999 4096"; return 0;;
+         (*cal-seed.job*) printf "{ \"client_stats\": [ { \"jobname\": \"s\", \"hostname\": \"h1\", \"error\": 0, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"read\": { \"bw_bytes\": 0, \"iops\": 0, \"total_ios\": 0, \"io_bytes\": 0 } } ] }\n";;
+         (*) return 0;;
+     esac; }
+     CAL_SETTLE=0
+     cal_seed_scratch h1 h2) 2>&1 )
+    case "$out" in
+        *"not enough free space"*) echo "$out" >&2; false;;
+        *) true;;
+    esac'
 t_assert "calibrate: -u removes the calibration scratch, the default keeps it" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
@@ -2797,7 +2857,7 @@ t_assert "calibrate: -u removes the calibration scratch, the default keeps it" b
          copy_to_master() { :; }
          run_host() { case "$2" in
              (*find*) return 0;;
-             (*df*) echo 99999999; return 0;;
+             (*df*) echo "wekafs 999999999 99999999"; return 0;;
              (*rm\ -rf*) echo "RM: $2" >> "$d/oplog"; return 0;;
          esac; cal_json 1000; }
          calibrate) >/dev/null 2>&1
@@ -2821,7 +2881,7 @@ t_assert "calibrate: a turned-over curve stops the ladder early" bash -c '
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac; echo "$2" >> "$d/cells"
      # qd=1 is best: the curve turned over immediately
      case "$2" in (*qd1-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
@@ -2839,7 +2899,7 @@ t_assert "calibrate: a climbing curve is followed to the deepest rung" bash -c '
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac
      # value doubles per rung all the way up
      q=$(echo "$2" | grep -o "qd[0-9]*" | head -1 | tr -dc 0-9)
@@ -2864,7 +2924,7 @@ t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bas
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac
      case "$2" in
          (*qd4-nr2.job*)   # the probe: three very different answers
@@ -2876,9 +2936,15 @@ t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bas
      esac; }
      calibrate) 2>&1 )
     # peak is 1350 at qd=2; 1300/1350 = 96.3% fails a fixed 98% band but
-    # clears the noise-widened one, so the cheaper qd=1 wins
+    # clears the noise-widened one, so the cheaper qd=1 wins. The 33.3%
+    # spread exceeds CAL_MAX_SPREAD=25, so the band is clamped (floor 50%,
+    # not 33%) and the verdict says so, with a WARNING.
     case "$out" in
-        *"bw-read: knee"*"at qd=1 (96% of peak"*) true;;
+        *"bw-read: knee"*"at qd=1 (96% of peak"*"band >=50% (noise 33.3%, clamped)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in
+        *"WARNING: h1 bw-read: noise spread 33.3% exceeds CAL_MAX_SPREAD=25%"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 # The verdict must report real numbers, not just ratios: a ladder that
@@ -2894,7 +2960,7 @@ t_assert "calibrate: the verdict logs absolute values and the measured noise" ba
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac; cal_json 1073741824; }
      calibrate) 2>&1 )
     case "$out" in

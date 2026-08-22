@@ -853,12 +853,15 @@ PYEOF
 #     cpus_allowed_policy=split gives every job its own cpu.
 # Prints the COUNT, and fails loudly rather than printing 0: numjobs=0 is no
 # valid fio job, so a ladder sized from an unreadable probe must not run.
-usable_cores() {   # usable_cores <host> [list] -> count, or the cpu list itself
+usable_cores() {   # usable_cores <host> [count|list] [cpulist]
+                   # count (or list) of usable cpus: the given cpu list minus
+                   # weka's pinned cores when one is provided (the host-file
+                   # nj contract), every cpu minus weka's otherwise
     [ -f "$WORK_DIR/probe/$1" ] || {
         log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
         return 1
     }
-    python3 - "$WORK_DIR/probe/$1" "${2:-count}" <<'PYEOF' || return 1
+    python3 - "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" <<'PYEOF' || return 1
 import sys
 
 path = sys.argv[1]
@@ -883,7 +886,8 @@ for line in open(path):
         cpuset = parse_cpulist(f[1])
         if len(cpuset) == 1:      # single-cpu mask = a dedicated io thread
             weka |= cpuset
-usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
+base = parse_cpulist(sys.argv[3]) if sys.argv[3] else set(range(ncpus))
+usable = sorted(base - weka) or sorted(base) or list(range(ncpus))
 if not usable:
     sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
 if sys.argv[2] == "list":
@@ -957,14 +961,16 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
                 "$WORK_DIR/engine.results")
         fi
         [ -n "$eng" ] || eng=psync
+        cpus=""
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         if [ "$type" = lat ]; then
             nj=1   # latency is a single QD1 stream by definition
         else
-            nj=$(usable_cores "$host") \
+            # nj contract: the operator's cpu list minus weka's pinned cores
+            # when a list is given, every cpu minus weka's otherwise
+            nj=$(usable_cores "$host" count "$cpus") \
                 || die "$host: cannot size the $type $dirn calibration ladder"
         fi
-        cpus=""
-        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         # no operator pin: use the tuner's own usable set (every cpu except
         # the cores weka's node processes are pinned to) -- an unpinned
         # ladder is free to land anywhere, including weka's own cores, and
@@ -1093,6 +1099,13 @@ CAL_BW_WRITE_NR=${CAL_BW_WRITE_NR:-2}
 CAL_IOPS_READ_NR=${CAL_IOPS_READ_NR:-2}
 CAL_IOPS_WRITE_NR=${CAL_IOPS_WRITE_NR:-2}
 CAL_NOISE_QD=${CAL_NOISE_QD:-4}   # the rung measured 3x for the noise floor
+CAL_MAX_SPREAD=${CAL_MAX_SPREAD:-25}   # clamp on the measured spread's two
+                         # uses (climb threshold, verdict band): the worst
+                         # legitimate field spread seen is 11% (saving-calf
+                         # read iops), so anything past ~2x that is a broken
+                         # probe, not a wide band. Keeps the band floor at
+                         # >=50% of the peak and the climb from demanding
+                         # more than a 25% per-rung gain.
 
 # The tabled nrfiles for one (type, direction).
 cal_nr() {   # cal_nr <bw|iops> <read|write>
@@ -1299,7 +1312,8 @@ cal_push() {   # cal_push <host>...
 # sparse on weka, and the seed job sets fallocate=none.
 cal_seed_scratch() {   # cal_seed_scratch <host>...
     local sizes host hd hl nj eng cpus listing f cmd want nfiles nmib availmib short_hosts=""
-    local seedrun=()
+    local seedrun=() dfline src totkb key
+    rm -f "$WORK_DIR/cal/seedspace"
     for host in "$@"; do
         # The ladders THIS host still needs (its seedplan, written by
         # calibrate); a direct caller without a plan seeds the set-wide
@@ -1312,8 +1326,13 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         fi
         sizes=$(cal_seed_sizes "$hl") || die "$host: cannot compute the calibration seed plan"
         hd=$(host_dir "$host")
+        cpus=""
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         if printf '%s\n' "$hl" | grep -qE '^(bw|iops) '; then
-            nj=$(usable_cores "$host") || die "$host: cannot size the calibration seed"
+            # same nj contract as the ladders: seed exactly the job count
+            # the rungs will run
+            nj=$(usable_cores "$host" count "$cpus") \
+                || die "$host: cannot size the calibration seed"
         else
             nj=1
         fi
@@ -1323,8 +1342,6 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
                 "$WORK_DIR/engine.results")
         fi
         [ -n "$eng" ] || eng=psync
-        cpus=""
-        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         [ -n "$cpus" ] || cpus=$(usable_cores "$host" list) || cpus=""
         # No error suppression here: a find without GNU -printf must fail
         # LOUDLY, or an empty listing silently re-seeds the whole grid every
@@ -1378,14 +1395,34 @@ PYEOF
         [ "${nfiles:-0}" -eq 0 ] || seedrun+=("$host")
         debug "cal: $host: seed needs ${nfiles:-0} file(s), ${nmib:-0} MiB"
         if [ "${nmib:-0}" -gt 0 ]; then
-            availmib=$(run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print int(\$4/1024)}'") \
+            dfline=$(run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'") \
                 || die "$host: cannot check free space on $hd for the calibration scratch"
+            read -r src totkb availmib <<<"$dfline"
             case "$availmib" in
                 (""|*[!0-9]*) log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2 ;;
-                (*) [ "$availmib" -ge "$nmib" ] || short_hosts="$short_hosts $host:${nmib}MiB/avail=${availmib}MiB" ;;
+                (*) # hosts whose destinations sit on the same SHARED
+                    # filesystem (same df source and size; /dev/* and tmpfs
+                    # are host-local by definition) must fit their seeds in
+                    # it TOGETHER: per-host checks all pass individually and
+                    # the filesystem then fills at client two
+                    case "$src" in
+                        (/dev/*|tmpfs) key="local:$host" ;;
+                        (*)            key="$src|$totkb" ;;
+                    esac
+                    printf '%s %s %s %s\n' "$key" "$nmib" "$availmib" "$host" \
+                        >> "$WORK_DIR/cal/seedspace" ;;
             esac
         fi
     done
+    if [ -s "$WORK_DIR/cal/seedspace" ]; then
+        short_hosts=$(LC_ALL=C awk \
+            '{need[$1] += $2
+              if (!($1 in av) || $3 < av[$1]) av[$1] = $3
+              hosts[$1] = hosts[$1] " " $4}
+             END {for (k in need) if (need[k] > av[k])
+                      printf " [need=%dMiB avail=%dMiB on%s]", need[k], av[k], hosts[k]}' \
+            "$WORK_DIR/cal/seedspace")
+    fi
     if [ -n "$short_hosts" ]; then
         log "ERROR: not enough free space for the calibration scratch on:$short_hosts" >&2
         die "calibration needs its scratch laid out before it can measure; free space under the destination, shrink the CAL_*_TOTAL_MIB working sets, or drop -a cal"
@@ -1541,19 +1578,26 @@ calibrate() {
             for host in "${todo[@]}"; do
                 # mean of the three probe samples (the qd=CAL_NOISE_QD rung's
                 # value) and their spread in percent; the climb threshold is
-                # the spread floored at 1%. LC_ALL=C pins the decimal POINT:
-                # the verdict python parses the spread with float(), which a
-                # comma-decimal locale (de_DE, fr_FR, ...) would break.
-                LC_ALL=C awk '{s += $4; n++; if (min == "" || $4 < min) min = $4
+                # the spread floored at 1% and clamped at CAL_MAX_SPREAD.
+                # LC_ALL=C pins the decimal POINT: the verdict python parses
+                # the spread with float(), which a comma-decimal locale
+                # (de_DE, fr_FR, ...) would break.
+                LC_ALL=C awk -v maxs="$CAL_MAX_SPREAD" \
+                     '{s += $4; n++; if (min == "" || $4 < min) min = $4
                       if ($4 > max) max = $4}
                      END {if (n == 0 || s == 0) {print 0, "0.0", 1; exit}
                           m = s / n; sp = (max - min) * 100 / m
                           thr = int(sp) + (sp > int(sp) ? 1 : 0)
                           if (thr < 1) thr = 1
+                          if (thr > maxs) thr = maxs
                           printf "%d %.1f %d\n", m, sp, thr}' \
                     "$WORK_DIR/cal/noise-$type-$dirn.$host" \
                     > "$WORK_DIR/cal/thr-$type-$dirn.$host" \
                     || die "$host: cannot derive the $type $dirn noise floor"
+                read -r _ meanspread _ < "$WORK_DIR/cal/thr-$type-$dirn.$host"
+                [ "$(LC_ALL=C awk -v s="$meanspread" -v m="$CAL_MAX_SPREAD" \
+                        'BEGIN {print (s > m) ? 1 : 0}')" -eq 0 ] \
+                    || log "WARNING: $host $type-$dirn: noise spread ${meanspread}% exceeds CAL_MAX_SPREAD=${CAL_MAX_SPREAD}% -- climb threshold and verdict band clamped; treat this knee as suspect" >&2
             done
             for qd in $(cal_qds "$type"); do
                 if [ "$qd" -eq "$CAL_NOISE_QD" ]; then
@@ -1598,10 +1642,12 @@ calibrate() {
                 [ -s "$WORK_DIR/cal/hist-$type-$dirn.$host" ] || continue
                 read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
                 pick=$(python3 - "$WORK_DIR/cal/hist-$type-$dirn.$host" \
-                           "$CAL_KNEE_PCT" "$type" "$meanspread" <<'VERDICTEOF'
+                           "$CAL_KNEE_PCT" "$type" "$meanspread" \
+                           "$CAL_MAX_SPREAD" <<'VERDICTEOF'
 import sys
 
 path, knee_pct, mode, spread = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+max_spread = float(sys.argv[5])
 vals = {}
 for line in open(path):
     f = line.split()
@@ -1613,7 +1659,7 @@ peak_qd = max(vals, key=lambda q: vals[q])
 peak = vals[peak_qd]
 if peak <= 0:
     sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
-floor = min(float(knee_pct), 100.0 - 2 * spread)
+floor = min(float(knee_pct), 100.0 - 2 * min(spread, max_spread))
 win = min(q for q in sorted(vals) if vals[q] >= floor / 100 * peak)
 
 def human(v):
@@ -1621,9 +1667,10 @@ def human(v):
         return "%.2fGiB/s" % (v / (1 << 30))
     return "%s/s" % format(int(v), ",")
 
-print(win, "%s at qd=%d (%d%% of peak %s at qd=%d), band >=%.0f%% (noise %.1f%%)"
+print(win, "%s at qd=%d (%d%% of peak %s at qd=%d), band >=%.0f%% (noise %.1f%%%s)"
       % (human(vals[win]), win, round(vals[win] * 100 / peak),
-         human(peak), peak_qd, floor, spread))
+         human(peak), peak_qd, floor, spread,
+         ", clamped" if spread > max_spread else ""))
 VERDICTEOF
                 ) || die "$host: cannot pick the $type $dirn knee"
                 read -r qd rest <<<"$pick"
@@ -2638,7 +2685,16 @@ if len({len(f["weka"]) for f in facts.values()}) > 1:
 
 common_engines = [e for e in ENGINE_ORDER
                   if all(e in f["engines"] for f in facts.values())]
-min_usable = min(len(f["usable"]) for f in facts.values())
+def usable_for(h):
+    # the nj contract: the operator's cpu list minus weka's pinned cores
+    # when the host file gives one; every cpu minus weka's otherwise
+    c = target(h, "cpus")
+    if not c:
+        return facts[h]["usable"]
+    cs = parse_cpulist(c) - set(facts[h]["weka"])
+    return sorted(cs) or sorted(parse_cpulist(c))
+
+min_usable = min(len(usable_for(h)) for h in hosts)
 
 # --- jobfiles ---
 def report_items(path):
@@ -2799,7 +2855,7 @@ for job in jobs:
         # (filesize/nrfiles) is part of the measurement and must stay
         # untouched, so it must not also take the iops small-file path.
         is_iops = "iops" in items and not is_latency and not is_bw
-        usable_n = len(facts[h]["usable"])
+        usable_n = len(usable_for(h))
         best = common_engines[0] if common_engines else None
 
         cur_engines = {m.group(1) for l in lines
@@ -3428,7 +3484,7 @@ writeback_targets() {
     [ "$REGEN_LAYOUT" -eq 0 ] || mode=overwrite
     # file-only resolution (no CLI merge): what does the FILE itself provide?
     resolve_targets phase2 "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
-        > "$WORK_DIR/targets.fileonly" 2>/dev/null || : > "$WORK_DIR/targets.fileonly"
+        > "$WORK_DIR/targets.fileonly" || : > "$WORK_DIR/targets.fileonly"
     local h ident=""
     for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
@@ -3502,18 +3558,35 @@ def file_directions(lines):
         out.update(_DIRECTIONS.get((sec["rw"] or glob).lower().split(":")[0], ()))
     return out
 
-# derive per-host values from the STAGED variants -- the execution truth
+# derive per-host values: the measured knees first (cal.results is pure
+# measurement -- targets.final would also carry CLI-merged values, which are
+# not calibration's to record), then the STAGED variants for whatever was
+# not measured
+SLOTS = ("bw_r", "bw_w", "iops_r", "iops_w")
+measured = {}
+calres = os.path.join(work, "cal.results")
+if os.path.exists(calres):
+    for line in open(calres):
+        p = line.split()
+        if len(p) != 1 + 3 * len(SLOTS):
+            continue
+        m = {}
+        for i, slot in enumerate(SLOTS):
+            qd, nr, fs = p[1 + 3 * i:4 + 3 * i]
+            if qd != "-":
+                m[f"{slot}_qd"], m[f"{slot}_nr"], m[f"{slot}_fs"] = qd, nr, fs
+        if m:
+            measured[p[0]] = m
+
 KIND = {"latency": "lat", "bandwidth": "bw", "iops": "iops"}
 derived = {}
 for host in hosts:
+    d = dict(measured.get(host, {}))
     jdir = os.path.join(work, "jobs", host)
-    if not os.path.isdir(jdir):
-        continue
-    d = {}
     userf = os.path.join(work, "auth", f"{host}.user")
     if os.path.exists(userf):
         d["login"] = open(userf).read().strip()
-    for job in sorted(os.listdir(jdir)):
+    for job in sorted(os.listdir(jdir)) if os.path.isdir(jdir) else []:
         p = os.path.join(jdir, job)
         lines = open(p).read().splitlines()
         if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
@@ -3527,11 +3600,14 @@ for host in hosts:
         d.setdefault("cpus", first_value(lines, "cpus_allowed"))
         d.setdefault("dir", first_value(lines, "directory"))
         if kind:
-            # the values a variant ran with belong to every direction it
-            # exercised: a read-only file fills the _r slot, a mixed file both
+            # a measured direction already carries its own knee (preloaded
+            # above; setdefault cannot overwrite it), so the staged tuple
+            # fills only unmeasured slots. numjobs is never recorded: it is
+            # re-derived from the usable cores every run, and a recorded
+            # count would only go stale (weka re-pins, cpu list edits).
             for sfx in sorted({"read": "r", "write": "w"}[dd]
                               for dd in file_directions(lines)):
-                for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                for tkey, jkey in (("fs", "filesize"),
                                    ("nr", "nrfiles"), ("qd", "iodepth")):
                     v = first_value(lines, jkey)
                     if v:

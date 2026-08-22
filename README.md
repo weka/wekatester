@@ -227,7 +227,12 @@ spread)` percent — a quiet channel keeps the tight 98% band, a noisy one
 opens up and the **cheapest indistinguishable** rung wins, which is what the
 knee rule meant all along. The verdict prints the winner's and the peak's
 absolute throughput alongside the measured spread, so a ladder that measured
-nothing at all is visible as a number, not just as a ratio.
+nothing at all is visible as a number, not just as a ratio. Both uses of the
+spread are clamped at `CAL_MAX_SPREAD` (25%): the worst legitimate spread
+measured in the field is 11%, so anything past twice that is a broken probe,
+not a wide band — the raw number still prints (with a `clamped` marker and a
+WARNING), the band never opens below 50% of the peak, and the climb never
+demands more than a 25% per-rung gain.
 
 **The calibration scratch is seeded once, incrementally, and kept.** Every
 rung of every ladder reads `<host>.cal.<job>.<filenum>`; ladders differ only
@@ -239,7 +244,10 @@ left alone — size is a sufficient test **because the seed job sets
 `fallocate=none`**: a partial create leaves a short file that fails the
 test, never a full-size hollow one that passes it — so the scratch survives
 the run and the *next* calibration on that host seeds nothing at all. `-u`
-removes it, exactly as it removes the workload's own data files.
+removes it, exactly as it removes the workload's own data files. Before
+seeding, the needs of every host whose destination sits on the same shared
+filesystem are summed and checked against that filesystem's free space
+together — ten clients that each fit individually can still not fit at once.
 
 Each direction's winning (iodepth, nrfiles, filesize) is recorded into its
 own host-file columns — `bandwidthR`, `bandwidthW`, `iopsR`, `iopsW` — under
@@ -248,7 +256,12 @@ geometry you authored yourself still wins over calibration. Under `-g`
 everything derived overwrites the host file except the three columns the
 operator owns outright: host, login, and allowed_cpus. A jobfile that runs
 both directions takes the deeper-qd direction's WHOLE tuple — tuples never
-mix across directions, because a mixed tuple was never itself measured.
+mix across directions, because a mixed tuple was never itself measured — and
+the writeback records each measured direction's own knee straight from
+`cal.results`, so a mixed file cannot copy one direction's knee over the
+other's. `numjobs` is never recorded at all: it is re-derived every run as
+the operator's cpu list minus weka's pinned cores (every cpu minus weka's
+when no list is given), so it can never go stale when weka is re-pinned.
 Results flow into the run's geometry one precedence slot below the operator
 (CLI > host file > calibration > tuner) and persist to `hostlist.csv` via
 the `-a` writeback — which is also the cache: a host whose (fs, nr, qd)
