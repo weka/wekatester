@@ -1677,7 +1677,7 @@ t_assert "cal: the calibration seed disables preallocation" bash -c '
      run_host() { case "$2" in (*find*) return 0;;
          (*df*) echo 99999999; return 0;; esac
          printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
-     cal_seed_grid h1) >/dev/null 2>&1
+     cal_seed_scratch h1) >/dev/null 2>&1
     grep -q "^fallocate=none$" "$d/cal/h1/cal-seed.job"'
 
 # --- engine ranking: a tie goes to io_uring, never to read order ---
@@ -1975,11 +1975,16 @@ t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bas
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; REGEN_LAYOUT=1
-     printf "h1 4 32 - - - - - -\n" > "$d/cal.results"
-     printf "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
+     # cal.results: host + (qd nr fs) x (bw_r bw_w iops_r iops_w)
+     printf "h1 4 2 1024M 2 2 1024M 32 2 256M 16 2 256M\n" > "$d/cal.results"
+     # 29 columns; bw_r_qd (col 9) and iops_r_qd (col 25) carry old values
+     { printf "h1"
+       for i in $(seq 2 29); do
+          case $i in (9) printf "\t8";; (25) printf "\t64";; (*) printf "\t-";; esac
+       done; printf "\n"; } > "$d/targets.final"
      apply_cal_results)
-    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17}" "$d/targets.final")
-    [ "$a" = "4 32" ] || { echo "a=$a" >&2; false; }'
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$13, \$25, \$29}" "$d/targets.final")
+    [ "$a" = "4 2 32 16" ] || { echo "a=$a" >&2; false; }'
 t_assert "sweep: dry runs never mutate (no run_host at all)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -2075,13 +2080,13 @@ t_assert "targets: equal specificity warns naming both lines; first wins; run co
     esac'
 t_assert "targets: geometry columns parse with or without the type: prefix" bash -c '
     f=$(mktemp)
-    printf "h1,,,,,bandwidth:12/10G//8,latency:1///1,4/1G/56/64\n" > "$f"
+    printf "h1,,,,,bandwidthR:12/10G//8,12/10G//4,latencyR:1///1,,iopsR:4/1G/56/64,\n" > "$f"
     out=$(rt phase1 "$f" - - - h1)
-    [ "$out" = "h1	-	-	-	-	12	10G	-	8	1	-	-	1	4	1G	56	64" ] ||
-        { echo "$out" >&2; false; }'
+    want="h1	-	-	-	-	12	10G	-	8	12	10G	-	4	1	-	-	1	-	-	-	-	4	1G	56	64	-	-	-	-"
+    [ "$out" = "$want" ] || { echo "got:  $out" >&2; echo "want: $want" >&2; false; }'
 t_assert "targets: a wrong type: prefix in a geometry column is fatal" bash -c '
     f=$(mktemp)
-    printf "h1,,,,,iops:4///,,\n" > "$f"
+    printf "h1,,,,,iopsR:4///,,,,,\n" > "$f"
     ! rt phase1 "$f" - - - h1 2>/dev/null'
 t_assert "targets: CLI engine and dir beat the file everywhere" bash -c '
     f=$(mktemp)
@@ -2386,7 +2391,13 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
      WORK_DIR=$d; DIRECTORY=/mnt/global; HOSTS=(h1 h2); mkdir -p "$d/jobs" "$d/set"
      printf "# report iops\n[global]\nfilename_format=x/\$jobnum\ndirectory=/orig\nfilesize=10G\nnumjobs=32\nioengine=libaio\n[j]\nrw=randread\niodepth=8\n" > "$d/set/031-i.job"
      (source ./wekatester; generate_layout "$d/set" "$d/set") >/dev/null
-     printf "h1\t-\tpsync\t-\t/mnt/one\t-\t-\t-\t-\t-\t-\t-\t-\t4\t1G\t2\t16\nh2\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n" > "$d/targets.final"
+     { printf "h1\t-\tpsync\t-\t/mnt/one"
+       for i in $(seq 6 29); do
+          case $i in (22) printf "\t4";; (23) printf "\t1G";; (24) printf "\t2";;
+                     (25) printf "\t16";; (*) printf "\t-";; esac
+       done; printf "\n"
+       printf "h2"; for i in $(seq 2 29); do printf "\t-"; done; printf "\n"
+     } > "$d/targets.final"
      stage_variants "$d/set"
      v1=$d/jobs/h1/031-i.job; v2=$d/jobs/h2/031-i.job; l1=$d/jobs/h1/000-wekatester-layout.job
      grep -q "^directory=/mnt/one$" "$v1" && grep -q "^directory=/mnt/global$" "$v2" &&
@@ -2397,7 +2408,8 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
      grep -q "^numjobs=4$" "$l1" && grep -q "^filesize=1G$" "$l1" && grep -q "^nrfiles=2$" "$l1")'
 t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9\t-\t-\t-\t-\t-\t-\t-\t-\n" > "$FIX/targets.final"
+    { printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9"
+      for i in $(seq 10 29); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     v1="$FIX/jobs/h1/011-bw.job"; v2="$FIX/jobs/h2/011-bw.job"
@@ -2420,7 +2432,7 @@ wb_fixture() {   # builds WORK_DIR with staged variants + a host file; echoes di
     d=$(mktemp -d)
     mkdir -p "$d/jobs/h1" "$d/auth"
     printf "ubuntu\n" > "$d/auth/h1.user"
-    printf "# report iops\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1G\nnrfiles=8\niodepth=32\n" > "$d/jobs/h1/031-i.job"
+    printf "# report iops\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1G\nnrfiles=8\niodepth=32\nrw=randread\n" > "$d/jobs/h1/031-i.job"
     : > "$d/engine.results"
     echo "$d"
 }
@@ -2432,11 +2444,11 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
      writeback_targets) >/dev/null
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
-    tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,4/1G/8/32" &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,4/1G/8/32,$" &&
     (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >/dev/null)'
 t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
-    printf "h1,ubuntu,libaio,0-3,/mnt/w,,,4/1G/8/32\n" > "$f"
+    printf "h1,ubuntu,libaio,0-3,/mnt/w,,,,,4/1G/8/32,\n" > "$f"
     before=$(cat "$f")
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
@@ -2444,11 +2456,11 @@ t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     [ "$(cat "$f")" = "$before" ]'
 t_assert "writeback: -g overwrites without a prompt, but never login or allowed_cpus" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
-    printf "h1,opc,psync,9-11,,,,\n" > "$f"
+    printf "h1,opc,psync,9-11,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
      writeback_targets) >/dev/null
-    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,4/1G/8/32"'
+    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,4/1G/8/32,$"'
 t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     d=$(wb_fixture); mkdir "$d/set"
     (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null
@@ -2699,7 +2711,7 @@ cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
     printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1" "$1"
 }
 export -f cal_json
-t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in both directions" bash -c '
+t_assert "calibrate: the knee is the shallowest qd within the noise-widened band" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh
@@ -2709,47 +2721,53 @@ t_assert "calibrate: the grid picks the cheapest cell within CAL_KNEE_PCT in bot
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
-     # nr=4/qd=2 is the cheapest cell within 98% of the 2100 peak; nr=8/qd=16
-     # is fractionally faster but far more expensive, and must NOT win.
+     # peak 2100 at qd=8; qd=16/32 fall back (early stop after two misses);
+     # the knee is qd=8, the shallowest rung within 98% of the peak (qd=4
+     # sits at 97.6%)
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*find*) return 0;;
          (*df*) echo 99999999; return 0;;
          (*rm\ -rf*) echo "RM: $2" >> "$d/oplog";;
-         (*qd16-nr8.job*) cal_json 2100;;
-         (*qd2-nr4.job*)  cal_json 2090;;
          (*cal-seed.job*) cal_json 1000;;
-         (*-nr*.job*)     cal_json 1000;;
+         (*qd1-nr2.job*)  cal_json 1000;;
+         (*qd2-nr2.job*)  cal_json 1900;;
+         (*qd4-nr2.job*)  cal_json 2050;;
+         (*qd8-nr2.job*)  cal_json 2100;;
+         (*qd16-nr2.job*) cal_json 2000;;
+         (*qd32-nr2.job*) cal_json 1990;;
          (*) echo "UNEXPECTED: $2" >> "$d/oplog"; return 1;;
      esac; }
      calibrate) 2>&1 )
     case "$out" in
-        *"grid picks nrfiles=4 qd=2 fs=512M"*) true;;
+        *"bw-read: knee"*"at qd=8 (100% of peak"*"[nrfiles=2 fs=1024M]"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    grep -q "^h1 2 - - - 4 512M - -$" "$d/cal.results" &&
+    grep -q "^h1 8 2 1024M - - - - - - - - -$" "$d/cal.results" &&
+    # early stop: qd=16 and qd=32 both fail to beat 2100 by >1%, so qd=64
+    # is never staged
+    [ ! -f "$d/cal/h1/cal-bw-read-qd64-nr2.job" ] &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     ! grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
-    case "$out" in *"keeping the scratch grid"*) true;; *) echo "$out" >&2; false;; esac &&
-    grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd2-nr4.job"'
-# The 2 x nrfiles cap is the whole point of the grid shape: a row must never
-# be asked for a queue deeper than twice its file count.
-# The grid needs file f at the LARGEST size any row asks of it, so one seed
-# covers every row and both types: 2048M for file 0 down to 256M for 4-7,
-# 5120M per job where per-row seeding wrote 10240M.
-t_assert "cal_seed_sizes: the union is the largest size any row asks per file" bash -c '
+    case "$out" in *"keeping the calibration scratch"*) true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8-nr2.job"'
+# The seed is the union of what every ladder needs: file f at the largest
+# size any (type, direction) table entry asks of it.
+t_assert "cal_seed_sizes: the union is the largest size any ladder asks per file" bash -c '
     out=$( (source ./wekatester; cal_seed_sizes "bw read
 bw write
 iops read") | tr "\n" " " )
-    [ "$out" = "0 2048 1 1024 2 512 3 512 4 256 5 256 6 256 7 256 " ] ||
-        { echo "$out" >&2; false; }'
+    [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
 t_assert "cal_seed_sizes: iops alone needs a quarter of the bw working set" bash -c '
     out=$( (source ./wekatester; cal_seed_sizes "iops read") | tr "\n" " " )
-    [ "$out" = "0 512 1 256 2 128 3 128 4 64 5 64 6 64 7 64 " ] ||
-        { echo "$out" >&2; false; }'
+    [ "$out" = "0 256 1 256 " ] || { echo "$out" >&2; false; }'
+t_assert "cal_seed_sizes: a latency-only set still gets a plan" bash -c '
+    out=$( (source ./wekatester; cal_seed_sizes "lat read
+lat write") | tr "\n" " " )
+    [ "$out" = "0 64 1 64 " ] || { echo "$out" >&2; false; }'
 # Incremental: a file already at or above the needed size is left alone, so a
-# warm scratch seeds nothing and a cold one seeds exactly the shortfall.
-t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the union" bash -c '
+# warm scratch seeds nothing and a cold one seeds exactly the union.
+t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the union" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal"
     printf "ncpus 4\n" > "$d/probe/h1"      # -> 4 usable cores, so 4 jobs
     # cold: nothing exists
@@ -2758,14 +2776,12 @@ t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the unio
      TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
      ladders="bw read"
      copy_to_master() { :; }
-     run_host() { case "$2" in (*find*) return 0;;
-         (*df*) echo 99999999; return 0;; esac
+     run_host() { case "$2" in (*find*) return 0;; (*df*) echo 99999999; return 0;; esac
          echo "$2" >> "$d/ran"; printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
-     cal_seed_grid h1) >/dev/null 2>&1
-    # 4 jobs x 8 filenums = 32 sections, and the sizes are the union
-    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 32 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
-    grep -q "^filesize=2048M$" "$d/cal/h1/cal-seed.job" &&
-    grep -q "^filesize=256M$" "$d/cal/h1/cal-seed.job" || exit 1
+     cal_seed_scratch h1) >/dev/null 2>&1
+    # 4 jobs x 2 filenums = 8 sections, each at the 1024M union size
+    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 8 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
+    grep -q "^filesize=1024M$" "$d/cal/h1/cal-seed.job" || exit 1
     # warm: every file already present and big enough -> no fio invocation
     rm -f "$d/ran"
     (source ./wekatester
@@ -2775,16 +2791,15 @@ t_assert "cal_seed_grid: a warm scratch seeds nothing, a cold one seeds the unio
      copy_to_master() { :; }
      run_host() { case "$2" in
          (*df*) echo 99999999; return 0;;
-         (*find*) for j in 0 1 2 3; do for f in 0 1 2 3 4 5 6 7; do
+         (*find*) for j in 0 1 2 3; do for f in 0 1; do
                       echo "h1.cal.$j.$f 2147483648"; done; done; return 0;;
      esac; echo "$2" >> "$d/ran"; }
-     cal_seed_grid h1) >/dev/null 2>&1
+     cal_seed_scratch h1) >/dev/null 2>&1
     [ ! -f "$d/ran" ] || { echo "warm scratch still ran: $(cat "$d/ran")" >&2; exit 1; }
     [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 0 ]'
-
 # The scratch is the expensive part of a calibration, so it survives the run
 # for the next one to reuse -- unless -u, which removes data files by contract.
-t_assert "calibrate: -u removes the scratch grid, the default keeps it" bash -c '
+t_assert "calibrate: -u removes the calibration scratch, the default keeps it" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     run_one() {   # run_one <unlink> -> the oplog
@@ -2797,7 +2812,7 @@ t_assert "calibrate: -u removes the scratch grid, the default keeps it" bash -c 
          copy_to_master() { :; }
          run_host() { case "$2" in
              (*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
+             (*df*) echo 99999999; return 0;;
              (*rm\ -rf*) echo "RM: $2" >> "$d/oplog"; return 0;;
          esac; cal_json 1000; }
          calibrate) >/dev/null 2>&1
@@ -2805,31 +2820,52 @@ t_assert "calibrate: -u removes the scratch grid, the default keeps it" bash -c 
     run_one 0; grep -q "wekatester-cal" "$d/oplog" 2>/dev/null && { echo "default removed it" >&2; exit 1; }
     run_one 1; grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog"'
 
-t_assert "calibrate: each nrfiles row stops at qd = 2 x nrfiles" bash -c '
+# The ladder stops after CAL_STOP_BELOW rungs that fail to beat the best by
+# more than the measured noise -- a turned-over curve is not climbed forever.
+t_assert "calibrate: a turned-over curve stops the ladder early" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
-    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
-    (source ./tests/helpers.sh
-     source ./wekatester
+    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*|*find*) :;;
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
          (*df*) echo 99999999; return 0;;
-         (*) echo "$2" >> "$d/cells";;
-     esac; cal_json 1000; }
+     esac; echo "$2" >> "$d/cells"
+     # qd=1 is best: the curve turned over immediately
+     case "$2" in (*qd1-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
      calibrate) >/dev/null 2>&1
-    # every cell that was staged, as nr/qd pairs
-    got=$(grep -o "qd[0-9]*-nr[0-9]*" "$d/cells" | sort -u | sed "s/qd//;s/-nr/ /" | awk "{print \$2\"/\"\$1}" | sort -n -t/ -k1 -k2 | tr "\n" " ")
-    [ "$got" = "1/1 1/2 2/1 2/2 2/4 4/1 4/2 4/4 4/8 8/1 8/2 8/4 8/8 8/16 " ] ||
-        { echo "cells staged: $got" >&2; false; }'
-# The band must follow the box's measured spread. With a noisy probe the
-# cheapest cell wins even though it is well under the peak; under a fixed 98%
-# band only the peak cell itself would have qualified, which is how a grid
-# ends up chasing its own variance.
-t_assert "calibrate: a noisy probe widens the band so the cheapest cell wins" bash -c '
+    got=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
+    [ "$got" = "1 2 4 " ] || { echo "qds staged: $got" >&2; false; }'
+t_assert "calibrate: a climbing curve is followed to the deepest rung" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo 99999999; return 0;;
+     esac
+     # value doubles per rung all the way up
+     q=$(echo "$2" | grep -o "qd[0-9]*" | head -1 | tr -dc 0-9)
+     cal_json $((q * 100)); }
+     calibrate) 2>&1 )
+    [ -f "$d/cal/h1/cal-iops-read-qd256-nr2.job" ] &&
+    case "$out" in
+        *"iops-read: knee"*"at qd=256 (100% of peak"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+# The band must follow the box's measured spread: with a noisy probe the
+# shallowest rung wins even though a deeper one scored a few percent higher,
+# because within the noise they are the same number.
+t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh; source ./wekatester
@@ -2843,61 +2879,22 @@ t_assert "calibrate: a noisy probe widens the band so the cheapest cell wins" ba
          (*df*) echo 99999999; return 0;;
      esac
      case "$2" in
-         (*qd4-nr2.job*)  # the probe cell: three very different answers
-             n=$(cat "$d/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$d/n"
+         (*qd4-nr2.job*)   # the probe: three very different answers
+             [ -f "$d/n" ] || echo 0 > "$d/n"; n=$(cat "$d/n"); n=$((n + 1)); echo "$n" > "$d/n"
              case "$n" in (1) cal_json 1000;; (2) cal_json 1400;; (*) cal_json 1200;; esac;;
-         (*qd16-nr8.job*) cal_json 1500;;   # the peak, and the most expensive cell
-         (*qd1-nr1.job*)  cal_json 1300;;   # 87% of peak, and the cheapest cell
-         (*)              cal_json 900;;
+         (*qd1-nr2.job*)    cal_json 1300;;
+         (*qd2-nr2.job*)    cal_json 1350;;
+         (*)                cal_json 900;;
      esac; }
      calibrate) 2>&1 )
-    # a fixed 98% band would have forced 8/16; the measured spread admits 1/1
+    # peak is 1350 at qd=2; 1300/1350 = 96.3% fails a fixed 98% band but
+    # clears the noise-widened one, so the cheaper qd=1 wins
     case "$out" in
-        *"grid picks nrfiles=1 qd=1"*) true;;
+        *"bw-read: knee"*"at qd=1 (96% of peak"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-# The deep qd ladder is EARNED, not automatic: 9 extra qds x 2 directions is
-# ~45% of the iops budget, so it runs only when the capped grid's best cell
-# sits at the deepest queue tried -- i.e. the curve has not turned over.
-t_assert "calibrate: the iops deep row is skipped when the curve turns over inside the cap" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
-    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
-    (source ./tests/helpers.sh; source ./wekatester
-     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
-     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
-     printf "ncpus 4\n" > "$d/probe/h1"
-     copy_to_master() { :; }
-     run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
-     esac; echo "$2" >> "$d/cells"
-     # qd=1 is best, so the curve turned over immediately
-     case "$2" in (*qd1-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
-     calibrate) >/dev/null 2>&1
-    nr2=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
-    [ "$nr2" = "1 2 4 " ] || { echo "nr2 qds: $nr2" >&2; false; }'
-t_assert "calibrate: the iops deep row runs when the best cell sits at the cap" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
-    printf "# report iops\n[global]\nfilesize=1G\n[a]\nbs=4k\nrw=randread\n" > "$d/set/031-a.job"
-    out=$( (source ./tests/helpers.sh; source ./wekatester
-     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
-     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
-     printf "ncpus 4\n" > "$d/probe/h1"
-     copy_to_master() { :; }
-     run_host() { case "$2" in
-         (*mkdir*|*rm\ -rf*|*find*) return 0;;
-         (*df*) echo 99999999; return 0;;
-     esac; echo "$2" >> "$d/cells"
-     # qd=16 (the deepest the cap allows) is best, so keep climbing
-     case "$2" in (*qd16-nr*) cal_json 9000;; (*) cal_json 1000;; esac; }
-     calibrate) 2>&1 )
-    nr2=$(grep -o "qd[0-9]*-nr2\." "$d/cells" | sed "s/qd//;s/-nr2.//" | sort -un | tr "\n" " ")
-    [ "$nr2" = "1 2 4 32 64 128 256 " ] || { echo "nr2 qds: $nr2" >&2; exit 1; }
-    case "$out" in *"extending the nr=2 row"*) true;; *) echo "$out" >&2; false;; esac'
-# The verdict must report real numbers, not just ratios: a grid that measured
-# nothing (reads of a hollow layout) looks identical in percentage terms.
+# The verdict must report real numbers, not just ratios: a ladder that
+# measured nothing (reads of a hollow layout) looks identical in percentages.
 t_assert "calibrate: the verdict logs absolute values and the measured noise" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
@@ -2913,7 +2910,7 @@ t_assert "calibrate: the verdict logs absolute values and the measured noise" ba
      esac; cal_json 1073741824; }
      calibrate) 2>&1 )
     case "$out" in
-        *"read 1.00GiB/s"*"noise 0.0%"*) true;;
+        *"knee 1.00GiB/s at qd=1"*"noise 0.0%"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 
@@ -2938,14 +2935,19 @@ t_assert "-x stamps runtime+time_based on measured variants, never the layout" b
     l="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&
     ! grep -q "^runtime=77$" "$l"'
-# A COMPLETE recorded tuple (fs, nr, qd) skips the grid; a partial one does
-# not, because the grid records the three together and half of them is not a
-# geometry anyone measured.
-t_assert "calibrate: a complete host-file tuple skips that grid, a partial one does not" bash -c '
+# A COMPLETE recorded tuple (fs, nr, qd) for a direction skips its ladder; a
+# partial one does not, because the ladder records the three together and
+# half of them is not a geometry anyone measured.
+t_assert "calibrate: a complete host-file tuple skips that ladder, a partial one does not" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
-    run_cal() {   # run_cal <targets.final row>
-        printf "%b\n" "$1" > "$d/targets.final"
+    run_cal() {   # run_cal "<col>=<val> ..." -> 29-column targets.final row
+        { printf "h1"
+          for i in $(seq 2 29); do
+              v="-"
+              for kv in $1; do [ "${kv%%=*}" = "$i" ] && v=${kv#*=}; done
+              printf "\t%s" "$v"
+          done; printf "\n"; } > "$d/targets.final"
         rm -f "$d/cal.results"
         (source ./wekatester
          AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
@@ -2955,14 +2957,14 @@ t_assert "calibrate: a complete host-file tuple skips that grid, a partial one d
          run_host() { return 0; }
          calibrate) 2>&1
     }
-    # fs=1G nr=2 qd=8 -> complete, skipped
-    out=$(run_cal "h1\t-\t-\t-\t-\t-\t1G\t2\t8\t-\t-\t-\t-\t-\t-\t-\t-")
-    case "$out" in *"already carries bw geometry -- reusing"*) true;; *) echo "$out" >&2; false;; esac &&
+    # bw_r fs/nr/qd (cols 7-9) all present -> complete, skipped
+    out=$(run_cal "7=1G 8=2 9=8")
+    case "$out" in *"already carries bw read geometry -- reusing"*) true;; *) echo "$out" >&2; false;; esac &&
     [ ! -s "$d/cal.results" ] &&
     # qd alone -> incomplete, must NOT be treated as cached
-    out=$(run_cal "h1\t-\t-\t-\t-\t-\t-\t-\t8\t-\t-\t-\t-\t-\t-\t-\t-")
+    out=$(run_cal "9=8")
     case "$out" in
-        *"already carries bw geometry -- reusing"*) echo "$out" >&2; false;;
+        *"already carries bw read geometry -- reusing"*) echo "$out" >&2; false;;
         *) true;;
     esac'
 t_assert "calibrate: no-op below cal" bash -c '
@@ -2976,18 +2978,23 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d
-     printf "h1 4 32 - - - - 8 64M\nh2 8 - - - 1 2048M - -\n" > "$d/cal.results"
-     printf "h1\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t64\n" > "$d/targets.final"
+     # h1: bw_r measured (qd 4, nr 8, fs 64M) and iops_r measured (32/2/256M)
+     # h2: only bw_r measured (8/1/2048M)
+     printf "h1 4 8 64M - - - 32 2 256M - - -\nh2 8 1 2048M - - - - - - - - -\n" > "$d/cal.results"
+     # h1 already carries an operator iops_r_qd=64 (col 25): fill must keep it
+     { printf "h1"; for i in $(seq 2 29); do
+          case $i in (25) printf "\t64";; (*) printf "\t-";; esac
+       done; printf "\n"; } > "$d/targets.final"
      apply_cal_results)
-    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$17, \$15, \$16}" "$d/targets.final")
-    b=$(awk -F"\t" "\$1==\"h2\" {print \$9, \$17, \$7, \$8}" "$d/targets.final")
-    [ "$a" = "4 64 64M 8" ] && [ "$b" = "8 - 2048M 1" ] || { echo "a=$a b=$b" >&2; false; }
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$8, \$7, \$25, \$24, \$23}" "$d/targets.final")
+    b=$(awk -F"\t" "\$1==\"h2\" {print \$9, \$8, \$7}" "$d/targets.final")
+    [ "$a" = "4 8 64M 64 2 256M" ] && [ "$b" = "8 1 2048M" ] || { echo "a=$a b=$b" >&2; false; }
     (source ./wekatester
      WORK_DIR=$d; rm -f "$d/targets.final"
-     printf "h3 16 - - - - - - -\n" > "$d/cal.results"
+     printf "h3 16 2 1024M - - - - - - - - -\n" > "$d/cal.results"
      apply_cal_results)
     c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
-    [ "$c" = "17 16" ]'
+    [ "$c" = "29 16" ]'
 
 # --- sysinfo capture: per-host box context in every bundle ---
 t_assert "sysinfo: one file per item per host, missing tools say so" bash -c '

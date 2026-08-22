@@ -392,10 +392,11 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max|cal[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
-                          cal: measure a per-client nrfiles x iodepth grid before staging
-                          :secs shortens each grid cell from the 30s default
-                          (cal:15); it does not change how long the measured
-                          jobs run -- that is -x/--duration
+                          cal: measure per-client iodepth ladders (one per
+                          type and direction) before staging
+                          :secs shortens each ladder rung from the 30s
+                          default (cal:15); it does not change how long the
+                          measured jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -426,8 +427,8 @@ attaching is the way to pass a value that starts with a dash.
                           (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun), and
-                 the calibration scratch grid, which is otherwise kept so the
-                 next calibration can reuse it
+                 the calibration scratch files, which are otherwise kept
+                 so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
@@ -490,9 +491,9 @@ normalize_opt() {   # normalize_opt <token>
     esac
 }
 
-# -a takes a level and, for the measuring levels, an optional per-cell
-# duration: "cal:15" runs each grid cell for 15 measured seconds instead of
-# the 30s default. This is the CALIBRATION cell length; -x/--duration sets
+# -a takes a level and, for the measuring levels, an optional per-rung
+# duration: "cal:15" runs each ladder rung for 15 measured seconds instead of
+# the 30s default. This is the CALIBRATION rung length; -x/--duration sets
 # how long the measured jobs run, and the two are independent.
 set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
     local raw=$1 flag=$2 lvl secs
@@ -506,11 +507,11 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
         case "$lvl" in
             (cal) ;;
             (*) usage >&2
-                die "$flag: a cell duration applies only to cal, not $lvl" ;;
+                die "$flag: a rung duration applies only to cal, not $lvl" ;;
         esac
         case "$secs" in
             (""|*[!0-9]*|0) usage >&2
-                die "$flag: the cell duration must be whole seconds > 0, got: $secs" ;;
+                die "$flag: the rung duration must be whole seconds > 0, got: $secs" ;;
         esac
         CAL_RUNTIME=$secs
     fi
@@ -1082,46 +1083,86 @@ PYEOF
 }
 
 # --- calibration: a measured geometry, not a guessed one ---------------------
-# Grid points. -a cal:<secs> shortens each cell for a quick look.
-CAL_RUNTIME=${CAL_RUNTIME:-30}  # measured seconds per grid cell (plus a 2s
-                         # ramp). "-a cal:15" sets this per run; shorter cells
+# nrfiles is TAILORED, iodepth is MEASURED, and both are held per type AND
+# direction. File count never won by more than the noise of its own channel
+# in any lab measurement (saving-calf, UDP and DPDK; isca224), so it is not
+# worth a measured axis -- it is a table entry an operator can edit. Queue
+# depth moved 4x between backends on the same clients, so it is measured,
+# per direction, as a ladder at the tabled (nr, fs).
+CAL_RUNTIME=${CAL_RUNTIME:-30}  # measured seconds per ladder rung (plus a 2s
+                         # ramp). "-a cal:15" sets this per run; shorter rungs
                          # trade resolution for wall clock, and the verdict
-                         # compares cells whose differences can be small.
-CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed before measuring: the seed's
-                         # write backlog destages under the first rung
+                         # compares rungs whose differences can be small.
+CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed (and between a write
+                         # ladder and the read ladder that follows it): the
+                         # write backlog destages under the next rung
                          # otherwise (seen live: bw-write qd1 reads ~15% low
                          # in every run, while bw-read qd1 -- measured after
                          # the backlog drained -- does not)
-CAL_KNEE_PCT=98          # winning cell = cheapest within this % of the peak,
-                         # in EVERY measured direction
+CAL_KNEE_PCT=98          # knee = shallowest qd within this % of the ladder's
+                         # peak; widened per direction by the measured noise
+CAL_STOP_BELOW=2         # consecutive rungs that fail to beat the best by
+                         # more than the noise before the ladder stops
+CAL_BW_QDS="1 2 4 8 16 32 64 128"
 CAL_IOPS_QDS="1 2 4 8 16 32 64 128 256"
-CAL_NR_LADDER="1 2 4 8"   # nrfiles rows of the grid
-CAL_NOISE_NR=2           # the cell repeated to measure this box's own spread
-CAL_NOISE_QD=4           # (nr=2/qd=4 is mid-grid and legal under the 2xnr cap)
-CAL_GRID_QDS="1 2 4 8 16" # qd points per row, capped at 2 x nrfiles: a queue
-                          # deeper than twice the file count measures the
-                          # queue, not the layout. The iops nr=2 row ignores
-                          # the cap and runs CAL_IOPS_QDS so a deep-queue
-                          # peak stays discoverable.
+# Working set per job (MiB) and file count per (type, direction). fs = total
+# over count, so changing the count keeps the working set -- and with it the
+# capacity bill -- constant.
+CAL_BW_TOTAL_MIB=2048
+CAL_IOPS_TOTAL_MIB=512
+CAL_BW_READ_NR=2
+CAL_BW_WRITE_NR=2
+CAL_IOPS_READ_NR=2
+CAL_IOPS_WRITE_NR=2
+CAL_NOISE_QD=4           # the rung measured three times for the noise floor
+
+# The tabled nrfiles for one (type, direction).
+cal_nr() {   # cal_nr <bw|iops> <read|write>
+    case "$1 $2" in
+        ("bw read")    echo "$CAL_BW_READ_NR" ;;
+        ("bw write")   echo "$CAL_BW_WRITE_NR" ;;
+        ("iops read")  echo "$CAL_IOPS_READ_NR" ;;
+        ("iops write") echo "$CAL_IOPS_WRITE_NR" ;;
+        (*) die "cal_nr: unknown ladder: $1 $2" ;;
+    esac
+}
+
+cal_total_mib() {   # cal_total_mib <bw|iops>
+    [ "$1" = bw ] && echo "$CAL_BW_TOTAL_MIB" || echo "$CAL_IOPS_TOTAL_MIB"
+}
+
+cal_qds() {   # cal_qds <bw|iops>
+    [ "$1" = bw ] && echo "$CAL_BW_QDS" || echo "$CAL_IOPS_QDS"
+}
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
 # slot BELOW the operator: CLI > host file > calibration > tuner. When no
 # host file is in play targets.final does not exist -- synthesize it with
 # every other field '-' so the knees ride the exact application path the
 # host file uses (apply_targets_geometry, and the -a writeback after it).
-# bw knee -> field 9 (bw_qd), iops knee -> field 17 (iops_qd).
 apply_cal_results() {
     [ -s "$WORK_DIR/cal.results" ] || return 0
     # -g forces a re-measure -- and a re-measure someone forced should WIN:
-    # its knees replace host-file qd values instead of only filling gaps
+    # its knees replace host-file values instead of only filling gaps
     python3 - "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" <<'PYEOF' || die "cannot apply the calibration results"
 import os, sys
 
 res, final, force = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+
+# targets.final layout: host + 4 identity fields + 6 geometry slots of
+# nj/fs/nr/qd each (bw_r bw_w lat_r lat_w iops_r iops_w) = 29 columns.
+# cal.results carries (qd nr fs) per measured slot, in this order:
+SLOTS = ("bw_r", "bw_w", "iops_r", "iops_w")
+# 0-based ROW index of each slot's nj column (host=0, login=1, engine=2,
+# cpus=3, dir=4, then nj/fs/nr/qd per slot)
+BASE = {"bw_r": 5, "bw_w": 9, "lat_r": 13, "lat_w": 17,
+        "iops_r": 21, "iops_w": 25}
+NCOLS = 1 + 4 + 6 * 4
+
 knees = {}
 for line in open(res):
     f = line.split()
-    if len(f) == 9:
+    if len(f) == 1 + 3 * len(SLOTS):
         knees[f[0]] = f[1:]
 
 rows, order = {}, []
@@ -1131,30 +1172,20 @@ if os.path.exists(final):
         rows[f[0]] = f
         order.append(f[0])
 for host in sorted(knees):
-    bwq, ioq, bwnj, ionj, bwnr, bwfs, ionr, iofs = knees[host]
     row = rows.get(host)
     if row is None:
-        row = [host] + ["-"] * 16
+        row = [host] + ["-"] * (NCOLS - 1)
         rows[host] = row
         order.append(host)
-    while len(row) < 17:
+    while len(row) < NCOLS:
         row.append("-")
-    if bwq != "-" and (force or row[8] == "-"):
-        row[8] = bwq
-    if ioq != "-" and (force or row[16] == "-"):
-        row[16] = ioq
-    if bwnj != "-" and (force or row[5] == "-"):
-        row[5] = bwnj
-    if ionj != "-" and (force or row[13] == "-"):
-        row[13] = ionj
-    if bwfs != "-" and (force or row[6] == "-"):
-        row[6] = bwfs
-    if bwnr != "-" and (force or row[7] == "-"):
-        row[7] = bwnr
-    if iofs != "-" and (force or row[14] == "-"):
-        row[14] = iofs
-    if ionr != "-" and (force or row[15] == "-"):
-        row[15] = ionr
+    vals = knees[host]
+    for i, slot in enumerate(SLOTS):
+        qd, nr, fs = vals[3 * i:3 * i + 3]
+        base = BASE[slot]
+        for off, v in ((3, qd), (2, nr), (1, fs)):   # qd, nr, fs columns
+            if v != "-" and (force or row[base + off] == "-"):
+                row[base + off] = v
 with open(final, "w") as fp:
     for h in order:
         fp.write("\t".join(rows[h]) + "\n")
@@ -1180,101 +1211,110 @@ for s in data.get("client_stats", []):
 PYEOF
 }
 
-# The union file requirement across the whole grid. Every measured cell reads
-# <host>.cal.<jobnum>.<filenum>; rows differ only in how MANY of those files
-# they touch and how much of each they use (fio's filesize caps a job at a
-# prefix of a larger file). So the grid needs, per job, file f sized to the
-# LARGEST filesize any row asks of it -- with the default ladder that is
-# 2048M for file 0, 1024M for file 1, 512M for 2-3, 256M for 4-7.
-#
-# Seeding that union writes 5120M per job where per-row seeding wrote 10240M,
-# because per-row seeding re-created the same filenames at four different
-# sizes per type and then did it again for the other type. iops needs nothing
-# of its own: every file it wants already exists, larger, from the bw rows.
+# The union file requirement across every ladder. Every rung reads
+# <host>.cal.<jobnum>.<filenum>; ladders differ only in how MANY of those
+# files they touch and how much of each they use (fio's filesize caps a job
+# at a prefix of a larger file). So the scratch needs, per job, file f sized
+# to the LARGEST filesize any ladder asks of it -- with the default tables
+# that is two 1024M files (the bw ladders), which already covers the iops
+# ladders (256M) and the latency floors (64M).
 cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
-    python3 - "$1" "$CAL_NR_LADDER" <<'PYEOF' || return 1
-import sys
-ladders, nrl = sys.argv[1], sys.argv[2].split()
-types = {l.split()[0] for l in ladders.splitlines() if l.strip()}
-total = {"bw": 2048, "iops": 512}          # MiB of working set per job, per type
-need = {}
-for t in types & set(total):
-    for nr in (int(n) for n in nrl):
-        fsz = total[t] // nr
-        for f in range(nr):
-            need[f] = max(need.get(f, 0), fsz)
-# latency is not a grid: one qd1 stream over nrfiles=2 at 64M (see
-# stage_cal_step). Folding it in means the floor rungs need no seed of their
-# own -- and a latency-only set still gets a plan.
-if "lat" in types:
-    for f in (0, 1):
-        need[f] = max(need.get(f, 0), 64)
-if not need:
-    sys.exit(1)
-for f in sorted(need):
-    print(f, need[f])
-PYEOF
+    # Union over every (type, direction) the set ladders: file f is created at
+    # the LARGEST size any ladder asks of it, so one seed serves them all.
+    # Latency is not a ladder -- one qd1 stream over 2 files at 64M (see
+    # stage_cal_step) -- but folding it in means the floor rungs need no seed
+    # of their own, and a latency-only set still gets a plan.
+    local line type dirn nr fs f maxf=-1
+    local -a need
+    while read -r type dirn; do
+        [ -n "$type" ] || continue
+        case "$type" in
+            (bw|iops) nr=$(cal_nr "$type" "$dirn") || return 1
+                      fs=$(( $(cal_total_mib "$type") / nr )) ;;
+            (lat)     nr=2; fs=64 ;;
+            (*)       continue ;;
+        esac
+        for ((f = 0; f < nr; f++)); do
+            [ "${need[f]:-0}" -ge "$fs" ] || need[f]=$fs
+            [ "$f" -le "$maxf" ] || maxf=$f
+        done
+    done <<SIZEEOF
+$1
+SIZEEOF
+    [ "$maxf" -ge 0 ] || return 1
+    for ((f = 0; f <= maxf; f++)); do
+        [ "${need[f]:-0}" -eq 0 ] || echo "$f ${need[f]}"
+    done
 }
 
-# One seed pass for the whole grid, incremental: a file that already exists at
-# or above the size the grid needs is left alone, so a re-run against a warm
-# scratch seeds nothing at all. Size is a sufficient test here for the same
-# reason it is for the main layout -- laid-out files cannot be sparse on weka.
-# Only the per-host jobfile directories belong on the master. The cal
-# directory also accumulates every cell's raw JSON and the grid tallies, and
-# globbing the lot re-shipped all of it before every cell -- quadratic scp on
-# a remote run, for files the master never reads.
-# A type's geometry is cached only when the WHOLE tuple the grid records is
-# present -- filesize, nrfiles and iodepth. Testing iodepth alone let a row
-# with a qd but no nrfiles skip the grid entirely, leaving the pair
-# half-measured, which is the very thing the grid exists to prevent.
-# One grid cell on every host in $todo at once, appended to
-# $WORK_DIR/cal/<sink>-<type>.<host> as "<dirn> <nr> <qd> <value>". <tag>
-# keeps a repeated cell's raw JSON distinct so the noise probe does not
-# overwrite itself. Reads $todo, $ladders and $type from calibrate.
+# One ladder rung on every host in $todo at once, appended to
+# $WORK_DIR/cal/<sink>.<host> as "<dirn> <nr> <qd> <value>". <tag> keeps a
+# repeated rung's raw JSON distinct so the noise probe does not overwrite
+# itself. Reads $todo from calibrate.
 cal_cell() {   # cal_cell <type> <dirn> <qd> <nr> <fsz> <sink> <tag>
     local ctype=$1 cdirn=$2 cqd=$3 cnr=$4 cfsz=$5 sink=$6 tag=$7
     local ccmd cjson cgains ch cv cg
     CAL_NRFILES=$cnr CAL_FILESIZE=$cfsz \
         stage_cal_step "$ctype" "$cdirn" "$cqd" "$WORK_DIR/cal" "${todo[@]}"
-    cal_push "${todo[@]}" || die "cannot copy grid cell files to $MASTER"
+    cal_push "${todo[@]}" || die "cannot copy ladder rung files to $MASTER"
     ccmd="'$FIO_BIN' --output-format=json --eta=never"
     for ch in "${todo[@]}"; do
         ccmd="$ccmd --client=$ch '$TARGET_DIR.cal/$ch/cal-$ctype-$cdirn-qd$cqd-nr$cnr.job'"
     done
     cjson="$WORK_DIR/cal/res-$ctype-$cdirn-qd$cqd-nr$cnr$tag.json"
     run_host "$MASTER" "$ccmd" > "$cjson" \
-        || die "grid cell $ctype-$cdirn nr=$cnr qd=$cqd failed (output in $cjson)"
+        || die "rung $ctype-$cdirn qd=$cqd nr=$cnr failed (output in $cjson)"
     check_fio_errors "$cjson" measured \
-        || die "grid cell $ctype-$cdirn nr=$cnr qd=$cqd errored on a host (output in $cjson)"
+        || die "rung $ctype-$cdirn qd=$cqd nr=$cnr errored on a host (output in $cjson)"
     cgains=$(cal_gains - "$cjson" "$ctype") \
-        || die "cannot compute grid values for $ctype-$cdirn nr=$cnr qd=$cqd"
+        || die "cannot compute rung values for $ctype-$cdirn qd=$cqd nr=$cnr"
     debug "cal: $ctype-$cdirn nr=$cnr qd=$cqd$tag per-host [host value]: $(printf '%s' "$cgains" | tr '\n' ' ')"
     while read -r ch cv cg; do
         [ -n "$ch" ] || continue
         printf '%s %s %s %s\n' "$cdirn" "$cnr" "$cqd" "$cv" \
-            >> "$WORK_DIR/cal/$sink-$ctype.$ch"
+            >> "$WORK_DIR/cal/$sink.$ch"
     done <<CELLEOF
 $cgains
 CELLEOF
 }
 
-cal_geometry_cached() {   # cal_geometry_cached <host> <bw|iops>
-    local host=$1 type=$2 base f
-    [ "$type" = bw ] && base=7 || base=15      # fs, nr, qd triples
+# A direction's geometry is cached only when the WHOLE tuple its ladder
+# records is present -- filesize, nrfiles and iodepth. Testing iodepth alone
+# let a row with a qd but no nrfiles skip the ladder entirely, leaving the
+# tuple half-measured, which is the very thing recording it whole prevents.
+cal_geometry_cached() {   # cal_geometry_cached <host> <bw|iops> <read|write>
+    local host=$1 base f
+    # fs, nr, qd of that direction's slot in targets.final; nj is the
+    # operator's to pin and never part of what calibration records
+    case "$2 $3" in
+        ("bw read")    base=7 ;;
+        ("bw write")   base=11 ;;
+        ("iops read")  base=23 ;;
+        ("iops write") base=27 ;;
+        (*) die "cal_geometry_cached: unknown ladder: $2 $3" ;;
+    esac
     for f in "$base" $((base + 1)) $((base + 2)); do
         [ -n "$(targets_field "$host" "$f" "$WORK_DIR/targets.final")" ] || return 1
     done
     return 0
 }
 
+# Only the per-host jobfile directories belong on the master. The cal
+# directory also accumulates every rung's raw JSON and the ladder tallies,
+# and globbing the lot re-shipped all of it before every rung -- quadratic
+# scp on a remote run, for files the master never reads.
 cal_push() {   # cal_push <host>...
     local h dirs=()
     for h in "$@"; do dirs+=("$WORK_DIR/cal/$h"); done
     copy_to_master "${dirs[@]}" "$TARGET_DIR.cal/"
 }
 
-cal_seed_grid() {   # cal_seed_grid <host>...
+# One seed pass for the whole scratch, incremental: a file that already
+# exists at or above the size the union needs is left alone, so a re-run
+# against a warm scratch seeds nothing at all. Size is a sufficient test here
+# for the same reason it is for the main layout -- laid-out files cannot be
+# sparse on weka, and the seed job sets fallocate=none.
+cal_seed_scratch() {   # cal_seed_scratch <host>...
     local sizes host hd nj eng cpus listing f cmd want missing nfiles nmib availmib short_hosts=""
     sizes=$(cal_seed_sizes "$ladders") || die "cannot compute the calibration seed plan"
     missing=0
@@ -1291,7 +1331,7 @@ cal_seed_grid() {   # cal_seed_grid <host>...
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
         [ -n "$cpus" ] || cpus=$(usable_cores "$host" list) || cpus=""
         listing=$(run_host "$host" \
-            "find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n' 2>/dev/null || true") \
+            "find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n' || true") \
             || die "$host: cannot inspect the calibration scratch"
         mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
         # the listing goes in a file, not a pipe: "python3 - <<EOF" already
@@ -1349,10 +1389,10 @@ PYEOF
     done
     if [ -n "$short_hosts" ]; then
         log "ERROR: not enough free space for the calibration scratch on:$short_hosts" >&2
-        die "the calibration grid needs its scratch laid out before it can measure; free space under the destination, shrink CAL_NR_LADDER, or drop -a cal"
+        die "calibration needs its scratch laid out before it can measure; free space under the destination, shrink the CAL_*_TOTAL_MIB working sets, or drop -a cal"
     fi
     if [ "$missing" -eq 0 ]; then
-        log "cal: the scratch grid on every host already satisfies the grid -- no seeding needed"
+        log "cal: the scratch on every host already satisfies every ladder -- no seeding needed"
         return 0
     fi
     cal_push "$@" \
@@ -1361,7 +1401,7 @@ PYEOF
     for host in "$@"; do
         cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-seed.job'"
     done
-    log "cal: seeding the scratch grid on $# host(s)..."
+    log "cal: seeding the calibration scratch on $# host(s)..."
     run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-seed.json" \
         || die "calibration seed failed (output in $WORK_DIR/cal/res-seed.json)"
     check_fio_errors "$WORK_DIR/cal/res-seed.json" layout \
@@ -1369,28 +1409,23 @@ PYEOF
     sleep "$CAL_SETTLE"   # let the seed's write backlog destage
 }
 
-# The calibration engine. Per type it measures a GRID of (nrfiles x iodepth)
-# cells rather than sweeping each axis with the other frozen, because the
-# host file records the pair and only a measured pair can be trusted: with
-# per-axis ladders the recorded tuple was never itself run, and on
-# saving-calf it landed 3-17% below the peaks its own axes had reported.
-# qd is capped at 2 x nrfiles per row (deeper queues measure the queue, not
-# the layout); the iops nr=2 row ignores the cap and runs the full deep
-# ladder so a deep-queue peak stays findable. numjobs is not an axis -- it
-# is the host's usable cores throughout.
+# The calibration engine. nrfiles and filesize are TABLED per (type,
+# direction) -- file count never won by more than its own channel's noise in
+# any lab measurement, so it is an operator-editable table, not a searched
+# axis. iodepth is MEASURED: one noise-aware ladder per (type, direction),
+# at the tabled (nr, fs), because knees genuinely differ by direction
+# (saving-calf: iops write knee 4 vs read knee 16). What lands in the host
+# file is therefore always a tuple that actually ran. numjobs is the host's
+# usable cores throughout.
 #
-# One fio --client invocation per cell over every participating host AT
+# One fio --client invocation per rung over every participating host AT
 # ONCE, so every number is that client's ceiling UNDER CONTENTION, the
-# condition the measured jobs run in. Every cell is measured in both
-# laddered directions and the type takes ONE verdict: the cheapest cell
-# (shallowest queue, then fewest files) still delivering CAL_KNEE_PCT of
-# the best in EVERY direction, so a geometry that suits read cannot be
-# recorded over one that wrecks write.
+# condition the measured jobs run in.
 #
-# Winners land in cal.results, flow into targets.final via
-# apply_cal_results, and persist to hostlist.csv through the existing -a
-# writeback -- which is also the cache: a host whose relevant qd column is
-# already filled skips that type's grid entirely (-g forces a re-measure).
+# Knees land in cal.results, flow into targets.final via apply_cal_results,
+# and persist to hostlist.csv through the existing -a writeback -- which is
+# also the cache: a host whose (fs, nr, qd) slot for a direction is already
+# filled skips that ladder entirely (-g forces a re-measure).
 calibrate() {
     cal_mode || return 0
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
@@ -1416,226 +1451,178 @@ calibrate() {
     done
 
     local type dirn fieldno todo qds qd curjson cmd f
-    # One seed for the whole grid, before any measuring: every host that needs
-    # at least one type calibrated gets the union file set created once.
+    # One seed for every ladder, before any measuring: every host that needs
+    # at least one (type, direction) calibrated gets the union file set
+    # created once.
     local seedhosts=()
     for host in "${HOSTS[@]}"; do
         for type in bw iops; do
-            printf '%s\n' "$ladders" | grep -q "^$type " || continue
-            if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
-            if [ "$REGEN_LAYOUT" -ne 0 ] || ! cal_geometry_cached "$host" "$type"; then
-                seedhosts+=("$host"); break
-            fi
+            for dirn in write read; do
+                printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
+                if [ "$REGEN_LAYOUT" -ne 0 ] \
+                        || ! cal_geometry_cached "$host" "$type" "$dirn"; then
+                    seedhosts+=("$host"); break 2
+                fi
+            done
         done
     done
     if printf '%s\n' "$ladders" | grep -q "^lat "; then
         seedhosts=("${HOSTS[@]}")     # floors run everywhere and read the union
     fi
-    [ ${#seedhosts[@]} -eq 0 ] || cal_seed_grid "${seedhosts[@]}"
+    [ ${#seedhosts[@]} -eq 0 ] || cal_seed_scratch "${seedhosts[@]}"
 
-    local gains h v g human bwq ioq k nj ok gridpick short rest rep diddirn capmax climbing
+    # THE LADDERS. nrfiles and filesize come from the tables (cal_nr,
+    # cal_total_mib) -- file count never won by more than its channel's noise
+    # in any lab measurement, so it is tailored, not searched. iodepth is
+    # measured: one ladder per (type, direction), because the knees genuinely
+    # differ by direction (saving-calf: iops write knee 4 vs read knee 16 on
+    # UDP backends). numjobs is the host's usable cores throughout.
+    #
+    # Each ladder starts with a NOISE FLOOR: the CAL_NOISE_QD rung measured
+    # three times. The spread is this box's own run-to-run noise on this
+    # channel, and it drives both the climb and the verdict -- the best of
+    # many noisy rungs is biased high, so comparing against it with a fixed
+    # threshold chases variance (write iops ran 0.7% on saving-calf, read
+    # iops 11%). The three probe samples double as the ladder's
+    # qd=CAL_NOISE_QD rung (their mean), so the floor costs two extra rungs.
+    #
+    # The climb: a rung must beat the best so far by more than the measured
+    # noise (floored at 1%) to count as progress; CAL_STOP_BELOW consecutive
+    # misses end the ladder. A host that stopped keeps running until every
+    # host stopped, so contention stays constant for the hosts still
+    # climbing. The knee is the shallowest qd within the band -- CAL_KNEE_PCT
+    # widened by the noise -- of that direction's own peak.
+    local gains h v g human ok pick rest rep diddirn
+    local nrn nrfsz best below thr meanspread stopped
     for type in bw iops; do
-        if [ "$type" = bw ]; then fieldno=9; else fieldno=17; fi
-        todo=()
-        for host in "${HOSTS[@]}"; do
-            if [ "$REGEN_LAYOUT" -eq 0 ] && cal_geometry_cached "$host" "$type"; then
-                log "cal: $host: the host file already carries $type geometry -- reusing (re-measure with -g)"
-            else
-                todo+=("$host")
-            fi
-        done
-        [ ${#todo[@]} -gt 0 ] || continue
         printf '%s\n' "$ladders" | grep -q "^$type " || continue
-        # The (nrfiles x iodepth) GRID. Both axes move together instead of
-        # each being swept with the other frozen, because the pair is what
-        # the host file records and a per-axis winner pair was never
-        # actually run (saving-calf: the recorded tuple landed 3-17% under
-        # the peaks its own axes had measured). numjobs is NOT an axis --
-        # it is pinned to the host's usable cores. Its ladder was removed
-        # after the field data showed nothing to keep: the bw adoption
-        # changed no measured result (the client NIC caps bw regardless of
-        # geometry), and the iops adoption was one unreplicated rung.
-        #
-        # qd is capped at 2 x nrfiles: a queue deeper than twice the file
-        # count is measuring the queue, not the layout (Frank's rule).
-        # nr=1 -> qd 1,2   nr=2 -> qd 1,2,4   nr=4 -> qd 1,2,4,8   nr=8 -> +16
-        # For iops the nr=2 row IGNORES the cap and runs the full deep qd
-        # ladder, so a deep-queue peak (saving-calf: 639k iops at qd=256)
-        # stays discoverable.
-        #
-        # Every cell is measured in BOTH laddered directions and the type
-        # gets ONE verdict, so the single qd the host file carries per type
-        # is chosen with read and write both on the table.
-        local nrn nrqd nrfsz nrtot gridqds
-        if [ "$type" = bw ]; then nrtot=2048; else nrtot=512; fi
-        for host in "${todo[@]}"; do
-            rm -f "$WORK_DIR/cal/grid-$type.$host"
-        done
-        # NOISE PROBE. The verdict compares cells against the best cell, and
-        # the best of N noisy samples is biased high -- with 20+ cells a flat
-        # surface still produces a "peak" several percent above the truth, so
-        # a fixed 98% band admits nothing and the tie-break degenerates into
-        # "pick the luckiest cell". Measuring one cell three times gives the
-        # spread this box actually has, per direction, and the band widens to
-        # match. On a quiet channel (write iops ran 0.7% on saving-calf) the
-        # band stays where CAL_KNEE_PCT put it; on a noisy one (read iops ran
-        # 11%) it opens up and the CHEAPEST indistinguishable cell wins, which
-        # is what the knee rule meant in the first place.
-        for host in "${todo[@]}"; do
-            rm -f "$WORK_DIR/cal/noise-$type.$host"
-        done
+        diddirn=0
         for dirn in write read; do
             printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
-            for rep in 1 2 3; do
-                cal_cell "$type" "$dirn" "$CAL_NOISE_QD" "$CAL_NOISE_NR" \
-                    "$((nrtot / CAL_NOISE_NR))M" noise ".n$rep"
+            todo=()
+            for host in "${HOSTS[@]}"; do
+                if [ "$REGEN_LAYOUT" -eq 0 ] && cal_geometry_cached "$host" "$type" "$dirn"; then
+                    log "cal: $host: the host file already carries $type $dirn geometry -- reusing (re-measure with -g)"
+                else
+                    todo+=("$host")
+                fi
             done
-        done
-
-        for nrn in $CAL_NR_LADDER; do
-            nrfsz="$((nrtot / nrn))M"
-            gridqds=""
-            for qd in $CAL_GRID_QDS; do
-                [ "$qd" -le $((2 * nrn)) ] && gridqds="$gridqds $qd"
-            done
-            [ -n "$gridqds" ] || continue
-            # No per-row seeding: cal_seed_grid already created every file the
-            # whole grid needs, each at the largest size any row asks of it.
-            #
-            # Direction is the OUTER loop so a row's reads do not each land
-            # straight on top of a write of the same files -- one settle
-            # between the two blocks instead of a polluted read per cell.
-            diddirn=0
-            for dirn in write read; do
-                printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
-                [ "$diddirn" -eq 0 ] || sleep "$CAL_SETTLE"
-                diddirn=1
-                for qd in $gridqds; do
-                    cal_cell "$type" "$dirn" "$qd" "$nrn" "$nrfsz" grid ""
-                done
-            done
-        done
-
-        # Deep queue extension, iops only and only when the capped grid says
-        # the curve has not turned over yet: if the best cell sits AT the
-        # deepest queue the grid tried, there may be more above it (saving-calf
-        # peaked at qd=256). If it turned over earlier, those 9 extra cells per
-        # direction are ~45% of the iops budget spent confirming a known answer.
-        if [ "$type" = iops ]; then
-            capmax=0
-            for qd in $CAL_GRID_QDS; do
-                [ "$qd" -le $((2 * ${CAL_NR_LADDER##* })) ] && [ "$qd" -gt "$capmax" ] && capmax=$qd
-            done
-            climbing=0
+            [ ${#todo[@]} -gt 0 ] || continue
+            # write ladders run before read ladders (loop order above); the
+            # settle between the blocks keeps a read rung off the write
+            # ladder's destage backlog
+            [ "$diddirn" -eq 0 ] || sleep "$CAL_SETTLE"
+            diddirn=1
+            nrn=$(cal_nr "$type" "$dirn")
+            nrfsz="$(( $(cal_total_mib "$type") / nrn ))M"
             for host in "${todo[@]}"; do
-                [ -s "$WORK_DIR/cal/grid-$type.$host" ] || continue
-                awk -v cap="$capmax" '
-                    {v[$1"/"$3]=$4; if ($4+0 > best[$1]+0) {best[$1]=$4; bq[$1]=$3}}
-                    END {for (d in bq) if (bq[d]+0 == cap+0) exit 0; exit 1}
-                ' "$WORK_DIR/cal/grid-$type.$host" && climbing=1
+                rm -f "$WORK_DIR/cal/hist-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/noise-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/best-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/thr-$type-$dirn.$host"
             done
-            if [ "$climbing" -eq 1 ]; then
-                log "cal: iops peaks at the grid's deepest queue (qd=$capmax) -- extending the nr=$CAL_NOISE_NR row"
-                diddirn=0
-                for dirn in write read; do
-                    printf '%s\n' "$ladders" | grep -q "^iops $dirn$" || continue
-                    [ "$diddirn" -eq 0 ] || sleep "$CAL_SETTLE"
-                    diddirn=1
-                    for qd in $CAL_IOPS_QDS; do
-                        [ "$qd" -gt "$capmax" ] || continue
-                        cal_cell iops "$dirn" "$qd" "$CAL_NOISE_NR" \
-                            "$((nrtot / CAL_NOISE_NR))M" grid ""
+            for rep in 1 2 3; do
+                cal_cell "$type" "$dirn" "$CAL_NOISE_QD" "$nrn" "$nrfsz" \
+                    "noise-$type-$dirn" ".n$rep"
+            done
+            for host in "${todo[@]}"; do
+                # mean of the three probe samples (the qd=CAL_NOISE_QD rung's
+                # value) and their spread in percent; the climb threshold is
+                # the spread floored at 1%
+                awk '{s += $4; n++; if (min == "" || $4 < min) min = $4
+                      if ($4 > max) max = $4}
+                     END {if (n == 0 || s == 0) {print 0, "0.0", 1; exit}
+                          m = s / n; sp = (max - min) * 100 / m
+                          thr = int(sp) + (sp > int(sp) ? 1 : 0)
+                          if (thr < 1) thr = 1
+                          printf "%d %.1f %d\n", m, sp, thr}' \
+                    "$WORK_DIR/cal/noise-$type-$dirn.$host" \
+                    > "$WORK_DIR/cal/thr-$type-$dirn.$host" \
+                    || die "$host: cannot derive the $type $dirn noise floor"
+            done
+            for qd in $(cal_qds "$type"); do
+                if [ "$qd" -eq "$CAL_NOISE_QD" ]; then
+                    # the probe already measured this rung, three times over
+                    for host in "${todo[@]}"; do
+                        read -r v meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
+                        printf '%s %s %s %s\n' "$dirn" "$nrn" "$qd" "$v" \
+                            >> "$WORK_DIR/cal/hist-$type-$dirn.$host"
                     done
+                else
+                    stopped=1
+                    for host in "${todo[@]}"; do
+                        below=0
+                        [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
+                            || read -r best below < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                        [ "$below" -ge "$CAL_STOP_BELOW" ] || { stopped=0; break; }
+                    done
+                    [ "$stopped" -eq 0 ] || break
+                    cal_cell "$type" "$dirn" "$qd" "$nrn" "$nrfsz" \
+                        "hist-$type-$dirn" ""
+                fi
+                for host in "${todo[@]}"; do
+                    v=$(awk -v q="$qd" '$3 == q {v = $4} END {print v + 0}' \
+                        "$WORK_DIR/cal/hist-$type-$dirn.$host")
+                    read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
+                    best=0; below=0
+                    [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
+                        || read -r best below < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                    [ "$below" -ge "$CAL_STOP_BELOW" ] && continue
+                    if [ "$best" -eq 0 ] \
+                            || [ $((v * 100)) -ge $((best * (100 + thr))) ]; then
+                        printf '%s 0\n' "$v" > "$WORK_DIR/cal/best-$type-$dirn.$host"
+                    else
+                        printf '%s %s\n' "$best" $((below + 1)) \
+                            > "$WORK_DIR/cal/best-$type-$dirn.$host"
+                    fi
                 done
-            else
-                debug "cal: iops turned over inside the capped grid -- deep row skipped"
-            fi
-        fi
-        # Verdict, per host: the CHEAPEST cell -- shallowest queue first, then
-        # fewest files -- that is not distinguishable from the best cell in
-        # EVERY measured direction. "Not distinguishable" is the noise probe's
-        # spread, floored by CAL_KNEE_PCT, so a quiet channel keeps a tight
-        # band and a noisy one stops chasing its own variance. A cell has to
-        # qualify in read AND write, so one direction cannot drag the type onto
-        # a geometry that wrecks the other.
-        for host in "${todo[@]}"; do
-            [ -s "$WORK_DIR/cal/grid-$type.$host" ] || continue
-            gridpick=$(python3 - "$WORK_DIR/cal/grid-$type.$host" "$CAL_KNEE_PCT" \
-                           "$type" "$WORK_DIR/cal/noise-$type.$host" <<'PYEOF'
-import os, sys
-from collections import defaultdict
+            done
+            # verdict per host: shallowest qd within the noise-widened band of
+            # this direction's own peak, reported with real numbers
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/hist-$type-$dirn.$host" ] || continue
+                read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
+                pick=$(python3 - "$WORK_DIR/cal/hist-$type-$dirn.$host" \
+                           "$CAL_KNEE_PCT" "$type" "$meanspread" <<'VERDICTEOF'
+import sys
 
-path, knee_pct, mode, noise_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-
-def load(p):
-    out = defaultdict(list)
-    if not os.path.exists(p):
-        return out
-    for line in open(p):
-        f = line.split()
-        if len(f) == 4:
-            out[(f[0], int(f[1]), int(f[2]))].append(float(f[3]))
-    return out
-
-raw = load(path)
-cells, peak = defaultdict(dict), defaultdict(float)
-for (dirn, nr, qd), vals in raw.items():
-    v = sum(vals) / len(vals)
-    cells[(nr, qd)][dirn] = v
-    peak[dirn] = max(peak[dirn], v)
-dirs = sorted(peak)
-if not dirs or not cells:
-    sys.exit("ERROR: no grid cells")
-
-# spread of the repeated probe cell, per direction, as a percentage
-spread = {}
-for (dirn, _, _), vals in load(noise_path).items():
-    if len(vals) > 1 and sum(vals):
-        mean = sum(vals) / len(vals)
-        spread[dirn] = (max(vals) - min(vals)) / mean * 100 if mean else 0.0
-# the band never tightens past CAL_KNEE_PCT, only widens to cover the noise
-floor = {d: min(knee_pct, 100 - 2 * spread.get(d, 0.0)) for d in dirs}
-
-def ratio(c, d):
-    return cells[c].get(d, 0) / peak[d] * 100 if peak[d] else 100.0
-
-order = sorted(cells, key=lambda c: (c[1], c[0]))   # shallowest qd, then fewest files
-ok = [c for c in order if all(ratio(c, d) >= floor[d] for d in dirs)]
-if ok:
-    nr, qd = ok[0]
-    short = "-"
-else:
-    nr, qd = max(order, key=lambda c: min(ratio(c, d) for d in dirs))
-    short = "%d" % round(min(ratio((nr, qd), d) for d in dirs))
+path, knee_pct, mode, spread = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+vals = {}
+for line in open(path):
+    f = line.split()
+    if len(f) == 4:
+        vals[int(f[2])] = float(f[3])
+if not vals:
+    sys.exit("ERROR: empty ladder history")
+peak_qd = max(vals, key=lambda q: vals[q])
+peak = vals[peak_qd]
+if peak <= 0:
+    sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
+floor = min(float(knee_pct), 100.0 - 2 * spread)
+win = min(q for q in sorted(vals) if vals[q] >= floor / 100 * peak)
 
 def human(v):
     if mode == "bw":
         return "%.2fGiB/s" % (v / (1 << 30))
     return "%s/s" % format(int(v), ",")
 
-best = max(cells, key=lambda c: min(ratio(c, d) for d in dirs))
-detail = " ".join("%s %s (%d%% of %s)" % (d, human(cells[(nr, qd)].get(d, 0)),
-                                          round(ratio((nr, qd), d)), human(peak[d]))
-                  for d in dirs)
-bands = " ".join("%s>=%.0f%%(noise %.1f%%)" % (d, floor[d], spread.get(d, 0.0)) for d in dirs)
-print(nr, qd, short, "%s | %s | best cell %d/%d" % (detail, bands, best[0], best[1]))
-PYEOF
-            ) || die "$host: cannot pick the $type grid winner"
-            read -r nrn nrqd short rest <<<"$gridpick"
-            nrfsz="$((nrtot / nrn))M"
-            printf '%s %s %s\n' "$nrqd" "$nrn" "$nrfsz" > "$WORK_DIR/cal/gridwin-$type.$host"
-            if [ "$short" = "-" ]; then
-                log "cal: $host $type: grid picks nrfiles=$nrn qd=$nrqd fs=$nrfsz -- $rest"
-            else
-                log "cal: $host $type: WARNING no cell clears the band in both directions; taking nrfiles=$nrn qd=$nrqd fs=$nrfsz at ${short}% of its worst -- $rest"
-            fi
+print(win, "%s at qd=%d (%d%% of peak %s at qd=%d), band >=%.0f%% (noise %.1f%%)"
+      % (human(vals[win]), win, round(vals[win] * 100 / peak),
+         human(peak), peak_qd, floor, spread))
+VERDICTEOF
+                ) || die "$host: cannot pick the $type $dirn knee"
+                read -r qd rest <<<"$pick"
+                printf '%s %s %s\n' "$qd" "$nrn" "$nrfsz" \
+                    > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz]"
+            done
         done
     done
 
     # Latency floors: nothing to ladder (a latency test is one QD1 stream
     # by definition), so the upper limit IS the floor -- one short rung per
     # direction, reported and bundled, never written back.
-    # No seed here: cal_seed_grid already created the two 64M files a floor
+    # No seed here: cal_seed_scratch already created the two 64M files a floor
     # rung touches. The write floor still precedes the read floor, so settle
     # between them -- a latency floor measured on a write backlog is not a
     # floor.
@@ -1664,22 +1651,24 @@ $(cal_lat_floor "$latjson" "$dirn")
 LATEOF
     done
 
-    # One winning CELL per type, and it was actually measured as a pair --
-    # the (nrfiles, qd) the host file records is the geometry that produced
-    # the number, not two per-axis winners glued together. numjobs stays a
-    # dash: it is always the host's usable cores, which the tuner derives.
+    # One measured (qd, nr, fs) per (type, direction): the geometry the host
+    # file records is exactly what produced the number. numjobs stays out of
+    # it -- always the host's usable cores, which the tuner derives.
     : > "$WORK_DIR/cal.results"
-    local bwnj ionj bwnr bwfs ionr iofs
+    local line any tuple
     for host in "${HOSTS[@]}"; do
-        bwq=-; ioq=-; bwnj=-; ionj=-; bwnr=-; bwfs=-; ionr=-; iofs=-
-        [ ! -s "$WORK_DIR/cal/gridwin-bw.$host" ] \
-            || read -r bwq bwnr bwfs < "$WORK_DIR/cal/gridwin-bw.$host"
-        [ ! -s "$WORK_DIR/cal/gridwin-iops.$host" ] \
-            || read -r ioq ionr iofs < "$WORK_DIR/cal/gridwin-iops.$host"
-        if [ "$bwq" != - ] || [ "$ioq" != - ]; then
-            printf '%s %s %s %s %s %s %s %s %s\n' "$host" "$bwq" "$ioq" "$bwnj" "$ionj" \
-                "$bwnr" "$bwfs" "$ionr" "$iofs" >> "$WORK_DIR/cal.results"
-        fi
+        line=$host; any=0
+        for type in bw iops; do
+            for dirn in read write; do
+                if [ -s "$WORK_DIR/cal/dirwin-$type-$dirn.$host" ]; then
+                    read -r tuple < "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                    line="$line $tuple"; any=1
+                else
+                    line="$line - - -"
+                fi
+            done
+        done
+        [ "$any" -eq 0 ] || printf '%s\n' "$line" >> "$WORK_DIR/cal.results"
     done
     apply_cal_results
 
@@ -1693,7 +1682,7 @@ LATEOF
     fi
 
     # The scratch is KEPT by default so the next calibration seeds nothing:
-    # cal_seed_grid validates by size, and re-creating the grid is the single
+    # cal_seed_scratch validates by size, and re-creating the grid is the single
     # most expensive part of a run. -u removes it, exactly as it removes the
     # workload's own data files.
     pids=(); hs=()
@@ -1707,7 +1696,7 @@ LATEOF
                 || log "WARNING: could not remove the calibration scratch on ${hs[$i]}" >&2
         done
     else
-        log "cal: keeping the scratch grid ($CAL_SCRATCH under each destination) so the next calibration reuses it; -u removes it"
+        log "cal: keeping the calibration scratch ($CAL_SCRATCH under each destination) so the next calibration reuses it; -u removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
@@ -2473,9 +2462,12 @@ hosts = sys.argv[7:]
 TARGETS = {}
 if targets_path != "-" and os.path.exists(targets_path):
     _tf = ("login", "engine", "cpus", "dir",
-           "bw_nj", "bw_fs", "bw_nr", "bw_qd",
-           "lat_nj", "lat_fs", "lat_nr", "lat_qd",
-           "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+           "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
+           "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
+           "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
+           "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
+           "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
+           "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
     for _line in open(targets_path):
         _p = _line.rstrip("\n").split("\t")
         if len(_p) == len(_tf) + 1:
@@ -2483,6 +2475,52 @@ if targets_path != "-" and os.path.exists(targets_path):
 
 def target(h, key):
     return TARGETS.get(h, {}).get(key, "")
+
+# fio spells the option rw= or readwrite=; [global] is the fallback for
+# sections that do not set it themselves. Same rule as cal_required.
+_DIRECTIONS = {"read": ("read",), "randread": ("read",),
+               "write": ("write",), "randwrite": ("write",),
+               "rw": ("read", "write"), "randrw": ("read", "write"),
+               "readwrite": ("read", "write"),
+               "randreadwrite": ("read", "write")}
+
+def file_directions(lines):
+    glob, sections, cur = "", [], None
+    for line in lines:
+        m = re.match(r"^\[(.+)\]\s*$", line)
+        if m:
+            cur = None if m.group(1).strip() == "global" else {"rw": ""}
+            if cur is not None:
+                sections.append(cur)
+            continue
+        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
+        if not m:
+            continue
+        if cur is None:
+            glob = m.group(1)
+        else:
+            cur["rw"] = m.group(1)
+    out = set()
+    for sec in sections or [{"rw": ""}]:
+        out.update(_DIRECTIONS.get((sec["rw"] or glob).lower().split(":")[0], ()))
+    return out
+
+def pick_slot(h, kind, dirs):
+    """The geometry slot a file takes: its own direction, or -- for a
+    mixed-direction file -- the direction with the deeper recorded qd."""
+    if dirs == {"read"}:
+        return f"{kind}_r"
+    if dirs == {"write"}:
+        return f"{kind}_w"
+    def qd(sfx):
+        v = target(h, f"{kind}_{sfx}_qd")
+        return int(v) if v.isdigit() else -1
+    def any_vals(sfx):
+        return any(target(h, f"{kind}_{sfx}_{k}") for k in ("nj", "fs", "nr", "qd"))
+    if qd("r") < 0 and qd("w") < 0:
+        return (f"{kind}_r" if any_vals("r")
+                else f"{kind}_w" if any_vals("w") else "")
+    return f"{kind}_r" if qd("r") >= qd("w") else f"{kind}_w"
 
 SMALL_FILESIZE = "1G"
 IOPS_NRFILES = 2   # per job: enough that no job pounds a single inode
@@ -2798,12 +2836,16 @@ for job in jobs:
             if any(re.match(r"^size=", l) for l in lines):
                 out = override(out, "size", f"{nr}G")
 
-        # host-file values land LAST: the file beats the tuner, per type
+        # host-file values land LAST: the file beats the tuner, per type AND
+        # direction. A single-direction file takes its own slot; a mixed file
+        # takes the deeper-queued direction's WHOLE tuple -- a coherent
+        # measured pair, never a blend of the two directions.
         kind_key = "lat" if is_latency else ("bw" if is_bw else "iops" if is_iops else "")
         if kind_key:
+            slot = pick_slot(h, kind_key, file_directions(lines))
             for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
                                ("nr", "nrfiles"), ("qd", "iodepth")):
-                v = target(h, f"{kind_key}_{tkey}")
+                v = target(h, f"{slot}_{tkey}") if slot else ""
                 if v:
                     out = override(out, jkey, v)
         if target(h, "engine"):
@@ -3160,7 +3202,8 @@ PYEOF
 # --- host files (-t) --------------------------------------------------------------
 # A hostlist.csv assigns per-host settings without a jobfile set per client:
 #   host,user_login,ioengine,allowed_cpus,destination_folder,\
-#       bandwidth:nj/fs/nr/qd,latency:nj/fs/nr/qd,iops:nj/fs/nr/qd
+#       bandwidthR:nj/fs/nr/qd,bandwidthW:...,latencyR:...,latencyW:...,\
+#       iopsR:...,iopsW:...
 # Lines naming a host assign to that host (two lines naming one host is
 # fatal). Host-less lines are SELECTOR lines: their login and/or ioengine
 # choose which hosts they apply to (login = hosts using that login; engine =
@@ -3178,17 +3221,21 @@ PYEOF
 # tests, results in a file as "host engine ok|fail" lines -- NOT stdin,
 # the python heredoc owns stdin) = everything.
 # Output, one host per line, tab-separated, "-" = unset:
-#   host login engine cpus dir bw_nj/bw_fs/bw_nr/bw_qd lat_... iops_...
+#   host login engine cpus dir, then nj/fs/nr/qd per slot in
+#   bw_r, bw_w, lat_r, lat_w, iops_r, iops_w order (29 columns)
 # CLI values arrive as arguments and take precedence over the file.
 # A fresh host file: header plus a commented format reference, so an editor
 # session or a later -a writeback starts from something self-describing.
 write_targets_template() {   # write_targets_template <path>
     cat > "$1" <<'CSVEOF' || die "cannot create host file $1"
-host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth:nj/fs/nr/qd,latency:nj/fs/nr/qd,iops:nj/fs/nr/qd
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd
 # One host per line assigns to that host; lines without a host apply to the
 # hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
-# Example:  client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,1///1,12/1G/56/64
-# Example:  ,,io_uring,,,,,        (io_uring for every host that supports it)
+# Geometry is per type AND direction: R columns shape read jobs, W columns
+# write jobs; a mixed-direction jobfile takes the deeper-queued direction's
+# whole tuple.
+# Example:  client-1,ubuntu,io_uring,"8,10",/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8
+# Example:  ,,io_uring,,,,,,,,     (io_uring for every host that supports it)
 # A host may be written as <name>/<machine-id>; the id is ignored when the
 # row is read and only ever added by wekatester itself, to name a machine it
 # is recording for the first time. Plain hostnames are equally valid, and a
@@ -3376,9 +3423,12 @@ def host_addr(cell):
     name = cell.split("/", 1)[0].strip()
     return ALIAS.get(name, name)
 FIELDS = ("login", "engine", "cpus", "dir",
-          "bw_nj", "bw_fs", "bw_nr", "bw_qd",
-          "lat_nj", "lat_fs", "lat_nr", "lat_qd",
-          "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+          "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
+          "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
+          "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
+          "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
+          "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
+          "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
 
 def load_tsv(path):
     out = {}
@@ -3397,6 +3447,33 @@ def first_value(lines, key):
         if m:
             return m.group(1)
     return ""
+
+_DIRECTIONS = {"read": ("read",), "randread": ("read",),
+               "write": ("write",), "randwrite": ("write",),
+               "rw": ("read", "write"), "randrw": ("read", "write"),
+               "readwrite": ("read", "write"),
+               "randreadwrite": ("read", "write")}
+
+def file_directions(lines):
+    glob, sections, cur = "", [], None
+    for line in lines:
+        m = re.match(r"^\[(.+)\]\s*$", line)
+        if m:
+            cur = None if m.group(1).strip() == "global" else {"rw": ""}
+            if cur is not None:
+                sections.append(cur)
+            continue
+        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
+        if not m:
+            continue
+        if cur is None:
+            glob = m.group(1)
+        else:
+            cur["rw"] = m.group(1)
+    out = set()
+    for sec in sections or [{"rw": ""}]:
+        out.update(_DIRECTIONS.get((sec["rw"] or glob).lower().split(":")[0], ()))
+    return out
 
 # derive per-host values from the STAGED variants -- the execution truth
 KIND = {"latency": "lat", "bandwidth": "bw", "iops": "iops"}
@@ -3423,11 +3500,15 @@ for host in hosts:
         d.setdefault("cpus", first_value(lines, "cpus_allowed"))
         d.setdefault("dir", first_value(lines, "directory"))
         if kind:
-            for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
-                               ("nr", "nrfiles"), ("qd", "iodepth")):
-                v = first_value(lines, jkey)
-                if v:
-                    d.setdefault(f"{kind}_{tkey}", v)
+            # the values a variant ran with belong to every direction it
+            # exercised: a read-only file fills the _r slot, a mixed file both
+            for sfx in sorted({"read": "r", "write": "w"}[dd]
+                              for dd in file_directions(lines)):
+                for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                                   ("nr", "nrfiles"), ("qd", "iodepth")):
+                    v = first_value(lines, jkey)
+                    if v:
+                        d.setdefault(f"{kind}_{sfx}_{tkey}", v)
     derived[host] = {k: v for k, v in d.items() if v}
 
 # desired host line per host
@@ -3466,8 +3547,8 @@ for line in lines:
     else:
         out.append(line)
 
-def geom(want, kind):
-    parts = [want.get(f"{kind}_{k}", "") for k in ("nj", "fs", "nr", "qd")]
+def geom(want, slot):
+    parts = [want.get(f"{slot}_{k}", "") for k in ("nj", "fs", "nr", "qd")]
     return "/".join(parts).rstrip("/") if any(parts) else ""
 
 import io
@@ -3480,7 +3561,9 @@ for host in hosts:
     cell = seen_cell.get(host) or IDENT.get(host, host)
     w.writerow([cell, want.get("login", ""), want.get("engine", ""),
                 want.get("cpus", ""), want.get("dir", ""),
-                geom(want, "bw"), geom(want, "lat"), geom(want, "iops")])
+                geom(want, "bw_r"), geom(want, "bw_w"),
+                geom(want, "lat_r"), geom(want, "lat_w"),
+                geom(want, "iops_r"), geom(want, "iops_w")])
 with open(wb, "w") as fp:
     fp.write("\n".join(out) + "\n" + buf.getvalue())
 print(f"host file: recorded {len(updates)} host line(s) in {wb} ({mode})")
@@ -3515,11 +3598,14 @@ import csv, os, sys
 
 phase, path, cli_engine, cli_dir, results = sys.argv[1:6]
 hosts = sys.argv[6:]
-GEOM = ("bandwidth", "latency", "iops")
+GEOM = ("bandwidthR", "bandwidthW", "latencyR", "latencyW", "iopsR", "iopsW")
 FIELDS = ("login", "engine", "cpus", "dir",
-          "bw_nj", "bw_fs", "bw_nr", "bw_qd",
-          "lat_nj", "lat_fs", "lat_nr", "lat_qd",
-          "iops_nj", "iops_fs", "iops_nr", "iops_qd")
+          "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
+          "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
+          "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
+          "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
+          "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
+          "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
 
 def host_addr(cell):
     """A host cell may be '<name>/<machine-id>' and may name the box by
@@ -3541,17 +3627,19 @@ def die(msg):
     sys.exit(1)
 
 def parse_geom(kind, raw, lineno):
-    """'bandwidth:12/10G/1/8' or bare '12/10G/1/8'; empty parts = unset."""
+    """'bandwidthR:12/10G/1/8' or bare '12/10G/1/8'; empty parts = unset."""
     raw = raw.strip()
     if not raw:
         return {}
     if ":" in raw:
         pfx, rest = raw.split(":", 1)
-        if pfx.strip().lower() != kind:
+        if pfx.strip().lower() != kind.lower():
             die(f"{path}:{lineno}: column for {kind} carries prefix '{pfx}'")
         raw = rest
     parts = (raw.split("/") + ["", "", "", ""])[:4]
-    keys = {"bandwidth": "bw", "latency": "lat", "iops": "iops"}[kind]
+    keys = {"bandwidthR": "bw_r", "bandwidthW": "bw_w",
+            "latencyR": "lat_r", "latencyW": "lat_w",
+            "iopsR": "iops_r", "iopsW": "iops_w"}[kind]
     out = {}
     for key, val in zip(("nj", "fs", "nr", "qd"), parts):
         if val.strip():
@@ -3572,7 +3660,7 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         continue
     if lineno == 1 and row[0].strip().lower() == "host":
         continue   # header
-    row = [c.strip() for c in (row + [""] * 8)[:8]]
+    row = [c.strip() for c in (row + [""] * 11)[:11]]
     host_cell = row[0]
     host, login, engine, cpus, ddir = host_addr(host_cell), row[1], row[2], row[3], row[4]
     fields = {}
@@ -3582,7 +3670,7 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         fields["cpus"] = cpus
     if ddir:
         fields["dir"] = ddir
-    for kind, raw in zip(GEOM, row[5:8]):
+    for kind, raw in zip(GEOM, row[5:11]):
         fields.update(parse_geom(kind, raw, lineno))
     if host:
         if login:
@@ -3913,9 +4001,40 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # Build $WORK_DIR/jobs/<host>/<job> for every host. Auto mode delegates to
 # the tuner; plain mode copies with the directory override (variants are
 # identical across hosts, but one layout = one code path).
-# Host-file geometry (targets.final fields: 6.. per type nj/fs/nr/qd) onto a
-# staged variant, by the jobfile's report type. Returns 0 when it changed
-# anything -- the caller re-derives that host's layout from the new grid.
+
+# Directions a jobfile exercises: each section's effective rw= (its own, else
+# [global]'s). Prints "read", "write", or "read write". Same rule as
+# cal_required's python.
+file_directions() {   # file_directions <file>
+    awk '
+        /^\[/ { ins = ($0 != "[global]"); if (ins) { n++; secrw[n] = "" }; next }
+        /^(rw|readwrite)=/ {
+            v = $0; sub(/^[a-z]*=/, "", v); sub(/:.*/, "", v)
+            if (ins) secrw[n] = v; else grw = v
+        }
+        END {
+            if (n == 0) { vals[tolower(grw)] = 1 }
+            else for (i = 1; i <= n; i++)
+                vals[tolower(secrw[i] != "" ? secrw[i] : grw)] = 1
+            for (v in vals) {
+                if (v == "read" || v == "randread") r = 1
+                else if (v == "write" || v == "randwrite") w = 1
+                else if (v == "rw" || v == "randrw" || v == "readwrite" \
+                         || v == "randreadwrite") { r = 1; w = 1 }
+            }
+            out = ""
+            if (r) out = "read"
+            if (w) out = out (out == "" ? "" : " ") "write"
+            print out
+        }' "$1"
+}
+
+# Host-file geometry (targets.final: six nj/fs/nr/qd slots, one per type and
+# direction) onto a staged variant, by the jobfile's report type and the
+# direction(s) it exercises. A single-direction file takes its own slot; a
+# mixed file takes the deeper-queued direction's WHOLE tuple -- a coherent
+# measured pair, never a blend. Returns 0 when it changed anything -- the
+# caller re-derives that host's layout from the new grid.
 apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
     local host=$1 f=$2 items base changed=1
     [ -f "$WORK_DIR/targets.final" ] || return 1
@@ -3927,12 +4046,38 @@ apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
         (*" iops "*) kind=iops ;;
     esac
     [ -n "$kind" ] || return 1
+    local base_r base_w dirs qr qw i v key
     case "$kind" in
-        (bw)   base=6 ;;
-        (lat)  base=10 ;;
-        (iops) base=14 ;;
+        (bw)   base_r=6;  base_w=10 ;;
+        (lat)  base_r=14; base_w=18 ;;
+        (iops) base_r=22; base_w=26 ;;
     esac
-    local v key i=0
+    dirs=$(file_directions "$f")
+    case "$dirs" in
+        (read)  base=$base_r ;;
+        (write) base=$base_w ;;
+        ("read write")
+            qr=$(targets_field "$host" $((base_r + 3)) "$WORK_DIR/targets.final")
+            qw=$(targets_field "$host" $((base_w + 3)) "$WORK_DIR/targets.final")
+            if [ -n "$qr$qw" ]; then
+                [ "${qr:-0}" -ge "${qw:-0}" ] && base=$base_r || base=$base_w
+            else
+                base=""
+                for i in 0 1 2 3; do
+                    [ -z "$(targets_field "$host" $((base_r + i)) "$WORK_DIR/targets.final")" ] \
+                        || { base=$base_r; break; }
+                done
+                if [ -z "$base" ]; then
+                    for i in 0 1 2 3; do
+                        [ -z "$(targets_field "$host" $((base_w + i)) "$WORK_DIR/targets.final")" ] \
+                            || { base=$base_w; break; }
+                    done
+                fi
+                [ -n "$base" ] || return 1
+            fi ;;
+        (*) return 1 ;;
+    esac
+    i=0
     for key in numjobs filesize nrfiles iodepth; do
         v=$(targets_field "$host" $((base + i)) "$WORK_DIR/targets.final")
         i=$((i + 1))

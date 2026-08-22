@@ -44,10 +44,11 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max|cal[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
-                          cal: measure a per-client nrfiles x iodepth grid before staging
-                          :secs shortens each grid cell from the 30s default
-                          (cal:15); it does not change how long the measured
-                          jobs run -- that is -x/--duration
+                          cal: measure per-client iodepth ladders (one per
+                          type and direction) before staging
+                          :secs shortens each ladder rung from the 30s
+                          default (cal:15); it does not change how long the
+                          measured jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -78,8 +79,8 @@ attaching is the way to pass a value that starts with a dash.
                           (time_based); layout and unlink keep their own timing
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun), and
-                 the calibration scratch grid, which is otherwise kept so the
-                 next calibration can reuse it
+                 the calibration scratch files, which are otherwise kept
+                 so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
@@ -141,7 +142,7 @@ Jobfiles get edited in the field — `-C` makes that a guided flow instead of `c
 ./wekatester -C ./path/to/set -- host1 host2                  # explicit path; hosts after --
 ```
 
-The flow: the workload set is copied (shipped sets are never edited in place — `-C default` customizes a fresh copy, not `fio-jobfiles/default` itself), the set's `hostlist.csv` opens in your editor (`$VISUAL`, then `$EDITOR`, then `vi`) — the host file is the primary customization surface: per-host login, engine, cpus, destination, and per-type geometry in one CSV — then a 5s prompt (default no) offers editing the jobfiles individually in run order, the layout job is generated, and you are offered a chance to edit it (5s prompt, default no). A set created without a name lands in `./fio-jobfiles/<date>-<time>/` and you choose whether to keep it for reuse (5s prompt, default keep); a set you chose not to keep is removed **only after a fully successful run** — any failure preserves your edits. Naming an existing *custom* set edits it as-is; adding an explicit `-w` on top of one asks (a real y/N, no timeout) before **replacing** its jobfiles with a fresh copy of that workload.
+The flow: the workload set is copied (shipped sets are never edited in place — `-C default` customizes a fresh copy, not `fio-jobfiles/default` itself), the set's `hostlist.csv` opens in your editor (`$VISUAL`, then `$EDITOR`, then `vi`) — the host file is the primary customization surface: per-host login, engine, cpus, destination, and per-direction geometry in one CSV — then a 5s prompt (default no) offers editing the jobfiles individually in run order, the layout job is generated, and you are offered a chance to edit it (5s prompt, default no). A set created without a name lands in `./fio-jobfiles/<date>-<time>/` and you choose whether to keep it for reuse (5s prompt, default keep); a set you chose not to keep is removed **only after a fully successful run** — any failure preserves your edits. Naming an existing *custom* set edits it as-is; adding an explicit `-w` on top of one asks (a real y/N, no timeout) before **replacing** its jobfiles with a fresh copy of that workload.
 
 With no attached set name, the token after `-C` is assumed to be a client; if it turns out unreachable over ssh, wekatester asks (5s, default yes) whether it was actually the set name. Put hosts after `--` to make it unambiguous.
 
@@ -181,79 +182,80 @@ of trusting the jobfiles' static values. Four levels:
   these numbers" becomes "measured on your clients against this cluster."
 
 How calibration works: before staging, the set is inspected for what it
-actually runs — bandwidth and/or iops grids, read and/or write directions;
-latency has no queue to ladder, so its FLOOR is measured instead (one QD1
-rung per direction, reported and bundled, never cached).
+actually runs — bandwidth and/or iops, read and/or write directions; latency
+has no queue to ladder, so its FLOOR is measured instead (one QD1 rung per
+direction, reported and bundled, never cached).
 
-Calibration measures a **grid of (nrfiles × iodepth) cells**, not one axis at
-a time. The pair is what the host file records, and only a measured pair can
-be trusted — with per-axis ladders the recorded tuple was never itself run,
-and in the field it landed 3–17% below the peaks its own axes had reported.
-Rows are 1, 2, 4 and 8 files per job at the same working set (each file
-proportionally smaller, so the comparison is file count and not capacity),
-and each row's queue depths are capped at **2 × nrfiles** — a queue deeper
-than twice the file count measures the queue, not the layout. So nr=1 runs
-qd 1–2, nr=2 runs 1–4, nr=4 runs 1–8, nr=8 runs 1–16. The iops nr=2 row is
-the one exception: it ignores the cap and runs the full deep ladder (to
-qd 256), so a deep-queue peak stays discoverable. `numjobs` is not an axis —
-it is the host's usable cores throughout.
+Calibration measures **one iodepth ladder per (type, direction)** — bw read,
+bw write, iops read, iops write, whichever the set actually contains —
+because the knees genuinely differ by direction (in the field: iops write
+knee 4 vs read knee 16 on the same clients). File count and size are not
+searched: each ladder runs 2 files per job against a fixed working set
+(2048MiB for bandwidth, 512MiB for iops, split evenly across the files),
+tunable per type and direction via `CAL_BW_READ_NR`, `CAL_IOPS_TOTAL_MIB`
+and friends. (An earlier release searched a (nrfiles × iodepth) grid; the
+extra axis multiplied the budget, and A/B tests on real hardware kept
+landing on 2 files per job.) `numjobs` is not an axis either — it is the
+host's usable cores throughout.
 
-Every cell runs ~32s by default (30s measured after a 2s ramp) on ALL
-clients at once, so every number is that client's ceiling under contention —
-the condition the real jobs run in. `-a cal:15` shortens the measured part.
-Within a row, **direction is the outer loop**: all of a row's writes, one
-settle, then all of its reads, so a read never lands straight on top of a
-write of the same files.
+Bandwidth ladders climb qd 1–128, iops 1–256. Every rung runs ~32s by
+default (30s measured after a 2s ramp) on ALL clients at once, so every
+number is that client's ceiling under contention — the condition the real
+jobs run in. `-a cal:15` shortens the measured part. **Direction is the
+outer loop**: the whole write ladder, one settle, then the whole read
+ladder, so a read rung never lands straight on top of a write of the same
+files.
 
-Before the grid, one cell (`nr=2/qd=4`) is **measured three times per
-direction** to find the spread this box actually has. That matters because
-the verdict compares every cell against the best cell, and the best of
-twenty-odd noisy samples is biased high — on a flat surface a fixed band
-would admit nothing and the tie-break would degenerate into picking the
-luckiest cell. The acceptance band is therefore `max(CAL_KNEE_PCT, 100 − 2 ×
-spread)` per direction: a quiet channel keeps its tight band, a noisy one
-opens up and the **cheapest indistinguishable** cell wins, which is what the
-knee rule meant all along. The measured spread is printed with the verdict,
-alongside the winner's and the peak's absolute throughput — so a grid that
-measured nothing at all is visible as a number, not just as a ratio.
+Each ladder starts with a **noise floor**: its qd=4 rung measured three
+times. The spread is that box's own run-to-run noise on that channel, and it
+drives both the climb and the verdict — the best of many noisy rungs is
+biased high, so comparing against it with a fixed threshold chases variance
+(in the field, write iops repeated to 0.7% and read iops to 11% on the same
+client). The three samples double as the ladder's qd=4 rung (their mean), so
+the floor costs two extra rungs.
 
-Each type then takes ONE verdict: the cheapest cell — shallowest queue first,
-then fewest files — that clears the band in every measured direction.
-Requiring both directions means a geometry that suits read cannot be recorded
-over one that wrecks write. If no cell clears it in both, the cell with the
-best worst-direction ratio wins and the shortfall is logged as a warning.
+The climb: a rung must beat the best so far by more than the measured noise
+(floored at 1%) to count as progress, and two consecutive misses end the
+ladder — a curve that turns over stops early, so the deep rungs are only
+paid for while there may still be something above them. A host that stopped
+keeps running each rung until every host has stopped, so contention stays
+constant for the hosts still climbing; only its tally is frozen.
 
-The iops **deep queue ladder is earned, not automatic**: nine extra queue
-depths in both directions is roughly 45% of the iops budget, so it runs only
-when the capped grid's best cell sits at the deepest queue tried — that is,
-when the curve has not turned over yet and there may be more above it. When
-iops peaks inside the cap, those cells are skipped.
+The verdict: the knee is the shallowest qd within the acceptance band of
+that direction's own peak, and the band is `min(CAL_KNEE_PCT, 100 − 2 ×
+spread)` percent — a quiet channel keeps the tight 98% band, a noisy one
+opens up and the **cheapest indistinguishable** rung wins, which is what the
+knee rule meant all along. The verdict prints the winner's and the peak's
+absolute throughput alongside the measured spread, so a ladder that measured
+nothing at all is visible as a number, not just as a ratio.
 
-**The scratch grid is seeded once, incrementally, and kept.** Every cell reads
-`<host>.cal.<job>.<filenum>`; rows differ only in how many of those files they
-touch and how much of each they use, so the grid needs file *f* sized to the
-largest any row asks of it — 2048M for file 0 down to 256M for files 4–7 with
-the default ladder. That union is 5120M per job where per-row seeding wrote
-10240M, because per-row seeding re-created the same filenames at four sizes
-per type and then did it again for the other type; iops now needs no seed of
-its own, since every file it wants already exists and is larger. A file
-already at or above the size the grid needs is left alone (size is a
-sufficient test — laid-out files cannot be sparse on weka), so the scratch
-survives the run and the *next* calibration on that host seeds nothing at
-all. `-u` removes it, exactly as it removes the workload's own data files.
+**The calibration scratch is seeded once, incrementally, and kept.** Every
+rung of every ladder reads `<host>.cal.<job>.<filenum>`; ladders differ only
+in how much of each file they use, so the scratch needs file *f* sized to
+the largest any ladder asks of it — with the default tables, two 1024M files
+per job (the bandwidth ladders), which already covers the iops ladders and
+the latency floors. A file already at or above the size the union needs is
+left alone — size is a sufficient test **because the seed job sets
+`fallocate=none`**: a partial create leaves a short file that fails the
+test, never a full-size hollow one that passes it — so the scratch survives
+the run and the *next* calibration on that host seeds nothing at all. `-u`
+removes it, exactly as it removes the workload's own data files.
 
-The winning cell's (nrfiles, filesize, iodepth) is recorded into the host
-file under the usual rules — filling empty fields only, overwriting under
-`-g` — so a geometry you authored yourself still wins over calibration. Under
-`-g` everything derived overwrites the host file except the three columns the
-operator owns outright: host, login, and allowed_cpus. The scratch grid
-(`.wekatester-cal/` under each destination) is seeded in full per row before
-any measured cell — creation is never measured — and removed afterward.
+Each direction's winning (iodepth, nrfiles, filesize) is recorded into its
+own host-file columns — `bandwidthR`, `bandwidthW`, `iopsR`, `iopsW` — under
+the usual rules — filling empty fields only, overwriting under `-g` — so a
+geometry you authored yourself still wins over calibration. Under `-g`
+everything derived overwrites the host file except the three columns the
+operator owns outright: host, login, and allowed_cpus. A jobfile that runs
+both directions takes the deeper-qd direction's WHOLE tuple — tuples never
+mix across directions, because a mixed tuple was never itself measured.
 Results flow into the run's geometry one precedence slot below the operator
-(CLI > host file > calibration > tuner) and persist to `hostlist.csv` via the
-`-a` writeback — which is also the cache: a host whose qd columns are already
-filled skips that type's grid (`-g` re-measures). `-n` names the grids a run
-would perform without executing them.
+(CLI > host file > calibration > tuner) and persist to `hostlist.csv` via
+the `-a` writeback — which is also the cache: a host whose (fs, nr, qd)
+triple for a direction is already complete skips that ladder (`-g`
+re-measures; a partial triple never counts, half a geometry is not something
+anyone measured). `-n` names the ladders a run would perform without
+executing them.
 
 Every staged jobfile records what auto derived for that host in header
 comments. Auto also warns when workers differ (core counts, weka cores).
@@ -293,7 +295,7 @@ Without `-t` no host file is used — with one exception: a `-C` set's own `host
 
 Every ioengine the file (or `-e`) names is **proven with a real one-file job on that host's destination** before use — `--enghelp` lists what fio was built with, not what the kernel and filesystem will run — and in auto mode the tuner's common engine comes from the proven set. A requested `allowed_cpus` outside the host's current `taskset -cp` mask, or overlapping weka's pinned cores, is an error showing all three (request, mask, weka cores) unless a passwordless escalator works — probed per host as dzdo, pbrun, sesu, pmrun, doas, ksu, then sudo last (sites that install an enterprise escalator usually mandate it), each tested non-interactively with a 5s timeout. Escalation is as-needed: a self-affinable mask (pure-isolated cpus, or inside the current taskset) runs fio as the login user even when an escalator exists. When escalation is needed it covers the `taskset` only — fio itself drops back to the login user via `runuser` where policy allows (keeping test files user-owned), falls back to a root fio with a NOTE otherwise, and is torn down with the same privilege (cpus overlapping weka's dedicated cores are excluded at execution — the host file keeps your list as written). weka CLI queries, when a future feature issues any, try the login user first and get one escalated retry on failure. Each host may also point at its own `destination_folder`: the mount guard, write probe, layout grid sweep, and staged variants all follow it (auto mode's capacity estimate still measures the master's filesystem — approximate when destinations differ).
 
-With `-a`, the derived values (established login, proven engine, cpus, directory, per-type geometry) are recorded back into the host file for re-use — filling only what the file didn't provide; add `-g` to be asked (no timeout) whether to overwrite instead. Updates never edit lines in place: the old host line is commented out and the new one appended, preserving history. A machine wekatester records for the **first** time is named `<short hostname>/<machine-id>` rather than by whatever the run happened to address it as — `localhost` identifies nothing, and a bare hostname collides as soon as a host file is shared between labs. The id comes from `/sys/class/dmi/id/product_uuid`, falling back to `/etc/machine-id`, and is omitted entirely when neither can be read. You never have to type it: a row you wrote keeps your spelling forever, and the id is ignored when the file is read — the name before the `/` is matched against the host the run is using, so a local run still resolves its own row without ssh. Two rows whose names collide but whose ids differ are rejected with both spellings named, since the run cannot tell which machine you meant.
+With `-a`, the derived values (established login, proven engine, cpus, directory, per-direction geometry) are recorded back into the host file for re-use — filling only what the file didn't provide; add `-g` to be asked (no timeout) whether to overwrite instead. Updates never edit lines in place: the old host line is commented out and the new one appended, preserving history. A machine wekatester records for the **first** time is named `<short hostname>/<machine-id>` rather than by whatever the run happened to address it as — `localhost` identifies nothing, and a bare hostname collides as soon as a host file is shared between labs. The id comes from `/sys/class/dmi/id/product_uuid`, falling back to `/etc/machine-id`, and is omitted entirely when neither can be read. You never have to type it: a row you wrote keeps your spelling forever, and the id is ignored when the file is read — the name before the `/` is matched against the host the run is using, so a local run still resolves its own row without ssh. Two rows whose names collide but whose ids differ are rejected with both spellings named, since the run cannot tell which machine you meant.
 
 # Authentication
 A large client list rarely shares one credential, so wekatester carries a pool and finds each worker's own. `-i [login:]keyfile` names a key, optionally bound to a login (`-i ubuntu:lab.pem`); it takes comma-separated lists and may be repeated, accumulating in order. A bare path (`-i lab.pem`) means ssh's default user. `-p [n]` prompts — on your terminal, passwords never echoed — for *n* (default 1) login/password pairs; an empty login answer means ssh's default user. `-i` and `-p` combine freely.
@@ -314,7 +316,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth);
 - `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`), plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, and `sar-end` (the sysstat log slice covering the run window, when the box keeps one). A host missing a tool records `not available` instead of failing the run;
-- `cal/` — on `-a cal` runs, every calibration cell's jobfile and raw JSON plus `cal.results`.
+- `cal/` — on `-a cal` runs, every ladder rung's jobfile and raw JSON plus `cal.results`.
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 
