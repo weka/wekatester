@@ -491,6 +491,156 @@ normalize_opt() {   # normalize_opt <token>
     esac
 }
 
+# --- the shared python layer -------------------------------------------------
+# One definition of the direction rule, the host-file schema, the slot
+# tie-break, and the small helpers every embedded python used to carry its
+# own copy of. pyrun() prepends this to the script on stdin, so a consumer
+# just uses the names. Four copies of the rw= rule in two languages had
+# already drifted once (the ':' modifier strip); this is where it lives now.
+WEKA_PYLIB=$(cat <<'PYLIBEOF'
+import os, re
+
+# fio spells the option rw= or readwrite=; trim-only mixes have no
+# calibratable direction.
+DIRECTIONS = {"read": ("read",), "randread": ("read",),
+              "write": ("write",), "randwrite": ("write",),
+              "rw": ("read", "write"), "randrw": ("read", "write"),
+              "readwrite": ("read", "write"),
+              "randreadwrite": ("read", "write")}
+
+def rw_directions(value):
+    # fio's ":<modifier>" suffix (rw=randrw:8) is not part of the direction
+    return DIRECTIONS.get(value.lower().split(":")[0], ())
+
+def file_directions(lines):
+    """Every direction the file's job sections exercise. [global] supplies
+    the fallback for sections that do not set rw= themselves."""
+    glob, sections, cur = "", [], None
+    for line in lines:
+        m = re.match(r"^\[(.+)\]\s*$", line)
+        if m:
+            # [global] is not a job: its rw= is the fallback, not a section
+            cur = None if m.group(1).strip() == "global" else {"rw": ""}
+            if cur is not None:
+                sections.append(cur)
+            continue
+        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
+        if not m:
+            continue
+        if cur is None:
+            glob = m.group(1)
+        else:
+            cur["rw"] = m.group(1)
+    out = set()
+    for sec in sections or [{"rw": ""}]:   # no sections: [global] is the job
+        out.update(rw_directions(sec["rw"] or glob))
+    return out
+
+# The host-file schema: the host, four identity columns, then six nj/fs/nr/qd
+# geometry slots, one per (type, direction).
+GEOM_SLOTS = ("bw_r", "bw_w", "lat_r", "lat_w", "iops_r", "iops_w")
+GEOM_NAMES = ("bandwidthR", "bandwidthW", "latencyR", "latencyW",
+              "iopsR", "iopsW")
+FIELDS = ("login", "engine", "cpus", "dir") + tuple(
+    f"{s}_{k}" for s in GEOM_SLOTS for k in ("nj", "fs", "nr", "qd"))
+
+def slot_base(slot):
+    # 0-based ROW index of the slot's nj column (host=0, login=1, engine=2,
+    # cpus=3, dir=4, then nj/fs/nr/qd per slot)
+    return 5 + 4 * GEOM_SLOTS.index(slot)
+
+# cal.results: host + (qd nr fs) per measured slot, in this order
+CAL_SLOTS = ("bw_r", "bw_w", "iops_r", "iops_w")
+
+def pick_slot(kind, dirs, get):
+    """The geometry slot a file takes: its own direction, or -- for a
+    mixed-direction (or unclassifiable) file -- the direction with the
+    deeper recorded qd: a coherent measured pair, never a blend.
+    get(key) returns that host's recorded value, "" when unset."""
+    if dirs == {"read"}:
+        return f"{kind}_r"
+    if dirs == {"write"}:
+        return f"{kind}_w"
+    def qd(sfx):
+        v = get(f"{kind}_{sfx}_qd")
+        return int(v) if v.isdigit() else -1
+    def any_vals(sfx):
+        return any(get(f"{kind}_{sfx}_{k}") for k in ("nj", "fs", "nr", "qd"))
+    if qd("r") < 0 and qd("w") < 0:
+        return (f"{kind}_r" if any_vals("r")
+                else f"{kind}_w" if any_vals("w") else "")
+    return f"{kind}_r" if qd("r") >= qd("w") else f"{kind}_w"
+
+ENGINE_ORDER = ["io_uring", "libaio", "psync"]
+
+def pick_engine(tally):
+    # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
+    # libaio over psync -- instead of to whichever jobfile happened to be
+    # read first, which is what plain max() over a dict gives you. Same
+    # order decides the no-engine-declared fallback.
+    if not tally:
+        return ENGINE_ORDER[0]
+    rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
+    return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
+
+def first_value(lines, key):
+    for l in lines:
+        m = re.match(rf"^{key}=(\S+)", l)
+        if m: return m.group(1)
+    return ""
+
+def last_section(lines):
+    name = ""
+    for l in lines:
+        m = re.match(r"^\[(.+)\]\s*$", l)
+        if m: name = m.group(1)
+    return name
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
+    if not m: raise ValueError(f"bad size: {s}")
+    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
+    return int(float(m.group(1)) * mult)
+
+def parse_cpulist(s):
+    cpus = set()
+    for part in s.split(","):
+        if "-" in part:
+            a, b = part.split("-"); cpus.update(range(int(a), int(b) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
+
+def fmt_cpulist(cpus):
+    out, run = [], []
+    for c in sorted(cpus):
+        if run and c == run[-1] + 1: run.append(c)
+        else:
+            if run: out.append(run)
+            run = [c]
+    if run: out.append(run)
+    return ",".join(f"{r[0]}-{r[-1]}" if len(r) > 1 else f"{r[0]}" for r in out)
+
+def _kv(name):
+    return dict(kv.split("=", 1)
+                for kv in os.environ.get(name, "").split(",") if "=" in kv)
+
+ALIAS = _kv("WEKATESTER_HOST_ALIAS")     # name in the file -> address we use
+IDENT = _kv("WEKATESTER_HOST_IDENT")     # address -> "<name>/<machine-id>"
+
+def host_addr(cell):
+    """A host cell may be '<name>/<machine-id>' and may name the box by
+    something other than the address this run uses (local mode calls it
+    localhost). Strip the id, then map the name onto the address."""
+    name = cell.split("/", 1)[0].strip()
+    return ALIAS.get(name, name)
+PYLIBEOF
+)
+
+pyrun() {   # pyrun <args...> -- python script on stdin, WEKA_PYLIB prepended
+    { printf '%s\n' "$WEKA_PYLIB"; cat; } | python3 - "$@"
+}
+
 # -a takes a level and, for the measuring levels, an optional per-rung
 # duration: "cal:15" runs each ladder rung for 15 measured seconds instead of
 # the 30s default. This is the CALIBRATION rung length; -x/--duration sets
@@ -757,7 +907,7 @@ cal_mode() { [ "$AUTO_LEVEL" = cal ]; }
 # the mixed forms -> both. A file that names no rw= anywhere contributes no
 # direction, hence no ladder.
 cal_required() {   # cal_required <setdir>
-    python3 - "$1" <<'PYEOF' || return 1
+    pyrun "$1" <<'PYEOF' || return 1
 import os, re, sys
 
 src = sys.argv[1]
@@ -767,12 +917,6 @@ if not os.path.isdir(src):
 # Layout-job rule, same as is_layout_file/generate_layout -- keep in sync.
 MARKER = "# wekatester-layout: generated"
 NAME = "000-wekatester-layout.job"
-
-# fio spells the option rw= or readwrite=; trim-only mixes are not calibrated.
-DIRECTIONS = {"read": ("read",), "randread": ("read",),
-              "write": ("write",), "randwrite": ("write",),
-              "rw": ("read", "write"), "randrw": ("read", "write"),
-              "readwrite": ("read", "write"), "randreadwrite": ("read", "write")}
 
 def report_items(lines):
     """Directive items, by the same rule as report_directive() in the bash
@@ -784,28 +928,6 @@ def report_items(lines):
         m = re.match(r"^#\s*report\s+(.*)", line)
         if m: items += m.group(1).split()
     return items
-
-def directions(lines):
-    """Every direction the file's job sections exercise. [global] supplies the
-    fallback for sections that do not set rw= themselves."""
-    glob, sections, cur = "", [], None
-    for line in lines:
-        m = re.match(r"^\[(.+)\]\s*$", line)
-        if m:
-            # [global] is not a job: its rw= is the fallback, not a section.
-            cur = None if m.group(1).strip() == "global" else {"rw": ""}
-            if cur is not None: sections.append(cur)
-            continue
-        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
-        if not m: continue
-        if cur is None: glob = m.group(1)
-        else: cur["rw"] = m.group(1)
-    out = set()
-    for s in sections or [{"rw": ""}]:   # no sections: [global] is the job
-        # strip fio's ":<modifier>" suffix (rw=randrw:8), same as the
-        # file_directions twins in the tuner, the writeback, and the bash awk
-        out.update(DIRECTIONS.get((s["rw"] or glob).lower().split(":")[0], ()))
-    return out
 
 needed = set()
 for f in sorted(os.listdir(src)):
@@ -819,14 +941,14 @@ for f in sorted(os.listdir(src)):
     if "latency" in items:
         # latency has no queue to ladder, but its FLOOR is measured: one
         # QD1 rung per direction the file uses (reported, never cached)
-        for d in directions(lines):
+        for d in file_directions(lines):
             needed.add(f"lat {d}")
         continue
     types = []
     if "bandwidth" in items or not items: types.append("bw")
     if "iops" in items: types.append("iops")
     for t in types:
-        for d in directions(lines):
+        for d in file_directions(lines):
             needed.add(f"{t} {d}")
 
 for line in sorted(needed):
@@ -861,19 +983,10 @@ usable_cores() {   # usable_cores <host> [count|list] [cpulist]
         log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
         return 1
     }
-    python3 - "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" <<'PYEOF' || return 1
+    pyrun "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" <<'PYEOF' || return 1
 import sys
 
 path = sys.argv[1]
-
-def parse_cpulist(s):
-    cpus = set()
-    for part in s.split(","):
-        if "-" in part:
-            a, b = part.split("-"); cpus.update(range(int(a), int(b) + 1))
-        elif part:
-            cpus.add(int(part))
-    return cpus
 
 ncpus, weka = 0, set()
 for line in open(path):
@@ -1135,26 +1248,24 @@ apply_cal_results() {
     [ -s "$WORK_DIR/cal.results" ] || return 0
     # -g forces a re-measure -- and a re-measure someone forced should WIN:
     # its knees replace host-file values instead of only filling gaps
-    python3 - "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" <<'PYEOF' || die "cannot apply the calibration results"
+    pyrun "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" <<'PYEOF' || die "cannot apply the calibration results"
 import os, sys
 
 res, final, force = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 
-# targets.final layout: host + 4 identity fields + 6 geometry slots of
-# nj/fs/nr/qd each (bw_r bw_w lat_r lat_w iops_r iops_w) = 29 columns.
-# cal.results carries (qd nr fs) per measured slot, in this order:
-SLOTS = ("bw_r", "bw_w", "iops_r", "iops_w")
-# 0-based ROW index of each slot's nj column (host=0, login=1, engine=2,
-# cpus=3, dir=4, then nj/fs/nr/qd per slot)
-BASE = {"bw_r": 5, "bw_w": 9, "lat_r": 13, "lat_w": 17,
-        "iops_r": 21, "iops_w": 25}
-NCOLS = 1 + 4 + 6 * 4
+NCOLS = 1 + len(FIELDS)
 
 knees = {}
 for line in open(res):
     f = line.split()
-    if len(f) == 1 + 3 * len(SLOTS):
-        knees[f[0]] = f[1:]
+    if not f:
+        continue
+    # a malformed line is a schema break, not a skip: silently dropping it
+    # discards a 30-45 minute measurement with no diagnostic
+    if len(f) != 1 + 3 * len(CAL_SLOTS):
+        sys.exit(f"ERROR: cal.results: malformed line "
+                 f"(want {1 + 3 * len(CAL_SLOTS)} fields): {line.rstrip()}")
+    knees[f[0]] = f[1:]
 
 rows, order = {}, []
 if os.path.exists(final):
@@ -1171,9 +1282,9 @@ for host in sorted(knees):
     while len(row) < NCOLS:
         row.append("-")
     vals = knees[host]
-    for i, slot in enumerate(SLOTS):
+    for i, slot in enumerate(CAL_SLOTS):
         qd, nr, fs = vals[3 * i:3 * i + 3]
-        base = BASE[slot]
+        base = slot_base(slot)
         for off, v in ((3, qd), (2, nr), (1, fs)):   # qd, nr, fs columns
             if v != "-" and (force or row[base + off] == "-"):
                 row[base + off] = v
@@ -1251,7 +1362,8 @@ cal_cell() {   # cal_cell <type> <dirn> <qd> <nr> <fsz> <sink> <tag> [reuse]
     if [ "$reuse" != reuse ]; then
         CAL_NRFILES=$cnr CAL_FILESIZE=$cfsz \
             stage_cal_step "$ctype" "$cdirn" "$cqd" "$WORK_DIR/cal" "${todo[@]}"
-        cal_push "${todo[@]}" || die "cannot copy ladder rung files to $MASTER"
+        cal_push "cal-$ctype-$cdirn-qd$cqd-nr$cnr.job" "${todo[@]}" \
+            || die "cannot copy ladder rung files to $MASTER"
     fi
     ccmd="'$FIO_BIN' --output-format=json --eta=never"
     for ch in "${todo[@]}"; do
@@ -1269,6 +1381,9 @@ cal_cell() {   # cal_cell <type> <dirn> <qd> <nr> <fsz> <sink> <tag> [reuse]
         [ -n "$ch" ] || continue
         printf '%s %s %s %s\n' "$cdirn" "$cnr" "$cqd" "$cv" \
             >> "$WORK_DIR/cal/$sink.$ch"
+        # the rung's own value, for the climb -- re-parsing the whole hist
+        # file per rung per host was an awk spawn per data point
+        printf '%s\n' "$cv" > "$WORK_DIR/cal/rung.$ch"
     done <<CELLEOF
 $cvals
 CELLEOF
@@ -1279,30 +1394,33 @@ CELLEOF
 # let a row with a qd but no nrfiles skip the ladder entirely, leaving the
 # tuple half-measured, which is the very thing recording it whole prevents.
 cal_geometry_cached() {   # cal_geometry_cached <host> <bw|iops> <read|write>
-    local host=$1 base f
+    local host=$1 base f sfx=r
+    [ "$3" = read ] || sfx=w
     # fs, nr, qd of that direction's slot in targets.final; nj is the
     # operator's to pin and never part of what calibration records
-    case "$2 $3" in
-        ("bw read")    base=7 ;;
-        ("bw write")   base=11 ;;
-        ("iops read")  base=23 ;;
-        ("iops write") base=27 ;;
-        (*) die "cal_geometry_cached: unknown ladder: $2 $3" ;;
-    esac
+    base=$(pyrun "$2_$sfx" <<'PYEOF'
+import sys
+print(slot_base(sys.argv[1]) + 2)   # 1-based column of the slot's fs
+PYEOF
+    ) || die "cal_geometry_cached: unknown ladder: $2 $3"
     for f in "$base" $((base + 1)) $((base + 2)); do
         [ -n "$(targets_field "$host" "$f" "$WORK_DIR/targets.final")" ] || return 1
     done
     return 0
 }
 
-# Only the per-host jobfile directories belong on the master. The cal
-# directory also accumulates every rung's raw JSON and the ladder tallies,
-# and globbing the lot re-shipped all of it before every rung -- quadratic
-# scp on a remote run, for files the master never reads.
-cal_push() {   # cal_push <host>...
-    local h dirs=()
-    for h in "$@"; do dirs+=("$WORK_DIR/cal/$h"); done
-    copy_to_master "${dirs[@]}" "$TARGET_DIR.cal/"
+# Only the rung's own file belongs on the master -- the per-host dirs
+# accumulate every staged rung and probe artifact, so shipping whole dirs
+# grew linearly as a ladder climbed (and the cal dir's JSONs would be
+# quadratic). One staging tree, one scp per push, whatever the fleet size.
+cal_push() {   # cal_push <basename> <host>...
+    local base=$1 h; shift
+    rm -rf "$WORK_DIR/cal/.push" || return 1
+    for h in "$@"; do
+        mkdir -p "$WORK_DIR/cal/.push/$h" || return 1
+        cp "$WORK_DIR/cal/$h/$base" "$WORK_DIR/cal/.push/$h/" || return 1
+    done
+    copy_to_master "$WORK_DIR/cal/.push"/* "$TARGET_DIR.cal/"
 }
 
 # One seed pass for the whole scratch, incremental: a file that already
@@ -1311,9 +1429,29 @@ cal_push() {   # cal_push <host>...
 # for the same reason it is for the main layout -- laid-out files cannot be
 # sparse on weka, and the seed job sets fallocate=none.
 cal_seed_scratch() {   # cal_seed_scratch <host>...
-    local sizes host hd hl nj eng cpus listing f cmd want nfiles nmib availmib short_hosts=""
-    local seedrun=() dfline src totkb key
+    local sizes host hd hl nj eng cpus f cmd want nfiles nmib availmib short_hosts=""
+    local seedrun=() dfline src totkb key pids=() hs=() i
     rm -f "$WORK_DIR/cal/seedspace"
+    # Both remote probes for every host at once -- serially they cost two
+    # blocking ssh round trips per host. No error suppression on the find:
+    # one without GNU -printf must fail LOUDLY, or an empty listing silently
+    # re-seeds the whole grid every run; the -d guard covers the one
+    # legitimate empty case. The listing goes in a file, not a pipe:
+    # "python3 - <<EOF" already takes its stdin from the heredoc.
+    for host in "$@"; do
+        hd=$(host_dir "$host")
+        mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
+        { run_host "$host" \
+              "if [ -d '$hd/$CAL_SCRATCH' ]; then find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n'; fi" \
+              > "$WORK_DIR/cal/$host/scratch.list" \
+          && run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+              > "$WORK_DIR/cal/$host/dfline"; } &
+        pids+=($!); hs+=("$host")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" \
+            || die "${hs[$i]}: cannot inspect the calibration scratch or its free space"
+    done
     for host in "$@"; do
         # The ladders THIS host still needs (its seedplan, written by
         # calibrate); a direct caller without a plan seeds the set-wide
@@ -1343,16 +1481,6 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         fi
         [ -n "$eng" ] || eng=psync
         [ -n "$cpus" ] || cpus=$(usable_cores "$host" list) || cpus=""
-        # No error suppression here: a find without GNU -printf must fail
-        # LOUDLY, or an empty listing silently re-seeds the whole grid every
-        # run. The -d guard covers the one legitimate empty case.
-        listing=$(run_host "$host" \
-            "if [ -d '$hd/$CAL_SCRATCH' ]; then find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n'; fi") \
-            || die "$host: cannot inspect the calibration scratch"
-        mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
-        # the listing goes in a file, not a pipe: "python3 - <<EOF" already
-        # takes its stdin from the heredoc that carries the script
-        printf '%s\n' "$listing" > "$WORK_DIR/cal/$host/scratch.list"
         want=$(python3 - "$host" "$nj" "$sizes" \
                    "$hd/$CAL_SCRATCH" "$eng" "$cpus" \
                    "$WORK_DIR/cal/$host/cal-seed.job" \
@@ -1395,9 +1523,7 @@ PYEOF
         [ "${nfiles:-0}" -eq 0 ] || seedrun+=("$host")
         debug "cal: $host: seed needs ${nfiles:-0} file(s), ${nmib:-0} MiB"
         if [ "${nmib:-0}" -gt 0 ]; then
-            dfline=$(run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'") \
-                || die "$host: cannot check free space on $hd for the calibration scratch"
-            read -r src totkb availmib <<<"$dfline"
+            read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
             case "$availmib" in
                 (""|*[!0-9]*) log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2 ;;
                 (*) # hosts whose destinations sit on the same SHARED
@@ -1434,7 +1560,7 @@ PYEOF
     # Only the hosts whose seed job has work: fio refuses a jobless file
     # ("No job(s) defined"), so a warm host in the --client list would abort
     # the whole seed run.
-    cal_push "${seedrun[@]}" \
+    cal_push cal-seed.job "${seedrun[@]}" \
         || die "cannot copy the calibration seed to $MASTER"
     cmd="'$FIO_BIN' --output-format=json --eta=never"
     for host in "${seedrun[@]}"; do
@@ -1606,6 +1732,7 @@ calibrate() {
                         read -r v meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
                         printf '%s %s %s %s\n' "$dirn" "$nrn" "$qd" "$v" \
                             >> "$WORK_DIR/cal/hist-$type-$dirn.$host"
+                        printf '%s\n' "$v" > "$WORK_DIR/cal/rung.$host"
                     done
                 else
                     stopped=1
@@ -1620,8 +1747,7 @@ calibrate() {
                         "hist-$type-$dirn" ""
                 fi
                 for host in "${todo[@]}"; do
-                    v=$(awk -v q="$qd" '$3 == q {v = $4} END {print v + 0}' \
-                        "$WORK_DIR/cal/hist-$type-$dirn.$host")
+                    read -r v < "$WORK_DIR/cal/rung.$host" || v=0
                     read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
                     best=0; below=0
                     [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
@@ -1695,7 +1821,7 @@ VERDICTEOF
         [ "$wrote" -eq 0 ] || sleep "$CAL_SETTLE"
         wrote=0
         stage_cal_step lat "$dirn" 1 "$WORK_DIR/cal" "${HOSTS[@]}"
-        cal_push "${HOSTS[@]}" \
+        cal_push "cal-lat-$dirn-qd1.job" "${HOSTS[@]}" \
             || die "cannot copy the latency rung to $MASTER"
         cmd="'$FIO_BIN' --output-format=json --eta=never"
         for host in "${HOSTS[@]}"; do
@@ -2501,7 +2627,7 @@ probe_workers() {
 # warning (--ignore-capacity), 0 to abort. Returns nonzero on any failure,
 # including the capacity check, so the caller aborts before fio starts.
 auto_tune() {
-    python3 - "$@" <<'PYEOF' || return 1
+    pyrun "$@" <<'PYEOF' || return 1
 import math, os, re, sys
 
 # Validate the flag slot before unpacking: without this, an old-style call
@@ -2525,82 +2651,18 @@ hosts = sys.argv[7:]
 # tuner -- CLI beats the file upstream, the file beats what is derived here.
 TARGETS = {}
 if targets_path != "-" and os.path.exists(targets_path):
-    _tf = ("login", "engine", "cpus", "dir",
-           "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
-           "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
-           "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
-           "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
-           "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
-           "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
     for _line in open(targets_path):
         _p = _line.rstrip("\n").split("\t")
-        if len(_p) == len(_tf) + 1:
-            TARGETS[_p[0]] = {k: v for k, v in zip(_tf, _p[1:]) if v != "-"}
+        if len(_p) == len(FIELDS) + 1:
+            TARGETS[_p[0]] = {k: v for k, v in zip(FIELDS, _p[1:]) if v != "-"}
 
 def target(h, key):
     return TARGETS.get(h, {}).get(key, "")
-
-# fio spells the option rw= or readwrite=; [global] is the fallback for
-# sections that do not set it themselves. Same rule as cal_required.
-_DIRECTIONS = {"read": ("read",), "randread": ("read",),
-               "write": ("write",), "randwrite": ("write",),
-               "rw": ("read", "write"), "randrw": ("read", "write"),
-               "readwrite": ("read", "write"),
-               "randreadwrite": ("read", "write")}
-
-def file_directions(lines):
-    glob, sections, cur = "", [], None
-    for line in lines:
-        m = re.match(r"^\[(.+)\]\s*$", line)
-        if m:
-            cur = None if m.group(1).strip() == "global" else {"rw": ""}
-            if cur is not None:
-                sections.append(cur)
-            continue
-        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
-        if not m:
-            continue
-        if cur is None:
-            glob = m.group(1)
-        else:
-            cur["rw"] = m.group(1)
-    out = set()
-    for sec in sections or [{"rw": ""}]:
-        out.update(_DIRECTIONS.get((sec["rw"] or glob).lower().split(":")[0], ()))
-    return out
-
-def pick_slot(h, kind, dirs):
-    """The geometry slot a file takes: its own direction, or -- for a
-    mixed-direction file -- the direction with the deeper recorded qd."""
-    if dirs == {"read"}:
-        return f"{kind}_r"
-    if dirs == {"write"}:
-        return f"{kind}_w"
-    def qd(sfx):
-        v = target(h, f"{kind}_{sfx}_qd")
-        return int(v) if v.isdigit() else -1
-    def any_vals(sfx):
-        return any(target(h, f"{kind}_{sfx}_{k}") for k in ("nj", "fs", "nr", "qd"))
-    if qd("r") < 0 and qd("w") < 0:
-        return (f"{kind}_r" if any_vals("r")
-                else f"{kind}_w" if any_vals("w") else "")
-    return f"{kind}_r" if qd("r") >= qd("w") else f"{kind}_w"
 
 SMALL_FILESIZE = "1G"
 IOPS_NRFILES = 2   # per job: enough that no job pounds a single inode
 LAT_NRFILES = 8    # the one QD1 latency job still walks a small spread
 IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64
-ENGINE_ORDER = ["io_uring", "libaio", "psync"]
-
-def pick_engine(tally):
-    # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
-    # libaio over psync -- instead of to whichever jobfile happened to be
-    # read first, which is what plain max() over a dict gives you. Same
-    # order decides the no-engine-declared fallback.
-    if not tally:
-        return ENGINE_ORDER[0]
-    rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
-    return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
 
 def warn(msg): print(f"WARNING: {msg}", file=sys.stderr)
 
@@ -2608,31 +2670,6 @@ _warned = set()
 def warn_once(msg):   # per-host loops would otherwise repeat the same warning
     if msg not in _warned:
         _warned.add(msg); warn(msg)
-
-def parse_cpulist(s):
-    cpus = set()
-    for part in s.split(","):
-        if "-" in part:
-            a, b = part.split("-"); cpus.update(range(int(a), int(b) + 1))
-        elif part:
-            cpus.add(int(part))
-    return cpus
-
-def fmt_cpulist(cpus):
-    out, run = [], []
-    for c in sorted(cpus):
-        if run and c == run[-1] + 1: run.append(c)
-        else:
-            if run: out.append(run)
-            run = [c]
-    if run: out.append(run)
-    return ",".join(f"{r[0]}-{r[-1]}" if len(r) > 1 else f"{r[0]}" for r in out)
-
-def parse_size(s):
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
-    if not m: raise ValueError(f"bad size: {s}")
-    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
-    return int(float(m.group(1)) * mult)
 
 # --- probe facts ---
 facts = {}
@@ -2747,19 +2784,6 @@ def layout_pristine(lines):
             digest = hashlib.sha256("\n".join(x.rstrip() for x in body).encode()).hexdigest()
             return digest == m.group(1)
     return False
-
-def first_value(lines, key):
-    for l in lines:
-        m = re.match(rf"^{key}=(\S+)", l)
-        if m: return m.group(1)
-    return ""
-
-def last_section(lines):
-    name = ""
-    for l in lines:
-        m = re.match(r"^\[(.+)\]\s*$", l)
-        if m: name = m.group(1)
-    return name
 
 jobs = sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f))
 layout_set = {j for j in jobs if is_layout(os.path.join(src, j))}
@@ -2915,7 +2939,8 @@ for job in jobs:
         # measured pair, never a blend of the two directions.
         kind_key = "lat" if is_latency else ("bw" if is_bw else "iops" if is_iops else "")
         if kind_key:
-            slot = pick_slot(h, kind_key, file_directions(lines))
+            slot = pick_slot(kind_key, file_directions(lines),
+                             lambda k: target(h, k))
             for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
                                ("nr", "nrfiles"), ("qd", "iodepth")):
                 v = target(h, f"{slot}_{tkey}") if slot else ""
@@ -2978,19 +3003,13 @@ check_capacity() {
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: cannot df on ${HOSTS[$i]}; its capacity is unchecked" >&2
     done
-    python3 - "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
+    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
 import os, re, sys
 
 work = sys.argv[1]
 hosts = sys.argv[2:]
 SKIP = {"000-wekatester-relayout.job", "999-wekatester-unlink.job"}
 MARKER = "# wekatester-layout: generated"
-
-def parse_size(s):
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
-    if not m: raise ValueError(s)
-    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
-    return int(float(m.group(1)) * mult)
 
 def job_value(path, key, default):
     for line in open(path):
@@ -3121,43 +3140,12 @@ is_layout_file() {   # is_layout_file <path>
 # the body identifies a pristine (never hand-edited) file -- the tuner uses
 # that to decide whether it may re-derive the staged variant at -a max.
 generate_layout() {   # generate_layout <setdir> <outdir>
-    python3 - "$1" "$2" <<'PYEOF' || return 1
+    pyrun "$1" "$2" <<'PYEOF' || return 1
 import hashlib, os, re, sys
 
 src, outdir = sys.argv[1], sys.argv[2]
 MARKER = "# wekatester-layout: generated"
 NAME = "000-wekatester-layout.job"
-ENGINE_ORDER = ["io_uring", "libaio", "psync"]
-
-def pick_engine(tally):
-    # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
-    # libaio over psync -- instead of to whichever jobfile happened to be
-    # read first, which is what plain max() over a dict gives you. Same
-    # order decides the no-engine-declared fallback.
-    if not tally:
-        return ENGINE_ORDER[0]
-    rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
-    return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
-
-def parse_size(s):
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
-    if not m: raise ValueError(f"bad size: {s}")
-    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
-    return int(float(m.group(1)) * mult)
-
-def first_value(lines, key):
-    for l in lines:
-        m = re.match(rf"^{key}=(\S+)", l)
-        if m: return m.group(1)
-    return ""
-
-def last_section(lines):
-    name = ""
-    for l in lines:
-        m = re.match(r"^\[(.+)\]\s*$", l)
-        if m: name = m.group(1)
-    return name
-
 # One namespace collects CONTRIBUTORS -- each source job's own geometry.
 # Emitting one section per (pruned) contributor lays out exactly the union of
 # files the jobs will open. A single independent-max section (max numjobs x
@@ -3489,29 +3477,11 @@ writeback_targets() {
     for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
     WEKATESTER_HOST_IDENT=$ident \
-    python3 - "$wb" "$mode" "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "host file writeback failed ($wb)"
+    pyrun "$wb" "$mode" "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "host file writeback failed ($wb)"
 import csv, os, re, sys
 
 wb, mode, work = sys.argv[1:4]
 hosts = sys.argv[4:]
-
-def _kv(name):
-    return dict(kv.split("=", 1)
-                for kv in os.environ.get(name, "").split(",") if "=" in kv)
-
-ALIAS = _kv("WEKATESTER_HOST_ALIAS")     # name in the file -> address we use
-IDENT = _kv("WEKATESTER_HOST_IDENT")     # address -> "<name>/<machine-id>"
-
-def host_addr(cell):
-    name = cell.split("/", 1)[0].strip()
-    return ALIAS.get(name, name)
-FIELDS = ("login", "engine", "cpus", "dir",
-          "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
-          "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
-          "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
-          "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
-          "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
-          "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
 
 def load_tsv(path):
     out = {}
@@ -3524,54 +3494,24 @@ def load_tsv(path):
 
 fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
 
-def first_value(lines, key):
-    for l in lines:
-        m = re.match(rf"^{key}=(\S+)", l)
-        if m:
-            return m.group(1)
-    return ""
-
-_DIRECTIONS = {"read": ("read",), "randread": ("read",),
-               "write": ("write",), "randwrite": ("write",),
-               "rw": ("read", "write"), "randrw": ("read", "write"),
-               "readwrite": ("read", "write"),
-               "randreadwrite": ("read", "write")}
-
-def file_directions(lines):
-    glob, sections, cur = "", [], None
-    for line in lines:
-        m = re.match(r"^\[(.+)\]\s*$", line)
-        if m:
-            cur = None if m.group(1).strip() == "global" else {"rw": ""}
-            if cur is not None:
-                sections.append(cur)
-            continue
-        m = re.match(r"^(?:rw|readwrite)=(\S+)", line)
-        if not m:
-            continue
-        if cur is None:
-            glob = m.group(1)
-        else:
-            cur["rw"] = m.group(1)
-    out = set()
-    for sec in sections or [{"rw": ""}]:
-        out.update(_DIRECTIONS.get((sec["rw"] or glob).lower().split(":")[0], ()))
-    return out
-
 # derive per-host values: the measured knees first (cal.results is pure
 # measurement -- targets.final would also carry CLI-merged values, which are
 # not calibration's to record), then the STAGED variants for whatever was
 # not measured
-SLOTS = ("bw_r", "bw_w", "iops_r", "iops_w")
 measured = {}
 calres = os.path.join(work, "cal.results")
 if os.path.exists(calres):
     for line in open(calres):
         p = line.split()
-        if len(p) != 1 + 3 * len(SLOTS):
+        if not p:
             continue
+        # a malformed line is a schema break, not a skip -- see
+        # apply_cal_results, which dies on the same seam
+        if len(p) != 1 + 3 * len(CAL_SLOTS):
+            sys.exit(f"ERROR: cal.results: malformed line "
+                     f"(want {1 + 3 * len(CAL_SLOTS)} fields): {line.rstrip()}")
         m = {}
-        for i, slot in enumerate(SLOTS):
+        for i, slot in enumerate(CAL_SLOTS):
             qd, nr, fs = p[1 + 3 * i:4 + 3 * i]
             if qd != "-":
                 m[f"{slot}_qd"], m[f"{slot}_nr"], m[f"{slot}_fs"] = qd, nr, fs
@@ -3696,31 +3636,11 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
 }
 
 resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
-    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") python3 - "$@" <<'PYEOF'
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") pyrun "$@" <<'PYEOF'
 import csv, os, sys
 
 phase, path, cli_engine, cli_dir, results = sys.argv[1:6]
 hosts = sys.argv[6:]
-GEOM = ("bandwidthR", "bandwidthW", "latencyR", "latencyW", "iopsR", "iopsW")
-FIELDS = ("login", "engine", "cpus", "dir",
-          "bw_r_nj", "bw_r_fs", "bw_r_nr", "bw_r_qd",
-          "bw_w_nj", "bw_w_fs", "bw_w_nr", "bw_w_qd",
-          "lat_r_nj", "lat_r_fs", "lat_r_nr", "lat_r_qd",
-          "lat_w_nj", "lat_w_fs", "lat_w_nr", "lat_w_qd",
-          "iops_r_nj", "iops_r_fs", "iops_r_nr", "iops_r_qd",
-          "iops_w_nj", "iops_w_fs", "iops_w_nr", "iops_w_qd")
-
-def host_addr(cell):
-    """A host cell may be '<name>/<machine-id>' and may name the box by
-    something other than the address this run uses (local mode calls it
-    localhost). Strip the id, then map the name onto the address."""
-    name = cell.split("/", 1)[0].strip()
-    return ALIAS.get(name, name)
-
-ALIAS = dict(
-    kv.split("=", 1)
-    for kv in os.environ.get("WEKATESTER_HOST_ALIAS", "").split(",") if "=" in kv
-)
 
 def warn(msg):
     print(f"WARNING: {msg}", file=sys.stderr)
@@ -3740,9 +3660,7 @@ def parse_geom(kind, raw, lineno):
             die(f"{path}:{lineno}: column for {kind} carries prefix '{pfx}'")
         raw = rest
     parts = (raw.split("/") + ["", "", "", ""])[:4]
-    keys = {"bandwidthR": "bw_r", "bandwidthW": "bw_w",
-            "latencyR": "lat_r", "latencyW": "lat_w",
-            "iopsR": "iops_r", "iopsW": "iops_w"}[kind]
+    keys = dict(zip(GEOM_NAMES, GEOM_SLOTS))[kind]
     out = {}
     for key, val in zip(("nj", "fs", "nr", "qd"), parts):
         if val.strip():
@@ -3773,7 +3691,7 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         fields["cpus"] = cpus
     if ddir:
         fields["dir"] = ddir
-    for kind, raw in zip(GEOM, row[5:11]):
+    for kind, raw in zip(GEOM_NAMES, row[5:11]):
         fields.update(parse_geom(kind, raw, lineno))
     if host:
         if login:
@@ -4108,89 +4026,58 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # Directions a jobfile exercises: each section's effective rw= (its own, else
 # [global]'s). Prints "read", "write", or "read write". Same rule as
 # cal_required's python.
-file_directions() {   # file_directions <file>
-    awk '
-        # tolerate trailing spaces and CRLF, as the python twins do
-        { sub(/[ \t\r]+$/, "") }
-        /^\[/ { ins = ($0 != "[global]"); if (ins) { n++; secrw[n] = "" }; next }
-        /^(rw|readwrite)=/ {
-            v = $0; sub(/^[a-z]*=/, "", v); sub(/:.*/, "", v)
-            if (ins) secrw[n] = v; else grw = v
-        }
-        END {
-            if (n == 0) { vals[tolower(grw)] = 1 }
-            else for (i = 1; i <= n; i++)
-                vals[tolower(secrw[i] != "" ? secrw[i] : grw)] = 1
-            for (v in vals) {
-                if (v == "read" || v == "randread") r = 1
-                else if (v == "write" || v == "randwrite") w = 1
-                else if (v == "rw" || v == "randrw" || v == "readwrite" \
-                         || v == "randreadwrite") { r = 1; w = 1 }
-            }
-            out = ""
-            if (r) out = "read"
-            if (w) out = out (out == "" ? "" : " ") "write"
-            print out
-        }' "$1"
-}
-
 # Host-file geometry (targets.final: six nj/fs/nr/qd slots, one per type and
 # direction) onto a staged variant, by the jobfile's report type and the
-# direction(s) it exercises. A single-direction file takes its own slot; a
-# mixed file takes the deeper-queued direction's WHOLE tuple -- a coherent
-# measured pair, never a blend. Returns 0 when it changed anything -- the
+# direction(s) it exercises. Slot selection is pick_slot -- the SAME resolver
+# the auto path uses, via the shared python layer -- so plain -t and -a can
+# never disagree on which tuple a file takes. One python call reads the
+# host's row once, replacing a per-field awk scan of targets.final (up to 16
+# spawns per host and jobfile). Returns 0 when it changed anything -- the
 # caller re-derives that host's layout from the new grid.
 apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
-    local host=$1 f=$2 items base changed=1
+    local host=$1 f=$2 items kind="" changed=1 pairs key v
     [ -f "$WORK_DIR/targets.final" ] || return 1
     items=$(report_directive "$f")
-    local kind=""
     case " $items " in
         (*" latency "*) kind=lat ;;
         (*" bandwidth "*) kind=bw ;;
         (*" iops "*) kind=iops ;;
     esac
     [ -n "$kind" ] || return 1
-    local base_r base_w dirs qr qw i v key
-    case "$kind" in
-        (bw)   base_r=6;  base_w=10 ;;
-        (lat)  base_r=14; base_w=18 ;;
-        (iops) base_r=22; base_w=26 ;;
-    esac
-    dirs=$(file_directions "$f")
-    local b
-    case "$dirs" in
-        (read)  base=$base_r ;;
-        (write) base=$base_w ;;
-        ("read write"|"")
-            # An empty direction (no rw= anywhere -- fio defaults to read --
-            # or a trim form) takes the same path as a mixed file, exactly
-            # as pick_slot does on the auto path: deeper recorded qd wins,
-            # and with neither qd recorded, whichever slot has any value.
-            # Non-numeric qds are treated as unrecorded, as pick_slot does.
-            qr=$(targets_field "$host" $((base_r + 3)) "$WORK_DIR/targets.final")
-            qw=$(targets_field "$host" $((base_w + 3)) "$WORK_DIR/targets.final")
-            case "$qr" in (""|*[!0-9]*) qr="" ;; esac
-            case "$qw" in (""|*[!0-9]*) qw="" ;; esac
-            if [ -n "$qr$qw" ]; then
-                [ "${qr:-0}" -ge "${qw:-0}" ] && base=$base_r || base=$base_w
-            else
-                base=""
-                for b in "$base_r" "$base_w"; do
-                    for i in 0 1 2 3; do
-                        [ -z "$(targets_field "$host" $((b + i)) "$WORK_DIR/targets.final")" ] \
-                            || { base=$b; break 2; }
-                    done
-                done
-                [ -n "$base" ] || return 1
-            fi ;;
-    esac
-    i=0
-    for key in numjobs filesize nrfiles iodepth; do
-        v=$(targets_field "$host" $((base + i)) "$WORK_DIR/targets.final")
-        i=$((i + 1))
-        [ -z "$v" ] || { override_variant_key "$f" "$key" "$v"; changed=0; }
-    done
+    pairs=$(pyrun "$f" "$host" "$WORK_DIR/targets.final" "$kind" <<'PYEOF'
+import sys
+
+path, host, targets, kind = sys.argv[1:5]
+row = []
+for line in open(targets):
+    p = line.rstrip("\n").split("\t")
+    if p and p[0] == host:
+        row = p
+        break
+
+def get(key):
+    i = 1 + FIELDS.index(key)
+    v = row[i] if i < len(row) else ""
+    return "" if v == "-" else v
+
+if row:
+    slot = pick_slot(kind, file_directions(open(path).read().splitlines()), get)
+    if slot:
+        for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                           ("nr", "nrfiles"), ("qd", "iodepth")):
+            v = get(f"{slot}_{tkey}")
+            if v:
+                print(jkey, v)
+PYEOF
+    ) || die "$host: cannot resolve host-file geometry for ${f##*/}"
+    [ -n "$pairs" ] || return 1
+    while read -r key v; do
+        [ -n "$key" ] || continue
+        override_variant_key "$f" "$key" "$v"
+        changed=0
+    done <<GEOMEOF
+$pairs
+GEOMEOF
     return $changed
 }
 
@@ -4780,15 +4667,8 @@ PYEOF
 # host's destination dir by the caller; maxdepth bounds find to the format's
 # own depth so nothing outside the grid is ever touched.
 layout_grid_spec() {   # layout_grid_spec <staged layout jobfile>
-    python3 - "$1" <<'PYEOF'
+    pyrun "$1" <<'PYEOF'
 import re, sys
-
-def parse_size(s):
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT]?)i?[bB]?", s.strip())
-    if not m:
-        sys.exit(f"ERROR: layout_grid_spec: cannot parse size {s!r}")
-    mult = {"": 1, "k": 2**10, "m": 2**20, "g": 2**30, "t": 2**40}[m.group(2).lower()]
-    return int(float(m.group(1)) * mult)
 
 glb, sections, cur = {}, [], None
 for raw in open(sys.argv[1]):

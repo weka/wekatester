@@ -2515,6 +2515,14 @@ t_assert "pinning: only the cores weka's node processes own are excluded (isca22
         check_cpu_pinning) 2>&1 )
     case "$out" in *overlap*|*"executing on the remainder"*) echo "$out" >&2; false;; *) true;; esac &&
     [ "$(cat "$d/auth/h1.cpus")" = "4-13,28-55" ]'
+# The shared python layer is the single encoding of the schema and the
+# direction rule; pin its load-bearing numbers so a drift fails here first.
+t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash -c '
+    source ./wekatester
+    a=$(pyrun <<< "print(len(FIELDS), slot_base(\"bw_r\"), slot_base(\"iops_w\"), len(CAL_SLOTS))") &&
+    [ "$a" = "28 5 25 4" ] &&
+    b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
+    [ "$b" = "read write" ]'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
