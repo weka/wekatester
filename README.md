@@ -232,7 +232,9 @@ spread are clamped at `CAL_MAX_SPREAD` (25%): the worst legitimate spread
 measured in the field is 11%, so anything past twice that is a broken probe,
 not a wide band — the raw number still prints (with a `clamped` marker and a
 WARNING), the band never opens below 50% of the peak, and the climb never
-demands more than a 25% per-rung gain.
+demands more than a 25% per-rung gain. A knee measured on such a probe is
+reported but never recorded — not into the host file, and not from the
+staged tuple either — so the next `-a cal` re-measures that ladder.
 
 **The calibration scratch is seeded once, incrementally, and kept.** Every
 rung of every ladder reads `<host>.cal.<job>.<filenum>`; ladders differ only

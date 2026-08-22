@@ -1604,6 +1604,7 @@ calibrate() {
     local host i pids hs
     pids=(); hs=()
     mkdir -p "$WORK_DIR/cal"
+    rm -f "$WORK_DIR/cal/suspect"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     for host in "${HOSTS[@]}"; do
@@ -1723,7 +1724,7 @@ calibrate() {
                 read -r _ meanspread _ < "$WORK_DIR/cal/thr-$type-$dirn.$host"
                 [ "$(LC_ALL=C awk -v s="$meanspread" -v m="$CAL_MAX_SPREAD" \
                         'BEGIN {print (s > m) ? 1 : 0}')" -eq 0 ] \
-                    || log "WARNING: $host $type-$dirn: noise spread ${meanspread}% exceeds CAL_MAX_SPREAD=${CAL_MAX_SPREAD}% -- climb threshold and verdict band clamped; treat this knee as suspect" >&2
+                    || log "WARNING: $host $type-$dirn: noise spread ${meanspread}% exceeds CAL_MAX_SPREAD=${CAL_MAX_SPREAD}% -- climb threshold and verdict band clamped; this ladder's knee will be reported but NOT recorded" >&2
             done
             for qd in $(cal_qds "$type"); do
                 if [ "$qd" -eq "$CAL_NOISE_QD" ]; then
@@ -1800,9 +1801,22 @@ print(win, "%s at qd=%d (%d%% of peak %s at qd=%d), band >=%.0f%% (noise %.1f%%%
 VERDICTEOF
                 ) || die "$host: cannot pick the $type $dirn knee"
                 read -r qd rest <<<"$pick"
-                printf '%s %s %s\n' "$qd" "$nrn" "$nrfsz" \
-                    > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
-                log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz]"
+                if [ "$(LC_ALL=C awk -v s="$meanspread" -v m="$CAL_MAX_SPREAD" \
+                        'BEGIN {print (s > m) ? 1 : 0}')" -eq 1 ]; then
+                    # a probe that noisy is a broken measurement, not a wide
+                    # band: the knee is reported but NOT recorded -- no
+                    # dirwin, so no cal.results entry and no host-file cache,
+                    # and the suspect ledger keeps the writeback from
+                    # re-caching the staged tuple -- so the next -a cal
+                    # re-measures this ladder
+                    printf '%s %s\n' "$host" "${type}_${dirn:0:1}" \
+                        >> "$WORK_DIR/cal/suspect"
+                    log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz] -- SUSPECT, not recorded; the next -a cal re-measures"
+                else
+                    printf '%s %s %s\n' "$qd" "$nrn" "$nrfsz" \
+                        > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                    log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz]"
+                fi
             done
             [ "$dirn" != write ] || wrote=1
         done
@@ -1845,18 +1859,24 @@ LATEOF
     # file records is exactly what produced the number. numjobs stays out of
     # it -- always the host's usable cores, which the tuner derives.
     : > "$WORK_DIR/cal.results"
-    local line any tuple
+    local line any tuple slot slots
+    # the slot order IS the cal.results schema: take it from the shared
+    # layer instead of spelling it a second time as two nested loops
+    slots=$(pyrun <<'PYEOF'
+print("\n".join(CAL_SLOTS))
+PYEOF
+    ) || die "cannot derive the cal.results slot order"
     for host in "${HOSTS[@]}"; do
         line=$host; any=0
-        for type in bw iops; do
-            for dirn in read write; do
-                if [ -s "$WORK_DIR/cal/dirwin-$type-$dirn.$host" ]; then
-                    read -r tuple < "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
-                    line="$line $tuple"; any=1
-                else
-                    line="$line - - -"
-                fi
-            done
+        for slot in $slots; do
+            type=${slot%_*}
+            dirn=read; [ "${slot##*_}" = r ] || dirn=write
+            if [ -s "$WORK_DIR/cal/dirwin-$type-$dirn.$host" ]; then
+                read -r tuple < "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                line="$line $tuple"; any=1
+            else
+                line="$line - - -"
+            fi
         done
         [ "$any" -eq 0 ] || printf '%s\n' "$line" >> "$WORK_DIR/cal.results"
     done
@@ -3288,8 +3308,15 @@ PYEOF
 # A fresh host file: header plus a commented format reference, so an editor
 # session or a later -a writeback starts from something self-describing.
 write_targets_template() {   # write_targets_template <path>
-    cat > "$1" <<'CSVEOF' || die "cannot create host file $1"
-host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd
+    local header
+    # the column list comes from the shared schema, not a second spelling
+    header=$(pyrun <<'PYEOF'
+print("host,user_login,ioengine,allowed_cpus,destination_folder,"
+      + ",".join(f"{n}:nj/fs/nr/qd" for n in GEOM_NAMES))
+PYEOF
+    ) || die "cannot derive the host file header"
+    { printf '%s\n' "$header"
+      cat <<'CSVEOF'
 # One host per line assigns to that host; lines without a host apply to the
 # hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
 # Geometry is per type AND direction: R columns shape read jobs, W columns
@@ -3302,6 +3329,7 @@ host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,
 # is recording for the first time. Plain hostnames are equally valid, and a
 # row you wrote keeps the spelling you gave it.
 CSVEOF
+    } > "$1" || die "cannot create host file $1"
     log "created host file $1"
 }
 
@@ -3494,6 +3522,17 @@ def load_tsv(path):
 
 fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
 
+# ladders whose noise probe exceeded CAL_MAX_SPREAD: reported, never
+# recorded -- not from cal.results (calibrate wrote no entry) and not from
+# the staged tuple either, or the cache would block the re-measure
+suspect = set()
+_sf = os.path.join(work, "cal", "suspect")
+if os.path.exists(_sf):
+    for _line in open(_sf):
+        _p = _line.split()
+        if len(_p) == 2:
+            suspect.add((_p[0], _p[1]))
+
 # derive per-host values: the measured knees first (cal.results is pure
 # measurement -- targets.final would also carry CLI-merged values, which are
 # not calibration's to record), then the STAGED variants for whatever was
@@ -3547,6 +3586,8 @@ for host in hosts:
             # count would only go stale (weka re-pins, cpu list edits).
             for sfx in sorted({"read": "r", "write": "w"}[dd]
                               for dd in file_directions(lines)):
+                if (host, f"{kind}_{sfx}") in suspect:
+                    continue
                 for tkey, jkey in (("fs", "filesize"),
                                    ("nr", "nrfiles"), ("qd", "iodepth")):
                     v = first_value(lines, jkey)

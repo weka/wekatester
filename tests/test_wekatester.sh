@@ -2452,6 +2452,18 @@ t_assert "writeback: -C set owns the target when -t was not given" bash -c '
      FAST_TRACK=1
      writeback_targets) >/dev/null
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
+# A ladder whose probe was too noisy stays unrecorded EVERYWHERE: the
+# writeback must not re-cache the staged tuple into the suspect slot, or
+# the cache would block the re-measure the suspect verdict promised.
+t_assert "writeback: a suspect slot is not re-cached from the staged tuple" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    mkdir -p "$d/cal"; printf "h1 iops_r\n" > "$d/cal/suspect"
+    printf "host,user_login,ioengine\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,,$" ||
+        { tail -1 "$f" >&2; false; }'
 # A mixed-direction file stages ONE direction's tuple, but both directions
 # were measured; the writeback must record each measured knee into its own
 # slot, never the staged tuple into both.
@@ -2521,6 +2533,10 @@ t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash
     source ./wekatester
     a=$(pyrun <<< "print(len(FIELDS), slot_base(\"bw_r\"), slot_base(\"iops_w\"), len(CAL_SLOTS))") &&
     [ "$a" = "28 5 25 4" ] &&
+    c=$(pyrun <<< "print(\" \".join(CAL_SLOTS))") &&
+    [ "$c" = "bw_r bw_w iops_r iops_w" ] &&
+    d=$(mktemp -d) && write_targets_template "$d/t.csv" >/dev/null &&
+    head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd$" &&
     b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
     [ "$b" = "read write" ]'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
@@ -2946,15 +2962,18 @@ t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bas
     # peak is 1350 at qd=2; 1300/1350 = 96.3% fails a fixed 98% band but
     # clears the noise-widened one, so the cheaper qd=1 wins. The 33.3%
     # spread exceeds CAL_MAX_SPREAD=25, so the band is clamped (floor 50%,
-    # not 33%) and the verdict says so, with a WARNING.
+    # not 33%), the verdict says so with a WARNING -- and the knee is
+    # reported but NOT recorded, so the next -a cal re-measures.
     case "$out" in
-        *"bw-read: knee"*"at qd=1 (96% of peak"*"band >=50% (noise 33.3%, clamped)"*) true;;
+        *"bw-read: knee"*"at qd=1 (96% of peak"*"band >=50% (noise 33.3%, clamped)"*"SUSPECT, not recorded"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     case "$out" in
         *"WARNING: h1 bw-read: noise spread 33.3% exceeds CAL_MAX_SPREAD=25%"*) true;;
         *) echo "$out" >&2; false;;
-    esac'
+    esac &&
+    [ ! -s "$d/cal.results" ] &&
+    [ "$(cat "$d/cal/suspect")" = "h1 bw_r" ]'
 # The verdict must report real numbers, not just ratios: a ladder that
 # measured nothing (reads of a hollow layout) looks identical in percentages.
 t_assert "calibrate: the verdict logs absolute values and the measured noise" bash -c '
