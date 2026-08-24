@@ -2577,13 +2577,38 @@ t_assert "writeback: measured knees land per direction; a mixed file cannot copy
     printf "ubuntu\n" > "$d/auth/h1.user"
     printf "# report bandwidth\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1024M\nnrfiles=2\niodepth=32\nrw=rw\n" > "$d/jobs/h1/011-b.job"
     : > "$d/engine.results"
-    printf "h1 32 2 1024M 4 2 1024M - - - - - -\n" > "$d/cal.results"
+    # 17 fields (qd nr fs nj per slot) -- and bw_w carries a measured nj=2,
+    # a CAL_SPLIT winner, which must land in the host file with its tuple
+    printf "h1 32 2 1024M - 4 2 1024M 2 - - - - - - - -\n" > "$d/cal.results"
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
      writeback_targets) >/dev/null
-    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,/1024M/2/32,/1024M/2/4,,,,$" ||
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,/1024M/2/32,2/1024M/2/4,,,,$" ||
         { tail -1 "$f" >&2; false; }'
+
+# The seam that broke on isca224 (2026-08-24): calibrate writes cal.results
+# and TWO parsers read it -- apply_cal_results and the writeback. They must
+# accept the same width, and the cheapest proof is a row from the shared
+# layer's own constants going through both.
+t_assert "cal.results: one width, both parsers accept what the shared layer defines" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/jobs" "$d/auth"
+    row=$( (source ./wekatester; pyrun <<"PYW"
+print("h1 " + " ".join(["4", "2", "1024M", "-"] * len(CAL_SLOTS)))
+PYW
+    ) )
+    printf "%s\n" "$row" > "$d/cal.results"
+    : > "$d/engine.results"
+    # parser 1: apply_cal_results
+    (source ./wekatester; WORK_DIR=$d; REGEN_LAYOUT=0; apply_cal_results) ||
+        { echo "apply_cal_results rejected: $row" >&2; false; }
+    # parser 2: the writeback
+    f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null ||
+        { echo "writeback rejected: $row" >&2; false; }
+    tail -1 "$f" | grep -q "^h1,"'
 
 # --- isolcpus awareness (field: isca224, isolcpus=domain,4-55) ---
 t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" bash -c '
