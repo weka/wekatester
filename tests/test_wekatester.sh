@@ -3215,15 +3215,72 @@ $writes
 WRITELADDERS
     [ "$n" = 4 ] || { echo "write: judged $n ladders, want 4" >&2; exit 1; }
     true'
-t_assert "cal_scratch_fmt: the workload's subdirectory shape is mirrored, flat stays flat" bash -c '
+# SIZE IS THE ONLY TEST. No marker, no manifest, no per-run bookkeeping: the
+# seed lists what is on disk, compares each file against the size this run
+# needs, and rewrites exactly the ones that fall short. That is what makes the
+# scratch reusable, so it is pinned here for the nested shape too -- with
+# subdirectories the listing has to key on the PATH, because h1.cal.0/0 and
+# h1.cal.1/0 share a basename and would otherwise mask each other.
+t_assert "cal_seed_scratch: sufficiency is the only test, at any shape" bash -c '
+    plan() {   # plan <fmt> <find-listing> -> the seed sections planned
+        d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal/h1"
+        printf "ncpus 2\n" > "$d/probe/h1"
+        printf "iops read\n" > "$d/cal/seedplan.h1"
+        listing=$2
+        (source ./wekatester
+         WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka; CAL_SETTLE=0
+         CAL_FMT=$1; ladders="iops read"
+         run_host() { case "$2" in
+             (*find*) printf "%s" "$listing";;
+             (*df*)   echo "wekafs 999999999 99999999";;
+         esac; return 0; }
+         cal_seed_scratch h1) >/dev/null 2>&1
+        [ -f "$d/cal/h1/cal-seed.job" ] || { echo NONE; return 0; }
+        got=$(grep "^filename=" "$d/cal/h1/cal-seed.job" | sed "s/^filename=//" | tr "\n" " ")
+        printf "%s" "${got:-NONE}"
+    }
+    # iops read at nr=2 is 512MiB total -> two 256M files per job, two jobs
+    warm="h1.cal.0/0 268435456
+h1.cal.1/0 268435456
+h1.cal.0/1 268435456
+h1.cal.1/1 268435456
+"
+    short="h1.cal.0/0 268435456
+h1.cal.1/0 100
+h1.cal.0/1 268435456
+h1.cal.1/1 268435456
+"
+    big=$(printf "%s" "$warm" | sed "s/268435456/1073741824/")
+    flat="h1.cal.0.0 268435456
+h1.cal.0.1 268435456
+h1.cal.1.0 268435456
+h1.cal.1.1 268435456
+"
+    nested="\$filenum/\$jobnum"
+    a=$(plan "$nested" "$warm")   # every file big enough -> nothing to do
+    b=$(plan "$nested" "$short")  # one short file -> exactly that one
+    c=$(plan "$nested" "$big")    # oversized is still sufficient
+    e=$(plan "$nested" "$flat")   # a scratch of another shape matches nothing
+    rc=0
+    [ "$a" = NONE ]              || { echo "warm planned: [$a]" >&2; rc=1; }
+    [ "$b" = "h1.cal.1/0 " ]     || { echo "short planned: [$b]" >&2; rc=1; }
+    [ "$c" = NONE ]              || { echo "oversized planned: [$c]" >&2; rc=1; }
+    [ "$e" = "h1.cal.0/0 h1.cal.1/0 h1.cal.0/1 h1.cal.1/1 " ] \
+                                 || { echo "cross-shape planned: [$e]" >&2; rc=1; }
+    exit $rc'
+# The scratch keeps ONE stable shape by default, whatever the workload does:
+# its names are reused on purpose, and a shape that follows the set would
+# re-seed on every switch between sets that spell their layout differently.
+t_assert "cal_scratch_fmt: the scratch shape is stable by default, mirrored only on request" bash -c '
     d=$(mktemp -d); mkdir -p "$d/set" "$d/flat"
     printf "# report iops\n[global]\nfilename_format=\$filenum/\$jobnum\n[a]\nrw=randread\n" > "$d/set/031-a.job"
     printf "# report iops\n[global]\n[a]\nrw=randread\n" > "$d/flat/031-a.job"
     a=$( (source ./wekatester; cal_scratch_fmt "$d/set") )
     b=$( (source ./wekatester; cal_scratch_fmt "$d/flat") )
-    c=$( (source ./wekatester; CAL_FMT_PARITY=0; cal_scratch_fmt "$d/set") )
-    [ "$a" = "\$filenum/\$jobnum" ] && [ "$b" = "\$jobnum.\$filenum" ] &&
-    [ "$c" = "\$jobnum.\$filenum" ]'
+    c=$( (source ./wekatester; CAL_FMT_PARITY=1; cal_scratch_fmt "$d/set") )
+    e=$( (source ./wekatester; CAL_FMT_PARITY=1; cal_scratch_fmt "$d/flat") )
+    [ "$a" = "\$jobnum.\$filenum" ] && [ "$b" = "\$jobnum.\$filenum" ] &&
+    [ "$c" = "\$filenum/\$jobnum" ] && [ "$e" = "\$jobnum.\$filenum" ]'
 t_assert "cal_scratch_dirs: every directory the names imply, once" bash -c '
     out=$( (source ./wekatester; cal_scratch_dirs h1 "\$filenum/\$jobnum" 3 1) | tr "\n" " " )
     [ "$out" = "h1.cal.0 h1.cal.1 " ] || { echo "$out" >&2; false; }

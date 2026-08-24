@@ -307,15 +307,20 @@ shared:
   has nowhere to put the excess. Seen live before this rule existed: the
   ladders ran 52 jobs in a 46-cpu mask while the staged jobs ran 52 in a
   52-cpu mask.
-- **the scratch's file layout** mirrors the workload's `filename_format`, so a
-  set whose files live in subdirectories is measured on files in
-  subdirectories — a different metadata spread is a different measurement.
-  One shape serves the whole scratch (the bw and iops ladders deliberately
-  share their files), and `CAL_FMT_PARITY=0` pins the flat shape.
+- **the scratch's file layout** can mirror the workload's `filename_format`
+  (`CAL_FMT_PARITY=1`), so a set whose files live in subdirectories is
+  measured on files in subdirectories — a different metadata spread is a
+  different measurement. **Off by default**, because the scratch's names are
+  reused on purpose: the shipped sets do not agree on a layout
+  (`$filenum/$jobnum` for default, mixed and 2x400Gb; flat for smoke;
+  `wekawithin/$jobnum` for wekawithin), so a shape that follows the set would
+  re-seed on every switch between them and strand the other shapes' files
+  with nothing to reclaim them. Turn it on when the question is specifically
+  whether directory-entry spread moves the number, and expect one re-seed.
 
 **The calibration scratch is seeded once, incrementally, and kept.** Every
-rung of every ladder reads `<host>.cal.` plus the workload's own name shape
-(`<job>.<filenum>` when the set has none); ladders differ only
+rung of every ladder reads `<host>.cal.<job>.<filenum>` (or the workload's own
+shape under `CAL_FMT_PARITY=1`); ladders differ only
 in how much of each file they use, so the scratch needs file *f* sized to
 the largest any ladder asks of it — with the default tables, two 1024M files
 per job (the bandwidth ladders), which already covers the iops ladders and

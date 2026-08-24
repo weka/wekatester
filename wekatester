@@ -1021,13 +1021,25 @@ PYEOF
 # ONE shape for the whole scratch, not one per type: the bw and iops ladders
 # deliberately share their files (cal_required orders bw first so the 1G files
 # already exist when the iops rungs write 256M into them), so their names have
-# to agree. The set's first format carrying a "/" wins; a set with no such
-# format keeps the flat "$jobnum.$filenum" this always used.
+# to agree.
 #
-# CAL_FMT_PARITY=0 pins the flat shape regardless -- the escape hatch if a
-# workload's format ever resolves to something the seed cannot pre-create.
+# OFF BY DEFAULT, and the reason is the scratch's whole point. The names are
+# reused deliberately: the seed's only test is whether the file already in
+# place is big enough, so a warm scratch costs nothing and re-creating it is
+# the single most expensive part of a run. Tie the names to the workload and
+# that property goes away -- the shipped sets do not agree on a shape
+# ($filenum/$jobnum for default, mixed and 2x400Gb; flat for smoke;
+# wekawithin/$jobnum for wekawithin), so every switch between sets would
+# re-seed from scratch and leave the other shapes' files stranded on disk
+# with nothing to ever reclaim them.
+#
+# CAL_FMT_PARITY=1 turns it on: the scratch then mirrors the workload's
+# filename_format, so a set whose files live in subdirectories is measured on
+# files in subdirectories. Worth it when the question is specifically whether
+# the directory-entry spread moves the number -- and it costs one re-seed on
+# the first run, plus another on every switch to a set with a different shape.
 cal_scratch_fmt() {   # cal_scratch_fmt <set-dir> -> the suffix after "<host>.cal."
-    [ "${CAL_FMT_PARITY:-1}" -eq 1 ] || { printf '$jobnum.$filenum\n'; return 0; }
+    [ "${CAL_FMT_PARITY:-0}" -eq 1 ] || { printf '$jobnum.$filenum\n'; return 0; }
     pyrun "$1" <<'FMTEOF'
 import os
 import re
@@ -2043,7 +2055,7 @@ calibrate() {
         || die "cannot derive the calibration name shape from $capdir"
     case "$CAL_FMT" in
         ('$jobnum.$filenum') ;;
-        (*) log "cal: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT)" ;;
+        (*) log "cal: CAL_FMT_PARITY: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT) -- the scratch is now shape-specific, so a set with a different layout re-seeds" ;;
     esac
     local host i pids hs
     pids=(); hs=()
