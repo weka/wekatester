@@ -2523,18 +2523,6 @@ t_assert "writeback: -C set owns the target when -t was not given" bash -c '
      FAST_TRACK=1
      writeback_targets) >/dev/null
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
-# A ladder whose probe was too noisy stays unrecorded EVERYWHERE: the
-# writeback must not re-cache the staged tuple into the suspect slot, or
-# the cache would block the re-measure the suspect verdict promised.
-t_assert "writeback: a suspect slot is not re-cached from the staged tuple" bash -c '
-    d=$(wb_fixture); f="$d/host.csv"
-    mkdir -p "$d/cal"; printf "h1 iops_r\n" > "$d/cal/suspect"
-    printf "host,user_login,ioengine\n" > "$f"
-    (source ./wekatester
-     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
-    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,,$" ||
-        { tail -1 "$f" >&2; false; }'
 # A mixed-direction file stages ONE direction's tuple, but both directions
 # were measured; the writeback must record each measured knee into its own
 # slot, never the staged tuple into both.
@@ -2808,7 +2796,8 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
 # best by more than CAL_SHAPE_THR, a DECISION pass of CAL_REPS interleaved
 # repeats over the nominated candidates, a verdict that is plateau membership
 # against a FIXED CAL_KNEE_PCT band, hysteresis against a recorded qd the
-# plateau contains, CAL_MAX_CV refusing to record a noisy measurement,
+# plateau contains, every rung credited with its best reading, CAL_NOISY_PCT
+# warning about a contended window without voiding the ladder,
 # per-(type,direction) tuples in cal.results, and a scratch kept unless -u.
 cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
     # the value lands in BOTH bw_bytes and iops so the same helper drives a
@@ -3069,11 +3058,10 @@ t_assert "calibrate: a climbing curve is followed to the deepest rung" bash -c '
         *"iops-read: qd=256 -- plateau qd=256 >=98.5% of best"*"at qd=256"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-# The band does NOT widen any more, and this is the test that says so: a
-# measurement too noisy to trust is REFUSED, not accommodated. Widening it was
-# how four runs of the same command on a quiet cluster recorded qd=16, 32 and
-# 64 and reported iops 23% apart.
-t_assert "calibrate: a noisy decision pass is refused, not accommodated" bash -c '
+# A wide spread is REPORTED, not punished. Contention only ever costs
+# throughput, so repeats that disagree mean some of them ran busy -- the rung's
+# best reading is still evidence of what the client did, and the ladder records.
+t_assert "calibrate: noisy repeats warn and still record, they do not void the ladder" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh; source ./wekatester
@@ -3089,26 +3077,41 @@ t_assert "calibrate: a noisy decision pass is refused, not accommodated" bash -c
      case "$2" in
          (*qd2-nr2.job*)
              # call 1 is the shape pass; calls 2-4 are the decision repeats,
-             # and they disagree by far more than CAL_MAX_CV
+             # and two of them landed in a contended window
              [ -f "$d/n" ] || echo 0 > "$d/n"; n=$(cat "$d/n"); n=$((n + 1)); echo "$n" > "$d/n"
              case "$n" in (1) cal_json 1350;; (2) cal_json 1000;; (3) cal_json 1400;; (*) cal_json 1200;; esac;;
          (*qd1-nr2.job*) cal_json 1000;;
          (*)             cal_json 900;;
      esac; }
      calibrate) 2>&1 )
-    # mean 1200, sample sd 200 -> cv 16.7%, past CAL_MAX_CV=8: reported, not
-    # recorded, and the ladder is left on the suspect ledger so the next
-    # -a cal re-measures it
+    # cv over 1000/1400/1200 is 16.7%, past CAL_NOISY_PCT=8: warned, and the
+    # rung is credited with 1400 -- the best it was seen to do
     case "$out" in
-        *"bw-read: qd=2 reported but NOT recorded -- cv 16.7% exceeds CAL_MAX_CV=8%"*) true;;
+        *"WARNING: h1 bw-read: repeats disagree by up to 16.7%"*"contended window"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     case "$out" in
-        *"the next -a cal re-measures"*) true;;
+        *"bw-read: qd=2 -- plateau qd=2 >=98.5% of best"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ ! -s "$d/cal.results" ] &&
-    [ "$(cat "$d/cal/suspect")" = "h1 bw_r" ]'
+    # recorded, not discarded
+    grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+# A rung is worth its BEST reading, not the average of its repeats: averaging
+# credits it with less than it demonstrably did, and pushes whichever rung
+# caught a busy window off the plateau.
+t_assert "cal_verdict: a rung is credited with its best reading, not its mean" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    # qd=16 reached 1000 once and 600 under contention (best 1000, mean 800);
+    # qd=32 sat at 900 twice. Averaging puts qd=32 on top and drops qd=16 off
+    # a 98.5% band; the best readings put qd=16 on top and it is the pick.
+    printf "read 2 16 1000\nread 2 16 600\nread 2 32 900\nread 2 32 900\n" \
+        > "$d/cal/hist-bw-read.h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; CAL_HYSTERESIS=0
+            cal_verdict h1 bw read) 2>/dev/null )
+    case "$out" in
+        "16 qd=16 -- plateau qd=16 >=98.5% of best "*"at qd=16 "*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 # The verdict must report real numbers, not just ratios: a ladder that
 # measured nothing (reads of a hollow layout) looks identical in percentages.
 t_assert "calibrate: the verdict logs absolute values, the plateau and the cv" bash -c '

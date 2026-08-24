@@ -1406,15 +1406,15 @@ CAL_BW_READ_NR=${CAL_BW_READ_NR:-2}
 CAL_BW_WRITE_NR=${CAL_BW_WRITE_NR:-2}
 CAL_IOPS_READ_NR=${CAL_IOPS_READ_NR:-2}
 CAL_IOPS_WRITE_NR=${CAL_IOPS_WRITE_NR:-2}
-CAL_MAX_CV=${CAL_MAX_CV:-8}   # a candidate whose decision-pass coefficient of
-                         # variation exceeds this is a broken measurement, not
-                         # a wide band: the ladder's knee is reported but NOT
-                         # recorded, so the next -a cal re-measures. CV (sample
-                         # sd over mean) not range: a range over three samples
-                         # is an order statistic whose expected value grows
-                         # with n, so it is not comparable between runs, and
-                         # it reports drift as noise. At the top of the ladder
-                         # the field CV is under 1%, so 8 is far outside.
+CAL_NOISY_PCT=${CAL_NOISY_PCT:-8}   # a candidate whose repeats disagree by more
+                         # than this coefficient of variation earns a WARNING
+                         # naming the window, and nothing more. It used to
+                         # discard the whole ladder, which had
+                         # the physics backwards: contention only ever costs
+                         # throughput, so a wide spread means some repeats ran
+                         # busy -- not that the rung's best reading is wrong.
+                         # At the top of a quiet ladder the field CV is under
+                         # 1%, so 8 is a genuinely noisy window.
 CAL_SPLIT=${CAL_SPLIT:-1}   # after the plateau verdict, re-test the winning
                          # OUTSTANDING IO (numjobs x iodepth) at a different
                          # split. Queue depth is only half of what the client
@@ -1683,15 +1683,24 @@ CELLEOF
 
 # The verdict for one (host, type, direction): plateau membership over the
 # decision pass, with hysteresis against what the host file already carries.
-# Prints "<qd> <message>", or "SUSPECT <message>" when the measurement is too
-# noisy to record.
+# Prints "<qd> <message>". Every ladder that measured anything records a
+# geometry: there is no longer a reading noisy enough to throw the ladder away.
 #
 # The band is FIXED (CAL_KNEE_PCT). Nothing widens it -- see the tunables
-# block for why the noise-widened band had to go. The measured spread's only
-# job now is to refuse a broken measurement (CAL_MAX_CV), and it is a
-# coefficient of variation over the repeats, not a range: a range over three
-# samples is an order statistic that is not comparable between runs and that
-# reports drift as noise.
+# block for why the noise-widened band had to go.
+#
+# A RUNG IS WORTH ITS BEST READING, not the average of its repeats. A client
+# cannot exceed its own ceiling, and contention only ever subtracts, so a
+# rung's repeats sit under a hard ceiling with a left tail rather than either
+# side of a true value. Averaging them credits the rung with less than it
+# demonstrably did, and it does so unevenly -- whichever rung happened to catch
+# a busy window gets pushed off the plateau. Same rule as brutal_verdict, same
+# reason.
+#
+# The measured spread therefore decides nothing. It is reported, because a wide
+# spread is real information about the window the run happened in, and it is
+# warned about past CAL_NOISY_PCT -- but a contended repeat is not grounds for
+# discarding a ladder whose best readings are perfectly good evidence.
 cal_verdict() {   # cal_verdict <host> <bw|iops> <read|write>
     local host=$1 ctype=$2 cdirn=$3 base rec="" sfx=r
     [ "$cdirn" = read ] || sfx=w
@@ -1704,12 +1713,13 @@ QDCOLEOF
         rec=$(targets_field "$host" "$base" "$WORK_DIR/targets.final")
     fi
     python3 - "$WORK_DIR/cal/hist-$ctype-$cdirn.$host" "$CAL_KNEE_PCT" \
-             "$ctype" "$CAL_MAX_CV" "$rec" <<'VERDICTEOF'
+             "$ctype" "$CAL_NOISY_PCT" "$rec" "$host" "$cdirn" <<'VERDICTEOF'
 import statistics as st
 import sys
 
-path, band, mode, max_cv, rec = (sys.argv[1], float(sys.argv[2]), sys.argv[3],
-                                 float(sys.argv[4]), sys.argv[5])
+path, band, mode, noisy, rec = (sys.argv[1], float(sys.argv[2]), sys.argv[3],
+                                float(sys.argv[4]), sys.argv[5])
+who = "%s %s-%s" % (sys.argv[6], mode, sys.argv[7])
 samples = {}
 for line in open(path):
     f = line.split()
@@ -1718,9 +1728,10 @@ for line in open(path):
 if not samples:
     sys.exit("ERROR: empty ladder history")
 
-means = {q: st.fmean(v) for q, v in samples.items()}
-peak_qd = max(means, key=lambda q: means[q])
-peak = means[peak_qd]
+# each rung at the best it was ever seen to do
+best = {q: max(v) for q, v in samples.items()}
+peak_qd = max(best, key=lambda q: best[q])
+peak = best[peak_qd]
 if peak <= 0:
     sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
 
@@ -1733,7 +1744,7 @@ def cv(q):
 
 worst_cv = max(cv(q) for q in samples)
 reps = max(len(v) for v in samples.values())
-plateau = [q for q in sorted(means) if means[q] >= band / 100 * peak]
+plateau = [q for q in sorted(best) if best[q] >= band / 100 * peak]
 fresh = plateau[0]
 
 def human(v):
@@ -1746,11 +1757,14 @@ span = ("qd=%d" % plateau[0] if len(plateau) == 1
 detail = ("plateau %s >=%g%% of best %s at qd=%d (n=%d, cv<=%.1f%%)"
           % (span, band, human(peak), peak_qd, reps, worst_cv))
 
-if worst_cv > max_cv:
-    print("SUSPECT", "qd=%d reported but NOT recorded -- cv %.1f%% exceeds "
-                     "CAL_MAX_CV=%g%%; %s; the next -a cal re-measures"
-                     % (fresh, worst_cv, max_cv, detail))
-    raise SystemExit(0)
+# A wide spread is reported, never punished: the repeats disagreed because some
+# of them ran in a contended window, and the ones that did not are still valid
+# evidence of what this client can do.
+if worst_cv > noisy:
+    print("WARNING: %s: repeats disagree by up to %.1f%% (CAL_NOISY_PCT=%g) -- "
+          "some ran in a contended window; the geometry below is what the best "
+          "readings showed, which is still what this client did"
+          % (who, worst_cv, noisy), file=sys.stderr)
 
 # Hysteresis: a recorded qd this plateau contains is kept. The measurement
 # found no difference between it and the fresh pick, so claiming one -- and
@@ -2497,16 +2511,7 @@ CANDEOF
                     || die "$host: cannot pick the $type $dirn geometry"
                 read -r qd rest <<<"$pick"
                 log "cal: $host $type-$dirn: $rest [nrfiles=$nrn fs=$nrfsz]"
-                case "$qd" in
-                    (SUSPECT)
-                        # a measurement this noisy is not a wide band: report
-                        # it, record nothing, leave no dirwin -- so no
-                        # cal.results entry, no host-file cache, and the next
-                        # -a cal re-measures this ladder
-                        printf '%s %s\n' "$host" "${type}_${dirn:0:1}" \
-                            >> "$WORK_DIR/cal/suspect" ;;
-                    (*) printf '%s\n' "$qd" > "$WORK_DIR/cal/win-$type-$dirn.$host" ;;
-                esac
+                printf '%s\n' "$qd" > "$WORK_DIR/cal/win-$type-$dirn.$host"
             done
 
             # --- refinements: the axes the ladder held fixed ---
@@ -2593,7 +2598,6 @@ calibrate() {
     local host i pids hs
     pids=(); hs=()
     mkdir -p "$WORK_DIR/cal"
-    rm -f "$WORK_DIR/cal/suspect"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     for host in "${HOSTS[@]}"; do
@@ -4361,17 +4365,6 @@ def load_tsv(path):
 
 fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
 
-# ladders whose decision pass exceeded CAL_MAX_CV: reported, never
-# recorded -- not from cal.results (calibrate wrote no entry) and not from
-# the staged tuple either, or the cache would block the re-measure
-suspect = set()
-_sf = os.path.join(work, "cal", "suspect")
-if os.path.exists(_sf):
-    for _line in open(_sf):
-        _p = _line.split()
-        if len(_p) == 2:
-            suspect.add((_p[0], _p[1]))
-
 # derive per-host values: the measured knees first (cal.results is pure
 # measurement -- targets.final would also carry CLI-merged values, which are
 # not calibration's to record), then the STAGED variants for whatever was
@@ -4425,8 +4418,6 @@ for host in hosts:
             # count would only go stale (weka re-pins, cpu list edits).
             for sfx in sorted({"read": "r", "write": "w"}[dd]
                               for dd in file_directions(lines)):
-                if (host, f"{kind}_{sfx}") in suspect:
-                    continue
                 for tkey, jkey in (("fs", "filesize"),
                                    ("nr", "nrfiles"), ("qd", "iodepth")):
                     v = first_value(lines, jkey)

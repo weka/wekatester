@@ -242,9 +242,14 @@ Wall clock lands about where the single-pass release did, because that one
 paid three full-length cells for the probe and measured every rung once.
 What changed is that every rung deciding the answer now carries n=3.
 
-The verdict is **plateau membership**: every candidate within `CAL_KNEE_PCT`
-(98.5%) of the best *mean* is on the plateau, and the pick is the shallowest
-of them. The band is fixed — nothing widens it. 98.5 is measured: on that
+The verdict is **plateau membership**, and every candidate is credited with
+**its best reading**, not the average of its repeats. A client cannot exceed its
+own ceiling and contention only ever subtracts, so a rung's repeats sit under a
+hard ceiling with a left tail rather than either side of a true value: averaging
+credits a rung with less than it demonstrably did, and does it unevenly, pushing
+whichever rung caught a busy window off the plateau. Every candidate within
+`CAL_KNEE_PCT` (98.5%) of the best reading anywhere is on the plateau, and the
+pick is the shallowest of them. The band is fixed — nothing widens it. 98.5 is measured: on that
 client it resolves all four ladders to a unique rung at 99.5–100% of the
 peak, while 99.5 destabilises every one of them, because the band can never
 be tighter than the peak's own measurement error. Without the decision pass's
@@ -258,13 +263,13 @@ write down, so a recorded qd the new plateau **contains** is kept
 (`CAL_HYSTERESIS`, on by default) and the log says so. That churn is what
 "`-a cal` picks different settings every time" actually was.
 
-The measured spread has exactly one job left: refusing a broken measurement.
-A candidate whose decision-pass coefficient of variation exceeds
-`CAL_MAX_CV` (8%) is reported but never recorded — not into the host file,
-and not from the staged tuple either — so the next `-a cal` re-measures that
-ladder. CV, not a range: a range over three samples is an order statistic
-whose expected value grows with n, so it is not comparable between runs, and
-it reports drift as noise.
+The measured spread decides nothing. A candidate whose repeats disagree by
+more than `CAL_NOISY_PCT` (8%) earns a WARNING naming the host and the ladder,
+and the ladder records anyway — the repeats disagreed because some of them ran
+in a contended window, and the ones that did not are still evidence of what the
+client did. An earlier release discarded the whole ladder in that case, which
+had the physics backwards and threw away good measurements; the suspect ledger
+that implemented it is gone.
 
 ### `-a brutal`: the exhaustive grid
 
