@@ -1736,6 +1736,9 @@ if peak <= 0:
     sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
 
 def cv(q):
+    # sum/len, not statistics.fmean: fmean is 3.8+ and the workers are RHEL 8
+    # (python 3.6). A coefficient of variation needs a mean as its scale
+    # factor, which is the only place a mean belongs in this verdict.
     v = samples[q]
     m = st.fmean(v)
     # sample sd (n-1), the estimator that does not shrink with n the way a
@@ -1818,12 +1821,15 @@ def rungs(path):
 hist = rungs(os.path.join(caldir, f"hist-{ctype}-{cdirn}.{host}"))
 if pick not in hist:
     sys.exit(f"ERROR: {host}: no decision-pass samples at qd={pick}")
-base = st.fmean(hist[pick])
+# the pick at its best reading, same estimator as the verdict that chose it:
+# a refinement has to beat what the pick demonstrably did
+base = max(hist[pick])
 if base <= 0:
     sys.exit(f"ERROR: {host}: the decision pass measured nothing at qd={pick}")
 
 def cv(v):
-    m = st.fmean(v)
+    # sum/len, not statistics.fmean (3.8+; the workers are python 3.6)
+    m = sum(v) / len(v)
     return st.stdev(v) / m * 100 if len(v) > 1 and m > 0 else 0.0
 
 bar = max(max(cv(v) for v in hist.values()), 1.0)
@@ -1842,7 +1848,7 @@ for path in sorted(glob.glob(os.path.join(caldir, f"split-{ctype}-{cdirn}-p*.{ho
     vals = rungs(path).get(qd2)
     if not vals:
         continue
-    got = st.fmean(vals)
+    got = max(vals)
     cands.append(((got - base) / base * 100, qd2, nr, pct,
                   f"numjobs at {pct}% with qd={qd2}"))
 for path in sorted(glob.glob(os.path.join(caldir, f"nrt-{ctype}-{cdirn}-n*.{host}"))):
@@ -1853,7 +1859,7 @@ for path in sorted(glob.glob(os.path.join(caldir, f"nrt-{ctype}-{cdirn}-n*.{host
     vals = rungs(path).get(pick)
     if not vals:
         continue
-    got = st.fmean(vals)
+    got = max(vals)
     cands.append(((got - base) / base * 100, pick, nr2, 100,
                   f"nrfiles={nr2}"))
 

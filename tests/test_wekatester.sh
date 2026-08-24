@@ -1208,6 +1208,52 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
+# --- python floor: the workers are older than this laptop ---
+# The inline python has to run on the WORKERS, and a Weka client is commonly
+# RHEL 8, which ships python 3.6. A developer box running 3.9+ will happily
+# execute a 3.8-only call and say nothing, and the failure then lands in the
+# field halfway through a calibration -- which is exactly how
+# statistics.fmean got in (it is 3.8+, and it took out -a cal:30 on isca224
+# after six minutes of measuring). Grep for the ones that would do it again.
+t_assert "python floor: no stdlib or syntax newer than 3.6 in the inline python" bash -c '
+    # API and syntax added after 3.6, spelled as they would appear here
+    pat="statistics\.fmean|st\.fmean"
+    pat="$pat|statistics\.quantiles|st\.quantiles|statistics\.multimode|st\.multimode"
+    pat="$pat|statistics\.geometric_mean|statistics\.harmonic_mean"
+    pat="$pat|math\.prod|math\.dist|math\.perm|math\.comb|math\.isqrt"
+    pat="$pat|\.removeprefix\(|\.removesuffix\(|functools\.cached_property"
+    pat="$pat|shlex\.join|graphlib|importlib\.metadata"
+    hits=$(grep -nE "$pat" ./wekatester | grep -v "^[0-9]*: *#" | grep -v "not statistics\." || true)
+    [ -z "$hits" ] || { printf "post-3.6 API in the inline python:\n%s\n" "$hits" >&2; false; }'
+# Every inline python block has to at least PARSE. A syntax error in a heredoc
+# is invisible until the branch that runs it runs, which for a calibration
+# verdict is minutes into a real run on a real client.
+t_assert "python floor: every inline python heredoc parses" bash -c '
+    d=$(mktemp -d); n=0; bad=0
+    # each block is "<<\x27TAG\x27" ... TAG, with the python between; pull them
+    # out by tag and compile each one
+    for tag in $(grep -oE "<<.[A-Z][A-Z0-9]*EOF." ./wekatester | tr -d "<\x27\"" | sort -u); do
+        awk -v t="$tag" "
+            \$0 ~ (\"<<.\" t \".\$\") { inb = 1; next }
+            inb && \$0 == t             { inb = 0; print \"###SPLIT###\"; next }
+            inb                        { print }
+        " ./wekatester > "$d/$tag.raw"
+        [ -s "$d/$tag.raw" ] || continue
+        i=0
+        while IFS= read -r line; do
+            case "$line" in ("###SPLIT###") i=$((i + 1)); continue;; esac
+            printf "%s\n" "$line" >> "$d/$tag.$i.py"
+        done < "$d/$tag.raw"
+        for f in "$d/$tag".*.py; do
+            [ -f "$f" ] || continue
+            n=$((n + 1))
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" \
+                || { echo "does not parse: $f" >&2; bad=1; }
+        done
+    done
+    [ "$n" -gt 10 ] || { echo "only found $n blocks -- the extractor is broken" >&2; false; }
+    [ "$bad" -eq 0 ]'
+
 # --- brutal: the exhaustive grid ---
 # Both measured levels gate the calibration phase; only one of them is brutal.
 t_assert "parse: -a brutal sets the level, and :secs sets the cell duration" bash -c '
