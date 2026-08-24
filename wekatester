@@ -1463,14 +1463,14 @@ BRUTAL_FILESIZE=${BRUTAL_FILESIZE:-1024}   # MiB PER FILE, so the working set is
                          # honest reading of "push the client to its limit" --
                          # but it means the scratch is sized by the LARGEST
                          # nrfiles: 128 files x 1G x one job per core.
-BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-3}   # re-measure this many top cells before
-                         # declaring a winner. The max of 64 single samples is
-                         # an order statistic, biased high: the luckiest cell
-                         # wins the grid and then the real measured run comes in
-                         # under what calibration promised -- which is the
-                         # complaint that motivated brutal in the first place.
-                         # Re-measuring the shortlist costs a handful of cells
-                         # and makes the promise match the delivery. 0 disables.
+BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-3}   # give this many top cells a second run at
+                         # showing their ceiling. Contention only ever costs
+                         # throughput, so a further sample can raise a cell's
+                         # best and never lower it: this is insurance against
+                         # the real best combination having drawn a contended
+                         # window on its single pass, not a correction to the
+                         # winner's number. A handful of cells out of 256.
+                         # 0 disables -- the grid's own maximum then stands.
 BRUTAL_MEM_FRAC=${BRUTAL_MEM_FRAC:-25}   # percent of a host's MemTotal that the
                          # in-flight buffers of one cell may occupy
                          # (numjobs x iodepth x bs). A backstop for small
@@ -1876,11 +1876,22 @@ brutal_memtotal() {   # brutal_memtotal <host> -> MiB, or nothing if unreadable
 }
 
 # THE BRUTAL GRID. Every (nrfiles, iodepth) pair, BRUTAL_RUNTIME seconds each,
-# best number wins. There is no band, no plateau and no knee here on purpose:
-# this level exists because a measured selection rule kept choosing geometry the
-# real test then failed to reproduce, and the exhaustive answer cannot be wrong
-# about which cell was fastest -- only about whether that cell was lucky, which
-# is what BRUTAL_CONFIRM handles.
+# highest number wins. There is no band, no plateau and no knee here on purpose.
+#
+# THE ESTIMATOR IS THE MAXIMUM, NOT THE MEAN, and that is not a shortcut. A
+# client cannot exceed its own ceiling: cores, NIC and the backend's service
+# rate bound throughput from above, while contention -- a busy filesystem, a
+# loaded network, cpu steal -- only ever subtracts. So a cell's samples are not
+# scattered either side of a true value; they sit under a hard ceiling with a
+# left tail. A high reading is therefore evidence the client DID that, and
+# averaging it against a contaminated reading throws that evidence away. The
+# highest value a combination ever produced is the best estimate of what that
+# combination can do, so that is what ranks the grid and that is what gets
+# recorded.
+#
+# (The symmetric-noise argument for distrusting a maximum -- the order
+# statistic being biased high -- does not apply here, and an earlier version of
+# this code wrongly imported it.)
 #
 # numjobs is fixed at the cores fio will run on. filesize is fixed per FILE, so
 # the working set grows with nrfiles (see BRUTAL_FILESIZE) -- the seed sized the
@@ -1983,10 +1994,10 @@ brutal_grids() {   # brutal_grids <ladders>
     log "brutal: $cells cell(s) measured${skipped:+, $skipped skipped}"
 }
 
-# The BRUTAL_CONFIRM best cells of a grid, as "<nr>/<qd>" lines.
+# The BRUTAL_CONFIRM best cells of a grid, as "<nr>/<qd>" lines, ranked by the
+# highest value each one reached.
 brutal_shortlist() {   # brutal_shortlist <grid-file> <n>
     python3 - "$1" "$2" <<'SHORTEOF'
-import statistics as st
 import sys
 
 path, n = sys.argv[1], int(sys.argv[2])
@@ -1997,19 +2008,21 @@ for line in open(path):
         cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
 if not cells:
     sys.exit(f"ERROR: {path} holds no grid cells")
-best = sorted(cells, key=lambda k: -st.fmean(cells[k]))[:n]
+best = sorted(cells, key=lambda k: -max(cells[k]))[:n]
 print("\n".join(f"{nr}/{qd}" for nr, qd in best))
 SHORTEOF
 }
 
-# The winner for one (host, type, direction): argmax over the grid, restricted
-# to the confirmed shortlist when one exists. Prints "<qd> <nr> <message>".
+# The winner for one (host, type, direction): the combination that reached the
+# HIGHEST value anywhere in the grid. Extra samples can only raise a cell's
+# best, never lower it, so re-measuring the shortlist can promote a cell whose
+# first sample landed in a contended window -- it can never demote one.
+# Prints "<qd> <nr> <message>".
 brutal_verdict() {   # brutal_verdict <host> <bw|iops> <read|write> <fsz>
     local host=$1 ctype=$2 cdirn=$3 fsz=$4 short=""
     [ ! -s "$WORK_DIR/cal/short-$ctype-$cdirn.$host" ] \
         || short=$(tr '\n' ' ' < "$WORK_DIR/cal/short-$ctype-$cdirn.$host")
     python3 - "$WORK_DIR/cal/grid-$ctype-$cdirn.$host" "$ctype" "$fsz" "$short" <<'BVEOF'
-import statistics as st
 import sys
 
 path, mode, fsz, short = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -2021,18 +2034,13 @@ for line in open(path):
 if not cells:
     sys.exit("ERROR: the grid measured nothing")
 
-shortlist = set()
-for tok in short.split():
-    nr, _, qd = tok.partition("/")
-    if nr.isdigit() and qd.isdigit():
-        shortlist.add((int(nr), int(qd)))
-# Rank on the shortlist when there is one: those cells carry >=2 samples, so
-# a first sample that was merely lucky has already regressed.
-pool = {k: v for k, v in cells.items() if k in shortlist} or cells
-ranked = sorted(pool, key=lambda k: -st.fmean(pool[k]))
+# Every cell competes on its best reading, shortlisted or not: a re-measured
+# cell has had more chances to show its ceiling, which is an advantage it
+# earned, not one that needs correcting for.
+ranked = sorted(cells, key=lambda k: -max(cells[k]))
 nr, qd = ranked[0]
-val = st.fmean(pool[(nr, qd)])
-reps = len(pool[(nr, qd)])
+val = max(cells[(nr, qd)])
+reps = len(cells[(nr, qd)])
 
 def human(v):
     if mode == "bw":
@@ -2042,25 +2050,25 @@ def human(v):
 runner = ""
 if len(ranked) > 1:
     r_nr, r_qd = ranked[1]
-    r_val = st.fmean(pool[(r_nr, r_qd)])
+    r_val = max(cells[(r_nr, r_qd)])
     runner = ("; runner-up nrfiles=%d qd=%d at %.1f%%"
               % (r_nr, r_qd, r_val * 100 / val if val else 0))
 spread = ""
-allmeans = sorted(st.fmean(v) for v in cells.values())
-if len(allmeans) > 2 and allmeans[-1] > 0:
+allbest = sorted(max(v) for v in cells.values())
+if len(allbest) > 2 and allbest[-1] > 0:
     spread = ("; grid spans %.0f-100%% of best over %d cells"
-              % (allmeans[0] * 100 / allmeans[-1], len(allmeans)))
+              % (allbest[0] * 100 / allbest[-1], len(allbest)))
 
-print(qd, nr, "nrfiles=%d iodepth=%d -> %s (n=%d%s%s) [fs=%s]"
-      % (nr, qd, human(val), reps, runner, spread, fsz))
+print(qd, nr, "nrfiles=%d iodepth=%d -> %s (best of %d sample%s%s%s) [fs=%s]"
+      % (nr, qd, human(val), reps, "" if reps == 1 else "s", runner, spread, fsz))
 BVEOF
 }
 
-# The grid as a table of percent-of-best, so a flat surface and a peaked one
-# are distinguishable at a glance in the run log.
+# The grid as a table of percent-of-best -- each cell at its own best reading,
+# same estimator as the verdict -- so a flat surface and a peaked one are
+# distinguishable at a glance in the run log.
 brutal_surface() {   # brutal_surface <grid-file> <bw|iops>
     python3 - "$1" "$2" <<'SURFEOF'
-import statistics as st
 import sys
 
 path, mode = sys.argv[1], sys.argv[2]
@@ -2071,7 +2079,7 @@ for line in open(path):
         cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
 if not cells:
     raise SystemExit(0)
-best = max(st.fmean(v) for v in cells.values())
+best = max(max(v) for v in cells.values())
 if best <= 0:
     raise SystemExit(0)
 nrs = sorted({k[0] for k in cells})
@@ -2081,7 +2089,7 @@ for nr in nrs:
     row = ""
     for q in qds:
         v = cells.get((nr, q))
-        row += "%6s" % ("-" if not v else "%d%%" % round(st.fmean(v) * 100 / best))
+        row += "%6s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
     print("nr%-5d%s" % (nr, row))
 SURFEOF
 }

@@ -294,16 +294,25 @@ Three things differ from `cal` beyond the search:
   scratch is sized by the *largest* nrfiles: 128 files &times; 1G &times; one job
   per core, seeded once and kept. On a 52-core client that is ~6.6TiB, and the
   capacity gate asks before writing it.
-- **the winner is argmax.** No band, no plateau, no knee, no hysteresis.
+- **the winner is the highest reading.** No band, no plateau, no knee, no
+  hysteresis, and no averaging.
 
-**Why the shortlist exists.** The maximum of 64 single samples is an order
-statistic, and it is biased high: the luckiest cell wins the sweep, then the
-staged run at that geometry comes in under what calibration promised &mdash;
-which is the complaint that produced this level. Worse, a cell that is genuinely
-a couple of percent slower can win outright on one good draw, and that geometry
-is what gets recorded. So `BRUTAL_CONFIRM` (3) re-measures the top cells and
-ranks the winner on their means. Luck does not repeat: the spike regresses, the
-genuinely fast cell keeps winning. It costs a handful of cells out of 256.
+**The estimator is the maximum, and that is a claim about the physics, not a
+shortcut.** A client cannot exceed its own ceiling &mdash; cores, NIC and the
+backend's service rate bound throughput from above &mdash; while contention (a
+busy filesystem, a loaded network, cpu steal) only ever subtracts. A cell's
+samples are therefore not scattered either side of a true value; they sit under
+a hard ceiling with a left tail. A high reading is evidence the client *did*
+that, so averaging it against a contaminated reading throws the evidence away.
+The highest value a combination ever reached is the best estimate of what that
+combination can do, and it is what gets recorded.
+
+**What the shortlist is for.** Since extra samples can only raise a cell's best
+and never lower it, `BRUTAL_CONFIRM` (3) gives the top cells a second run at
+showing their ceiling. It is insurance against the genuinely best combination
+having drawn a contended window on its single pass &mdash; not a correction to
+the winner's number, which needs none. Set it to 0 and the grid's own maximum
+stands.
 
 **The in-flight guard.** A cell holds `numjobs &times; iodepth &times; bs` of
 buffers &mdash; at the deep corner of a bandwidth grid that is real memory

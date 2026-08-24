@@ -1233,32 +1233,40 @@ iops write") | tr "\n" " " )
     # and cal is untouched: constant working set, split across the tabled files
     out=$( (source ./wekatester; cal_seed_sizes "bw read") | tr "\n" " " )
     [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
-t_assert "brutal_shortlist: the N best cells by mean, richest first" bash -c '
+t_assert "brutal_shortlist: the N cells that reached the highest values" bash -c '
     d=$(mktemp -d)
     printf "read 1 1 100\nread 1 2 900\nread 2 1 500\nread 2 2 700\n" > "$d/g"
     out=$( (source ./wekatester; brutal_shortlist "$d/g" 2) | tr "\n" " " )
     [ "$out" = "1/2 2/2 " ] || { echo "$out" >&2; false; }
     out=$( (source ./wekatester; brutal_shortlist "$d/g" 1) )
-    [ "$out" = "1/2" ] || { echo "$out" >&2; false; }'
-# The point of the shortlist: a cell that won the sweep on one lucky sample
-# loses to a cell that is genuinely faster once both are re-measured.
-t_assert "brutal_verdict: argmax over the confirmed shortlist, not the lucky sweep" bash -c '
+    [ "$out" = "1/2" ] || { echo "$out" >&2; false; }
+    # ranked on the best reading, not the average: nr=2/qd=1 touched 1200 once
+    # under a quiet moment and that is what it is capable of
+    printf "read 1 1 900\nread 1 1 900\nread 2 1 1200\nread 2 1 300\n" > "$d/g2"
+    out=$( (source ./wekatester; brutal_shortlist "$d/g2" 1) )
+    [ "$out" = "2/1" ] || { echo "max-vs-mean: $out" >&2; false; }'
+# A client cannot exceed its own ceiling, and contention only ever subtracts,
+# so the HIGHEST reading a combination reached is the best estimate of what it
+# can do. This fixture separates that rule from an averaging one: nr=1/qd=2
+# reached 1000 once and 700 under contention (best 1000, mean 850); nr=2/qd=2
+# sat at 900 twice (best 900, mean 900). Averaging would crown nr=2; the
+# demonstrated ceiling belongs to nr=1.
+t_assert "brutal_verdict: the highest reading wins, not the steadiest average" bash -c '
     d=$(mktemp -d); mkdir -p "$d/cal"
-    # nr=1/qd=2 spiked to 1000 once then came back at 800; nr=2/qd=2 is
-    # steady at 900. The sweep ranked the spike first; the means do not.
     printf "read 1 2 1000\nread 1 2 700\nread 2 2 900\nread 2 2 900\nread 1 1 100\n" \
         > "$d/cal/grid-bw-read.h1"
     printf "1/2\n2/2\n" > "$d/cal/short-bw-read.h1"
     out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
     case "$out" in
-        "2 2 nrfiles=2 iodepth=2 -> "*"(n=2; runner-up nrfiles=1 qd=2 at 94.4%"*) true;;
+        "2 1 nrfiles=1 iodepth=2 -> "*"(best of 2 samples; runner-up nrfiles=2 qd=2 at 90.0%; grid spans 10-100% of best over 3 cells)"*) true;;
         *) echo "$out" >&2; false;;
     esac
-    # with no shortlist it falls back to the whole grid, spike and all
+    # the shortlist only decides which cells got a second run; every cell in
+    # the grid still competes on its own best reading
     rm -f "$d/cal/short-bw-read.h1"
     out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
-    case "$out" in ("2 2 "*) true;; (*) echo "no-shortlist: $out" >&2; false;; esac'
-t_assert "brutal_surface: the grid as percent-of-best" bash -c '
+    case "$out" in ("2 1 "*) true;; (*) echo "no-shortlist: $out" >&2; false;; esac'
+t_assert "brutal_surface: the grid as percent-of-best, each cell at its best" bash -c '
     d=$(mktemp -d)
     printf "read 1 1 500\nread 1 2 1000\nread 2 1 250\nread 2 2 750\n" > "$d/g"
     out=$( (source ./wekatester; brutal_surface "$d/g" bw) )
@@ -2836,7 +2844,7 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
     grep -q "cal-bw-read-qd1-nr1.job" "$d/cells" &&
     grep -q "cal-bw-read-qd2-nr2.job" "$d/cells" &&
     case "$out" in
-        *"bw-read: nrfiles=2 iodepth=2 -> "*"(n=2"*"grid spans 25-100% of best over 4 cells"*) true;;
+        *"bw-read: nrfiles=2 iodepth=2 -> "*"(best of 2 samples"*"grid spans 25-100% of best over 4 cells"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
