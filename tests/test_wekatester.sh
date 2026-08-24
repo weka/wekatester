@@ -1208,6 +1208,30 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
+# The bug that killed brutal on iscg001 (2026-08-24): one seed section per
+# file per job = 52 x 128 = 6656 sections, and fio hard-caps a run at 4096
+# jobs, so the seed died at parse. Files are grouped into chunked sections
+# now; this pins the arithmetic at the widest shipped grid.
+t_assert "cal_seed_scratch: a brutal-width seed stays far below the fio 4096-job cap" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal/h1"
+    printf "ncpus 52\n" > "$d/probe/h1"
+    printf "bw read\niops read\n" > "$d/cal/seedplan.h1"
+    (source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka
+     CAL_SETTLE=0; ladders=$(printf "bw read\niops read\n")
+     run_host() { case "$2" in
+         (*find*) return 0;;
+         (*df*)   echo "wekafs 99999999999 999999999";;
+         (*)      return 0;;
+     esac; }
+     cal_seed_scratch h1) >/dev/null 2>&1
+    n=$(grep -c "^\[seed-" "$d/cal/h1/cal-seed.job")
+    # 52 jobs x 128 files in chunks of 16 = 416 sections, each nrfiles=16
+    [ "$n" = 416 ] || { echo "sections: $n" >&2; false; }
+    [ "$(grep -c "^nrfiles=16$" "$d/cal/h1/cal-seed.job")" = 416 ] || false
+    # and every filename line stays far below the 4096-byte fio parser buffer
+    [ "$(awk "/^filename=/ { if (length(\$0) > m) m = length(\$0) } END { print m }" "$d/cal/h1/cal-seed.job")" -lt 1024 ]'
+
 # --- python floor: the workers are older than this laptop ---
 # The inline python has to run on the WORKERS, and a Weka client is commonly
 # RHEL 8, which ships python 3.6. A developer box running 3.9+ will happily
@@ -3006,8 +3030,11 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
      run_host() { case "$2" in (*find*) return 0;; (*df*) echo "wekafs 999999999 99999999"; return 0;; esac
          echo "$2" >> "$d/ran"; printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_scratch h1) >/dev/null 2>&1
-    # 4 jobs x 2 filenums = 8 sections, each at the 1024M union size
-    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 8 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
+    # 4 jobs x 2 filenums, grouped per (job, size): 4 sections, each seeding
+    # both files of that job through a colon-joined filename list
+    [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 4 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
+    grep -q "^filename=h1.cal.0.0:h1.cal.0.1$" "$d/cal/h1/cal-seed.job" || exit 1
+    grep -q "^nrfiles=2$" "$d/cal/h1/cal-seed.job" || exit 1
     grep -q "^filesize=1024M$" "$d/cal/h1/cal-seed.job" || exit 1
     # warm: every file already present and big enough -> no fio invocation
     rm -f "$d/ran"
@@ -3466,7 +3493,7 @@ h1.cal.1.1 268435456
     [ "$a" = NONE ]              || { echo "warm planned: [$a]" >&2; rc=1; }
     [ "$b" = "h1.cal.1/0 " ]     || { echo "short planned: [$b]" >&2; rc=1; }
     [ "$c" = NONE ]              || { echo "oversized planned: [$c]" >&2; rc=1; }
-    [ "$e" = "h1.cal.0/0 h1.cal.1/0 h1.cal.0/1 h1.cal.1/1 " ] \
+    [ "$e" = "h1.cal.0/0:h1.cal.1/0 h1.cal.0/1:h1.cal.1/1 " ] \
                                  || { echo "cross-shape planned: [$e]" >&2; rc=1; }
     exit $rc'
 # The scratch keeps ONE stable shape by default, whatever the workload does:

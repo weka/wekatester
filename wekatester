@@ -1166,6 +1166,21 @@ NJCOLEOF
     printf '%s %s\n' "$ccpus" "$cnj"
 }
 
+# Copy a failed seed's evidence into the run dir so it lands in the bundle:
+# the workdir is on /dev/shm and is removed on exit, so anything left there
+# is gone before anyone can read the path the error printed.
+seed_evidence() {   # seed_evidence <host>...
+    local h
+    [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
+    mkdir -p "$RUN_DIR/cal" || return 0
+    [ ! -s "$WORK_DIR/cal/res-seed.json" ] \
+        || cp "$WORK_DIR/cal/res-seed.json" "$RUN_DIR/cal/" || true
+    for h in "$@"; do
+        [ ! -s "$WORK_DIR/cal/$h/cal-seed.job" ] \
+            || cp "$WORK_DIR/cal/$h/cal-seed.job" "$RUN_DIR/cal/cal-seed.$h.job" || true
+    done
+}
+
 # The calibration scratch namespace, under each host's own destination dir.
 CAL_SCRATCH=".wekatester-cal"
 
@@ -2248,6 +2263,7 @@ SEEDNJEOF2
                    "$WORK_DIR/cal/$host/scratch.list" \
                    "${CAL_FMT:-\$jobnum.\$filenum}" <<'PYEOF'
 import sys
+
 host, nj, sizes_raw, directory, eng, cpus, outpath, listpath, fmt = sys.argv[1:10]
 need = {}
 for line in sizes_raw.splitlines():
@@ -2274,8 +2290,29 @@ out = ["[global]", "directory=%s" % directory, "unique_filename=0",
        "fallocate=none", "create_on_open=1", "nrfiles=1"]
 if cpus:
     out += ["cpus_allowed=%s" % cpus, "cpus_allowed_policy=split"]
+# One section per file blew straight through fio's REAL_MAX_JOBS (4096) the
+# first time brutal seeded: 52 jobs x 128 files = 6656 sections, dead at
+# parse two seconds in (iscg001, 2026-08-24). A section now seeds up to
+# SEED_CHUNK files through a colon-joined filename list -- the incremental
+# skip stays exact (only files that failed the size test are listed), and
+# the chunk keeps the option line far below fio's 4096-byte parser buffer.
+# Grouped by (job, size) so one section carries one filesize.
+SEED_CHUNK = 16
+groups = {}
 for j, f, name, mib in todo:
-    out += ["[seed-%d-%d]" % (j, f), "filename=%s" % name, "filesize=%dM" % mib]
+    groups.setdefault((j, mib), []).append(name)
+sections = 0
+for (j, mib), names in sorted(groups.items()):
+    for c in range(0, len(names), SEED_CHUNK):
+        chunk = names[c:c + SEED_CHUNK]
+        sections += 1
+        out += ["[seed-%d-%d-%d]" % (j, mib, c // SEED_CHUNK),
+                "filename=%s" % ":".join(chunk),
+                "nrfiles=%d" % len(chunk),
+                "filesize=%dM" % mib]
+if sections > 4000:
+    sys.exit("ERROR: the seed needs %d fio sections and fio caps a run at "
+             "4096 jobs; narrow BRUTAL_NRS or seed in stages" % sections)
 with open(outpath, "w") as fh:
     fh.write("\n".join(out) + "\n")
 print(len(todo), mib_total)
@@ -2330,10 +2367,17 @@ PYEOF
         cmd="$cmd --client=$host '$TARGET_DIR.cal/$host/cal-seed.job'"
     done
     log "cal: seeding the calibration scratch on ${#seedrun[@]} host(s)..."
-    run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-seed.json" \
-        || die "calibration seed failed (output in $WORK_DIR/cal/res-seed.json)"
-    check_fio_errors "$WORK_DIR/cal/res-seed.json" layout \
-        || die "calibration seed errored on a host (output in $WORK_DIR/cal/res-seed.json)"
+    # a failed seed must leave its evidence somewhere that survives the
+    # workdir cleanup: the die message used to point into /dev/shm/wt.*,
+    # which is wiped on exit, so the operator could not even show the error
+    if ! run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-seed.json"; then
+        seed_evidence "$@"
+        die "calibration seed failed (res-seed.json and the per-host cal-seed jobfiles are in the run bundle under cal/)"
+    fi
+    if ! check_fio_errors "$WORK_DIR/cal/res-seed.json" layout; then
+        seed_evidence "$@"
+        die "calibration seed errored on a host (res-seed.json and the per-host cal-seed jobfiles are in the run bundle under cal/)"
+    fi
     sleep "$CAL_SETTLE"   # let the seed's write backlog destage
 }
 
