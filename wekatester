@@ -1740,7 +1740,7 @@ def cv(q):
     # (python 3.6). A coefficient of variation needs a mean as its scale
     # factor, which is the only place a mean belongs in this verdict.
     v = samples[q]
-    m = st.fmean(v)
+    m = sum(v) / len(v)
     # sample sd (n-1), the estimator that does not shrink with n the way a
     # range grows with it; a single sample has no dispersion to report
     return st.stdev(v) / m * 100 if len(v) > 1 and m > 0 else 0.0
