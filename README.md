@@ -46,9 +46,9 @@ attaching is the way to pass a value that starts with a dash.
                           (default level when omitted: max)
                           cal: measure per-client iodepth ladders (one per
                           type and direction) before staging
-                          :secs shortens each ladder rung from the 30s
-                          default (cal:15); it does not change how long the
-                          measured jobs run -- that is -x/--duration
+                          :secs shortens the decision pass cells from the
+                          30s default (cal:15); it does not change how long
+                          the measured jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -186,58 +186,136 @@ actually runs — bandwidth and/or iops, read and/or write directions; latency
 has no queue to ladder, so its FLOOR is measured instead (one QD1 rung per
 direction, reported and bundled, never cached).
 
+The objective is the **client's ceiling**: maximise throughput, and break
+ties toward the shallowest rung. These curves have a *plateau*, not a knee —
+on one 64-core client (2026-08-22) iops-read ran within 0.2% across qd=32,
+64 and 128 — so the verdict is a plateau-membership test against a fixed
+band, not a hunt for an elbow that is not there.
+
 Calibration measures **one iodepth ladder per (type, direction)** — bw read,
 bw write, iops read, iops write, whichever the set actually contains —
 because the knees genuinely differ by direction (in the field: iops write
-knee 4 vs read knee 16 on the same clients). File count and size are not
-searched: each ladder runs 2 files per job against a fixed working set
+knee 4 vs read knee 16 on the same clients). File count and size come from
+tables: each ladder runs 2 files per job against a fixed working set
 (2048MiB for bandwidth, 512MiB for iops, split evenly across the files),
 tunable per type and direction via `CAL_BW_READ_NR`, `CAL_IOPS_TOTAL_MIB`
 and friends. (An earlier release searched a (nrfiles × iodepth) grid; the
 extra axis multiplied the budget, and A/B tests on real hardware kept
-landing on 2 files per job.) `numjobs` is not an axis either — it is the
-host's usable cores throughout.
+landing on 2 files per job.) `numjobs` is one job per usable cpu — see
+**Refinements** below for the two axes that *are* re-measured once the
+depth is settled.
 
-Bandwidth ladders climb qd 1–128, iops 1–256. Every rung runs ~32s by
-default (30s measured after a 2s ramp) on ALL clients at once, so every
-number is that client's ceiling under contention — the condition the real
-jobs run in. `-a cal:15` shortens the measured part. **Direction is the
-outer loop**: the whole write ladder, one settle, then the whole read
-ladder, so a read rung never lands straight on top of a write of the same
-files.
+Bandwidth ladders climb qd 1–128, iops 1–256. Every cell runs on ALL clients
+at once, so every number is that client's ceiling under contention — the
+condition the real jobs run in. **Direction is the outer loop**: the whole
+write ladder, one settle, then the whole read ladder, so a read rung never
+lands straight on top of a write of the same files.
 
-Each ladder starts with a **noise floor**: its qd=4 rung measured three
-times. The spread is that box's own run-to-run noise on that channel, and it
-drives both the climb and the verdict — the best of many noisy rungs is
-biased high, so comparing against it with a fixed threshold chases variance
-(in the field, write iops repeated to 0.7% and read iops to 11% on the same
-client). The three samples double as the ladder's qd=4 rung (their mean), so
-the floor costs two extra rungs.
+Each ladder runs in **two passes**, because *where* the uncertainty is
+measured matters more than how. Per-rung standard deviation across four runs
+of the same command on one client: 4–6% at qd=1–4, under 1% at qd=16–128. An
+earlier release probed qd=4 — the noisiest point on the curve — and used that
+spread to widen the band over the quietest. Four runs on a quiet cluster then
+recorded qd=16, 32 and 64 and reported iops 23% apart, while the ladders
+behind them agreed to 2%.
 
-The climb: a rung must beat the best so far by more than the measured noise
-(floored at 1%) to count as progress, and two consecutive misses end the
-ladder — a curve that turns over stops early, so the deep rungs are only
-paid for while there may still be something above them. A host that stopped
-keeps running each rung until every host has stopped, so contention stays
-constant for the hosts still climbing; only its tally is frozen.
+1. The **shape pass** walks every rung once at `CAL_SHAPE_RUNTIME` (10s) and
+   only has to bracket the top. A rung must beat the best so far by more than
+   `CAL_SHAPE_THR` (2%) to count as progress, and `CAL_STOP_BELOW` (2)
+   consecutive misses end the ladder — a curve that turns over stops early. A
+   host that stopped keeps running each rung until every host has stopped, so
+   contention stays constant for the hosts still climbing.
+2. The **decision pass** measures only the rungs that could carry the verdict
+   — the shape peak, which anchors the peak estimate, plus the shallowest
+   rungs still within `CAL_SHAPE_MARGIN` (4) points of the band, at most
+   `CAL_CANDIDATES` (3) of them — `CAL_REPS` (3) times each at `CAL_RUNTIME`
+   (30s, `-a cal:15` shortens it), **interleaved**: round-robin across
+   candidates, never three-in-a-row. Interleaving is the point. Three
+   back-to-back cells cannot tell noise from drift, and a monotone decline
+   across them reads as noise it is not.
 
-The verdict: the knee is the shallowest qd within the acceptance band of
-that direction's own peak, and the band is `min(CAL_KNEE_PCT, 100 − 2 ×
-spread)` percent — a quiet channel keeps the tight 98% band, a noisy one
-opens up and the **cheapest indistinguishable** rung wins, which is what the
-knee rule meant all along. The verdict prints the winner's and the peak's
-absolute throughput alongside the measured spread, so a ladder that measured
-nothing at all is visible as a number, not just as a ratio. Both uses of the
-spread are clamped at `CAL_MAX_SPREAD` (25%): the worst legitimate spread
-measured in the field is 11%, so anything past twice that is a broken probe,
-not a wide band — the raw number still prints (with a `clamped` marker and a
-WARNING), the band never opens below 50% of the peak, and the climb never
-demands more than a 25% per-rung gain. A knee measured on such a probe is
-reported but never recorded — not into the host file, and not from the
-staged tuple either — so the next `-a cal` re-measures that ladder.
+Wall clock lands about where the single-pass release did, because that one
+paid three full-length cells for the probe and measured every rung once.
+What changed is that every rung deciding the answer now carries n=3.
+
+The verdict is **plateau membership**: every candidate within `CAL_KNEE_PCT`
+(98.5%) of the best *mean* is on the plateau, and the pick is the shallowest
+of them. The band is fixed — nothing widens it. 98.5 is measured: on that
+client it resolves all four ladders to a unique rung at 99.5–100% of the
+peak, while 99.5 destabilises every one of them, because the band can never
+be tighter than the peak's own measurement error. Without the decision pass's
+averaging, 96–97 is the honest setting. The verdict prints the plateau, the
+peak's absolute throughput and the worst coefficient of variation, so a
+ladder that measured nothing at all is visible as a number rather than a
+ratio.
+
+Two runs that cannot tell qd=32 from qd=64 must not disagree about which to
+write down, so a recorded qd the new plateau **contains** is kept
+(`CAL_HYSTERESIS`, on by default) and the log says so. That churn is what
+"`-a cal` picks different settings every time" actually was.
+
+The measured spread has exactly one job left: refusing a broken measurement.
+A candidate whose decision-pass coefficient of variation exceeds
+`CAL_MAX_CV` (8%) is reported but never recorded — not into the host file,
+and not from the staged tuple either — so the next `-a cal` re-measures that
+ladder. CV, not a range: a range over three samples is an order statistic
+whose expected value grows with n, so it is not comparable between runs, and
+it reports drift as noise.
+
+### Refinements: the axes the ladder holds fixed
+
+Iodepth alone is not the client's limit. What the client has in flight is
+`numjobs × iodepth`, and the two halves are not interchangeable — on that
+client iops-read saturated at 52×32 = 1,664 outstanding while iops-write
+needed 52×128 = 6,656 and collapsed 9% at 13,312. So once the depth is
+settled, two single-axis re-tests run at the winning depth:
+
+- **`CAL_SPLIT`** (on) re-measures the same outstanding IO at a different
+  split. `CAL_SPLIT_PCT` (`50`) halves the jobs and doubles the depth, which
+  is free because the seed already created files for every job. Adding `200`
+  tests the widening direction — more jobs than usable cpus — which needs the
+  seed to cover twice the jobs, so it doubles the calibration scratch and the
+  seed pass. Opt-in, not a default.
+- **`CAL_NR_RETEST`** (off) re-measures `CAL_NR_CANDIDATES` (`1 4 8`) file
+  counts at the winning `(numjobs, iodepth)`. Off for capacity, not doubt:
+  covering nr=8 means the seed union carries 8 files per job as well as 2,
+  roughly 75% more scratch and a longer seed pass. Worth running once per new
+  client shape — the historical nrfiles comparisons that motivated the table
+  were taken at a shallow qd, the region now known to be the noisiest on the
+  curve.
+
+Both are single-axis moves off the same baseline — the pick's own
+decision-pass mean — and **at most one is adopted**: compounding two
+one-sample measurements would claim a joint optimum neither of them measured.
+The bar is the decision pass's own worst CV, floored at 1%: a refinement has
+to beat the winner by more than the box could have wobbled, or it is not a
+finding. This is the one honest use of a measured spread — as a significance
+threshold on a *difference*, never as a band below a peak. A split that wins
+is recorded as `numjobs` in the host file; otherwise `numjobs` stays the
+operator's, one job per usable cpu.
+
+### Calibration measures what the test will run
+
+A knee measured under a parallelism or a file layout the staged jobs will not
+reproduce is not the test's ceiling. Two things are therefore derived once and
+shared:
+
+- **cpus and numjobs** come from one rule for the rungs, the seed and the
+  staged jobs alike: the operator's cpu list minus weka's pinned cores (every
+  cpu minus weka's when no list is given), and one job per cpu in that list
+  unless the host file pins `nj`. Never more jobs than cpus — split affinity
+  has nowhere to put the excess. Seen live before this rule existed: the
+  ladders ran 52 jobs in a 46-cpu mask while the staged jobs ran 52 in a
+  52-cpu mask.
+- **the scratch's file layout** mirrors the workload's `filename_format`, so a
+  set whose files live in subdirectories is measured on files in
+  subdirectories — a different metadata spread is a different measurement.
+  One shape serves the whole scratch (the bw and iops ladders deliberately
+  share their files), and `CAL_FMT_PARITY=0` pins the flat shape.
 
 **The calibration scratch is seeded once, incrementally, and kept.** Every
-rung of every ladder reads `<host>.cal.<job>.<filenum>`; ladders differ only
+rung of every ladder reads `<host>.cal.` plus the workload's own name shape
+(`<job>.<filenum>` when the set has none); ladders differ only
 in how much of each file they use, so the scratch needs file *f* sized to
 the largest any ladder asks of it — with the default tables, two 1024M files
 per job (the bandwidth ladders), which already covers the iops ladders and

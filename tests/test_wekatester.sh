@@ -1958,16 +1958,18 @@ t_assert "apply_cal_results: -g lets measured knees overwrite host-file qds" bas
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; REGEN_LAYOUT=1
-     # cal.results: host + (qd nr fs) x (bw_r bw_w iops_r iops_w)
-     printf "h1 4 2 1024M 2 2 1024M 32 2 256M 16 2 256M\n" > "$d/cal.results"
+     # cal.results: host + (qd nr fs nj) x (bw_r bw_w iops_r iops_w); nj is
+     # a dash unless a CAL_SPLIT re-test won, and bw_r here says one did
+     printf "h1 4 2 1024M 2 2 2 1024M - 32 2 256M - 16 2 256M -\n" > "$d/cal.results"
      # 29 columns; bw_r_qd (col 9) and iops_r_qd (col 25) carry old values
      { printf "h1"
        for i in $(seq 2 29); do
           case $i in (9) printf "\t8";; (25) printf "\t64";; (*) printf "\t-";; esac
        done; printf "\n"; } > "$d/targets.final"
      apply_cal_results)
-    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$13, \$25, \$29}" "$d/targets.final")
-    [ "$a" = "4 2 32 16" ] || { echo "a=$a" >&2; false; }'
+    a=$(awk -F"\t" "\$1==\"h1\" {print \$9, \$13, \$25, \$29, \$6}" "$d/targets.final")
+    # cols 9/13/25/29 are the four qds; col 6 is bw_r_nj, the split winner
+    [ "$a" = "4 2 32 16 2" ] || { echo "a=$a" >&2; false; }'
 t_assert "sweep: dry runs never mutate (no run_host at all)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -2397,7 +2399,10 @@ t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per ho
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     v1="$FIX/jobs/h1/011-bw.job"; v2="$FIX/jobs/h2/011-bw.job"
     grep -q "^directory=/mnt/pin$" "$v1" && grep -q "^directory=/mnt/weka$" "$v2" &&
-    grep -q "^cpus_allowed=2,4$" "$v1" &&
+    # the host file keeps the operator spelling "2,4"; the STAGED job declares
+    # what actually executes, and this fixture pins weka on cpus 0-2, so only
+    # cpu 4 survives -- the same effective set the calibration ladder measures
+    grep -q "^cpus_allowed=4$" "$v1" &&
     grep -q "^numjobs=3$" "$v1" && grep -q "^filesize=2G$" "$v1" && grep -q "^iodepth=9$" "$v1" &&
     grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=io_uring$" "$v2"'
 t_assert "host_dir: targets dir when resolved, global -d otherwise" bash -c '
@@ -2733,29 +2738,31 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
 
 # --- calibrate(): the ladder orchestrator ---
 # A run_host stub answers each rung with fabricated JSON. What the block
-# covers: a noise floor of three CAL_NOISE_QD samples whose spread widens the
-# CAL_KNEE_PCT band, a climb that stops after CAL_STOP_BELOW rungs fail to
-# beat the best by more than that noise, per-(type,direction) tuples in
-# cal.results, and a scratch that is kept unless -u.
+# covers: a SHAPE pass that stops after CAL_STOP_BELOW rungs fail to beat the
+# best by more than CAL_SHAPE_THR, a DECISION pass of CAL_REPS interleaved
+# repeats over the nominated candidates, a verdict that is plateau membership
+# against a FIXED CAL_KNEE_PCT band, hysteresis against a recorded qd the
+# plateau contains, CAL_MAX_CV refusing to record a noisy measurement,
+# per-(type,direction) tuples in cal.results, and a scratch kept unless -u.
 cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
     # the value lands in BOTH bw_bytes and iops so the same helper drives a
     # bw-mode ladder (cal_values keys on bw_bytes) and an iops-mode one (iops)
     printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1" "$1"
 }
 export -f cal_json
-t_assert "calibrate: the knee is the shallowest qd within the noise-widened band" bash -c '
+t_assert "calibrate: the pick is the shallowest rung on the plateau" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh
      source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      # peak 2100 at qd=8; qd=16/32 fall back (early stop after two misses);
-     # the knee is qd=8, the shallowest rung within 98% of the peak (qd=4
-     # sits at 97.6%)
+     # the pick is qd=8, the shallowest rung on the 98.5% plateau (qd=4 sits
+     # at 97.6% of the peak, so it is off it)
      run_host() { case "$2" in
          (*mkdir*) echo "MK: $2" >> "$d/oplog";;
          (*find*) return 0;;
@@ -2772,12 +2779,13 @@ t_assert "calibrate: the knee is the shallowest qd within the noise-widened band
      esac; }
      calibrate) 2>&1 )
     case "$out" in
-        *"bw-read: knee"*"at qd=8 (100% of peak"*"[nrfiles=2 fs=1024M]"*) true;;
+        *"bw-read: qd=8 -- plateau qd=8 >=98.5% of best"*"at qd=8 (n=3, cv<=0.0%)"*"[nrfiles=2 fs=1024M]"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    grep -q "^h1 8 2 1024M - - - - - - - - -$" "$d/cal.results" &&
-    # early stop: qd=16 and qd=32 both fail to beat 2100 by >1%, so qd=64
-    # is never staged
+    # nj is a dash: no split re-test won, so numjobs stays operator-owned
+    grep -q "^h1 8 2 1024M - - - - - - - - - - - - -$" "$d/cal.results" &&
+    # early stop: qd=16 and qd=32 both fail to beat 2100 by >CAL_SHAPE_THR,
+    # so qd=64 is never staged
     [ ! -f "$d/cal/h1/cal-bw-read-qd64-nr2.job" ] &&
     grep -q "^MK: mkdir -p ./mnt/weka/.wekatester-cal." "$d/oplog" &&
     ! grep -q "^RM: rm -rf ./mnt/weka/.wekatester-cal." "$d/oplog" &&
@@ -2900,7 +2908,7 @@ t_assert "calibrate: a turned-over curve stops the ladder early" bash -c '
     (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2918,7 +2926,7 @@ t_assert "calibrate: a climbing curve is followed to the deepest rung" bash -c '
     out=$( (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2931,19 +2939,20 @@ t_assert "calibrate: a climbing curve is followed to the deepest rung" bash -c '
      calibrate) 2>&1 )
     [ -f "$d/cal/h1/cal-iops-read-qd256-nr2.job" ] &&
     case "$out" in
-        *"iops-read: knee"*"at qd=256 (100% of peak"*) true;;
+        *"iops-read: qd=256 -- plateau qd=256 >=98.5% of best"*"at qd=256"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-# The band must follow the box's measured spread: with a noisy probe the
-# shallowest rung wins even though a deeper one scored a few percent higher,
-# because within the noise they are the same number.
-t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bash -c '
+# The band does NOT widen any more, and this is the test that says so: a
+# measurement too noisy to trust is REFUSED, not accommodated. Widening it was
+# how four runs of the same command on a quiet cluster recorded qd=16, 32 and
+# 64 and reported iops 23% apart.
+t_assert "calibrate: a noisy decision pass is refused, not accommodated" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2951,38 +2960,37 @@ t_assert "calibrate: a noisy probe widens the band so the shallow rung wins" bas
          (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac
      case "$2" in
-         (*qd4-nr2.job*)   # the probe: three very different answers
+         (*qd2-nr2.job*)
+             # call 1 is the shape pass; calls 2-4 are the decision repeats,
+             # and they disagree by far more than CAL_MAX_CV
              [ -f "$d/n" ] || echo 0 > "$d/n"; n=$(cat "$d/n"); n=$((n + 1)); echo "$n" > "$d/n"
-             case "$n" in (1) cal_json 1000;; (2) cal_json 1400;; (*) cal_json 1200;; esac;;
-         (*qd1-nr2.job*)    cal_json 1300;;
-         (*qd2-nr2.job*)    cal_json 1350;;
-         (*)                cal_json 900;;
+             case "$n" in (1) cal_json 1350;; (2) cal_json 1000;; (3) cal_json 1400;; (*) cal_json 1200;; esac;;
+         (*qd1-nr2.job*) cal_json 1000;;
+         (*)             cal_json 900;;
      esac; }
      calibrate) 2>&1 )
-    # peak is 1350 at qd=2; 1300/1350 = 96.3% fails a fixed 98% band but
-    # clears the noise-widened one, so the cheaper qd=1 wins. The 33.3%
-    # spread exceeds CAL_MAX_SPREAD=25, so the band is clamped (floor 50%,
-    # not 33%), the verdict says so with a WARNING -- and the knee is
-    # reported but NOT recorded, so the next -a cal re-measures.
+    # mean 1200, sample sd 200 -> cv 16.7%, past CAL_MAX_CV=8: reported, not
+    # recorded, and the ladder is left on the suspect ledger so the next
+    # -a cal re-measures it
     case "$out" in
-        *"bw-read: knee"*"at qd=1 (96% of peak"*"band >=50% (noise 33.3%, clamped)"*"SUSPECT, not recorded"*) true;;
+        *"bw-read: qd=2 reported but NOT recorded -- cv 16.7% exceeds CAL_MAX_CV=8%"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     case "$out" in
-        *"WARNING: h1 bw-read: noise spread 33.3% exceeds CAL_MAX_SPREAD=25%"*) true;;
+        *"the next -a cal re-measures"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     [ ! -s "$d/cal.results" ] &&
     [ "$(cat "$d/cal/suspect")" = "h1 bw_r" ]'
 # The verdict must report real numbers, not just ratios: a ladder that
 # measured nothing (reads of a hollow layout) looks identical in percentages.
-t_assert "calibrate: the verdict logs absolute values and the measured noise" bash -c '
+t_assert "calibrate: the verdict logs absolute values, the plateau and the cv" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
     out=$( (source ./tests/helpers.sh; source ./wekatester
      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2990,10 +2998,257 @@ t_assert "calibrate: the verdict logs absolute values and the measured noise" ba
          (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac; cal_json 1073741824; }
      calibrate) 2>&1 )
+    # a dead-flat ladder IS a plateau: every rung ties, so the pick is the
+    # shallowest and the cv is zero
     case "$out" in
-        *"knee 1.00GiB/s at qd=1"*"noise 0.0%"*) true;;
+        *"bw-read: qd=1 -- plateau qd=1..4 >=98.5% of best 1.00GiB/s at qd=1 (n=3, cv<=0.0%)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+# Hysteresis: two runs that cannot tell one rung from another must not
+# disagree about which to write down. A recorded qd the plateau contains is
+# kept, and the log says so rather than silently churning the host file.
+t_assert "calibrate: a recorded qd the plateau contains is kept, not rewritten" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    # a 29-column row carrying bw_r_qd=2 and nothing else measured
+    row=h1; for i in $(seq 2 29); do row="$row	-"; done
+    printf "%s\n" "$row" | awk -F"\t" -v OFS="\t" "{ \$9 = 2; print }" > "$d/targets.final"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=1
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac; cal_json 1073741824; }
+     calibrate) 2>&1 )
+    # flat ladder -> plateau qd=1..4, fresh pick qd=1; the host file already
+    # says qd=2, which is on that plateau, so qd=2 stands
+    case "$out" in
+        *"bw-read: qd=2 (kept: the host file"*"is on this plateau; fresh pick was qd=1)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    awk "{ print \$2 }" "$d/cal.results" | grep -qx 2'
+t_assert "calibrate: CAL_HYSTERESIS=0 takes the fresh pick instead" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    row=h1; for i in $(seq 2 29); do row="$row	-"; done
+    printf "%s\n" "$row" | awk -F"\t" -v OFS="\t" "{ \$9 = 2; print }" > "$d/targets.final"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=1
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_HYSTERESIS=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac; cal_json 1073741824; }
+     calibrate) >/dev/null 2>&1
+    awk "{ print \$2 }" "$d/cal.results" | grep -qx 1'
+# The decision pass measures each candidate CAL_REPS times, ROUND-ROBIN: three
+# back-to-back cells cannot tell noise from drift.
+t_assert "calibrate: the decision pass interleaves its repeats" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac
+     echo "$2" | grep -o "qd[0-9]*-nr2" >> "$d/order"
+     cal_json 1073741824; }
+     calibrate) >/dev/null 2>&1
+    # shape pass qd1,qd2,qd4 then THREE round-robins over the candidates --
+    # never qd1,qd1,qd1
+    tail -9 "$d/order" | tr "\n" " " > "$d/seen"
+    grep -qx "qd1-nr2 qd2-nr2 qd4-nr2 qd1-nr2 qd2-nr2 qd4-nr2 qd1-nr2 qd2-nr2 qd4-nr2 " "$d/seen"'
+# The shape pass runs SHORT cells and the decision pass full ones: the budget
+# goes where the verdict is decided.
+t_assert "calibrate: shape cells are short, decision cells are full length" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     CAL_RUNTIME=30; CAL_SHAPE_RUNTIME=7; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac
+     case "$2" in (*qd8-nr2.job*) grep "^runtime=" "$d/cal/h1/cal-bw-read-qd8-nr2.job" >> "$d/rt";; esac
+     # climbs to qd=8 then flattens: the shape pass stops at qd=32 and
+     # nominates qd=8 (the peak) plus its plateau neighbours, so qd=8 is
+     # measured in BOTH passes
+     q=$(echo "$2" | grep -o "qd[0-9]*" | head -1 | tr -dc 0-9)
+     [ "$q" -le 8 ] || q=8
+     cal_json $((q * 100)); }
+     calibrate) >/dev/null 2>&1
+    # the shape cell saw runtime=7, a later decision cell saw runtime=30
+    head -1 "$d/rt" | grep -qx "runtime=7" && grep -qx "runtime=30" "$d/rt"'
+# CAL_SPLIT re-tests the winning OUTSTANDING io at a different split, and only
+# adopts one that beats the pick by more than the decision pass wobbled.
+t_assert "calibrate: a split that wins is recorded as numjobs, one that does not is not" bash -c '
+    run_split() {   # run_split <split-value> -> the cal.results row
+        # named, not $1: inside run_host, $1 is run_host`s own parameter
+        sv=$1
+        d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+        printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+        (source ./tests/helpers.sh; source ./wekatester
+         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+         CAL_SPLIT=1; CAL_SPLIT_PCT=50
+         printf "ncpus 4\n" > "$d/probe/h1"
+         copy_to_master() { :; }
+         run_host() { case "$2" in
+             (*mkdir*|*rm\ -rf*|*find*) return 0;;
+             (*df*) echo "wekafs 999999999 99999999"; return 0;;
+         esac
+         case "$2" in
+             (*-nj50.job*)  cal_json "$sv";;   # the halved-jobs cell
+             (*qd1-nr2.job*) cal_json 1000;;
+             (*)             cal_json 900;;
+         esac; }
+         calibrate) >/dev/null 2>&1
+        cat "$d/cal.results"
+    }
+    # pick is qd=1 at 1000 with a 1% bar; the split runs 2 jobs at qd=2
+    # a 3% win is real -> numjobs 2 recorded beside qd=2
+    run_split 1030 | grep -qx "h1 2 2 1024M 2 - - - - - - - - - - - -" &&
+    # a 0.5% win is inside the bar -> nothing changes, nj stays a dash
+    run_split 1005 | grep -qx "h1 1 2 1024M - - - - - - - - - - - - -"'
+# One shape for the whole scratch, taken from the workload: a set whose files
+# live in subdirectories is measured on files in subdirectories.
+# The WIDENING direction of CAL_SPLIT: more jobs than usable cpus at a
+# shallower depth. It is the one Frank named (104xqd64 vs 52xqd128), it is
+# opt-in because it costs seed capacity, and this is the test that the extra
+# capacity is actually seeded and the cell actually runs.
+t_assert "calibrate: CAL_SPLIT_PCT above 100 seeds the wider job count and runs its cell" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     CAL_SPLIT=1; CAL_SPLIT_PCT=200
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac
+     echo "$2" >> "$d/cells"
+     case "$2" in
+         (*-nj200.job*)  cal_json 1200;;   # 8 jobs at qd=1 beats 4 at qd=2
+         (*qd2-nr2.job*) cal_json 1000;;
+         (*)             cal_json 900;;
+     esac; }
+     calibrate) 2>&1 )
+    # the pick is qd=2; 200% of numjobs at half the depth is qd=1 with 8 jobs
+    grep -q "cal-bw-read-qd1-nr2-nj200.job" "$d/cells" &&
+    # the seed covered eight jobs, not four: job 7 has files
+    grep -q "^\[seed-7-" "$d/cal/h1/cal-seed.job" &&
+    grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd1-nr2-nj200.job" &&
+    case "$out" in
+        *"numjobs at 200% with qd=1 beats the pick by +20.0%"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    grep -qx "h1 1 2 1024M 8 - - - - - - - - - - - -" "$d/cal.results"'
+# The shipped verdict against the ladders that motivated it: four runs of the
+# same command on one client (iscg001, 2026-08-21/22), replayed through
+# cal_verdict itself rather than through an analysis script.
+t_assert "cal_verdict: the archived iscg001 ladders all resolve to one setting" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    # iops-read, qd 1..128, one line per rung per repeat (three identical
+    # repeats: the archive holds one sample per rung, and a flat cv is the
+    # conservative reading -- it gives the band nothing to hide behind)
+    reads="271775 554535 1019299 1612326 2056052 2353459 2358459 2350381
+287942 560493 1030853 1652492 2077107 2341663 2331300 2330369
+263020 513836 945576 1571938 2059615 2342622 2352450 2331872
+265905 514803 965580 1575286 2048699 2317393 2318070 2329622"
+    # iops-write, qd 1..256
+    writes="268534 525816 971124 1443521 1790673 1944499 2033621 2051369 1883564
+270606 538694 964300 1479581 1815145 1945351 2024936 2085846 1895450
+238944 473059 881090 1381786 1799140 1906475 2011045 2052253 1877492
+247557 487708 867230 1378474 1776357 1939038 2032767 2072587 1871064"
+    n=0
+    printf "%s\n" "$reads" | while read -r row; do
+        n=$((n + 1)); f="$d/cal/hist-iops-read.h$n"; : > "$f"
+        q=1; for v in $row; do
+            for r in 1 2 3; do printf "read 2 %s %s\n" "$q" "$v" >> "$f"; done
+            q=$((q * 2))
+        done
+        got=$( (source ./wekatester; WORK_DIR=$d; CAL_HYSTERESIS=0
+                cal_verdict "h$n" iops read) | cut -d" " -f1 )
+        [ "$got" = 32 ] || { echo "run $n read picked qd=$got, want 32" >&2; exit 1; }
+    done || exit 1
+    # write: the plateau is qd=64..128 in run 1 and qd=128 alone after that,
+    # so a host file already carrying qd=128 keeps it in every run -- which is
+    # the whole claim of hysteresis
+    row9=h; for i in $(seq 2 29); do row9="$row9	-"; done
+    n=0
+    printf "%s\n" "$writes" | while read -r row; do
+        n=$((n + 1)); f="$d/cal/hist-iops-write.h$n"; : > "$f"
+        q=1; for v in $row; do
+            for r in 1 2 3; do printf "write 2 %s %s\n" "$q" "$v" >> "$f"; done
+            q=$((q * 2))
+        done
+        # col 29 is iops_w_qd
+        printf "h%s\n" "$n" | awk -F"\t" -v OFS="\t" "{ \$1 = \"h$n\"; for (i = 2; i <= 29; i++) if (\$i == \"\") \$i = \"-\"; \$29 = 128; NF = 29; print }" > "$d/targets.final"
+        got=$( (source ./wekatester; WORK_DIR=$d; cal_verdict "h$n" iops write) | cut -d" " -f1 )
+        [ "$got" = 128 ] || { echo "run $n write picked qd=$got, want 128" >&2; exit 1; }
+    done || exit 1
+    true'
+t_assert "cal_scratch_fmt: the workload's subdirectory shape is mirrored, flat stays flat" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set" "$d/flat"
+    printf "# report iops\n[global]\nfilename_format=\$filenum/\$jobnum\n[a]\nrw=randread\n" > "$d/set/031-a.job"
+    printf "# report iops\n[global]\n[a]\nrw=randread\n" > "$d/flat/031-a.job"
+    a=$( (source ./wekatester; cal_scratch_fmt "$d/set") )
+    b=$( (source ./wekatester; cal_scratch_fmt "$d/flat") )
+    c=$( (source ./wekatester; CAL_FMT_PARITY=0; cal_scratch_fmt "$d/set") )
+    [ "$a" = "\$filenum/\$jobnum" ] && [ "$b" = "\$jobnum.\$filenum" ] &&
+    [ "$c" = "\$jobnum.\$filenum" ]'
+t_assert "cal_scratch_dirs: every directory the names imply, once" bash -c '
+    out=$( (source ./wekatester; cal_scratch_dirs h1 "\$filenum/\$jobnum" 3 1) | tr "\n" " " )
+    [ "$out" = "h1.cal.0 h1.cal.1 " ] || { echo "$out" >&2; false; }
+    out=$( (source ./wekatester; cal_scratch_dirs h1 "\$jobnum.\$filenum" 3 1) )
+    [ -z "$out" ] || { echo "$out" >&2; false; }'
+# One rule for (cpus, numjobs), used by the rungs, the seed and the staged
+# jobs alike: 52 jobs in a 46-cpu mask is the bug this prevents.
+t_assert "cal_cpus_nj: the effective mask and one job per cpu in it" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 8\nweka_allowed 0\nweka_allowed 1\n" > "$d/probe/h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth; cal_cpus_nj h1 bw read) )
+    [ "$out" = "2,3,4,5,6,7 6" ] || { echo "derived: $out" >&2; false; }
+    printf "4-7\n" > "$d/auth/h1.cpus"
+    out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth; cal_cpus_nj h1 bw read) )
+    [ "$out" = "4-7 4" ] || { echo "auth: $out" >&2; false; }
+    out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth; cal_cpus_nj h1 lat read) )
+    [ "$out" = "4-7 1" ] || { echo "lat: $out" >&2; false; }'
+t_assert "cal_cpus_nj: a host-file nj wider than the mask is honoured, loudly" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 8\n" > "$d/probe/h1"
+    printf "4-7\n" > "$d/auth/h1.cpus"
+    row=h1; for i in $(seq 2 29); do row="$row	-"; done
+    printf "%s\n" "$row" | awk -F"\t" -v OFS="\t" "{ \$6 = 52; print }" > "$d/targets.final"
+    err=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
+            cal_cpus_nj h1 bw read) 2>&1 >/dev/null )
+    out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
+            cal_cpus_nj h1 bw read) 2>/dev/null )
+    # the host file is the operator`s: 52 stands, but it is called out
+    [ "$out" = "4-7 52" ] || { echo "got: $out" >&2; false; }
+    case "$err" in (*"exceeds its 4 usable cpu(s)"*"double-book 48"*) true;; (*) echo "$err" >&2; false;; esac'
 
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
@@ -3060,8 +3315,8 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     (source ./wekatester
      WORK_DIR=$d
      # h1: bw_r measured (qd 4, nr 8, fs 64M) and iops_r measured (32/2/256M)
-     # h2: only bw_r measured (8/1/2048M)
-     printf "h1 4 8 64M - - - 32 2 256M - - -\nh2 8 1 2048M - - - - - - - - -\n" > "$d/cal.results"
+     # h2: only bw_r measured (8/1/2048M). Every nj is a dash: no split won.
+     printf "h1 4 8 64M - - - - - 32 2 256M - - - - -\nh2 8 1 2048M - - - - - - - - - - - - -\n" > "$d/cal.results"
      # h1 already carries an operator iops_r_qd=64 (col 25): fill must keep it
      { printf "h1"; for i in $(seq 2 29); do
           case $i in (25) printf "\t64";; (*) printf "\t-";; esac
@@ -3072,7 +3327,7 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     [ "$a" = "4 8 64M 64 2 256M" ] && [ "$b" = "8 1 2048M" ] || { echo "a=$a b=$b" >&2; false; }
     (source ./wekatester
      WORK_DIR=$d; rm -f "$d/targets.final"
-     printf "h3 16 2 1024M - - - - - - - - -\n" > "$d/cal.results"
+     printf "h3 16 2 1024M - - - - - - - - - - - - -\n" > "$d/cal.results"
      apply_cal_results)
     c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
     [ "$c" = "29 16" ]'

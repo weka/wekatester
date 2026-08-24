@@ -394,9 +394,9 @@ attaching is the way to pass a value that starts with a dash.
                           (default level when omitted: max)
                           cal: measure per-client iodepth ladders (one per
                           type and direction) before staging
-                          :secs shortens each ladder rung from the 30s
-                          default (cal:15); it does not change how long the
-                          measured jobs run -- that is -x/--duration
+                          :secs shortens the decision pass cells from the
+                          30s default (cal:15); it does not change how long
+                          the measured jobs run -- that is -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -1010,6 +1010,132 @@ else:
 PYEOF
 }
 
+# The SHAPE of the calibration scratch's names, taken from the workload the
+# run is about to measure. fio spreads a job's files with filename_format, and
+# a format with a "/" in it puts them in subdirectories -- which is a different
+# metadata spread from one flat directory, and therefore a different
+# measurement. Seen live (iscg001, 2026-08-22): the ladders wrote 104 files
+# into one directory while the staged jobs wrote 52 into each of two, so the
+# knee was measured on a layout the test never used.
+#
+# ONE shape for the whole scratch, not one per type: the bw and iops ladders
+# deliberately share their files (cal_required orders bw first so the 1G files
+# already exist when the iops rungs write 256M into them), so their names have
+# to agree. The set's first format carrying a "/" wins; a set with no such
+# format keeps the flat "$jobnum.$filenum" this always used.
+#
+# CAL_FMT_PARITY=0 pins the flat shape regardless -- the escape hatch if a
+# workload's format ever resolves to something the seed cannot pre-create.
+cal_scratch_fmt() {   # cal_scratch_fmt <set-dir> -> the suffix after "<host>.cal."
+    [ "${CAL_FMT_PARITY:-1}" -eq 1 ] || { printf '$jobnum.$filenum\n'; return 0; }
+    pyrun "$1" <<'FMTEOF'
+import os
+import re
+import sys
+
+src = sys.argv[1]
+best = ""
+for job in sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f)):
+    path = os.path.join(src, job)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        continue
+    if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
+        continue          # the layout job mirrors the measured ones
+    fmt = first_value(lines, "filename_format")
+    if fmt and "/" in fmt:
+        best = fmt
+        break
+# $jobname would resolve to the CAL section name, not the workload's, so a
+# format that leans on it cannot be mirrored: fall back to flat rather than
+# invent a directory the seed and the rungs would disagree about.
+if not best or "$jobname" in best:
+    best = "$jobnum.$filenum"
+print(best)
+FMTEOF
+}
+
+# Every directory the scratch's names imply, relative to the scratch root.
+# fio never mkdirs, so the caller creates these before the seed writes.
+cal_scratch_dirs() {   # cal_scratch_dirs <host> <fmt> <nj> <maxfilenum>
+    pyrun "$1" "$2" "$3" "$4" <<'DIREOF'
+import os
+import sys
+
+host, fmt, nj, maxf = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+dirs = set()
+for j in range(nj):
+    for f in range(maxf + 1):
+        name = (f"{host}.cal." + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
+        d = os.path.dirname(name)
+        if d:
+            dirs.add(d)
+print("\n".join(sorted(dirs)))
+DIREOF
+}
+
+# ONE source of truth for the (cpu list, numjobs) a host runs -- calibration
+# rungs, the calibration seed, and the staged measured jobs all take it from
+# here, so a knee can never be measured under a parallelism the test will not
+# reproduce.
+#
+# Seen live (iscg001, 2026-08-22): the ladders ran 52 fio jobs pinned into a
+# 46-cpu mask -- six cpus double-booked under cpus_allowed_policy=split --
+# while the staged jobs ran 52 jobs in a 52-cpu mask. Calibration was not
+# measuring the configuration it prescribed. The two sides derived the pair
+# from different places (one from the probe's usable set, one from the host
+# file as written), which is a divergence waiting to happen however carefully
+# either side is written. Now there is one place.
+#
+# The rule, unchanged in substance from what the tuner always intended:
+#   cpus = the operator's list minus weka's pinned cores, every cpu minus
+#          weka's when no list is given -- the set that ACTUALLY executes,
+#          and therefore the set that gets declared
+#   nj   = the host file's recorded nj for this slot when it has one, else one
+#          job per cpu in that list
+#
+# A recorded nj wider than that cpu list is honoured -- the host file is the
+# operator's -- but it is called out, because under cpus_allowed_policy=split
+# the excess jobs double-book cpus the earlier ones already hold, and a
+# recorded nj that outruns its mask is far more often a stale writeback than
+# an intention. Parity is what actually fixes the bug this warning describes:
+# both sides now read the pair from here, so they cannot disagree about it.
+cal_cpus_nj() {   # cal_cpus_nj <host> <bw|iops|lat> <read|write> -> "<cpus> <nj>"
+    local host=$1 ctype=$2 cdirn=$3 hf ccpus cnj ncpu base sfx=r
+    [ "$cdirn" = read ] || sfx=w
+    # $AUTH_DIR/<host>.cpus is the EFFECTIVE set the cpu-enforcement phase
+    # already resolved -- the operator's list minus weka's dedicated cores,
+    # and the mask the fio server is tasksetted to. Prefer it: deriving the
+    # same set a second time is how the two sides drifted apart. Without it
+    # (unit tests, a direct caller) derive it from the host file the same way.
+    ccpus=""
+    [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || ccpus=$(cat "$AUTH_DIR/$host.cpus")
+    if [ -n "$ccpus" ]; then
+        ncpu=$(usable_cores "$host" count "$ccpus") || return 1
+    else
+        hf=$(targets_field "$host" 4 "$WORK_DIR/targets.final")
+        ccpus=$(usable_cores "$host" list "$hf") || return 1
+        ncpu=$(usable_cores "$host" count "$hf") || return 1
+    fi
+    if [ "$ctype" = lat ]; then
+        printf '%s 1\n' "$ccpus"   # a latency floor is one QD1 stream, by definition
+        return 0
+    fi
+    base=$(pyrun "${ctype}_$sfx" <<'NJCOLEOF'
+import sys
+print(slot_base(sys.argv[1]) + 1)   # 1-based column of the slot's nj
+NJCOLEOF
+    ) || return 1
+    cnj=$(targets_field "$host" "$base" "$WORK_DIR/targets.final")
+    case "$cnj" in
+        (""|*[!0-9]*|0) cnj=$ncpu ;;
+        (*) [ "$cnj" -le "$ncpu" ] \
+                || log "WARNING: $host: host-file ${ctype}_${sfx}_nj=$cnj exceeds its $ncpu usable cpu(s) -- split affinity will double-book $((cnj - ncpu)) of them; widen the cpus column or clear the nj to run one job per cpu" >&2 ;;
+    esac
+    printf '%s %s\n' "$ccpus" "$cnj"
+}
+
 # The calibration scratch namespace, under each host's own destination dir.
 CAL_SCRATCH=".wekatester-cal"
 
@@ -1065,7 +1191,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
     case "$qd" in
         (""|*[!0-9]*) die "stage_cal_step: iodepth is not a number: $qd" ;;
     esac
-    local host hd eng nj cpus f
+    local host hd eng nj cpus f pair
     for host in "$@"; do
         hd=$(host_dir "$host")
         eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
@@ -1074,32 +1200,27 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
                 "$WORK_DIR/engine.results")
         fi
         [ -n "$eng" ] || eng=psync
-        cpus=""
-        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        if [ "$type" = lat ]; then
-            nj=1   # latency is a single QD1 stream by definition
-        else
-            # nj contract: the operator's cpu list minus weka's pinned cores
-            # when a list is given, every cpu minus weka's otherwise
-            nj=$(usable_cores "$host" count "$cpus") \
-                || die "$host: cannot size the $type $dirn calibration ladder"
-        fi
-        # no operator pin: use the tuner's own usable set (every cpu except
-        # the cores weka's node processes are pinned to) -- an unpinned
-        # ladder is free to land anywhere, including weka's own cores, and
-        # measures THAT contention instead of the client's ceiling (seen
-        # live: 0.6GB/s knees on an 18GB/s box)
-        if [ -z "$cpus" ]; then
-            cpus=$(usable_cores "$host" list) \
-                || die "$host: cannot derive the calibration cpu set"
+        # cpus AND numjobs from the one shared rule (cal_cpus_nj), which the
+        # staged measured jobs use too: a ladder measured under a parallelism
+        # the test will not reproduce is not the test's ceiling.
+        pair=$(cal_cpus_nj "$host" "$type" "$dirn") \
+            || die "$host: cannot derive the $type $dirn calibration cpu set"
+        read -r cpus nj <<<"$pair"
+        # CAL_SPLIT re-tests the winning outstanding IO at a different split:
+        # scale numjobs by a percentage here and the caller scales iodepth
+        # inversely, so numjobs x iodepth -- what the client really has in
+        # flight -- is held constant.
+        if [ -n "${CAL_NJ_PCT:-}" ] && [ "$type" != lat ]; then
+            nj=$(( nj * CAL_NJ_PCT / 100 ))
+            [ "$nj" -ge 1 ] || nj=1
         fi
         mkdir -p "$outdir/$host" || die "cannot create $outdir/$host"
-        f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NRFILES:+-nr${CAL_NRFILES}}.job"
+        f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NRFILES:+-nr${CAL_NRFILES}}${CAL_NJ_PCT:+-nj${CAL_NJ_PCT}}.job"
         {
             printf '[global]\n'
             printf 'directory=%s/%s\n' "$hd" "$CAL_SCRATCH"
             printf 'unique_filename=0\n'
-            printf 'filename_format=%s.cal.$jobnum.$filenum\n' "$host"
+            printf 'filename_format=%s.cal.%s\n' "$host" "${CAL_FMT:-\$jobnum.\$filenum}"
             printf 'ioengine=%s\n' "$eng"
             printf 'direct=1\n'
             printf 'bs=%s\n' "$bs"
@@ -1108,7 +1229,9 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             printf 'numjobs=%s\n' "$nj"
             printf 'iodepth=%s\n' "$qd"
             printf 'time_based=1\n'
-            printf 'runtime=%s\n' "$CAL_RUNTIME"
+            # the shape pass runs short cells, the decision pass full ones;
+            # CAL_CELL_RUNTIME is how the orchestrator says which
+            printf 'runtime=%s\n' "${CAL_CELL_RUNTIME:-$CAL_RUNTIME}"
             printf 'ramp_time=2\n'
             if [ -n "$cpus" ]; then
                 printf 'cpus_allowed=%s\n' "$cpus"
@@ -1179,24 +1302,72 @@ PYEOF
 }
 
 # --- calibration: a measured geometry, not a guessed one ---------------------
-# nrfiles is TAILORED, iodepth is MEASURED, and both are held per type AND
-# direction. File count never won by more than the noise of its own channel
-# in any lab measurement (saving-calf, UDP and DPDK; isca224), so it is not
-# worth a measured axis -- it is a table entry an operator can edit. Queue
-# depth moved 4x between backends on the same clients, so it is measured,
-# per direction, as a ladder at the tabled (nr, fs).
-CAL_RUNTIME=${CAL_RUNTIME:-30}  # measured seconds per ladder rung (plus a 2s
-                         # ramp). "-a cal:15" sets this per run; shorter rungs
+# The objective is the CLIENT'S CEILING: maximise throughput, and break ties
+# toward the shallowest rung. These curves have a PLATEAU, not a knee -- on
+# iscg001 (2026-08-22) iops-read ran within 0.2% across qd=32/64/128 -- so the
+# verdict is a plateau-membership test against a FIXED band, never a
+# noise-scaled hunt for an elbow that is not there.
+#
+# Why fixed: an earlier release widened the band by the measured noise
+# (floor = min(pct, 100 - 2*spread)). The spread came from three back-to-back
+# samples at a fixed shallow rung, and on a moderately loaded client that
+# estimate straddled a cliff: four runs of the same command recorded qd=16,
+# 32 and 64 and reported iops 23% apart, while the ladders behind them agreed
+# to 2%. A band is a statement about the curve, not about the box's mood.
+#
+# WHERE the uncertainty is measured matters more than how. Per-rung sd across
+# those four runs: 4-6% at qd=1..4, under 1% at qd=16..128. The old probe sat
+# at qd=4 -- the noisiest point on the curve -- and licensed a 14-point haircut
+# on the quietest. So the budget goes where the decision is made:
+#
+#   SHAPE PASS     every rung once, CAL_SHAPE_RUNTIME seconds -- locate the top
+#   DECISION PASS  CAL_REPS interleaved repeats of the top CAL_CANDIDATES
+#                  rungs at CAL_RUNTIME seconds -- mean, sd and the verdict
+#
+# Wall clock is about neutral against the release this replaces (which paid
+# three full-length cells for the probe and measured every rung once), and
+# every rung that decides the answer now carries n=CAL_REPS. The shape pass is
+# cheap because it only has to find the top: run 23:11 on iscg001 was
+# -a cal:10 and its deep rungs matched the 30s runs to 1.6%.
+CAL_RUNTIME=${CAL_RUNTIME:-30}  # DECISION-pass seconds per cell (plus a 2s
+                         # ramp). "-a cal:15" sets this per run; shorter cells
                          # trade resolution for wall clock, and the verdict
                          # compares rungs whose differences can be small.
+CAL_SHAPE_RUNTIME=${CAL_SHAPE_RUNTIME:-10}   # SHAPE-pass seconds per rung.
+                         # This pass only has to bracket the top; its stop
+                         # rule never decides the recorded geometry.
+CAL_REPS=${CAL_REPS:-3}   # decision-pass repeats per candidate rung, measured
+                         # INTERLEAVED (round-robin across candidates, not
+                         # three-in-a-row): drift inside the decision window
+                         # then lands on every candidate equally instead of
+                         # masquerading as one candidate's noise. Three
+                         # back-to-back cells is how the old probe turned a
+                         # monotone 7% decline into "7% noise".
+CAL_CANDIDATES=${CAL_CANDIDATES:-3}   # how many rungs reach the decision pass
+CAL_SHAPE_MARGIN=${CAL_SHAPE_MARGIN:-4}   # points of slack below the band when
+                         # the shape pass nominates candidates: a 10s rung
+                         # carries a couple of percent of error, so anything
+                         # that could still qualify at full length is kept.
+CAL_SHAPE_THR=${CAL_SHAPE_THR:-2}   # shape-pass climb threshold, percent. A
+                         # FIXED number on purpose -- deriving it from a noise
+                         # probe is the circular dependency this rewrite
+                         # removes, and the shape pass owns no verdict.
 CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed (and between a write
                          # ladder and the read ladder that follows it): the
                          # write backlog destages under the next rung
                          # otherwise (seen live: bw-write qd1 reads ~15% low
                          # in every run, while bw-read qd1 -- measured after
                          # the backlog drained -- does not)
-CAL_KNEE_PCT=${CAL_KNEE_PCT:-98}   # knee = shallowest qd within this % of the
-                         # ladder's peak; widened per direction by the noise
+CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # THE BAND: a rung is on the plateau
+                         # when it reaches this % of the ladder's peak, and
+                         # the pick is the shallowest such rung. Fixed --
+                         # nothing widens it. 98.5 is measured: on iscg001 it
+                         # resolves all four ladders to a unique rung at
+                         # 99.5-100% of the peak, while 99.5 destabilises
+                         # every one of them (the band can never be tighter
+                         # than the peak's own measurement error, because the
+                         # peak is an estimate too). Without the decision
+                         # pass's averaging, 96-97 is the honest setting.
 CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs that fail to beat the
                          # best by more than the noise before the ladder stops
 CAL_BW_QDS=${CAL_BW_QDS:-"1 2 4 8 16 32 64 128"}
@@ -1211,14 +1382,48 @@ CAL_BW_READ_NR=${CAL_BW_READ_NR:-2}
 CAL_BW_WRITE_NR=${CAL_BW_WRITE_NR:-2}
 CAL_IOPS_READ_NR=${CAL_IOPS_READ_NR:-2}
 CAL_IOPS_WRITE_NR=${CAL_IOPS_WRITE_NR:-2}
-CAL_NOISE_QD=${CAL_NOISE_QD:-4}   # the rung measured 3x for the noise floor
-CAL_MAX_SPREAD=${CAL_MAX_SPREAD:-25}   # clamp on the measured spread's two
-                         # uses (climb threshold, verdict band): the worst
-                         # legitimate field spread seen is 11% (saving-calf
-                         # read iops), so anything past ~2x that is a broken
-                         # probe, not a wide band. Keeps the band floor at
-                         # >=50% of the peak and the climb from demanding
-                         # more than a 25% per-rung gain.
+CAL_MAX_CV=${CAL_MAX_CV:-8}   # a candidate whose decision-pass coefficient of
+                         # variation exceeds this is a broken measurement, not
+                         # a wide band: the ladder's knee is reported but NOT
+                         # recorded, so the next -a cal re-measures. CV (sample
+                         # sd over mean) not range: a range over three samples
+                         # is an order statistic whose expected value grows
+                         # with n, so it is not comparable between runs, and
+                         # it reports drift as noise. At the top of the ladder
+                         # the field CV is under 1%, so 8 is far outside.
+CAL_SPLIT=${CAL_SPLIT:-1}   # after the plateau verdict, re-test the winning
+                         # OUTSTANDING IO (numjobs x iodepth) at a different
+                         # split. Queue depth is only half of what the client
+                         # actually has in flight, and the two halves are not
+                         # interchangeable: on iscg001 iops-read saturated at
+                         # 52x32 = 1,664 outstanding while iops-write needed
+                         # 52x128 = 6,656 and collapsed 9% at 13,312. Whether
+                         # the same outstanding is better spent on more jobs
+                         # or deeper queues is a measurement, not a guess.
+CAL_SPLIT_PCT=${CAL_SPLIT_PCT:-"50"}   # numjobs percentages to try at constant
+                         # outstanding (iodepth scales inversely). 50 halves
+                         # the jobs and doubles the depth -- free, because the
+                         # seed already created files for every job. Adding
+                         # 200 tests the WIDENING direction (more jobs than
+                         # usable cores), which needs the seed to cover twice
+                         # the jobs: it doubles the calibration scratch and
+                         # the seed pass, so it is opt-in, not a default.
+CAL_NR_RETEST=${CAL_NR_RETEST:-0}   # re-test nrfiles at the WINNING (nj, qd)
+                         # instead of trusting the table. Off by default for
+                         # capacity, not doubt: covering nr=8 means the seed
+                         # union carries 8 files per job as well as 2, ~75%
+                         # more scratch and a longer seed pass. The historical
+                         # nrfiles comparisons that motivated the table were
+                         # taken at a shallow qd -- the region now known to be
+                         # the noisiest on the curve -- so this is worth
+                         # running once per new client shape.
+CAL_NR_CANDIDATES=${CAL_NR_CANDIDATES:-"1 4 8"}   # the nrfiles CAL_NR_RETEST tries
+CAL_HYSTERESIS=${CAL_HYSTERESIS:-1}   # when the new plateau CONTAINS the qd the
+                         # host file already carries, keep the recorded one.
+                         # Two runs that cannot tell qd=32 from qd=64 must not
+                         # disagree about which to write down -- that churn is
+                         # what "-a cal picks different settings every time"
+                         # actually was. Set 0 to always take the new pick.
 
 # The tabled nrfiles for one (type, direction).
 cal_nr() {   # cal_nr <bw|iops> <read|write>
@@ -1262,9 +1467,9 @@ for line in open(res):
         continue
     # a malformed line is a schema break, not a skip: silently dropping it
     # discards a 30-45 minute measurement with no diagnostic
-    if len(f) != 1 + 3 * len(CAL_SLOTS):
+    if len(f) != 1 + 4 * len(CAL_SLOTS):
         sys.exit(f"ERROR: cal.results: malformed line "
-                 f"(want {1 + 3 * len(CAL_SLOTS)} fields): {line.rstrip()}")
+                 f"(want {1 + 4 * len(CAL_SLOTS)} fields): {line.rstrip()}")
     knees[f[0]] = f[1:]
 
 rows, order = {}, []
@@ -1283,9 +1488,9 @@ for host in sorted(knees):
         row.append("-")
     vals = knees[host]
     for i, slot in enumerate(CAL_SLOTS):
-        qd, nr, fs = vals[3 * i:3 * i + 3]
+        qd, nr, fs, nj = vals[4 * i:4 * i + 4]
         base = slot_base(slot)
-        for off, v in ((3, qd), (2, nr), (1, fs)):   # qd, nr, fs columns
+        for off, v in ((3, qd), (2, nr), (1, fs), (0, nj)):   # qd, nr, fs, nj
             if v != "-" and (force or row[base + off] == "-"):
                 row[base + off] = v
 with open(final, "w") as fp:
@@ -1326,7 +1531,7 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
     # Latency is not a ladder -- one qd1 stream over 2 files at 64M (see
     # stage_cal_step) -- but folding it in means the floor rungs need no seed
     # of their own, and a latency-only set still gets a plan.
-    local type dirn nr fs f maxf=-1
+    local type dirn nr fs f maxf=-1 nr2 tot
     local -a need
     while read -r type dirn; do
         [ -n "$type" ] || continue
@@ -1339,6 +1544,21 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
         for ((f = 0; f < nr; f++)); do
             [ "${need[f]:-0}" -ge "$fs" ] || need[f]=$fs
             [ "$f" -le "$maxf" ] || maxf=$f
+        done
+        # CAL_NR_RETEST measures other file counts at the SAME working set, so
+        # the union has to carry their files too -- one seed pass, not one per
+        # candidate. This is the capacity CAL_NR_RETEST costs, and why it is
+        # off by default: nr=8 at total/8 adds six more files per job.
+        [ "$type" = lat ] && continue
+        [ "${CAL_NR_RETEST:-0}" -eq 1 ] || continue
+        tot=$(cal_total_mib "$type") || return 1
+        for nr2 in $CAL_NR_CANDIDATES; do
+            case "$nr2" in (""|*[!0-9]*|0) continue ;; esac
+            fs=$(( tot / nr2 ))
+            for ((f = 0; f < nr2; f++)); do
+                [ "${need[f]:-0}" -ge "$fs" ] || need[f]=$fs
+                [ "$f" -le "$maxf" ] || maxf=$f
+            done
         done
     done <<SIZEEOF
 $1
@@ -1355,23 +1575,26 @@ SIZEEOF
 # itself. Reads $todo from calibrate.
 cal_cell() {   # cal_cell <type> <dirn> <qd> <nr> <fsz> <sink> <tag> [reuse]
     local ctype=$1 cdirn=$2 cqd=$3 cnr=$4 cfsz=$5 sink=$6 tag=$7 reuse=${8:-}
-    local ccmd cjson cvals ch cv
+    local ccmd cjson cvals ch cv base
+    # the staged basename carries every axis the cell varies, so a split or
+    # nrfiles re-test never collides with the ladder it is refining
+    base="cal-$ctype-$cdirn-qd$cqd-nr$cnr${CAL_NJ_PCT:+-nj$CAL_NJ_PCT}"
     # "reuse": a repeated rung (the noise probe) differs only in its local
     # JSON name, so the jobfiles staged and pushed for the first sample are
     # reused as they are.
     if [ "$reuse" != reuse ]; then
         CAL_NRFILES=$cnr CAL_FILESIZE=$cfsz \
             stage_cal_step "$ctype" "$cdirn" "$cqd" "$WORK_DIR/cal" "${todo[@]}"
-        cal_push "cal-$ctype-$cdirn-qd$cqd-nr$cnr.job" "${todo[@]}" \
+        cal_push "$base.job" "${todo[@]}" \
             || die "cannot copy ladder rung files to $MASTER"
     fi
     ccmd="'$FIO_BIN' --output-format=json --eta=never"
     for ch in "${todo[@]}"; do
-        ccmd="$ccmd --client=$ch '$TARGET_DIR.cal/$ch/cal-$ctype-$cdirn-qd$cqd-nr$cnr.job'"
+        ccmd="$ccmd --client=$ch '$TARGET_DIR.cal/$ch/$base.job'"
     done
-    cjson="$WORK_DIR/cal/res-$ctype-$cdirn-qd$cqd-nr$cnr$tag.json"
+    cjson="$WORK_DIR/cal/res-$ctype-$cdirn-qd$cqd-nr$cnr${CAL_NJ_PCT:+-nj$CAL_NJ_PCT}$tag.json"
     run_host "$MASTER" "$ccmd" > "$cjson" \
-        || die "rung $ctype-$cdirn qd=$cqd nr=$cnr failed (output in $cjson)"
+        || die "rung $ctype-$cdirn qd=$cqd nr=$cnr${CAL_NJ_PCT:+ nj%$CAL_NJ_PCT} failed (output in $cjson)"
     check_fio_errors "$cjson" measured \
         || die "rung $ctype-$cdirn qd=$cqd nr=$cnr errored on a host (output in $cjson)"
     cvals=$(cal_values "$cjson" "$ctype") \
@@ -1387,6 +1610,187 @@ cal_cell() {   # cal_cell <type> <dirn> <qd> <nr> <fsz> <sink> <tag> [reuse]
     done <<CELLEOF
 $cvals
 CELLEOF
+}
+
+# The verdict for one (host, type, direction): plateau membership over the
+# decision pass, with hysteresis against what the host file already carries.
+# Prints "<qd> <message>", or "SUSPECT <message>" when the measurement is too
+# noisy to record.
+#
+# The band is FIXED (CAL_KNEE_PCT). Nothing widens it -- see the tunables
+# block for why the noise-widened band had to go. The measured spread's only
+# job now is to refuse a broken measurement (CAL_MAX_CV), and it is a
+# coefficient of variation over the repeats, not a range: a range over three
+# samples is an order statistic that is not comparable between runs and that
+# reports drift as noise.
+cal_verdict() {   # cal_verdict <host> <bw|iops> <read|write>
+    local host=$1 ctype=$2 cdirn=$3 base rec="" sfx=r
+    [ "$cdirn" = read ] || sfx=w
+    if [ "$CAL_HYSTERESIS" -eq 1 ]; then
+        base=$(pyrun "${ctype}_$sfx" <<'QDCOLEOF'
+import sys
+print(slot_base(sys.argv[1]) + 4)   # 1-based column of the slot's qd
+QDCOLEOF
+        ) || return 1
+        rec=$(targets_field "$host" "$base" "$WORK_DIR/targets.final")
+    fi
+    python3 - "$WORK_DIR/cal/hist-$ctype-$cdirn.$host" "$CAL_KNEE_PCT" \
+             "$ctype" "$CAL_MAX_CV" "$rec" <<'VERDICTEOF'
+import statistics as st
+import sys
+
+path, band, mode, max_cv, rec = (sys.argv[1], float(sys.argv[2]), sys.argv[3],
+                                 float(sys.argv[4]), sys.argv[5])
+samples = {}
+for line in open(path):
+    f = line.split()
+    if len(f) == 4:
+        samples.setdefault(int(f[2]), []).append(float(f[3]))
+if not samples:
+    sys.exit("ERROR: empty ladder history")
+
+means = {q: st.fmean(v) for q, v in samples.items()}
+peak_qd = max(means, key=lambda q: means[q])
+peak = means[peak_qd]
+if peak <= 0:
+    sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
+
+def cv(q):
+    v = samples[q]
+    m = st.fmean(v)
+    # sample sd (n-1), the estimator that does not shrink with n the way a
+    # range grows with it; a single sample has no dispersion to report
+    return st.stdev(v) / m * 100 if len(v) > 1 and m > 0 else 0.0
+
+worst_cv = max(cv(q) for q in samples)
+reps = max(len(v) for v in samples.values())
+plateau = [q for q in sorted(means) if means[q] >= band / 100 * peak]
+fresh = plateau[0]
+
+def human(v):
+    if mode == "bw":
+        return "%.2fGiB/s" % (v / (1 << 30))
+    return "%s/s" % format(int(v), ",")
+
+span = ("qd=%d" % plateau[0] if len(plateau) == 1
+        else "qd=%d..%d" % (plateau[0], plateau[-1]))
+detail = ("plateau %s >=%g%% of best %s at qd=%d (n=%d, cv<=%.1f%%)"
+          % (span, band, human(peak), peak_qd, reps, worst_cv))
+
+if worst_cv > max_cv:
+    print("SUSPECT", "qd=%d reported but NOT recorded -- cv %.1f%% exceeds "
+                     "CAL_MAX_CV=%g%%; %s; the next -a cal re-measures"
+                     % (fresh, worst_cv, max_cv, detail))
+    raise SystemExit(0)
+
+# Hysteresis: a recorded qd this plateau contains is kept. The measurement
+# found no difference between it and the fresh pick, so claiming one -- and
+# rewriting the host file for it -- is churn, not a finding.
+if rec.isdigit() and int(rec) in plateau and int(rec) != fresh:
+    print(int(rec), "qd=%s (kept: the host file's qd is on this plateau; "
+                    "fresh pick was qd=%d) -- %s" % (rec, fresh, detail))
+else:
+    print(fresh, "qd=%d -- %s" % (fresh, detail))
+VERDICTEOF
+}
+
+# One host's REFINEMENT verdict: does a different outstanding-IO split
+# (CAL_SPLIT) or a different file count (CAL_NR_RETEST) actually beat the
+# plateau pick? Prints "<qd> <nr> <fs> <njpct> <note>".
+#
+# Both refinements are single-axis moves off the SAME baseline -- the pick's
+# own decision-pass mean -- and at most one is adopted, the largest gain that
+# clears the bar. Compounding two one-sample measurements would be claiming a
+# joint optimum neither of them measured.
+#
+# The bar is the decision pass's own worst CV, floored at 1%: a refinement has
+# to beat the winner by more than the box could have wobbled, or it is not a
+# finding. This is the one honest use of a measured spread -- as a
+# significance threshold on a DIFFERENCE, never as a band below a peak.
+cal_refine_verdict() {   # cal_refine_verdict <host> <type> <dirn> <pick_qd> <nr> <fs>
+    python3 - "$WORK_DIR/cal" "$1" "$2" "$3" "$4" "$5" "$6" <<'REFINEEOF'
+import glob
+import os
+import re
+import statistics as st
+import sys
+
+caldir, host, ctype, cdirn, pick, nr, fs = sys.argv[1:8]
+pick, nr = int(pick), int(nr)
+
+def rungs(path):
+    """{qd: [values]} from a "<dirn> <nr> <qd> <value>" sink."""
+    out = {}
+    try:
+        fh = open(path)
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            f = line.split()
+            if len(f) == 4:
+                out.setdefault(int(f[2]), []).append(float(f[3]))
+    return out
+
+hist = rungs(os.path.join(caldir, f"hist-{ctype}-{cdirn}.{host}"))
+if pick not in hist:
+    sys.exit(f"ERROR: {host}: no decision-pass samples at qd={pick}")
+base = st.fmean(hist[pick])
+if base <= 0:
+    sys.exit(f"ERROR: {host}: the decision pass measured nothing at qd={pick}")
+
+def cv(v):
+    m = st.fmean(v)
+    return st.stdev(v) / m * 100 if len(v) > 1 and m > 0 else 0.0
+
+bar = max(max(cv(v) for v in hist.values()), 1.0)
+
+# (gain%, qd, nr, njpct, label) for every refinement that measured something
+cands = []
+for path in sorted(glob.glob(os.path.join(caldir, f"split-{ctype}-{cdirn}-p*.{host}"))):
+    m = re.search(r"-p(\d+)\.", os.path.basename(path))
+    if not m:
+        continue
+    pct = int(m.group(1))
+    # the cell that holds this host's outstanding constant against ITS pick
+    if pick * 100 % pct:
+        continue
+    qd2 = pick * 100 // pct
+    vals = rungs(path).get(qd2)
+    if not vals:
+        continue
+    got = st.fmean(vals)
+    cands.append(((got - base) / base * 100, qd2, nr, pct,
+                  f"numjobs at {pct}% with qd={qd2}"))
+for path in sorted(glob.glob(os.path.join(caldir, f"nrt-{ctype}-{cdirn}-n*.{host}"))):
+    m = re.search(r"-n(\d+)\.", os.path.basename(path))
+    if not m:
+        continue
+    nr2 = int(m.group(1))
+    vals = rungs(path).get(pick)
+    if not vals:
+        continue
+    got = st.fmean(vals)
+    cands.append(((got - base) / base * 100, pick, nr2, 100,
+                  f"nrfiles={nr2}"))
+
+if not cands:
+    print(pick, nr, fs, 100, "")
+    raise SystemExit(0)
+
+cands.sort(key=lambda c: -c[0])
+gain, qd2, nr2, pct, label = cands[0]
+tried = ", ".join(f"{c[4]} {c[0]:+.1f}%" for c in cands)
+if gain <= bar:
+    print(pick, nr, fs, 100,
+          f"refine: nothing beat the pick by more than the {bar:.1f}% bar ({tried})")
+    raise SystemExit(0)
+# fs is per file and the working set is held constant, so a new file count
+# rescales it -- exactly as cal_nr/cal_total_mib do for the ladder
+fs2 = fs if nr2 == nr else "%dM" % (int(nr) * int(fs.rstrip("Mm")) // nr2)
+print(qd2, nr2, fs2, pct,
+      f"refine: {label} beats the pick by {gain:+.1f}% (bar {bar:.1f}%; {tried})")
+REFINEEOF
 }
 
 # A direction's geometry is cached only when the WHOLE tuple its ladder
@@ -1431,6 +1835,7 @@ cal_push() {   # cal_push <basename> <host>...
 cal_seed_scratch() {   # cal_seed_scratch <host>...
     local sizes host hd hl nj eng cpus f cmd want nfiles nmib availmib short_hosts=""
     local seedrun=() dfline src totkb key pids=() hs=() i
+    local sty sdi spair scpus snj spct maxf subdirs
     rm -f "$WORK_DIR/cal/seedspace"
     # Both remote probes for every host at once -- serially they cost two
     # blocking ssh round trips per host. No error suppression on the find:
@@ -1442,7 +1847,7 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         hd=$(host_dir "$host")
         mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
         { run_host "$host" \
-              "if [ -d '$hd/$CAL_SCRATCH' ]; then find '$hd/$CAL_SCRATCH' -maxdepth 1 -type f -printf '%f %s\\n'; fi" \
+              "if [ -d '$hd/$CAL_SCRATCH' ]; then find '$hd/$CAL_SCRATCH' -type f -printf '%P %s\\n'; fi" \
               > "$WORK_DIR/cal/$host/scratch.list" \
           && run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
               > "$WORK_DIR/cal/$host/dfline"; } &
@@ -1464,15 +1869,30 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         fi
         sizes=$(cal_seed_sizes "$hl") || die "$host: cannot compute the calibration seed plan"
         hd=$(host_dir "$host")
-        cpus=""
-        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        if printf '%s\n' "$hl" | grep -qE '^(bw|iops) '; then
-            # same nj contract as the ladders: seed exactly the job count
-            # the rungs will run
-            nj=$(usable_cores "$host" count "$cpus") \
+        # The seed creates files for the WIDEST job count any planned ladder
+        # will run -- nj is per (type, direction) now, because the host file
+        # can pin it per slot, and a rung whose files stop at job 45 measures
+        # a short read on job 46.
+        cpus=""; nj=1
+        while read -r sty sdi; do
+            [ -n "$sty" ] || continue
+            spair=$(cal_cpus_nj "$host" "$sty" "$sdi") \
                 || die "$host: cannot size the calibration seed"
-        else
-            nj=1
+            read -r scpus snj <<<"$spair"
+            [ -n "$cpus" ] || cpus=$scpus
+            [ "$snj" -le "$nj" ] || nj=$snj
+        done <<SEEDNJEOF2
+$hl
+SEEDNJEOF2
+        # A CAL_SPLIT percentage above 100 runs MORE jobs than cores at the
+        # winning depth, and job n needs file n: seed the widest split too, or
+        # the widening test measures short files instead of wide parallelism.
+        if [ "${CAL_SPLIT:-0}" -eq 1 ]; then
+            for spct in $CAL_SPLIT_PCT; do
+                case "$spct" in (""|*[!0-9]*) continue ;; esac
+                [ "$spct" -gt 100 ] || continue
+                [ $(( nj * spct / 100 )) -le "$nj" ] || nj=$(( nj * spct / 100 ))
+            done
         fi
         eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
         if [ -z "$eng" ] && [ -f "$WORK_DIR/engine.results" ]; then
@@ -1481,12 +1901,26 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         fi
         [ -n "$eng" ] || eng=psync
         [ -n "$cpus" ] || cpus=$(usable_cores "$host" list) || cpus=""
+        # fio never mkdirs. A flat shape needs nothing beyond the scratch
+        # root (already created); a subdirectory shape needs its directories
+        # before the seed writes a single file into them.
+        maxf=$(printf '%s\n' "$sizes" | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
+        subdirs=$(cal_scratch_dirs "$host" "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
+            || die "$host: cannot derive the calibration scratch directories"
+        if [ -n "$subdirs" ]; then
+            cmd=$(printf '%s\n' "$subdirs" \
+                  | sed "s|^|mkdir -p '$hd/$CAL_SCRATCH/|;s|\$|' \&\&|" \
+                  | tr '\n' ' ')
+            run_host "$host" "${cmd% &&}" \
+                || die "$host: cannot create the calibration scratch subdirectories"
+        fi
         want=$(python3 - "$host" "$nj" "$sizes" \
                    "$hd/$CAL_SCRATCH" "$eng" "$cpus" \
                    "$WORK_DIR/cal/$host/cal-seed.job" \
-                   "$WORK_DIR/cal/$host/scratch.list" <<'PYEOF'
+                   "$WORK_DIR/cal/$host/scratch.list" \
+                   "${CAL_FMT:-\$jobnum.\$filenum}" <<'PYEOF'
 import sys
-host, nj, sizes_raw, directory, eng, cpus, outpath, listpath = sys.argv[1:9]
+host, nj, sizes_raw, directory, eng, cpus, outpath, listpath, fmt = sys.argv[1:10]
 need = {}
 for line in sizes_raw.splitlines():
     f, mib = line.split()
@@ -1499,7 +1933,8 @@ for line in open(listpath):
 todo, mib_total = [], 0
 for j in range(int(nj)):
     for f, mib in sorted(need.items()):
-        name = "%s.cal.%d.%d" % (host, j, f)
+        name = (("%s.cal." % host) + fmt).replace("$jobnum", str(j)) \
+                                             .replace("$filenum", str(f))
         if have.get(name, 0) >= mib * 1024 * 1024:
             continue          # already big enough: a cell just uses a prefix
         todo.append((j, f, name, mib))
@@ -1601,6 +2036,15 @@ calibrate() {
     fi
     echo
     log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
+    # NOT local: stage_cal_step and cal_seed_scratch both read it, and the
+    # whole point is that one shape serves the seed, every rung, and the
+    # directories they need
+    CAL_FMT=$(cal_scratch_fmt "$capdir") \
+        || die "cannot derive the calibration name shape from $capdir"
+    case "$CAL_FMT" in
+        ('$jobnum.$filenum') ;;
+        (*) log "cal: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT)" ;;
+    esac
     local host i pids hs
     pids=(); hs=()
     mkdir -p "$WORK_DIR/cal"
@@ -1646,28 +2090,34 @@ calibrate() {
     [ ${#seedhosts[@]} -eq 0 ] || cal_seed_scratch "${seedhosts[@]}"
 
     # THE LADDERS. nrfiles and filesize come from the tables (cal_nr,
-    # cal_total_mib) -- file count never won by more than its channel's noise
-    # in any lab measurement, so it is tailored, not searched. iodepth is
-    # measured: one ladder per (type, direction), because the knees genuinely
-    # differ by direction (saving-calf: iops write knee 4 vs read knee 16 on
-    # UDP backends). numjobs is the host's usable cores throughout.
+    # cal_total_mib); iodepth is MEASURED, one ladder per (type, direction),
+    # because the knees genuinely differ by direction (saving-calf: iops
+    # write knee 4 vs read knee 16 on UDP backends). numjobs comes from
+    # cal_cpus_nj -- the same rule the staged jobs use.
     #
-    # Each ladder starts with a NOISE FLOOR: the CAL_NOISE_QD rung measured
-    # three times. The spread is this box's own run-to-run noise on this
-    # channel, and it drives both the climb and the verdict -- the best of
-    # many noisy rungs is biased high, so comparing against it with a fixed
-    # threshold chases variance (write iops ran 0.7% on saving-calf, read
-    # iops 11%). The three probe samples double as the ladder's
-    # qd=CAL_NOISE_QD rung (their mean), so the floor costs two extra rungs.
+    # TWO PASSES. The shape pass walks every rung once at CAL_SHAPE_RUNTIME
+    # and only has to bracket the top: a rung must beat the best so far by
+    # more than CAL_SHAPE_THR percent to count as progress, and
+    # CAL_STOP_BELOW consecutive misses end it. A host that stopped keeps
+    # running until every host stopped, so contention stays constant for the
+    # hosts still climbing.
     #
-    # The climb: a rung must beat the best so far by more than the measured
-    # noise (floored at 1%) to count as progress; CAL_STOP_BELOW consecutive
-    # misses end the ladder. A host that stopped keeps running until every
-    # host stopped, so contention stays constant for the hosts still
-    # climbing. The knee is the shallowest qd within the band -- CAL_KNEE_PCT
-    # widened by the noise -- of that direction's own peak.
+    # The decision pass then measures only the rungs that could carry the
+    # verdict -- the shape peak, which anchors the peak estimate, plus the
+    # shallowest rungs still within CAL_SHAPE_MARGIN points of the band --
+    # CAL_REPS times each at full length, INTERLEAVED. Interleaving is the
+    # point: three back-to-back cells cannot tell noise from drift, and a
+    # monotone decline across them reads as noise it is not.
+    #
+    # The verdict is plateau membership, never an elbow hunt: every candidate
+    # within CAL_KNEE_PCT of the best mean is on the plateau, and the pick is
+    # the shallowest of them. When the host file already carries a qd this
+    # plateau contains, that one is kept (CAL_HYSTERESIS) -- two runs that
+    # cannot tell qd=32 from qd=64 must not disagree about which to write
+    # down.
     local h v pick rest rep wrote=0
-    local nrn nrfsz best below thr meanspread stopped
+    local nrn nrfsz best below stopped pairs allcands allwins pct nr2
+    local fqd fnr ffs fpct fnj
     for type in bw iops; do
         printf '%s\n' "$ladders" | grep -q "^$type " || continue
         for dirn in write read; do
@@ -1691,71 +2141,37 @@ calibrate() {
             nrn=$(cal_nr "$type" "$dirn")
             nrfsz="$(( $(cal_total_mib "$type") / nrn ))M"
             for host in "${todo[@]}"; do
-                rm -f "$WORK_DIR/cal/hist-$type-$dirn.$host" \
-                      "$WORK_DIR/cal/noise-$type-$dirn.$host" \
+                rm -f "$WORK_DIR/cal/shape-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/hist-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/cand-$type-$dirn.$host" \
                       "$WORK_DIR/cal/best-$type-$dirn.$host" \
-                      "$WORK_DIR/cal/thr-$type-$dirn.$host"
+                      "$WORK_DIR/cal/win-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                rm -f "$WORK_DIR/cal/split-$type-$dirn-p"*".$host" \
+                      "$WORK_DIR/cal/nrt-$type-$dirn-n"*".$host"
             done
-            cal_cell "$type" "$dirn" "$CAL_NOISE_QD" "$nrn" "$nrfsz" \
-                "noise-$type-$dirn" ".n1"
-            for rep in 2 3; do
-                cal_cell "$type" "$dirn" "$CAL_NOISE_QD" "$nrn" "$nrfsz" \
-                    "noise-$type-$dirn" ".n$rep" reuse
-            done
-            for host in "${todo[@]}"; do
-                # mean of the three probe samples (the qd=CAL_NOISE_QD rung's
-                # value) and their spread in percent; the climb threshold is
-                # the spread floored at 1% and clamped at CAL_MAX_SPREAD.
-                # LC_ALL=C pins the decimal POINT: the verdict python parses
-                # the spread with float(), which a comma-decimal locale
-                # (de_DE, fr_FR, ...) would break.
-                LC_ALL=C awk -v maxs="$CAL_MAX_SPREAD" \
-                     '{s += $4; n++; if (min == "" || $4 < min) min = $4
-                      if ($4 > max) max = $4}
-                     END {if (n == 0 || s == 0) {print 0, "0.0", 1; exit}
-                          m = s / n; sp = (max - min) * 100 / m
-                          thr = int(sp) + (sp > int(sp) ? 1 : 0)
-                          if (thr < 1) thr = 1
-                          if (thr > maxs) thr = maxs
-                          printf "%d %.1f %d\n", m, sp, thr}' \
-                    "$WORK_DIR/cal/noise-$type-$dirn.$host" \
-                    > "$WORK_DIR/cal/thr-$type-$dirn.$host" \
-                    || die "$host: cannot derive the $type $dirn noise floor"
-                read -r _ meanspread _ < "$WORK_DIR/cal/thr-$type-$dirn.$host"
-                [ "$(LC_ALL=C awk -v s="$meanspread" -v m="$CAL_MAX_SPREAD" \
-                        'BEGIN {print (s > m) ? 1 : 0}')" -eq 0 ] \
-                    || log "WARNING: $host $type-$dirn: noise spread ${meanspread}% exceeds CAL_MAX_SPREAD=${CAL_MAX_SPREAD}% -- climb threshold and verdict band clamped; this ladder's knee will be reported but NOT recorded" >&2
-            done
+
+            # --- shape pass: locate the top, cheaply ---
             for qd in $(cal_qds "$type"); do
-                if [ "$qd" -eq "$CAL_NOISE_QD" ]; then
-                    # the probe already measured this rung, three times over
-                    for host in "${todo[@]}"; do
-                        read -r v meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
-                        printf '%s %s %s %s\n' "$dirn" "$nrn" "$qd" "$v" \
-                            >> "$WORK_DIR/cal/hist-$type-$dirn.$host"
-                        printf '%s\n' "$v" > "$WORK_DIR/cal/rung.$host"
-                    done
-                else
-                    stopped=1
-                    for host in "${todo[@]}"; do
-                        below=0
-                        [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
-                            || read -r best below < "$WORK_DIR/cal/best-$type-$dirn.$host"
-                        [ "$below" -ge "$CAL_STOP_BELOW" ] || { stopped=0; break; }
-                    done
-                    [ "$stopped" -eq 0 ] || break
+                stopped=1
+                for host in "${todo[@]}"; do
+                    below=0
+                    [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
+                        || read -r best below < "$WORK_DIR/cal/best-$type-$dirn.$host"
+                    [ "$below" -ge "$CAL_STOP_BELOW" ] || { stopped=0; break; }
+                done
+                [ "$stopped" -eq 0 ] || break
+                CAL_CELL_RUNTIME=$CAL_SHAPE_RUNTIME \
                     cal_cell "$type" "$dirn" "$qd" "$nrn" "$nrfsz" \
-                        "hist-$type-$dirn" ""
-                fi
+                        "shape-$type-$dirn" ".shape"
                 for host in "${todo[@]}"; do
                     read -r v < "$WORK_DIR/cal/rung.$host" || v=0
-                    read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
                     best=0; below=0
                     [ ! -s "$WORK_DIR/cal/best-$type-$dirn.$host" ] \
                         || read -r best below < "$WORK_DIR/cal/best-$type-$dirn.$host"
                     [ "$below" -ge "$CAL_STOP_BELOW" ] && continue
                     if [ "$best" -eq 0 ] \
-                            || [ $((v * 100)) -ge $((best * (100 + thr))) ]; then
+                            || [ $((v * 100)) -ge $((best * (100 + CAL_SHAPE_THR))) ]; then
                         printf '%s 0\n' "$v" > "$WORK_DIR/cal/best-$type-$dirn.$host"
                     else
                         printf '%s %s\n' "$best" $((below + 1)) \
@@ -1763,60 +2179,148 @@ calibrate() {
                     fi
                 done
             done
-            # verdict per host: shallowest qd within the noise-widened band of
-            # this direction's own peak, reported with real numbers
+
+            # --- candidates: per host, then the fleet-wide union ---
+            # A cell runs on every host in $todo at once (that is what keeps
+            # the contention constant), so the decision pass measures the
+            # UNION of what the hosts nominated; each host still judges only
+            # its own numbers.
             for host in "${todo[@]}"; do
-                [ -s "$WORK_DIR/cal/hist-$type-$dirn.$host" ] || continue
-                read -r _ meanspread thr < "$WORK_DIR/cal/thr-$type-$dirn.$host"
-                pick=$(python3 - "$WORK_DIR/cal/hist-$type-$dirn.$host" \
-                           "$CAL_KNEE_PCT" "$type" "$meanspread" \
-                           "$CAL_MAX_SPREAD" <<'VERDICTEOF'
+                [ -s "$WORK_DIR/cal/shape-$type-$dirn.$host" ] || continue
+                pick=$(python3 - "$WORK_DIR/cal/shape-$type-$dirn.$host" \
+                           "$CAL_KNEE_PCT" "$CAL_SHAPE_MARGIN" "$CAL_CANDIDATES" <<'CANDEOF'
 import sys
 
-path, knee_pct, mode, spread = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
-max_spread = float(sys.argv[5])
+path, band, margin, ncand = (sys.argv[1], float(sys.argv[2]),
+                             float(sys.argv[3]), int(sys.argv[4]))
 vals = {}
 for line in open(path):
     f = line.split()
     if len(f) == 4:
         vals[int(f[2])] = float(f[3])
 if not vals:
-    sys.exit("ERROR: empty ladder history")
+    sys.exit("ERROR: the shape pass recorded no rungs")
 peak_qd = max(vals, key=lambda q: vals[q])
-peak = vals[peak_qd]
-if peak <= 0:
-    sys.exit("ERROR: the ladder measured nothing (all rungs zero)")
-floor = min(float(knee_pct), 100.0 - 2 * min(spread, max_spread))
-win = min(q for q in sorted(vals) if vals[q] >= floor / 100 * peak)
+if vals[peak_qd] <= 0:
+    sys.exit("ERROR: the shape pass measured nothing (all rungs zero)")
+# The shape peak ALWAYS survives: it anchors the peak the band is taken
+# against. Everything else is filled shallowest-first, because the pick is
+# the shallowest rung on the plateau and a rung deeper than the peak can
+# never be it.
+floor = (band - margin) / 100 * vals[peak_qd]
+keep = {peak_qd}
+for q in sorted(vals):
+    if len(keep) >= ncand:
+        break
+    if vals[q] >= floor:
+        keep.add(q)
+print(" ".join(str(q) for q in sorted(keep)))
+CANDEOF
+                ) || die "$host: cannot nominate $type $dirn decision candidates"
+                printf '%s\n' "$pick" > "$WORK_DIR/cal/cand-$type-$dirn.$host"
+            done
+            # collected host by host, not by glob: an unmatched glob would
+            # need its error swallowed, and a swallowed error is how a real
+            # failure gets to look like an empty result
+            allcands=""
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/cand-$type-$dirn.$host" ] || continue
+                allcands="$allcands $(cat "$WORK_DIR/cal/cand-$type-$dirn.$host")"
+            done
+            allcands=$(printf '%s\n' $allcands | sort -un | tr '\n' ' ')
+            [ -n "$allcands" ] || die "no $type $dirn decision candidates on any host"
+            debug "cal: $type-$dirn decision candidates: $allcands (x$CAL_REPS at ${CAL_RUNTIME}s)"
 
-def human(v):
-    if mode == "bw":
-        return "%.2fGiB/s" % (v / (1 << 30))
-    return "%s/s" % format(int(v), ",")
+            # --- decision pass: interleaved repeats of the candidates ---
+            for ((rep = 1; rep <= CAL_REPS; rep++)); do
+                for qd in $allcands; do
+                    if [ "$rep" -eq 1 ]; then
+                        cal_cell "$type" "$dirn" "$qd" "$nrn" "$nrfsz" \
+                            "hist-$type-$dirn" ".r1"
+                    else
+                        # same jobfile, already staged and pushed by rep 1
+                        cal_cell "$type" "$dirn" "$qd" "$nrn" "$nrfsz" \
+                            "hist-$type-$dirn" ".r$rep" reuse
+                    fi
+                done
+            done
 
-print(win, "%s at qd=%d (%d%% of peak %s at qd=%d), band >=%.0f%% (noise %.1f%%%s)"
-      % (human(vals[win]), win, round(vals[win] * 100 / peak),
-         human(peak), peak_qd, floor, spread,
-         ", clamped" if spread > max_spread else ""))
-VERDICTEOF
-                ) || die "$host: cannot pick the $type $dirn knee"
+            # --- verdict: plateau membership, with hysteresis ---
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/hist-$type-$dirn.$host" ] || continue
+                pick=$(cal_verdict "$host" "$type" "$dirn") \
+                    || die "$host: cannot pick the $type $dirn geometry"
                 read -r qd rest <<<"$pick"
-                if [ "$(LC_ALL=C awk -v s="$meanspread" -v m="$CAL_MAX_SPREAD" \
-                        'BEGIN {print (s > m) ? 1 : 0}')" -eq 1 ]; then
-                    # a probe that noisy is a broken measurement, not a wide
-                    # band: the knee is reported but NOT recorded -- no
-                    # dirwin, so no cal.results entry and no host-file cache,
-                    # and the suspect ledger keeps the writeback from
-                    # re-caching the staged tuple -- so the next -a cal
-                    # re-measures this ladder
-                    printf '%s %s\n' "$host" "${type}_${dirn:0:1}" \
-                        >> "$WORK_DIR/cal/suspect"
-                    log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz] -- SUSPECT, not recorded; the next -a cal re-measures"
-                else
-                    printf '%s %s %s\n' "$qd" "$nrn" "$nrfsz" \
-                        > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
-                    log "cal: $host $type-$dirn: knee $rest [nrfiles=$nrn fs=$nrfsz]"
+                log "cal: $host $type-$dirn: $rest [nrfiles=$nrn fs=$nrfsz]"
+                case "$qd" in
+                    (SUSPECT)
+                        # a measurement this noisy is not a wide band: report
+                        # it, record nothing, leave no dirwin -- so no
+                        # cal.results entry, no host-file cache, and the next
+                        # -a cal re-measures this ladder
+                        printf '%s %s\n' "$host" "${type}_${dirn:0:1}" \
+                            >> "$WORK_DIR/cal/suspect" ;;
+                    (*) printf '%s\n' "$qd" > "$WORK_DIR/cal/win-$type-$dirn.$host" ;;
+                esac
+            done
+
+            # --- refinements: the axes the ladder held fixed ---
+            # Iodepth alone is not "the client's limit": what the client has in
+            # flight is numjobs x iodepth, and the file count decides how that
+            # traffic spreads over metadata. Both are measured HERE, at the
+            # winning depth, rather than at the shallow rung where the old
+            # nrfiles comparisons were taken. Cells run fleet-wide over the
+            # union of the hosts' winning depths; each host judges its own.
+            allwins=""
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/win-$type-$dirn.$host" ] || continue
+                allwins="$allwins $(cat "$WORK_DIR/cal/win-$type-$dirn.$host")"
+            done
+            allwins=$(printf '%s\n' $allwins | sort -un | tr '\n' ' ')
+            if [ -n "$allwins" ]; then
+                if [ "$CAL_SPLIT" -eq 1 ]; then
+                    for pct in $CAL_SPLIT_PCT; do
+                        [ "$pct" -ne 100 ] || continue
+                        for qd in $allwins; do
+                            # hold numjobs x iodepth constant: only exact
+                            # inverses are a constant-outstanding comparison
+                            [ $((qd * 100 % pct)) -eq 0 ] || continue
+                            [ $((qd * 100 / pct)) -ge 1 ] || continue
+                            CAL_NJ_PCT=$pct \
+                                cal_cell "$type" "$dirn" $((qd * 100 / pct)) \
+                                    "$nrn" "$nrfsz" "split-$type-$dirn-p$pct" ".s"
+                        done
+                    done
                 fi
+                if [ "$CAL_NR_RETEST" -eq 1 ]; then
+                    for nr2 in $CAL_NR_CANDIDATES; do
+                        [ "$nr2" -ne "$nrn" ] || continue
+                        for qd in $allwins; do
+                            cal_cell "$type" "$dirn" "$qd" "$nr2" \
+                                "$(( $(cal_total_mib "$type") / nr2 ))M" \
+                                "nrt-$type-$dirn-n$nr2" ".n"
+                        done
+                    done
+                fi
+            fi
+
+            # --- record: the tuple that actually produced the number ---
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/win-$type-$dirn.$host" ] || continue
+                read -r qd < "$WORK_DIR/cal/win-$type-$dirn.$host"
+                pick=$(cal_refine_verdict "$host" "$type" "$dirn" "$qd" "$nrn" "$nrfsz") \
+                    || die "$host: cannot judge the $type $dirn refinements"
+                read -r fqd fnr ffs fpct rest <<<"$pick"
+                fnj="-"
+                if [ "$fpct" -ne 100 ]; then
+                    pair=$(cal_cpus_nj "$host" "$type" "$dirn") \
+                        || die "$host: cannot resolve the $type $dirn numjobs"
+                    read -r _ fnj <<<"$pair"
+                    fnj=$(( fnj * fpct / 100 )); [ "$fnj" -ge 1 ] || fnj=1
+                fi
+                [ -z "$rest" ] || log "cal: $host $type-$dirn: $rest"
+                printf '%s %s %s %s\n' "$fqd" "$fnr" "$ffs" "$fnj" \
+                    > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
             done
             [ "$dirn" != write ] || wrote=1
         done
@@ -1855,9 +2359,11 @@ LATEOF
         [ "$dirn" != write ] || wrote=1
     done
 
-    # One measured (qd, nr, fs) per (type, direction): the geometry the host
-    # file records is exactly what produced the number. numjobs stays out of
-    # it -- always the host's usable cores, which the tuner derives.
+    # One measured (qd, nr, fs, nj) per (type, direction): the geometry the
+    # host file records is exactly what produced the number. nj is "-" unless
+    # a CAL_SPLIT re-test actually won -- numjobs is still the operator's to
+    # pin, and one job per usable core is still the default; calibration only
+    # writes it down when it measured a different split winning.
     : > "$WORK_DIR/cal.results"
     local line any tuple slot slots
     # the slot order IS the cal.results schema: take it from the shared
@@ -1875,7 +2381,7 @@ PYEOF
                 read -r tuple < "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
                 line="$line $tuple"; any=1
             else
-                line="$line - - -"
+                line="$line - - - -"
             fi
         done
         [ "$any" -eq 0 ] || printf '%s\n' "$line" >> "$WORK_DIR/cal.results"
@@ -2851,7 +3357,7 @@ def derive_layout_variant(h):
     best = pick_engine(engines)
     out = [f"# re-derived by wekatester auto[{label}] from this host's tuned variants",
            "[global]", f"directory={directory}",
-           f"cpus_allowed={fmt_cpulist(facts[h]['usable'])}",
+           f"cpus_allowed={fmt_cpulist(usable_for(h))}",
            "create_serialize=0", "fallocate=none", f"ioengine={best}"]
     n = 0
     for key in sorted(namespaces):
@@ -2889,8 +3395,11 @@ for job in jobs:
     items = report_items(os.path.join(src, job))
     for h in hosts:
         out = override(lines, "directory", target(h, "dir") or directory)
-        out = override(out, "cpus_allowed",
-                       target(h, "cpus") or fmt_cpulist(facts[h]["usable"]))
+        # usable_for(h) is the operator's list minus weka's pinned cores --
+        # the same effective set stage_cal_step measures the ladder on. The
+        # host file still keeps the list AS WRITTEN; only what executes is
+        # declared here, so calibration and measurement cannot disagree.
+        out = override(out, "cpus_allowed", fmt_cpulist(usable_for(h)))
 
         is_latency = "latency" in items
         is_bw = "bandwidth" in items and not is_latency
@@ -2964,8 +3473,21 @@ for job in jobs:
             for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
                                ("nr", "nrfiles"), ("qd", "iodepth")):
                 v = target(h, f"{slot}_{tkey}") if slot else ""
-                if v:
-                    out = override(out, jkey, v)
+                if not v:
+                    continue
+                if tkey == "nj" and v.isdigit():
+                    # The host file is the operator's, so this is honoured --
+                    # but under cpus_allowed_policy=split the excess jobs
+                    # double-book cpus the earlier ones already hold, and the
+                    # calibration ladder is now sized from the same pair, so
+                    # say so once rather than letting it pass unremarked
+                    # (seen live on iscg001: 52 jobs in a 46-cpu mask).
+                    cap = len(usable_for(h))
+                    if int(v) > cap:
+                        warn_once(f"{h}: host-file {slot}_nj={v} exceeds its "
+                                  f"{cap} usable cpu(s) -- split affinity will "
+                                  f"double-book {int(v) - cap} of them")
+                out = override(out, jkey, v)
         if target(h, "engine"):
             out = override(out, "ioengine", target(h, "engine"))
 
@@ -2994,7 +3516,7 @@ for job in sorted(layout_set):
             out = derive_layout_variant(h)
         else:
             out = override(lines, "directory", directory)
-            out = override(out, "cpus_allowed", fmt_cpulist(facts[h]["usable"]))
+            out = override(out, "cpus_allowed", fmt_cpulist(usable_for(h)))
         with open(os.path.join(work, "jobs", h, job), "w") as fp:
             fp.write("\n".join(out) + "\n")
     print(f"auto[{label}]: {job} type=layout")
@@ -3522,7 +4044,7 @@ def load_tsv(path):
 
 fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
 
-# ladders whose noise probe exceeded CAL_MAX_SPREAD: reported, never
+# ladders whose decision pass exceeded CAL_MAX_CV: reported, never
 # recorded -- not from cal.results (calibrate wrote no entry) and not from
 # the staged tuple either, or the cache would block the re-measure
 suspect = set()
