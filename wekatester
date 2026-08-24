@@ -103,7 +103,7 @@ AUTH_DIR=""          # $WORK_DIR/auth: per-host winning-credential state
 LOCAL_MODE=0
 
 # Auto mode: derive system-specific fio options
-AUTO_LEVEL=""    # "", "safe", "max", or "cal"
+AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 
 # --- logging -----------------------------------------------------------------
@@ -368,7 +368,7 @@ edit_jobfile() {   # edit_jobfile <path>
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal[:secs]]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -389,14 +389,18 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max|cal[:secs]]
+  -a, --auto [safe|max|cal|brutal[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: measure per-client iodepth ladders (one per
                           type and direction) before staging
-                          :secs shortens the decision pass cells from the
-                          30s default (cal:15); it does not change how long
-                          the measured jobs run -- that is -x/--duration
+                          brutal: measure the whole nrfiles x iodepth grid for
+                          every type and direction; the best cell wins, with
+                          no band and no knee. Exhaustive and slow
+                          :secs sets the measured seconds per cell (cal
+                          defaults to 30, brutal wants 10); it does not change
+                          how long the measured jobs run -- that is
+                          -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -649,15 +653,15 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
     local raw=$1 flag=$2 lvl secs
     lvl=$(lower "${raw%%:*}")
     case "$lvl" in
-        (safe|max|cal) ;;
-        (*) usage >&2; die "unknown auto level: ${raw} (safe|max|cal)" ;;
+        (safe|max|cal|brutal) ;;
+        (*) usage >&2; die "unknown auto level: ${raw} (safe|max|cal|brutal)" ;;
     esac
     if [ "$raw" != "${raw%%:*}" ]; then
         secs=${raw#*:}
         case "$lvl" in
-            (cal) ;;
+            (cal|brutal) ;;
             (*) usage >&2
-                die "$flag: a rung duration applies only to cal, not $lvl" ;;
+                die "$flag: a cell duration applies only to cal and brutal, not $lvl" ;;
         esac
         case "$secs" in
             (""|*[!0-9]*|0) usage >&2
@@ -786,7 +790,7 @@ parse_args() {
                 # rides along with the keyword.
                 arg=$(lower "${2:-}")
                 case "${arg%%:*}" in
-                    (safe|max|cal) set_auto_level "$2" "$1"; shift ;;
+                    (safe|max|cal|brutal) set_auto_level "$2" "$1"; shift ;;
                 esac
                 shift ;;
             --auto=*)
@@ -865,9 +869,16 @@ parse_args() {
     fi
 }
 
-# Calibrated levels run a measured iodepth ladder before staging (cal from
-# scratch); safe/max/off never do.
-cal_mode() { [ "$AUTO_LEVEL" = cal ]; }
+# Measured levels run a measurement phase before staging; safe/max/off never
+# do. Both share the seed, the cells, the latency floors and the writeback --
+# they differ only in HOW they search:
+#   cal     two passes and a plateau verdict: cheap, and it reasons about which
+#           rungs are worth measuring at all
+#   brutal  the full (nrfiles x iodepth) cross product at every rung, winner is
+#           argmax. No reasoning, no bands, no knees -- when the clever search
+#           keeps mis-picking, the exhaustive one is the honest fallback
+cal_mode()    { case "$AUTO_LEVEL" in (cal|brutal) return 0 ;; esac; return 1; }
+brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 
 # Set inspection: which iodepth ladders does a jobfile set actually need?
 # Prints unique sorted lines from exactly {bw read, bw write, iops read,
@@ -1341,7 +1352,8 @@ PYEOF
 # every rung that decides the answer now carries n=CAL_REPS. The shape pass is
 # cheap because it only has to find the top: run 23:11 on iscg001 was
 # -a cal:10 and its deep rungs matched the 30s runs to 1.6%.
-CAL_RUNTIME=${CAL_RUNTIME:-30}  # DECISION-pass seconds per cell (plus a 2s
+CAL_RUNTIME=${CAL_RUNTIME:-30}  # DECISION-pass seconds per cell, and the
+                         # per-cell duration of a brutal grid (plus a 2s
                          # ramp). "-a cal:15" sets this per run; shorter cells
                          # trade resolution for wall clock, and the verdict
                          # compares rungs whose differences can be small.
@@ -1430,6 +1442,41 @@ CAL_NR_RETEST=${CAL_NR_RETEST:-0}   # re-test nrfiles at the WINNING (nj, qd)
                          # the noisiest on the curve -- so this is worth
                          # running once per new client shape.
 CAL_NR_CANDIDATES=${CAL_NR_CANDIDATES:-"1 4 8"}   # the nrfiles CAL_NR_RETEST tries
+# --- brutal: the exhaustive grid ---------------------------------------------
+# No search strategy at all, on purpose. Every (nrfiles, iodepth) pair is
+# measured for BRUTAL_RUNTIME seconds and the best number wins. It is the
+# fallback for exactly the situation that produced it: a measured selection
+# rule that kept picking geometry the real test then failed to reproduce.
+#
+# numjobs is NOT an axis -- it is the cores fio will actually run on
+# (cal_cpus_nj: the host file's cpu list minus weka's pinned cores). Sweeping
+# it as well would multiply a 64-cell grid by another eight and measure
+# combinations that cannot occur in a staged run.
+BRUTAL_NRS=${BRUTAL_NRS:-"1 2 4 8 16 32 64 128"}
+BRUTAL_QDS=${BRUTAL_QDS:-"1 2 4 8 16 32 64 128"}
+BRUTAL_FILESIZE=${BRUTAL_FILESIZE:-1024}   # MiB PER FILE, so the working set is
+                         # BRUTAL_FILESIZE x nrfiles per job and GROWS along the
+                         # nrfiles axis. That is deliberate and it is the
+                         # opposite of cal, which holds the working set constant
+                         # so the axis isolates file count. Here a wider grid
+                         # cell also reads more distinct data, which is the
+                         # honest reading of "push the client to its limit" --
+                         # but it means the scratch is sized by the LARGEST
+                         # nrfiles: 128 files x 1G x one job per core.
+BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-3}   # re-measure this many top cells before
+                         # declaring a winner. The max of 64 single samples is
+                         # an order statistic, biased high: the luckiest cell
+                         # wins the grid and then the real measured run comes in
+                         # under what calibration promised -- which is the
+                         # complaint that motivated brutal in the first place.
+                         # Re-measuring the shortlist costs a handful of cells
+                         # and makes the promise match the delivery. 0 disables.
+BRUTAL_MEM_FRAC=${BRUTAL_MEM_FRAC:-25}   # percent of a host's MemTotal that the
+                         # in-flight buffers of one cell may occupy
+                         # (numjobs x iodepth x bs). A backstop for small
+                         # clients at the deep corner of the grid, not a search
+                         # heuristic: a skipped cell is named in the log.
+
 CAL_HYSTERESIS=${CAL_HYSTERESIS:-1}   # when the new plateau CONTAINS the qd the
                          # host file already carries, keep the recorded one.
                          # Two runs that cannot tell qd=32 from qd=64 must not
@@ -1548,8 +1595,18 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
     while read -r type dirn; do
         [ -n "$type" ] || continue
         case "$type" in
-            (bw|iops) nr=$(cal_nr "$type" "$dirn") || return 1
-                      fs=$(( $(cal_total_mib "$type") / nr )) ;;
+            (bw|iops) if brutal_mode; then
+                          # every file the widest grid cell opens, at the fixed
+                          # per-file size: one union serves all 64 cells and
+                          # both types, and a warm scratch serves the next run
+                          nr=1; fs=$BRUTAL_FILESIZE
+                          for nr2 in $BRUTAL_NRS; do
+                              [ "$nr2" -le "$nr" ] || nr=$nr2
+                          done
+                      else
+                          nr=$(cal_nr "$type" "$dirn") || return 1
+                          fs=$(( $(cal_total_mib "$type") / nr ))
+                      fi ;;
             (lat)     nr=2; fs=64 ;;
             (*)       continue ;;
         esac
@@ -1805,6 +1862,230 @@ print(qd2, nr2, fs2, pct,
 REFINEEOF
 }
 
+# A host's MemTotal in MiB, read once and cached. Only the in-flight guard
+# needs it, and only at the deep corner of a bw grid.
+brutal_memtotal() {   # brutal_memtotal <host> -> MiB, or nothing if unreadable
+    local host=$1 kb f="$WORK_DIR/cal/mem.$host"
+    if [ ! -f "$f" ]; then
+        run_host "$host" "awk '/^MemTotal:/ {print \$2}' /proc/meminfo" > "$f" \
+            || : > "$f"
+    fi
+    read -r kb < "$f" || kb=""
+    case "$kb" in (""|*[!0-9]*) return 0 ;; esac
+    printf '%s\n' $((kb / 1024))
+}
+
+# THE BRUTAL GRID. Every (nrfiles, iodepth) pair, BRUTAL_RUNTIME seconds each,
+# best number wins. There is no band, no plateau and no knee here on purpose:
+# this level exists because a measured selection rule kept choosing geometry the
+# real test then failed to reproduce, and the exhaustive answer cannot be wrong
+# about which cell was fastest -- only about whether that cell was lucky, which
+# is what BRUTAL_CONFIRM handles.
+#
+# numjobs is fixed at the cores fio will run on. filesize is fixed per FILE, so
+# the working set grows with nrfiles (see BRUTAL_FILESIZE) -- the seed sized the
+# scratch for the widest cell before any of this ran.
+brutal_grids() {   # brutal_grids <ladders>
+    local ladders=$1
+    local type dirn host qd nr fsz bskib nj mem cap need skip pick rest
+    local cells=0 skipped=0
+    local -a todo
+    for type in bw iops; do
+        printf '%s\n' "$ladders" | grep -q "^$type " || continue
+        for dirn in write read; do
+            printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
+            todo=()
+            for host in "${HOSTS[@]}"; do
+                if [ "$REGEN_LAYOUT" -eq 0 ] && cal_geometry_cached "$host" "$type" "$dirn"; then
+                    log "brutal: $host: the host file already carries $type $dirn geometry -- reusing (re-measure with -g)"
+                else
+                    todo+=("$host")
+                fi
+            done
+            [ ${#todo[@]} -gt 0 ] || continue
+            # same settle contract as the ladders: a measured write block leaves
+            # a destage backlog, and a read cell landing on it is not a read
+            [ "$wrote" -eq 0 ] || sleep "$CAL_SETTLE"
+            wrote=0
+            fsz="${BRUTAL_FILESIZE}M"
+            [ "$type" = bw ] && bskib=1024 || bskib=4
+            for host in "${todo[@]}"; do
+                rm -f "$WORK_DIR/cal/grid-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/short-$type-$dirn.$host" \
+                      "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+            done
+            log "brutal: $type $dirn: $(printf '%s' "$BRUTAL_NRS" | wc -w | tr -d ' ') x $(printf '%s' "$BRUTAL_QDS" | wc -w | tr -d ' ') cells at ${CAL_RUNTIME}s, nrfiles x iodepth, ${BRUTAL_FILESIZE}M per file"
+
+            for nr in $BRUTAL_NRS; do
+                for qd in $BRUTAL_QDS; do
+                    # in-flight guard: numjobs x iodepth x bs of buffers has to
+                    # fit, or fio dies at the corner of the grid instead of
+                    # reporting it. Cells run fleet-wide, so one host that
+                    # cannot hold it skips the cell for everyone -- named, never
+                    # silent.
+                    skip=""
+                    for host in "${todo[@]}"; do
+                        read -r _ nj <<<"$(cal_cpus_nj "$host" "$type" "$dirn")" \
+                            || die "$host: cannot resolve the $type $dirn numjobs"
+                        mem=$(brutal_memtotal "$host")
+                        [ -n "$mem" ] || continue
+                        cap=$(( mem * BRUTAL_MEM_FRAC / 100 ))
+                        need=$(( nj * qd * bskib / 1024 ))
+                        [ "$need" -le "$cap" ] \
+                            || skip="$host (${need}MiB in flight vs ${cap}MiB allowed)"
+                    done
+                    if [ -n "$skip" ]; then
+                        log "brutal: $type-$dirn nr=$nr qd=$qd SKIPPED -- $skip; raise BRUTAL_MEM_FRAC to measure it anyway" >&2
+                        skipped=$((skipped + 1))
+                        continue
+                    fi
+                    cal_cell "$type" "$dirn" "$qd" "$nr" "$fsz" "grid-$type-$dirn" ""
+                    cells=$((cells + 1))
+                done
+            done
+
+            # --- shortlist, then re-measure it ---
+            # The grid's best is the max of many single samples, so it is biased
+            # high. Rank optimistically, then decide on >=2 samples each.
+            if [ "$BRUTAL_CONFIRM" -gt 0 ]; then
+                local shortset="" pairq pairn
+                for host in "${todo[@]}"; do
+                    [ -s "$WORK_DIR/cal/grid-$type-$dirn.$host" ] || continue
+                    brutal_shortlist "$WORK_DIR/cal/grid-$type-$dirn.$host" \
+                        "$BRUTAL_CONFIRM" > "$WORK_DIR/cal/short-$type-$dirn.$host" \
+                        || die "$host: cannot rank the $type $dirn grid"
+                    shortset="$shortset $(tr '\n' ' ' < "$WORK_DIR/cal/short-$type-$dirn.$host")"
+                done
+                # the union across hosts, since a cell runs on all of them
+                shortset=$(printf '%s\n' $shortset | sort -u | tr '\n' ' ')
+                for pick in $shortset; do
+                    pairn=${pick%%/*}; pairq=${pick##*/}
+                    cal_cell "$type" "$dirn" "$pairq" "$pairn" "$fsz" \
+                        "grid-$type-$dirn" ".c" reuse
+                    cells=$((cells + 1))
+                done
+            fi
+
+            for host in "${todo[@]}"; do
+                [ -s "$WORK_DIR/cal/grid-$type-$dirn.$host" ] || continue
+                pick=$(brutal_verdict "$host" "$type" "$dirn" "$fsz") \
+                    || die "$host: cannot pick the $type $dirn grid winner"
+                read -r qd nr rest <<<"$pick"
+                printf '%s %s %s -\n' "$qd" "$nr" "$fsz" \
+                    > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
+                log "brutal: $host $type-$dirn: $rest"
+                brutal_surface "$WORK_DIR/cal/grid-$type-$dirn.$host" "$type" \
+                    | while IFS= read -r rest; do log "brutal:   $rest"; done
+            done
+            [ "$dirn" != write ] || wrote=1
+        done
+    done
+    log "brutal: $cells cell(s) measured${skipped:+, $skipped skipped}"
+}
+
+# The BRUTAL_CONFIRM best cells of a grid, as "<nr>/<qd>" lines.
+brutal_shortlist() {   # brutal_shortlist <grid-file> <n>
+    python3 - "$1" "$2" <<'SHORTEOF'
+import statistics as st
+import sys
+
+path, n = sys.argv[1], int(sys.argv[2])
+cells = {}
+for line in open(path):
+    f = line.split()
+    if len(f) == 4:
+        cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
+if not cells:
+    sys.exit(f"ERROR: {path} holds no grid cells")
+best = sorted(cells, key=lambda k: -st.fmean(cells[k]))[:n]
+print("\n".join(f"{nr}/{qd}" for nr, qd in best))
+SHORTEOF
+}
+
+# The winner for one (host, type, direction): argmax over the grid, restricted
+# to the confirmed shortlist when one exists. Prints "<qd> <nr> <message>".
+brutal_verdict() {   # brutal_verdict <host> <bw|iops> <read|write> <fsz>
+    local host=$1 ctype=$2 cdirn=$3 fsz=$4 short=""
+    [ ! -s "$WORK_DIR/cal/short-$ctype-$cdirn.$host" ] \
+        || short=$(tr '\n' ' ' < "$WORK_DIR/cal/short-$ctype-$cdirn.$host")
+    python3 - "$WORK_DIR/cal/grid-$ctype-$cdirn.$host" "$ctype" "$fsz" "$short" <<'BVEOF'
+import statistics as st
+import sys
+
+path, mode, fsz, short = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+cells = {}
+for line in open(path):
+    f = line.split()
+    if len(f) == 4:
+        cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
+if not cells:
+    sys.exit("ERROR: the grid measured nothing")
+
+shortlist = set()
+for tok in short.split():
+    nr, _, qd = tok.partition("/")
+    if nr.isdigit() and qd.isdigit():
+        shortlist.add((int(nr), int(qd)))
+# Rank on the shortlist when there is one: those cells carry >=2 samples, so
+# a first sample that was merely lucky has already regressed.
+pool = {k: v for k, v in cells.items() if k in shortlist} or cells
+ranked = sorted(pool, key=lambda k: -st.fmean(pool[k]))
+nr, qd = ranked[0]
+val = st.fmean(pool[(nr, qd)])
+reps = len(pool[(nr, qd)])
+
+def human(v):
+    if mode == "bw":
+        return "%.2fGiB/s" % (v / (1 << 30))
+    return "%s/s" % format(int(v), ",")
+
+runner = ""
+if len(ranked) > 1:
+    r_nr, r_qd = ranked[1]
+    r_val = st.fmean(pool[(r_nr, r_qd)])
+    runner = ("; runner-up nrfiles=%d qd=%d at %.1f%%"
+              % (r_nr, r_qd, r_val * 100 / val if val else 0))
+spread = ""
+allmeans = sorted(st.fmean(v) for v in cells.values())
+if len(allmeans) > 2 and allmeans[-1] > 0:
+    spread = ("; grid spans %.0f-100%% of best over %d cells"
+              % (allmeans[0] * 100 / allmeans[-1], len(allmeans)))
+
+print(qd, nr, "nrfiles=%d iodepth=%d -> %s (n=%d%s%s) [fs=%s]"
+      % (nr, qd, human(val), reps, runner, spread, fsz))
+BVEOF
+}
+
+# The grid as a table of percent-of-best, so a flat surface and a peaked one
+# are distinguishable at a glance in the run log.
+brutal_surface() {   # brutal_surface <grid-file> <bw|iops>
+    python3 - "$1" "$2" <<'SURFEOF'
+import statistics as st
+import sys
+
+path, mode = sys.argv[1], sys.argv[2]
+cells = {}
+for line in open(path):
+    f = line.split()
+    if len(f) == 4:
+        cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
+if not cells:
+    raise SystemExit(0)
+best = max(st.fmean(v) for v in cells.values())
+if best <= 0:
+    raise SystemExit(0)
+nrs = sorted({k[0] for k in cells})
+qds = sorted({k[1] for k in cells})
+print("        " + "".join("%6s" % ("qd" + str(q)) for q in qds))
+for nr in nrs:
+    row = ""
+    for q in qds:
+        v = cells.get((nr, q))
+        row += "%6s" % ("-" if not v else "%d%%" % round(st.fmean(v) * 100 / best))
+    print("nr%-5d%s" % (nr, row))
+SURFEOF
+}
+
 # A direction's geometry is cached only when the WHOLE tuple its ladder
 # records is present -- filesize, nrfiles and iodepth. Testing iodepth alone
 # let a row with a qd but no nrfiles skip the ladder entirely, leaving the
@@ -2038,69 +2319,13 @@ PYEOF
 # and persist to hostlist.csv through the existing -a writeback -- which is
 # also the cache: a host whose (fs, nr, qd) slot for a direction is already
 # filled skips that ladder entirely (-g forces a re-measure).
-calibrate() {
-    cal_mode || return 0
-    local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
-    ladders=$(cal_required "$capdir") || die "cannot inspect $capdir for calibration"
-    if [ -z "$ladders" ]; then
-        log "cal: nothing to calibrate in this set (no measurable jobs)"
-        return 0
-    fi
-    echo
-    log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
-    # NOT local: stage_cal_step and cal_seed_scratch both read it, and the
-    # whole point is that one shape serves the seed, every rung, and the
-    # directories they need
-    CAL_FMT=$(cal_scratch_fmt "$capdir") \
-        || die "cannot derive the calibration name shape from $capdir"
-    case "$CAL_FMT" in
-        ('$jobnum.$filenum') ;;
-        (*) log "cal: CAL_FMT_PARITY: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT) -- the scratch is now shape-specific, so a set with a different layout re-seeds" ;;
-    esac
-    local host i pids hs
-    pids=(); hs=()
-    mkdir -p "$WORK_DIR/cal"
-    rm -f "$WORK_DIR/cal/suspect"
-    run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
-        || die "cannot create $TARGET_DIR.cal on $MASTER"
-    for host in "${HOSTS[@]}"; do
-        run_host "$host" "mkdir -p '$(host_dir "$host")/$CAL_SCRATCH'" &
-        pids+=($!); hs+=("$host")
-    done
-    for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "cannot create the calibration scratch dir on ${hs[$i]}"
-    done
-
-    local type dirn todo qd cmd
-    # One seed for every ladder, before any measuring: every host that needs
-    # at least one (type, direction) calibrated gets the union file set
-    # created once.
-    local seedhosts=() hl
-    for host in "${HOSTS[@]}"; do
-        # This host's seed plan: exactly the ladders it still has to run.
-        # Latency floors run on every host and read the seeded files, so lat
-        # lines ride along in every plan; a fully cached host in a set with
-        # no latency jobs needs nothing at all.
-        hl=""
-        for type in bw iops; do
-            for dirn in write read; do
-                printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
-                if [ "$REGEN_LAYOUT" -ne 0 ] \
-                        || ! cal_geometry_cached "$host" "$type" "$dirn"; then
-                    hl="$hl$type $dirn"$'\n'
-                fi
-            done
-        done
-        hl="$hl$(printf '%s\n' "$ladders" | grep '^lat ' || true)"
-        hl=$(printf '%s\n' "$hl" | sed '/^$/d')
-        if [ -n "$hl" ]; then
-            seedhosts+=("$host")
-            printf '%s\n' "$hl" > "$WORK_DIR/cal/seedplan.$host" \
-                || die "cannot write the seed plan for $host"
-        fi
-    done
-    [ ${#seedhosts[@]} -eq 0 ] || cal_seed_scratch "${seedhosts[@]}"
-
+# The two-pass ladder search: shape, decide, refine. Factored out so the
+# exhaustive grid (brutal_grids) can take its place without either search
+# having to know the other exists. `wrote` is deliberately NOT local --
+# the latency floors read it to decide whether they owe a settle.
+cal_ladders() {   # cal_ladders <ladders>
+    local ladders=$1
+    local type dirn todo qd host
     # THE LADDERS. nrfiles and filesize come from the tables (cal_nr,
     # cal_total_mib); iodepth is MEASURED, one ladder per (type, direction),
     # because the knees genuinely differ by direction (saving-calf: iops
@@ -2127,7 +2352,7 @@ calibrate() {
     # plateau contains, that one is kept (CAL_HYSTERESIS) -- two runs that
     # cannot tell qd=32 from qd=64 must not disagree about which to write
     # down.
-    local h v pick rest rep wrote=0
+    local h v pick rest rep
     local nrn nrfsz best below stopped pairs allcands allwins pct nr2
     local fqd fnr ffs fpct fnj
     for type in bw iops; do
@@ -2337,6 +2562,78 @@ CANDEOF
             [ "$dirn" != write ] || wrote=1
         done
     done
+}
+calibrate() {
+    cal_mode || return 0
+    local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
+    ladders=$(cal_required "$capdir") || die "cannot inspect $capdir for calibration"
+    if [ -z "$ladders" ]; then
+        log "cal: nothing to calibrate in this set (no measurable jobs)"
+        return 0
+    fi
+    echo
+    log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
+    # NOT local: stage_cal_step and cal_seed_scratch both read it, and the
+    # whole point is that one shape serves the seed, every rung, and the
+    # directories they need
+    CAL_FMT=$(cal_scratch_fmt "$capdir") \
+        || die "cannot derive the calibration name shape from $capdir"
+    case "$CAL_FMT" in
+        ('$jobnum.$filenum') ;;
+        (*) log "cal: CAL_FMT_PARITY: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT) -- the scratch is now shape-specific, so a set with a different layout re-seeds" ;;
+    esac
+    local host i pids hs
+    pids=(); hs=()
+    mkdir -p "$WORK_DIR/cal"
+    rm -f "$WORK_DIR/cal/suspect"
+    run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
+        || die "cannot create $TARGET_DIR.cal on $MASTER"
+    for host in "${HOSTS[@]}"; do
+        run_host "$host" "mkdir -p '$(host_dir "$host")/$CAL_SCRATCH'" &
+        pids+=($!); hs+=("$host")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || die "cannot create the calibration scratch dir on ${hs[$i]}"
+    done
+
+    local type dirn todo qd cmd
+    # One seed for every ladder, before any measuring: every host that needs
+    # at least one (type, direction) calibrated gets the union file set
+    # created once.
+    local seedhosts=() hl
+    for host in "${HOSTS[@]}"; do
+        # This host's seed plan: exactly the ladders it still has to run.
+        # Latency floors run on every host and read the seeded files, so lat
+        # lines ride along in every plan; a fully cached host in a set with
+        # no latency jobs needs nothing at all.
+        hl=""
+        for type in bw iops; do
+            for dirn in write read; do
+                printf '%s\n' "$ladders" | grep -q "^$type $dirn$" || continue
+                if [ "$REGEN_LAYOUT" -ne 0 ] \
+                        || ! cal_geometry_cached "$host" "$type" "$dirn"; then
+                    hl="$hl$type $dirn"$'\n'
+                fi
+            done
+        done
+        hl="$hl$(printf '%s\n' "$ladders" | grep '^lat ' || true)"
+        hl=$(printf '%s\n' "$hl" | sed '/^$/d')
+        if [ -n "$hl" ]; then
+            seedhosts+=("$host")
+            printf '%s\n' "$hl" > "$WORK_DIR/cal/seedplan.$host" \
+                || die "cannot write the seed plan for $host"
+        fi
+    done
+    [ ${#seedhosts[@]} -eq 0 ] || cal_seed_scratch "${seedhosts[@]}"
+
+    # WHICH SEARCH. Both share the seed above, the latency floors and the
+    # writeback below; they differ only in how they find the geometry.
+    local h v pick rest rep wrote=0
+    if brutal_mode; then
+        brutal_grids "$ladders"
+    else
+        cal_ladders "$ladders"
+    fi
 
     # Latency floors: nothing to ladder (a latency test is one QD1 stream
     # by definition), so the upper limit IS the floor -- one short rung per

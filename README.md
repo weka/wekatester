@@ -20,7 +20,7 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal[:secs]]] [--ignore-capacity]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -41,14 +41,18 @@ attaching is the way to pass a value that starts with a dash.
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
-  -a, --auto [safe|max|cal[:secs]]
+  -a, --auto [safe|max|cal|brutal[:secs]]
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: measure per-client iodepth ladders (one per
                           type and direction) before staging
-                          :secs shortens the decision pass cells from the
-                          30s default (cal:15); it does not change how long
-                          the measured jobs run -- that is -x/--duration
+                          brutal: measure the whole nrfiles x iodepth grid for
+                          every type and direction; the best cell wins, with
+                          no band and no knee. Exhaustive and slow
+                          :secs sets the measured seconds per cell (cal
+                          defaults to 30, brutal wants 10); it does not change
+                          how long the measured jobs run -- that is
+                          -x/--duration
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -261,6 +265,67 @@ and not from the staged tuple either — so the next `-a cal` re-measures that
 ladder. CV, not a range: a range over three samples is an order statistic
 whose expected value grows with n, so it is not comparable between runs, and
 it reports drift as noise.
+
+### `-a brutal`: the exhaustive grid
+
+`-a cal` reasons about which rungs are worth measuring. `-a brutal` doesn't
+reason at all: it measures the **whole (nrfiles &times; iodepth) cross product**
+for every type and direction and takes the best number. Both defaults run
+1&ndash;128 by doubling, so that is **64 cells per ladder, 256 for a full set**,
+and `-a brutal:10` sets the measured seconds per cell. Budget about **52 minutes**
+at ten seconds a cell.
+
+It exists for one situation, and it is worth being blunt about it: when a
+measured selection rule keeps choosing geometry the real test then fails to
+reproduce, an exhaustive sweep cannot be wrong about which cell was fastest.
+Use `cal` when you want the answer cheaply; use `brutal` when you want the
+answer settled.
+
+Three things differ from `cal` beyond the search:
+
+- **numjobs is not an axis.** It is the cores fio will actually run on &mdash;
+  the host file's cpu list minus weka's pinned cores, the same
+  `cal_cpus_nj` rule the staged jobs use. Sweeping it too would multiply the
+  grid by another eight and measure parallelism a staged run cannot produce.
+- **filesize is per FILE** (`BRUTAL_FILESIZE`, 1024 MiB), so the working set is
+  `1G &times; nrfiles` per job and **grows along the nrfiles axis** &mdash; the
+  opposite of `cal`, which holds the working set constant so the axis isolates
+  file count. A wider cell here also reads more distinct data. It also means the
+  scratch is sized by the *largest* nrfiles: 128 files &times; 1G &times; one job
+  per core, seeded once and kept. On a 52-core client that is ~6.6TiB, and the
+  capacity gate asks before writing it.
+- **the winner is argmax.** No band, no plateau, no knee, no hysteresis.
+
+**Why the shortlist exists.** The maximum of 64 single samples is an order
+statistic, and it is biased high: the luckiest cell wins the sweep, then the
+staged run at that geometry comes in under what calibration promised &mdash;
+which is the complaint that produced this level. Worse, a cell that is genuinely
+a couple of percent slower can win outright on one good draw, and that geometry
+is what gets recorded. So `BRUTAL_CONFIRM` (3) re-measures the top cells and
+ranks the winner on their means. Luck does not repeat: the spike regresses, the
+genuinely fast cell keeps winning. It costs a handful of cells out of 256.
+
+**The in-flight guard.** A cell holds `numjobs &times; iodepth &times; bs` of
+buffers &mdash; at the deep corner of a bandwidth grid that is real memory
+(52 jobs &times; qd 128 &times; 1MiB is 6.7GiB). A cell needing more than
+`BRUTAL_MEM_FRAC` (25%) of a host's MemTotal is skipped and **named in the log**,
+never dropped silently. Raise the fraction to measure it anyway.
+
+Latency is untouched: a floor is one QD1 stream by definition, so there is no
+grid to sweep, and it is measured exactly as `cal` measures it.
+
+The grid lands in the run bundle cell by cell, and the log prints it as a
+percent-of-best table per ladder, so a flat surface and a peaked one are
+distinguishable at a glance:
+
+```
+brutal: localhost bw-read: nrfiles=8 iodepth=32 -> 41.29GiB/s (n=2; runner-up
+        nrfiles=8 qd=64 at 99.4%; grid spans 31-100% of best over 64 cells)
+brutal:           qd1   qd2   qd4   qd8  qd16  qd32  qd64 qd128
+brutal:   nr1     31%   52%   78%   93%   97%   98%   97%   96%
+brutal:   nr2     34%   57%   84%   96%   99%   99%   99%   98%
+...
+```
 
 ### Refinements: the axes the ladder holds fixed
 

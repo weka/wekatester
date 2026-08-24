@@ -1185,7 +1185,7 @@ t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" b
     (source ./wekatester; parse_args -a=MAX h1; [ "$AUTO_LEVEL" = max ]) &&
     err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >/dev/null )
     case "$err" in
-        *"unknown auto level: bogus (safe|max|cal)"*) true;;
+        *"unknown auto level: bogus (safe|max|cal|brutal)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal" bash -c '
@@ -1194,7 +1194,7 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
     (source ./wekatester; parse_args --auto=cal h1; [ "$AUTO_LEVEL" = cal ]) &&
     err=$( (source ./wekatester; parse_args -acalx h1) 2>&1 >/dev/null )
     case "$err" in
-        *"unknown auto level: calx (safe|max|cal)"*) true;;
+        *"unknown auto level: calx (safe|max|cal|brutal)"*) true;;
         *) echo "$err" >&2; false;;
     esac &&
     err=$( (source ./wekatester; parse_args -ahybrid h1) 2>&1 >/dev/null )
@@ -1203,10 +1203,68 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
         *) echo "$err" >&2; false;;
     esac &&
     (source ./wekatester; AUTO_LEVEL=cal;    cal_mode) &&
+    (source ./wekatester; AUTO_LEVEL=brutal; cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=safe; cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
+# --- brutal: the exhaustive grid ---
+# Both measured levels gate the calibration phase; only one of them is brutal.
+t_assert "parse: -a brutal sets the level, and :secs sets the cell duration" bash -c '
+    (source ./wekatester; parse_args -a brutal h1;    [ "$AUTO_LEVEL" = brutal ]) &&
+    (source ./wekatester; parse_args -ABRUTAL h1;     [ "$AUTO_LEVEL" = brutal ]) &&
+    (source ./wekatester; parse_args --auto=brutal h1; [ "$AUTO_LEVEL" = brutal ]) &&
+    (source ./wekatester; parse_args -a brutal:10 h1
+     [ "$AUTO_LEVEL" = brutal ] && [ "$CAL_RUNTIME" = 10 ]) &&
+    (source ./wekatester; parse_args -a cal:15 h1;    [ "$CAL_RUNTIME" = 15 ]) &&
+    # a duration still belongs only to the measured levels
+    ! (source ./wekatester; parse_args -a max:10 h1) 2>/dev/null &&
+    (source ./wekatester; AUTO_LEVEL=brutal; brutal_mode) &&
+    ! (source ./wekatester; AUTO_LEVEL=cal;  brutal_mode) &&
+    ! (source ./wekatester; AUTO_LEVEL=max;  brutal_mode)'
+# The scratch has to hold the WIDEST cell the grid will open: every file index
+# the largest nrfiles reaches, at the fixed per-file size.
+t_assert "cal_seed_sizes: brutal sizes the union by its widest nrfiles" bash -c '
+    out=$( (source ./wekatester; AUTO_LEVEL=brutal
+            BRUTAL_NRS="1 2 4"; BRUTAL_FILESIZE=1024
+            cal_seed_sizes "bw read
+iops write") | tr "\n" " " )
+    [ "$out" = "0 1024 1 1024 2 1024 3 1024 " ] || { echo "$out" >&2; false; }
+    # and cal is untouched: constant working set, split across the tabled files
+    out=$( (source ./wekatester; cal_seed_sizes "bw read") | tr "\n" " " )
+    [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
+t_assert "brutal_shortlist: the N best cells by mean, richest first" bash -c '
+    d=$(mktemp -d)
+    printf "read 1 1 100\nread 1 2 900\nread 2 1 500\nread 2 2 700\n" > "$d/g"
+    out=$( (source ./wekatester; brutal_shortlist "$d/g" 2) | tr "\n" " " )
+    [ "$out" = "1/2 2/2 " ] || { echo "$out" >&2; false; }
+    out=$( (source ./wekatester; brutal_shortlist "$d/g" 1) )
+    [ "$out" = "1/2" ] || { echo "$out" >&2; false; }'
+# The point of the shortlist: a cell that won the sweep on one lucky sample
+# loses to a cell that is genuinely faster once both are re-measured.
+t_assert "brutal_verdict: argmax over the confirmed shortlist, not the lucky sweep" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    # nr=1/qd=2 spiked to 1000 once then came back at 800; nr=2/qd=2 is
+    # steady at 900. The sweep ranked the spike first; the means do not.
+    printf "read 1 2 1000\nread 1 2 700\nread 2 2 900\nread 2 2 900\nread 1 1 100\n" \
+        > "$d/cal/grid-bw-read.h1"
+    printf "1/2\n2/2\n" > "$d/cal/short-bw-read.h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
+    case "$out" in
+        "2 2 nrfiles=2 iodepth=2 -> "*"(n=2; runner-up nrfiles=1 qd=2 at 94.4%"*) true;;
+        *) echo "$out" >&2; false;;
+    esac
+    # with no shortlist it falls back to the whole grid, spike and all
+    rm -f "$d/cal/short-bw-read.h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
+    case "$out" in ("2 2 "*) true;; (*) echo "no-shortlist: $out" >&2; false;; esac'
+t_assert "brutal_surface: the grid as percent-of-best" bash -c '
+    d=$(mktemp -d)
+    printf "read 1 1 500\nread 1 2 1000\nread 2 1 250\nread 2 2 750\n" > "$d/g"
+    out=$( (source ./wekatester; brutal_surface "$d/g" bw) )
+    printf "%s\n" "$out" | grep -qE "^ +qd1 +qd2$" &&
+    printf "%s\n" "$out" | grep -qE "^nr1 +50% +100%$" &&
+    printf "%s\n" "$out" | grep -qE "^nr2 +25% +75%$"'
 # --- cal_required: which ladders does this set need ---
 # The output grammar is a contract shared with the calibration engine and the
 # dry-run report: unique sorted lines from {bw read, bw write, iops read,
@@ -2750,6 +2808,67 @@ cal_json() {   # cal_json <value> -> fio-style client_stats JSON on stdout
     printf '{ "client_stats": [ { "jobname": "cal-bw-read", "hostname": "h1", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": 100, "io_bytes": 1000 }, "write": { "bw_bytes": 0, "iops": 0, "total_ios": 0, "io_bytes": 0 } } ] }\n' "$1" "$1"
 }
 export -f cal_json
+t_assert "brutal_grids: every cell measured, the winner recorded, the surface logged" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+         (*MemTotal*) echo 8388608; return 0;;
+     esac
+     echo "$2" >> "$d/cells"
+     case "$2" in
+         (*qd2-nr2.job*) cal_json 4000;;
+         (*qd2-nr1.job*) cal_json 3000;;
+         (*qd1-nr2.job*) cal_json 2000;;
+         (*)             cal_json 1000;;
+     esac; }
+     calibrate) 2>&1 )
+    # 2x2 grid plus one confirm cell on the winner
+    [ "$(grep -c "qd[0-9]*-nr[0-9]*\.job" "$d/cells")" = 5 ] || { echo "cells: $(grep -c "qd..nr..job" "$d/cells")" >&2; false; }
+    grep -q "cal-bw-read-qd1-nr1.job" "$d/cells" &&
+    grep -q "cal-bw-read-qd2-nr2.job" "$d/cells" &&
+    case "$out" in
+        *"bw-read: nrfiles=2 iodepth=2 -> "*"(n=2"*"grid spans 25-100% of best over 4 cells"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
+    # the winning tuple lands in cal.results with numjobs left derived
+    grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+# The deep corner of a bw grid can ask for more in-flight buffers than a small
+# client has. Skipping is fine; skipping SILENTLY is not.
+t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, not hidden" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     BRUTAL_NRS="1"; BRUTAL_QDS="1 128"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
+     BRUTAL_MEM_FRAC=25
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+         (*MemTotal*) echo 1048576; return 0;;   # 1 GiB host
+     esac; echo "$2" >> "$d/cells"; cal_json 1000; }
+     calibrate) 2>&1 )
+    # 4 jobs x qd128 x 1MiB = 512MiB in flight, past 25% of a 1GiB host
+    case "$out" in
+        *"bw-read nr=1 qd=128 SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    ! grep -q "qd128" "$d/cells" &&
+    grep -q "qd1-nr1.job" "$d/cells"'
+
 t_assert "calibrate: the pick is the shallowest rung on the plateau" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
