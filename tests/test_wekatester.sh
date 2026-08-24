@@ -3183,7 +3183,7 @@ t_assert "cal_verdict: the archived iscg001 ladders all resolve to one setting" 
 238944 473059 881090 1381786 1799140 1906475 2011045 2052253 1877492
 247557 487708 867230 1378474 1776357 1939038 2032767 2072587 1871064"
     n=0
-    printf "%s\n" "$reads" | while read -r row; do
+    while read -r row; do
         n=$((n + 1)); f="$d/cal/hist-iops-read.h$n"; : > "$f"
         q=1; for v in $row; do
             for r in 1 2 3; do printf "read 2 %s %s\n" "$q" "$v" >> "$f"; done
@@ -3192,13 +3192,15 @@ t_assert "cal_verdict: the archived iscg001 ladders all resolve to one setting" 
         got=$( (source ./wekatester; WORK_DIR=$d; CAL_HYSTERESIS=0
                 cal_verdict "h$n" iops read) | cut -d" " -f1 )
         [ "$got" = 32 ] || { echo "run $n read picked qd=$got, want 32" >&2; exit 1; }
-    done || exit 1
+    done <<READLADDERS
+$reads
+READLADDERS
+    [ "$n" = 4 ] || { echo "read: judged $n ladders, want 4" >&2; exit 1; }
     # write: the plateau is qd=64..128 in run 1 and qd=128 alone after that,
     # so a host file already carrying qd=128 keeps it in every run -- which is
     # the whole claim of hysteresis
-    row9=h; for i in $(seq 2 29); do row9="$row9	-"; done
     n=0
-    printf "%s\n" "$writes" | while read -r row; do
+    while read -r row; do
         n=$((n + 1)); f="$d/cal/hist-iops-write.h$n"; : > "$f"
         q=1; for v in $row; do
             for r in 1 2 3; do printf "write 2 %s %s\n" "$q" "$v" >> "$f"; done
@@ -3208,7 +3210,10 @@ t_assert "cal_verdict: the archived iscg001 ladders all resolve to one setting" 
         printf "h%s\n" "$n" | awk -F"\t" -v OFS="\t" "{ \$1 = \"h$n\"; for (i = 2; i <= 29; i++) if (\$i == \"\") \$i = \"-\"; \$29 = 128; NF = 29; print }" > "$d/targets.final"
         got=$( (source ./wekatester; WORK_DIR=$d; cal_verdict "h$n" iops write) | cut -d" " -f1 )
         [ "$got" = 128 ] || { echo "run $n write picked qd=$got, want 128" >&2; exit 1; }
-    done || exit 1
+    done <<WRITELADDERS
+$writes
+WRITELADDERS
+    [ "$n" = 4 ] || { echo "write: judged $n ladders, want 4" >&2; exit 1; }
     true'
 t_assert "cal_scratch_fmt: the workload's subdirectory shape is mirrored, flat stays flat" bash -c '
     d=$(mktemp -d); mkdir -p "$d/set" "$d/flat"
