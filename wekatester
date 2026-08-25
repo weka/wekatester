@@ -1160,8 +1160,16 @@ NJCOLEOF
     cnj=$(targets_field "$host" "$base" "$WORK_DIR/targets.final")
     case "$cnj" in
         (""|*[!0-9]*|0) cnj=$ncpu ;;
-        (*) [ "$cnj" -le "$ncpu" ] \
-                || log "WARNING: $host: host-file ${ctype}_${sfx}_nj=$cnj exceeds its $ncpu usable cpu(s) -- split affinity will double-book $((cnj - ncpu)) of them; widen the cpus column or clear the nj to run one job per cpu" >&2 ;;
+        (*) if [ "$cnj" -gt "$ncpu" ]; then
+                if [ $(( cnj % ncpu )) -eq 0 ]; then
+                    # an exact multiple is what a BRUTAL_NJ winner records:
+                    # deliberate, measured, and worth a note rather than an
+                    # alarm
+                    log "note: $host: ${ctype}_${sfx}_nj=$cnj runs $(( cnj / ncpu )) jobs per cpu ($ncpu usable)" >&2
+                else
+                    log "WARNING: $host: host-file ${ctype}_${sfx}_nj=$cnj exceeds its $ncpu usable cpu(s) -- split affinity will double-book $((cnj - ncpu)) of them; widen the cpus column or clear the nj to run one job per cpu" >&2
+                fi
+            fi ;;
     esac
     printf '%s %s\n' "$ccpus" "$cnj"
 }
@@ -1474,8 +1482,28 @@ CAL_NR_CANDIDATES=${CAL_NR_CANDIDATES:-"1 4 8"}   # the nrfiles CAL_NR_RETEST tr
 # (cal_cpus_nj: the host file's cpu list minus weka's pinned cores). Sweeping
 # it as well would multiply a 64-cell grid by another eight and measure
 # combinations that cannot occur in a staged run.
-BRUTAL_NRS=${BRUTAL_NRS:-"1 2 4 8 16 32 64 128"}
-BRUTAL_QDS=${BRUTAL_QDS:-"1 2 4 8 16 32 64 128"}
+# The axes are PRUNED from the first field grids (iscg001 and isca224,
+# 2026-08-24, 64 cells per ladder each), not from theory:
+#   - nrfiles was the flattest axis on every surface -- reads within a few
+#     points across all eight rows -- so it keeps its endpoints and a log
+#     spread (1 2 8 32 128) rather than every doubling.
+#   - bw peaked shallow on both hosts (qd1-16) and qd64/128 never beat the
+#     qd16-32 cells by more than a tie, so bw stops at 32.
+#   - iops at qd1/qd2 never reached 25% of best anywhere, so iops starts at 4.
+# BRUTAL_QDS (unset by default) overrides BOTH per-type lists at once; every
+# pruned value is one env var away from coming back.
+BRUTAL_NRS=${BRUTAL_NRS:-"1 2 8 32 128"}
+BRUTAL_BW_QDS=${BRUTAL_BW_QDS:-"1 2 4 8 16 32"}
+BRUTAL_IOPS_QDS=${BRUTAL_IOPS_QDS:-"4 8 16 32 64 128"}
+BRUTAL_NJ=${BRUTAL_NJ:-"100 200"}   # numjobs levels, percent of one job per
+                         # usable cpu: the FULL grid runs once per level, so
+                         # the default measures every cell at one job per cpu
+                         # and again at two. Whether a second job per cpu buys
+                         # throughput is a measurement, not a guess -- and it
+                         # is the one axis the staged jobs could never explore,
+                         # because numjobs was always derived. A level above
+                         # 100 needs seed files for the extra jobs; the seed
+                         # widens itself accordingly.
 BRUTAL_FILESIZE=${BRUTAL_FILESIZE:-1024}   # MiB PER FILE, so the working set is
                          # BRUTAL_FILESIZE x nrfiles per job and GROWS along the
                          # nrfiles axis. That is deliberate and it is the
@@ -1523,6 +1551,19 @@ cal_total_mib() {   # cal_total_mib <bw|iops>
 
 cal_qds() {   # cal_qds <bw|iops>
     [ "$1" = bw ] && echo "$CAL_BW_QDS" || echo "$CAL_IOPS_QDS"
+}
+
+brutal_qds() {   # brutal_qds <bw|iops>
+    # BRUTAL_QDS overrides BOTH per-type lists, and it is read here rather
+    # than folded into their defaults so setting it after the script is
+    # sourced (tests, wrappers) still takes effect
+    if [ -n "${BRUTAL_QDS:-}" ]; then
+        echo "$BRUTAL_QDS"
+    elif [ "$1" = bw ]; then
+        echo "$BRUTAL_BW_QDS"
+    else
+        echo "$BRUTAL_IOPS_QDS"
+    fi
 }
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
@@ -1941,6 +1982,7 @@ brutal_memtotal() {   # brutal_memtotal <host> -> MiB, or nothing if unreadable
 brutal_grids() {   # brutal_grids <ladders>
     local ladders=$1
     local type dirn host qd nr fsz bskib nj mem cap need skip pick rest
+    local njpct qds fnj pct
     local cells=0 skipped=0
     local -a todo
     for type in bw iops; do
@@ -1962,15 +2004,21 @@ brutal_grids() {   # brutal_grids <ladders>
             wrote=0
             fsz="${BRUTAL_FILESIZE}M"
             [ "$type" = bw ] && bskib=1024 || bskib=4
+            qds=$(brutal_qds "$type")
             for host in "${todo[@]}"; do
-                rm -f "$WORK_DIR/cal/grid-$type-$dirn.$host" \
+                rm -f "$WORK_DIR/cal/grid-$type-$dirn-p"*".$host" \
                       "$WORK_DIR/cal/short-$type-$dirn.$host" \
                       "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
             done
-            log "brutal: $type $dirn: $(printf '%s' "$BRUTAL_NRS" | wc -w | tr -d ' ') x $(printf '%s' "$BRUTAL_QDS" | wc -w | tr -d ' ') cells at ${CAL_RUNTIME}s, nrfiles x iodepth, ${BRUTAL_FILESIZE}M per file"
+            log "brutal: $type $dirn: $(printf '%s' "$BRUTAL_NRS" | wc -w | tr -d ' ') x $(printf '%s' "$qds" | wc -w | tr -d ' ') cells x $(printf '%s' "$BRUTAL_NJ" | wc -w | tr -d ' ') numjobs level(s) at ${CAL_RUNTIME}s, nrfiles x iodepth, ${BRUTAL_FILESIZE}M per file"
 
-            for nr in $BRUTAL_NRS; do
-                for qd in $BRUTAL_QDS; do
+            # the FULL grid once per numjobs level: whether a second job per
+            # cpu buys throughput is the one axis the staged jobs can never
+            # explore on their own, because numjobs is otherwise derived
+            for njpct in $BRUTAL_NJ; do
+              case "$njpct" in (""|*[!0-9]*|0) die "BRUTAL_NJ: not a percentage: $njpct" ;; esac
+              for nr in $BRUTAL_NRS; do
+                for qd in $qds; do
                     # in-flight guard: numjobs x iodepth x bs of buffers has to
                     # fit, or fio dies at the corner of the grid instead of
                     # reporting it. Cells run fleet-wide, so one host that
@@ -1983,16 +2031,23 @@ brutal_grids() {   # brutal_grids <ladders>
                         mem=$(brutal_memtotal "$host")
                         [ -n "$mem" ] || continue
                         cap=$(( mem * BRUTAL_MEM_FRAC / 100 ))
-                        need=$(( nj * qd * bskib / 1024 ))
+                        need=$(( nj * njpct / 100 * qd * bskib / 1024 ))
                         [ "$need" -le "$cap" ] \
                             || skip="$host (${need}MiB in flight vs ${cap}MiB allowed)"
                     done
                     if [ -n "$skip" ]; then
-                        log "brutal: $type-$dirn nr=$nr qd=$qd SKIPPED -- $skip; raise BRUTAL_MEM_FRAC to measure it anyway" >&2
+                        log "brutal: $type-$dirn nr=$nr qd=$qd nj=${njpct}% SKIPPED -- $skip; raise BRUTAL_MEM_FRAC to measure it anyway" >&2
                         skipped=$((skipped + 1))
                         continue
                     fi
-                    cal_cell "$type" "$dirn" "$qd" "$nr" "$fsz" "grid-$type-$dirn" ""
+                    if [ "$njpct" -eq 100 ]; then
+                        cal_cell "$type" "$dirn" "$qd" "$nr" "$fsz" \
+                            "grid-$type-$dirn-p$njpct" ""
+                    else
+                        CAL_NJ_PCT=$njpct \
+                            cal_cell "$type" "$dirn" "$qd" "$nr" "$fsz" \
+                                "grid-$type-$dirn-p$njpct" ""
+                    fi
                     cells=$((cells + 1))
                     # a write cell leaves a destage backlog, and the next cell
                     # starts inside it. Measured on both field hosts
@@ -2004,6 +2059,7 @@ brutal_grids() {   # brutal_grids <ladders>
                     # cell measures the client, not its predecessor.
                     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
                 done
+              done
             done
 
             # --- shortlist, then re-measure it ---
@@ -2012,8 +2068,7 @@ brutal_grids() {   # brutal_grids <ladders>
             if [ "$BRUTAL_CONFIRM" -gt 0 ]; then
                 local shortset="" pairq pairn
                 for host in "${todo[@]}"; do
-                    [ -s "$WORK_DIR/cal/grid-$type-$dirn.$host" ] || continue
-                    brutal_shortlist "$WORK_DIR/cal/grid-$type-$dirn.$host" \
+                    brutal_shortlist "$WORK_DIR/cal" "$type" "$dirn" "$host" \
                         "$BRUTAL_CONFIRM" > "$WORK_DIR/cal/short-$type-$dirn.$host" \
                         || die "$host: cannot rank the $type $dirn grid"
                     shortset="$shortset $(tr '\n' ' ' < "$WORK_DIR/cal/short-$type-$dirn.$host")"
@@ -2021,9 +2076,18 @@ brutal_grids() {   # brutal_grids <ladders>
                 # the union across hosts, since a cell runs on all of them
                 shortset=$(printf '%s\n' $shortset | sort -u | tr '\n' ' ')
                 for pick in $shortset; do
-                    pairn=${pick%%/*}; pairq=${pick##*/}
-                    cal_cell "$type" "$dirn" "$pairq" "$pairn" "$fsz" \
-                        "grid-$type-$dirn" ".c" reuse
+                    # "<njpct>/<nr>/<qd>": the confirm re-runs the cell at the
+                    # numjobs level that produced it
+                    pct=${pick%%/*}; rest=${pick#*/}
+                    pairn=${rest%%/*}; pairq=${rest##*/}
+                    if [ "$pct" -eq 100 ]; then
+                        cal_cell "$type" "$dirn" "$pairq" "$pairn" "$fsz" \
+                            "grid-$type-$dirn-p$pct" ".c" reuse
+                    else
+                        CAL_NJ_PCT=$pct \
+                            cal_cell "$type" "$dirn" "$pairq" "$pairn" "$fsz" \
+                                "grid-$type-$dirn-p$pct" ".c" reuse
+                    fi
                     cells=$((cells + 1))
                     # same backlog rule as the grid cells above
                     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
@@ -2031,15 +2095,27 @@ brutal_grids() {   # brutal_grids <ladders>
             fi
 
             for host in "${todo[@]}"; do
-                [ -s "$WORK_DIR/cal/grid-$type-$dirn.$host" ] || continue
                 pick=$(brutal_verdict "$host" "$type" "$dirn" "$fsz") \
                     || die "$host: cannot pick the $type $dirn grid winner"
-                read -r qd nr rest <<<"$pick"
-                printf '%s %s %s -\n' "$qd" "$nr" "$fsz" \
+                read -r qd nr pct rest <<<"$pick"
+                # a winner from a >100% level records its actual job count --
+                # that count IS part of the winning combination; a 100% winner
+                # leaves nj derived from the usable cores, as always
+                fnj="-"
+                if [ "$pct" -ne 100 ]; then
+                    read -r _ fnj <<<"$(cal_cpus_nj "$host" "$type" "$dirn")" \
+                        || die "$host: cannot resolve the $type $dirn numjobs"
+                    fnj=$(( fnj * pct / 100 ))
+                fi
+                printf '%s %s %s %s\n' "$qd" "$nr" "$fsz" "$fnj" \
                     > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
                 log "brutal: $host $type-$dirn: $rest"
-                brutal_surface "$WORK_DIR/cal/grid-$type-$dirn.$host" "$type" \
-                    | while IFS= read -r rest; do log "brutal:   $rest"; done
+                for njpct in $BRUTAL_NJ; do
+                    [ -s "$WORK_DIR/cal/grid-$type-$dirn-p$njpct.$host" ] || continue
+                    log "brutal:   numjobs at ${njpct}%:"
+                    brutal_surface "$WORK_DIR/cal/grid-$type-$dirn-p$njpct.$host" "$type" \
+                        | while IFS= read -r rest; do log "brutal:   $rest"; done
+                done
             done
             # a write grid ends already settled (every write cell settles
             # above), so it owes the next block nothing -- wrote stays 0
@@ -2048,43 +2124,59 @@ brutal_grids() {   # brutal_grids <ladders>
     log "brutal: $cells cell(s) measured${skipped:+, $skipped skipped}"
 }
 
-# The BRUTAL_CONFIRM best cells of a grid, as "<nr>/<qd>" lines, ranked by the
-# highest value each one reached.
-brutal_shortlist() {   # brutal_shortlist <grid-file> <n>
-    python3 - "$1" "$2" <<'SHORTEOF'
+# The BRUTAL_CONFIRM best cells across every numjobs level of a grid, as
+# "<njpct>/<nr>/<qd>" lines, ranked by the highest value each one reached.
+brutal_shortlist() {   # brutal_shortlist <caldir> <bw|iops> <read|write> <host> <n>
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'SHORTEOF'
+import glob
+import os
+import re
 import sys
 
-path, n = sys.argv[1], int(sys.argv[2])
+caldir, ctype, cdirn, host, n = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                 sys.argv[4], int(sys.argv[5]))
 cells = {}
-for line in open(path):
-    f = line.split()
-    if len(f) == 4:
-        cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
+for path in sorted(glob.glob(os.path.join(caldir, f"grid-{ctype}-{cdirn}-p*.{host}"))):
+    m = re.search(r"-p(\d+)\.", os.path.basename(path))
+    if not m:
+        continue
+    pct = int(m.group(1))
+    for line in open(path):
+        f = line.split()
+        if len(f) == 4:
+            cells.setdefault((pct, int(f[1]), int(f[2])), []).append(float(f[3]))
 if not cells:
-    sys.exit(f"ERROR: {path} holds no grid cells")
+    sys.exit(f"ERROR: no grid cells for {host} {ctype} {cdirn} in {caldir}")
 best = sorted(cells, key=lambda k: -max(cells[k]))[:n]
-print("\n".join(f"{nr}/{qd}" for nr, qd in best))
+print("\n".join(f"{pct}/{nr}/{qd}" for pct, nr, qd in best))
 SHORTEOF
 }
 
 # The winner for one (host, type, direction): the combination that reached the
-# HIGHEST value anywhere in the grid. Extra samples can only raise a cell's
-# best, never lower it, so re-measuring the shortlist can promote a cell whose
-# first sample landed in a contended window -- it can never demote one.
-# Prints "<qd> <nr> <message>".
+# HIGHEST value anywhere across every numjobs level of the grid. Extra samples
+# can only raise a cell's best, never lower it, so re-measuring the shortlist
+# can promote a cell whose first sample landed in a contended window -- it can
+# never demote one. Prints "<qd> <nr> <njpct> <message>".
 brutal_verdict() {   # brutal_verdict <host> <bw|iops> <read|write> <fsz>
-    local host=$1 ctype=$2 cdirn=$3 fsz=$4 short=""
-    [ ! -s "$WORK_DIR/cal/short-$ctype-$cdirn.$host" ] \
-        || short=$(tr '\n' ' ' < "$WORK_DIR/cal/short-$ctype-$cdirn.$host")
-    python3 - "$WORK_DIR/cal/grid-$ctype-$cdirn.$host" "$ctype" "$fsz" "$short" <<'BVEOF'
+    local host=$1 ctype=$2 cdirn=$3 fsz=$4
+    python3 - "$WORK_DIR/cal" "$ctype" "$cdirn" "$host" "$fsz" <<'BVEOF'
+import glob
+import os
+import re
 import sys
 
-path, mode, fsz, short = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+caldir, mode, cdirn, host, fsz = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                  sys.argv[4], sys.argv[5])
 cells = {}
-for line in open(path):
-    f = line.split()
-    if len(f) == 4:
-        cells.setdefault((int(f[1]), int(f[2])), []).append(float(f[3]))
+for path in sorted(glob.glob(os.path.join(caldir, f"grid-{mode}-{cdirn}-p*.{host}"))):
+    m = re.search(r"-p(\d+)\.", os.path.basename(path))
+    if not m:
+        continue
+    pct = int(m.group(1))
+    for line in open(path):
+        f = line.split()
+        if len(f) == 4:
+            cells.setdefault((pct, int(f[1]), int(f[2])), []).append(float(f[3]))
 if not cells:
     sys.exit("ERROR: the grid measured nothing")
 
@@ -2092,29 +2184,34 @@ if not cells:
 # cell has had more chances to show its ceiling, which is an advantage it
 # earned, not one that needs correcting for.
 ranked = sorted(cells, key=lambda k: -max(cells[k]))
-nr, qd = ranked[0]
-val = max(cells[(nr, qd)])
-reps = len(cells[(nr, qd)])
+pct, nr, qd = ranked[0]
+val = max(cells[(pct, nr, qd)])
+reps = len(cells[(pct, nr, qd)])
 
 def human(v):
     if mode == "bw":
         return "%.2fGiB/s" % (v / (1 << 30))
     return "%s/s" % format(int(v), ",")
 
+def njtag(p):
+    return "" if p == 100 else " at %d%% numjobs" % p
+
 runner = ""
 if len(ranked) > 1:
-    r_nr, r_qd = ranked[1]
-    r_val = max(cells[(r_nr, r_qd)])
-    runner = ("; runner-up nrfiles=%d qd=%d at %.1f%%"
-              % (r_nr, r_qd, r_val * 100 / val if val else 0))
+    r_pct, r_nr, r_qd = ranked[1]
+    r_val = max(cells[(r_pct, r_nr, r_qd)])
+    runner = ("; runner-up nrfiles=%d qd=%d%s at %.1f%%"
+              % (r_nr, r_qd, njtag(r_pct), r_val * 100 / val if val else 0))
 spread = ""
 allbest = sorted(max(v) for v in cells.values())
 if len(allbest) > 2 and allbest[-1] > 0:
     spread = ("; grid spans %.0f-100%% of best over %d cells"
               % (allbest[0] * 100 / allbest[-1], len(allbest)))
 
-print(qd, nr, "nrfiles=%d iodepth=%d -> %s (best of %d sample%s%s%s) [fs=%s]"
-      % (nr, qd, human(val), reps, "" if reps == 1 else "s", runner, spread, fsz))
+print(qd, nr, pct,
+      "nrfiles=%d iodepth=%d%s -> %s (best of %d sample%s%s%s) [fs=%s]"
+      % (nr, qd, njtag(pct), human(val), reps,
+         "" if reps == 1 else "s", runner, spread, fsz))
 BVEOF
 }
 
@@ -2242,8 +2339,18 @@ SEEDNJEOF2
         # A CAL_SPLIT percentage above 100 runs MORE jobs than cores at the
         # winning depth, and job n needs file n: seed the widest split too, or
         # the widening test measures short files instead of wide parallelism.
-        if [ "${CAL_SPLIT:-0}" -eq 1 ]; then
+        if [ "${CAL_SPLIT:-0}" -eq 1 ] && ! brutal_mode; then
             for spct in $CAL_SPLIT_PCT; do
+                case "$spct" in (""|*[!0-9]*) continue ;; esac
+                [ "$spct" -gt 100 ] || continue
+                [ $(( nj * spct / 100 )) -le "$nj" ] || nj=$(( nj * spct / 100 ))
+            done
+        fi
+        # brutal runs the whole grid once per BRUTAL_NJ level, and a level
+        # above 100% runs more jobs than cores -- job n needs file n, so the
+        # seed has to cover the widest level or those cells read short files
+        if brutal_mode; then
+            for spct in $BRUTAL_NJ; do
                 case "$spct" in (""|*[!0-9]*) continue ;; esac
                 [ "$spct" -gt 100 ] || continue
                 [ $(( nj * spct / 100 )) -le "$nj" ] || nj=$(( nj * spct / 100 ))
@@ -3869,14 +3976,17 @@ for job in jobs:
                 if not v:
                     continue
                 if tkey == "nj" and v.isdigit():
-                    # The host file is the operator's, so this is honoured --
-                    # but under cpus_allowed_policy=split the excess jobs
-                    # double-book cpus the earlier ones already hold, and the
-                    # calibration ladder is now sized from the same pair, so
-                    # say so once rather than letting it pass unremarked
-                    # (seen live on iscg001: 52 jobs in a 46-cpu mask).
+                    # The host file is the operator's, so this is honoured.
+                    # An exact multiple of the usable cpus is a measured
+                    # BRUTAL_NJ winner and gets a note; anything else is
+                    # probably stale and gets the warning (seen live on
+                    # iscg001: 52 jobs in a 46-cpu mask).
                     cap = len(usable_for(h))
-                    if int(v) > cap:
+                    if int(v) > cap and int(v) % cap == 0:
+                        print(f"note: {h}: {slot}_nj={v} runs "
+                              f"{int(v) // cap} jobs per cpu ({cap} usable)",
+                              file=sys.stderr)
+                    elif int(v) > cap:
                         warn_once(f"{h}: host-file {slot}_nj={v} exceeds its "
                                   f"{cap} usable cpu(s) -- split affinity will "
                                   f"double-book {int(v) - cap} of them")

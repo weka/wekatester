@@ -275,16 +275,40 @@ that implemented it is gone.
 
 `-a cal` reasons about which rungs are worth measuring. `-a brutal` doesn't
 reason at all: it measures the **whole (nrfiles &times; iodepth) cross product**
-for every type and direction and takes the best number. Both defaults run
-1&ndash;128 by doubling, so that is **64 cells per ladder, 256 for a full set**,
-and `-a brutal:10` sets the measured seconds per cell. Budget about **52 minutes**
-at ten seconds a cell.
+for every type and direction, **once per numjobs level**, and takes the best
+number. The default axes are pruned from the first field grids, not from
+theory &mdash; nrfiles was the flattest axis on every surface, bw never won
+deep, iops never won shallow:
+
+| axis | default | pruned away |
+|---|---|---|
+| `BRUTAL_NRS` | 1 2 8 32 128 | 4, 16, 64 (flattest axis everywhere) |
+| `BRUTAL_BW_QDS` | 1 2 4 8 16 32 | 64, 128 (never beat qd16&ndash;32 by more than a tie) |
+| `BRUTAL_IOPS_QDS` | 4 8 16 32 64 128 | 1, 2 (never reached 25% of best) |
+| `BRUTAL_NJ` | 100 200 | &mdash; the full grid at one job per cpu AND at two |
+
+`BRUTAL_QDS` overrides both per-type lists at once, and every pruned value is
+one env var away from coming back. That is 30 cells per (ladder, numjobs
+level), **60 per ladder, 240 for a full set** &mdash; about the wall clock of
+the old 64-cell single-level grid, with the numjobs axis included.
+`-a brutal:10` sets the measured seconds per cell.
+
+**Why numjobs is an axis here and nowhere else.** Everywhere else numjobs is
+derived &mdash; one job per usable cpu &mdash; because a derived value cannot go
+stale. But whether a *second* job per cpu buys throughput is a question only a
+measurement can answer, and the staged jobs can never explore it on their own.
+A `BRUTAL_NJ` level above 100 stages every cell with proportionally more jobs
+(split affinity wraps them around the same cpus), the seed widens itself to
+cover the extra jobs' files, and a winner from that level records its actual
+job count in the host file &mdash; the recorded count then earns a note, not a
+warning, since an exact multiple of the usable cpus is a measured result.
 
 It exists for one situation, and it is worth being blunt about it: when a
 measured selection rule keeps choosing geometry the real test then fails to
 reproduce, an exhaustive sweep cannot be wrong about which cell was fastest.
 Use `cal` when you want the answer cheaply; use `brutal` when you want the
-answer settled.
+answer settled. Do not run its write grids with very short cells: even with
+the per-cell settle, a `:5` cell is barely longer than its ramp.
 
 Three things differ from `cal` beyond the search:
 

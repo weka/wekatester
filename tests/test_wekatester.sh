@@ -1303,18 +1303,21 @@ iops write") | tr "\n" " " )
     # and cal is untouched: constant working set, split across the tabled files
     out=$( (source ./wekatester; cal_seed_sizes "bw read") | tr "\n" " " )
     [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
-t_assert "brutal_shortlist: the N cells that reached the highest values" bash -c '
+t_assert "brutal_shortlist: the N cells that reached the highest values, across nj levels" bash -c '
     d=$(mktemp -d)
-    printf "read 1 1 100\nread 1 2 900\nread 2 1 500\nread 2 2 700\n" > "$d/g"
-    out=$( (source ./wekatester; brutal_shortlist "$d/g" 2) | tr "\n" " " )
-    [ "$out" = "1/2 2/2 " ] || { echo "$out" >&2; false; }
-    out=$( (source ./wekatester; brutal_shortlist "$d/g" 1) )
-    [ "$out" = "1/2" ] || { echo "$out" >&2; false; }
+    printf "read 1 1 100\nread 1 2 900\nread 2 1 500\nread 2 2 700\n" > "$d/grid-bw-read-p100.h1"
+    out=$( (source ./wekatester; brutal_shortlist "$d" bw read h1 2) | tr "\n" " " )
+    [ "$out" = "100/1/2 100/2/2 " ] || { echo "$out" >&2; false; }
+    # a 2x-numjobs pool competes cell for cell: its 1100 beats every 1x cell
+    printf "read 1 2 1100\n" > "$d/grid-bw-read-p200.h1"
+    out=$( (source ./wekatester; brutal_shortlist "$d" bw read h1 1) )
+    [ "$out" = "200/1/2" ] || { echo "2x: $out" >&2; false; }
     # ranked on the best reading, not the average: nr=2/qd=1 touched 1200 once
     # under a quiet moment and that is what it is capable of
-    printf "read 1 1 900\nread 1 1 900\nread 2 1 1200\nread 2 1 300\n" > "$d/g2"
-    out=$( (source ./wekatester; brutal_shortlist "$d/g2" 1) )
-    [ "$out" = "2/1" ] || { echo "max-vs-mean: $out" >&2; false; }'
+    rm "$d/grid-bw-read-p200.h1"
+    printf "read 1 1 900\nread 1 1 900\nread 2 1 1200\nread 2 1 300\n" > "$d/grid-bw-read-p100.h1"
+    out=$( (source ./wekatester; brutal_shortlist "$d" bw read h1 1) )
+    [ "$out" = "100/2/1" ] || { echo "max-vs-mean: $out" >&2; false; }'
 # A client cannot exceed its own ceiling, and contention only ever subtracts,
 # so the HIGHEST reading a combination reached is the best estimate of what it
 # can do. This fixture separates that rule from an averaging one: nr=1/qd=2
@@ -1324,18 +1327,20 @@ t_assert "brutal_shortlist: the N cells that reached the highest values" bash -c
 t_assert "brutal_verdict: the highest reading wins, not the steadiest average" bash -c '
     d=$(mktemp -d); mkdir -p "$d/cal"
     printf "read 1 2 1000\nread 1 2 700\nread 2 2 900\nread 2 2 900\nread 1 1 100\n" \
-        > "$d/cal/grid-bw-read.h1"
-    printf "1/2\n2/2\n" > "$d/cal/short-bw-read.h1"
+        > "$d/cal/grid-bw-read-p100.h1"
     out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
     case "$out" in
-        "2 1 nrfiles=1 iodepth=2 -> "*"(best of 2 samples; runner-up nrfiles=2 qd=2 at 90.0%; grid spans 10-100% of best over 3 cells)"*) true;;
+        "2 1 100 nrfiles=1 iodepth=2 -> "*"(best of 2 samples; runner-up nrfiles=2 qd=2 at 90.0%; grid spans 10-100% of best over 3 cells)"*) true;;
         *) echo "$out" >&2; false;;
     esac
-    # the shortlist only decides which cells got a second run; every cell in
-    # the grid still competes on its own best reading
-    rm -f "$d/cal/short-bw-read.h1"
+    # a 2x-numjobs cell that reached higher takes the whole verdict, and the
+    # verdict says which level it came from
+    printf "read 1 2 1050\n" > "$d/cal/grid-bw-read-p200.h1"
     out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
-    case "$out" in ("2 1 "*) true;; (*) echo "no-shortlist: $out" >&2; false;; esac'
+    case "$out" in
+        "2 1 200 nrfiles=1 iodepth=2 at 200% numjobs -> "*) true;;
+        *) echo "2x: $out" >&2; false;;
+    esac'
 t_assert "brutal_surface: the grid as percent-of-best, each cell at its best" bash -c '
     d=$(mktemp -d)
     printf "read 1 1 500\nread 1 2 1000\nread 2 1 250\nread 2 2 750\n" > "$d/g"
@@ -2908,6 +2913,7 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -2934,6 +2940,63 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
     case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
     # the winning tuple lands in cal.results with numjobs left derived
     grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+# The numjobs axis: the full grid runs once per BRUTAL_NJ level, a 2x cell is
+# staged with twice the jobs, and a 2x winner records its actual job count so
+# the staged test runs what measured best.
+t_assert "brutal_grids: a 2x-numjobs winner records its job count; a 1x winner a dash" bash -c '
+    run_nj() {   # run_nj <p200-value>: prints the cal.results row
+        v200=$1
+        d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+        printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+        (source ./tests/helpers.sh; source ./wekatester
+         AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+         BRUTAL_NRS="1"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
+         BRUTAL_NJ="100 200"
+         printf "ncpus 4\n" > "$d/probe/h1"
+         copy_to_master() { :; }
+         run_host() { case "$2" in
+             (*mkdir*|*rm\ -rf*|*find*) return 0;;
+             (*df*) echo "wekafs 999999999 99999999"; return 0;;
+             (*MemTotal*) echo 8388608; return 0;;
+         esac
+         echo "$2" >> "$d/cells"
+         case "$2" in
+             (*qd2-nr1-nj200.job*) cal_json "$v200";;
+             (*qd2-nr1.job*)       cal_json 1000;;
+             (*)                   cal_json 500;;
+         esac; }
+         calibrate) > "$d/log" 2>&1
+        # the 2x cells must have been staged with doubled jobs
+        grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nr1-nj200.job" || return 1
+        [ "$(grep -c "nj200.job" "$d/cells")" = 2 ] || return 1
+        cat "$d/cal.results"
+    }
+    # 2x pool reached higher -> winner is qd=2 with nj recorded as 8
+    # (4 usable cpus x 200%)
+    run_nj 1200 | grep -qx "h1 2 1 1024M 8 - - - - - - - - - - - -" &&
+    # 1x pool higher -> same qd, nj stays a dash (numjobs derived as always)
+    run_nj 900 | grep -qx "h1 2 1 1024M - - - - - - - - - - - - -"'
+# A BRUTAL_NJ level above 100 needs seed files for the extra jobs: job n
+# opens file n, and a 2x cell with only 1x seed files reads short.
+t_assert "cal_seed_scratch: BRUTAL_NJ above 100 widens the seed to the extra jobs" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal/h1"
+    printf "ncpus 2\n" > "$d/probe/h1"
+    printf "bw read\n" > "$d/cal/seedplan.h1"
+    (source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka
+     CAL_SETTLE=0; ladders="bw read"; BRUTAL_NRS="1 2"; BRUTAL_NJ="100 200"
+     run_host() { case "$2" in
+         (*find*) return 0;;
+         (*df*)   echo "wekafs 99999999999 999999999";;
+         (*)      return 0;;
+     esac; }
+     cal_seed_scratch h1) >/dev/null 2>&1
+    # 2 cpus x 200% = 4 jobs: the seed covers job 3
+    grep -q "^\[seed-3-" "$d/cal/h1/cal-seed.job" &&
+    ! grep -q "^\[seed-4-" "$d/cal/h1/cal-seed.job"'
+
 # A write cell leaves a destage backlog, and the next cell starts inside it:
 # on the first field runs every read surface was smooth while the write
 # surfaces carried the previous cell's debt. Write cells settle; reads never.
@@ -2945,6 +3008,7 @@ t_assert "brutal_grids: every write cell settles, read cells never do" bash -c '
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
      BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      sleep() { echo "settle $1" >> "$d/settles"; }
@@ -2967,6 +3031,7 @@ t_assert "brutal_grids: a read-only grid never settles" bash -c '
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
      BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      sleep() { echo "settle $1" >> "$d/settles"; }
@@ -2990,7 +3055,7 @@ t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, n
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      BRUTAL_NRS="1"; BRUTAL_QDS="1 128"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
-     BRUTAL_MEM_FRAC=25
+     BRUTAL_NJ=100; BRUTAL_MEM_FRAC=25
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
      run_host() { case "$2" in
@@ -3001,7 +3066,7 @@ t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, n
      calibrate) 2>&1 )
     # 4 jobs x qd128 x 1MiB = 512MiB in flight, past 25% of a 1GiB host
     case "$out" in
-        *"bw-read nr=1 qd=128 SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
+        *"bw-read nr=1 qd=128 nj=100% SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     ! grep -q "qd128" "$d/cells" &&
@@ -3572,19 +3637,28 @@ t_assert "cal_cpus_nj: the effective mask and one job per cpu in it" bash -c '
     [ "$out" = "4-7 4" ] || { echo "auth: $out" >&2; false; }
     out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth; cal_cpus_nj h1 lat read) )
     [ "$out" = "4-7 1" ] || { echo "lat: $out" >&2; false; }'
-t_assert "cal_cpus_nj: a host-file nj wider than the mask is honoured, loudly" bash -c '
+t_assert "cal_cpus_nj: nj wider than the mask -- a multiple is a note, a stray is a warning" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     printf "ncpus 8\n" > "$d/probe/h1"
     printf "4-7\n" > "$d/auth/h1.cpus"
     row=h1; for i in $(seq 2 29); do row="$row	-"; done
+    # 52 on 4 usable cpus is an exact multiple -- the shape a BRUTAL_NJ
+    # winner records -- so it is a note, and the value stands
     printf "%s\n" "$row" | awk -F"\t" -v OFS="\t" "{ \$6 = 52; print }" > "$d/targets.final"
     err=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
             cal_cpus_nj h1 bw read) 2>&1 >/dev/null )
     out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
             cal_cpus_nj h1 bw read) 2>/dev/null )
-    # the host file is the operator`s: 52 stands, but it is called out
     [ "$out" = "4-7 52" ] || { echo "got: $out" >&2; false; }
-    case "$err" in (*"exceeds its 4 usable cpu(s)"*"double-book 48"*) true;; (*) echo "$err" >&2; false;; esac'
+    case "$err" in (*"note: h1:"*"runs 13 jobs per cpu (4 usable)"*) true;; (*) echo "$err" >&2; false;; esac
+    # 6 on 4 is not a multiple of anything deliberate: warned, still honoured
+    printf "%s\n" "$row" | awk -F"\t" -v OFS="\t" "{ \$6 = 6; print }" > "$d/targets.final"
+    err=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
+            cal_cpus_nj h1 bw read) 2>&1 >/dev/null )
+    out=$( (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth
+            cal_cpus_nj h1 bw read) 2>/dev/null )
+    [ "$out" = "4-7 6" ] || { echo "got: $out" >&2; false; }
+    case "$err" in (*"WARNING"*"exceeds its 4 usable cpu(s)"*"double-book 2"*) true;; (*) echo "$err" >&2; false;; esac'
 
 t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x 60 h1;         [ "$DURATION" = 60 ]) &&
