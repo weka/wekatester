@@ -200,12 +200,13 @@ Calibration measures **one iodepth ladder per (type, direction)** — bw read,
 bw write, iops read, iops write, whichever the set actually contains —
 because the knees genuinely differ by direction (in the field: iops write
 knee 4 vs read knee 16 on the same clients). File count and size come from
-tables: each ladder runs 2 files per job against a fixed working set
-(2048MiB for bandwidth, 512MiB for iops, split evenly across the files),
-tunable per type and direction via `CAL_BW_READ_NR`, `CAL_IOPS_TOTAL_MIB`
-and friends. (An earlier release searched a (nrfiles × iodepth) grid; the
-extra axis multiplied the budget, and A/B tests on real hardware kept
-landing on 2 files per job.) `numjobs` is one job per usable cpu — see
+tables: each ladder runs 2 files per job (tunable per type and direction via
+`CAL_BW_READ_NR` and friends) at the normalized `FILESIZE_MIB` per file.
+(An earlier release searched a (nrfiles × iodepth) grid; the extra axis
+multiplied the budget, and A/B tests on real hardware kept landing on 2 files
+per job. Another held the working set constant by splitting a total across the
+count — retired with the normalization, since sizes are part of the
+measurement.) `numjobs` is one job per usable cpu — see
 **Refinements** below for the two axes that *are* re-measured once the
 depth is settled.
 
@@ -431,7 +432,24 @@ shared:
   with nothing to reclaim them. Turn it on when the question is specifically
   whether directory-entry spread moves the number, and expect one re-seed.
 
-**The calibration scratch is seeded once, incrementally, and kept.** Every
+**One dataset, one size.** Every calibration cell, every seeded file, and —
+through the measured tuples the writeback records — every staged test runs on
+`FILESIZE_MIB` (5G) files. Sizes are part of the measurement (the same staged
+iops-write geometry delivered 7.5% differently at 256M vs 1024M files, purely
+from the working set), so they are held equal everywhere; a host file that
+pins its own `fs` still wins, as host files always do.
+
+**Calibration measures on the workload's own files** whenever the set's
+`filename_format` can address the grid (both `$filenum` and `$jobnum`, no
+`$jobname`): the seed lays out the exact files the staged jobs will run —
+same directory, same host-prefixed names, same size — so the staged layout
+pass finds everything in place, the sweep credits it (one normalized size
+means no file is ever smaller than a section expects), and the capacity check
+counts it once. Sets whose format cannot express the grid fall back to the
+private `.wekatester-cal` scratch exactly as before. `-u` removes whichever
+dataset the run measured on.
+
+**The calibration dataset is seeded once, incrementally, and kept.** Every
 rung of every ladder reads `<host>.cal.<job>.<filenum>` (or the workload's own
 shape under `CAL_FMT_PARITY=1`); ladders differ only
 in how much of each file they use, so the scratch needs file *f* sized to

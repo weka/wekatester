@@ -1028,43 +1028,31 @@ else:
 PYEOF
 }
 
-# The SHAPE of the calibration scratch's names, taken from the workload the
-# run is about to measure. fio spreads a job's files with filename_format, and
-# a format with a "/" in it puts them in subdirectories -- which is a different
-# metadata spread from one flat directory, and therefore a different
-# measurement. Seen live (iscg001, 2026-08-22): the ladders wrote 104 files
-# into one directory while the staged jobs wrote 52 into each of two, so the
-# knee was measured on a layout the test never used.
+# WHERE calibration measures: on the workload's own files whenever the set's
+# filename_format can express the grid, in a private scratch otherwise.
 #
-# ONE shape for the whole scratch, not one per type: the bw and iops ladders
-# deliberately share their files (cal_required orders bw first so the 1G files
-# already exist when the iops rungs write 256M into them), so their names have
-# to agree.
+# ONE dataset for calibration and execution. The seed lays out the exact files
+# the staged jobs will run on -- same directory, same names, same 5G size --
+# so the staged layout pass finds everything already in place, the sweep
+# credits it (a file is a deviant only when SMALLER than a section expects,
+# and one normalized size means nothing ever is), and the capacity check
+# counts it once. Before this, the scratch and the workload layout were two
+# copies of much the same data, and calibration measured a layout the test
+# never used.
 #
-# OFF BY DEFAULT, and the reason is the scratch's whole point. The names are
-# reused deliberately: the seed's only test is whether the file already in
-# place is big enough, so a warm scratch costs nothing and re-creating it is
-# the single most expensive part of a run. Tie the names to the workload and
-# that property goes away -- the shipped sets do not agree on a shape
-# ($filenum/$jobnum for default, mixed and 2x400Gb; flat for smoke;
-# wekawithin/$jobnum for wekawithin), so every switch between sets would
-# re-seed from scratch and leave the other shapes' files stranded on disk
-# with nothing to ever reclaim them.
+# Unified needs a format that can address the grid: both $filenum and $jobnum,
+# and no $jobname (which would resolve to the CAL section's name, not the
+# workload's). A set without one -- flat formats, single-variable formats --
+# falls back to the private scratch exactly as before.
 #
-# CAL_FMT_PARITY=1 turns it on: the scratch then mirrors the workload's
-# filename_format, so a set whose files live in subdirectories is measured on
-# files in subdirectories. Worth it when the question is specifically whether
-# the directory-entry spread moves the number -- and it costs one re-seed on
-# the first run, plus another on every switch to a set with a different shape.
-cal_scratch_fmt() {   # cal_scratch_fmt <set-dir> -> the suffix after "<host>.cal."
-    [ "${CAL_FMT_PARITY:-0}" -eq 1 ] || { printf '$jobnum.$filenum\n'; return 0; }
-    pyrun "$1" <<'FMTEOF'
+# Prints "unified <fmt>" or "scratch $jobnum.$filenum".
+cal_namespace() {   # cal_namespace <set-dir>
+    pyrun "$1" <<'NSEOF'
 import os
 import re
 import sys
 
 src = sys.argv[1]
-best = ""
 for job in sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f)):
     path = os.path.join(src, job)
     try:
@@ -1074,30 +1062,26 @@ for job in sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f)):
     if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
         continue          # the layout job mirrors the measured ones
     fmt = first_value(lines, "filename_format")
-    if fmt and "/" in fmt:
-        best = fmt
-        break
-# $jobname would resolve to the CAL section name, not the workload's, so a
-# format that leans on it cannot be mirrored: fall back to flat rather than
-# invent a directory the seed and the rungs would disagree about.
-if not best or "$jobname" in best:
-    best = "$jobnum.$filenum"
-print(best)
-FMTEOF
+    if fmt and "$filenum" in fmt and "$jobnum" in fmt and "$jobname" not in fmt:
+        print("unified", fmt)
+        raise SystemExit(0)
+print("scratch", "$jobnum.$filenum")
+NSEOF
 }
 
 # Every directory the scratch's names imply, relative to the scratch root.
 # fio never mkdirs, so the caller creates these before the seed writes.
-cal_scratch_dirs() {   # cal_scratch_dirs <host> <fmt> <nj> <maxfilenum>
-    pyrun "$1" "$2" "$3" "$4" <<'DIREOF'
+cal_scratch_dirs() {   # cal_scratch_dirs <host> <sep> <fmt> <nj> <maxfilenum>
+    pyrun "$1" "$2" "$3" "$4" "$5" <<'DIREOF'
 import os
 import sys
 
-host, fmt, nj, maxf = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+host, sep, fmt, nj, maxf = (sys.argv[1], sys.argv[2], sys.argv[3],
+                            int(sys.argv[4]), int(sys.argv[5]))
 dirs = set()
 for j in range(nj):
     for f in range(maxf + 1):
-        name = (f"{host}.cal." + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
+        name = (host + sep + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
         d = os.path.dirname(name)
         if d:
             dirs.add(d)
@@ -1237,7 +1221,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
         (*) die "stage_cal_step: unknown ladder type: $type (bw|iops|lat)" ;;
     esac
     # nrfiles and filesize come from the per-(type,direction) tables (cal_nr,
-    # cal_total_mib); cal_cell passes them via CAL_NRFILES/CAL_FILESIZE. The
+    # FILESIZE_MIB); cal_cell passes them via CAL_NRFILES/CAL_FILESIZE. The
     # per-type defaults above only serve direct callers (the latency floors).
     nrf=${CAL_NRFILES:-2}
     [ -z "${CAL_FILESIZE:-}" ] || fsz=$CAL_FILESIZE
@@ -1271,9 +1255,9 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
         f="$outdir/$host/cal-$type-$dirn-qd$qd${CAL_NRFILES:+-nr${CAL_NRFILES}}${CAL_NJ_PCT:+-nj${CAL_NJ_PCT}}.job"
         {
             printf '[global]\n'
-            printf 'directory=%s/%s\n' "$hd" "$CAL_SCRATCH"
+            printf 'directory=%s%s\n' "$hd" "${CAL_NS_DIR-/$CAL_SCRATCH}"
             printf 'unique_filename=0\n'
-            printf 'filename_format=%s.cal.%s\n' "$host" "${CAL_FMT:-\$jobnum.\$filenum}"
+            printf 'filename_format=%s%s%s\n' "$host" "${CAL_SEP:-.cal.}" "${CAL_FMT:-\$jobnum.\$filenum}"
             printf 'ioengine=%s\n' "$eng"
             printf 'direct=1\n'
             printf 'bs=%s\n' "$bs"
@@ -1412,6 +1396,16 @@ CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after a seed (and between a write
                          # otherwise (seen live: bw-write qd1 reads ~15% low
                          # in every run, while bw-read qd1 -- measured after
                          # the backlog drained -- does not)
+# ONE file size everywhere. Every calibration cell, every seeded file and --
+# through the measured tuples the writeback records -- every staged test runs
+# on 5G files, so a number from any level is comparable with any other and
+# the sweep's size floor is satisfied by construction. Measured on isca224
+# (2026-08-24): the same staged iops-write geometry delivered 7.5% differently
+# at fs=256M vs fs=1024M, purely from the working set -- sizes are part of the
+# measurement, so they have to be held equal. A host file that pins its own
+# fs still wins, as host files always do.
+FILESIZE_MIB=${FILESIZE_MIB:-5120}
+
 CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # THE BAND: a rung is on the plateau
                          # when it reaches this % of the ladder's peak, and
                          # the pick is the shallowest such rung. Fixed --
@@ -1426,12 +1420,10 @@ CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs that fail to beat the
                          # best by more than the noise before the ladder stops
 CAL_BW_QDS=${CAL_BW_QDS:-"1 2 4 8 16 32 64 128"}
 CAL_IOPS_QDS=${CAL_IOPS_QDS:-"1 2 4 8 16 32 64 128 256"}
-# Working set per job (MiB) and file count per (type, direction). fs = total
-# over count, so changing the count keeps the working set -- and with it the
-# capacity bill -- constant. All ${:-} so the environment can retune them, as
-# the README and the seed's out-of-space advice both promise.
-CAL_BW_TOTAL_MIB=${CAL_BW_TOTAL_MIB:-2048}
-CAL_IOPS_TOTAL_MIB=${CAL_IOPS_TOTAL_MIB:-512}
+# File count per (type, direction); every file is FILESIZE_MIB. An earlier
+# release held the working set constant (total split across the count) so the
+# nrfiles axis isolated file count -- retired with the normalization: sizes
+# are part of the measurement, so every level runs the same per-file size.
 CAL_BW_READ_NR=${CAL_BW_READ_NR:-2}
 CAL_BW_WRITE_NR=${CAL_BW_WRITE_NR:-2}
 CAL_IOPS_READ_NR=${CAL_IOPS_READ_NR:-2}
@@ -1504,15 +1496,16 @@ BRUTAL_NJ=${BRUTAL_NJ:-"100 200"}   # numjobs levels, percent of one job per
                          # because numjobs was always derived. A level above
                          # 100 needs seed files for the extra jobs; the seed
                          # widens itself accordingly.
-BRUTAL_FILESIZE=${BRUTAL_FILESIZE:-1024}   # MiB PER FILE, so the working set is
-                         # BRUTAL_FILESIZE x nrfiles per job and GROWS along the
-                         # nrfiles axis. That is deliberate and it is the
-                         # opposite of cal, which holds the working set constant
-                         # so the axis isolates file count. Here a wider grid
-                         # cell also reads more distinct data, which is the
-                         # honest reading of "push the client to its limit" --
-                         # but it means the scratch is sized by the LARGEST
-                         # nrfiles: 128 files x 1G x one job per core.
+BRUTAL_FILESIZE=${BRUTAL_FILESIZE:-$FILESIZE_MIB}   # MiB PER FILE, so the
+                         # working set is BRUTAL_FILESIZE x nrfiles per job and
+                         # GROWS along the nrfiles axis: a wider cell also
+                         # touches more distinct data, which is the honest
+                         # reading of "push the client to its limit". The
+                         # dataset is sized by the LARGEST nrfiles times the
+                         # widest numjobs level -- at the defaults, 128 files
+                         # x 5G x two jobs per core: ~66TiB on a 52-core
+                         # client. The seed's capacity check prices it before
+                         # writing a byte.
 BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-3}   # give this many top cells a second run at
                          # showing their ceiling. Contention only ever costs
                          # throughput, so a further sample can raise a cell's
@@ -1543,10 +1536,6 @@ cal_nr() {   # cal_nr <bw|iops> <read|write>
         ("iops write") echo "$CAL_IOPS_WRITE_NR" ;;
         (*) die "cal_nr: unknown ladder: $1 $2" ;;
     esac
-}
-
-cal_total_mib() {   # cal_total_mib <bw|iops>
-    [ "$1" = bw ] && echo "$CAL_BW_TOTAL_MIB" || echo "$CAL_IOPS_TOTAL_MIB"
 }
 
 cal_qds() {   # cal_qds <bw|iops>
@@ -1659,18 +1648,17 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
         [ -n "$type" ] || continue
         case "$type" in
             (bw|iops) if brutal_mode; then
-                          # every file the widest grid cell opens, at the fixed
-                          # per-file size: one union serves all 64 cells and
-                          # both types, and a warm scratch serves the next run
+                          # every file the widest grid cell opens: one union
+                          # serves every cell and a warm dataset the next run
                           nr=1; fs=$BRUTAL_FILESIZE
                           for nr2 in $BRUTAL_NRS; do
                               [ "$nr2" -le "$nr" ] || nr=$nr2
                           done
                       else
                           nr=$(cal_nr "$type" "$dirn") || return 1
-                          fs=$(( $(cal_total_mib "$type") / nr ))
+                          fs=$FILESIZE_MIB
                       fi ;;
-            (lat)     nr=2; fs=64 ;;
+            (lat)     nr=2; fs=$FILESIZE_MIB ;;
             (*)       continue ;;
         esac
         for ((f = 0; f < nr; f++)); do
@@ -1683,10 +1671,9 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
         # off by default: nr=8 at total/8 adds six more files per job.
         [ "$type" = lat ] && continue
         [ "${CAL_NR_RETEST:-0}" -eq 1 ] || continue
-        tot=$(cal_total_mib "$type") || return 1
         for nr2 in $CAL_NR_CANDIDATES; do
             case "$nr2" in (""|*[!0-9]*|0) continue ;; esac
-            fs=$(( tot / nr2 ))
+            fs=$FILESIZE_MIB
             for ((f = 0; f < nr2; f++)); do
                 [ "${need[f]:-0}" -ge "$fs" ] || need[f]=$fs
                 [ "$f" -le "$maxf" ] || maxf=$f
@@ -1937,10 +1924,8 @@ if gain <= bar:
     print(pick, nr, fs, 100,
           f"refine: nothing beat the pick by more than the {bar:.1f}% bar ({tried})")
     raise SystemExit(0)
-# fs is per file and the working set is held constant, so a new file count
-# rescales it -- exactly as cal_nr/cal_total_mib do for the ladder
-fs2 = fs if nr2 == nr else "%dM" % (int(nr) * int(fs.rstrip("Mm")) // nr2)
-print(qd2, nr2, fs2, pct,
+# fs is per file and normalized, so a different file count keeps it
+print(qd2, nr2, fs, pct,
       f"refine: {label} beats the pick by {gain:+.1f}% (bar {bar:.1f}%; {tried})")
 REFINEEOF
 }
@@ -2299,7 +2284,7 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         hd=$(host_dir "$host")
         mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
         { run_host "$host" \
-              "if [ -d '$hd/$CAL_SCRATCH' ]; then find '$hd/$CAL_SCRATCH' -type f -printf '%P %s\\n'; fi" \
+              "if [ -d '$hd${CAL_NS_DIR-/$CAL_SCRATCH}' ]; then find '$hd${CAL_NS_DIR-/$CAL_SCRATCH}' -type f -printf '%P %s\\n'; fi" \
               > "$WORK_DIR/cal/$host/scratch.list" \
           && run_host "$host" "df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
               > "$WORK_DIR/cal/$host/dfline"; } &
@@ -2367,23 +2352,24 @@ SEEDNJEOF2
         # root (already created); a subdirectory shape needs its directories
         # before the seed writes a single file into them.
         maxf=$(printf '%s\n' "$sizes" | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
-        subdirs=$(cal_scratch_dirs "$host" "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
-            || die "$host: cannot derive the calibration scratch directories"
+        subdirs=$(cal_scratch_dirs "$host" "${CAL_SEP:-.cal.}" \
+                      "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
+            || die "$host: cannot derive the calibration namespace directories"
         if [ -n "$subdirs" ]; then
             cmd=$(printf '%s\n' "$subdirs" \
-                  | sed "s|^|mkdir -p '$hd/$CAL_SCRATCH/|;s|\$|' \&\&|" \
+                  | sed "s|^|mkdir -p '$hd${CAL_NS_DIR-/$CAL_SCRATCH}/|;s|\$|' \&\&|" \
                   | tr '\n' ' ')
             run_host "$host" "${cmd% &&}" \
-                || die "$host: cannot create the calibration scratch subdirectories"
+                || die "$host: cannot create the calibration namespace subdirectories"
         fi
         want=$(python3 - "$host" "$nj" "$sizes" \
-                   "$hd/$CAL_SCRATCH" "$eng" "$cpus" \
+                   "$hd${CAL_NS_DIR-/$CAL_SCRATCH}" "$eng" "$cpus" \
                    "$WORK_DIR/cal/$host/cal-seed.job" \
                    "$WORK_DIR/cal/$host/scratch.list" \
-                   "${CAL_FMT:-\$jobnum.\$filenum}" <<'PYEOF'
+                   "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" <<'PYEOF'
 import sys
 
-host, nj, sizes_raw, directory, eng, cpus, outpath, listpath, fmt = sys.argv[1:10]
+host, nj, sizes_raw, directory, eng, cpus, outpath, listpath, fmt, sep = sys.argv[1:11]
 need = {}
 for line in sizes_raw.splitlines():
     f, mib = line.split()
@@ -2396,8 +2382,8 @@ for line in open(listpath):
 todo, mib_total = [], 0
 for j in range(int(nj)):
     for f, mib in sorted(need.items()):
-        name = (("%s.cal." % host) + fmt).replace("$jobnum", str(j)) \
-                                             .replace("$filenum", str(f))
+        name = (host + sep + fmt).replace("$jobnum", str(j)) \
+                                  .replace("$filenum", str(f))
         if have.get(name, 0) >= mib * 1024 * 1024:
             continue          # already big enough: a cell just uses a prefix
         todo.append((j, f, name, mib))
@@ -2470,7 +2456,7 @@ PYEOF
     fi
     if [ -n "$short_hosts" ]; then
         log "ERROR: not enough free space for the calibration scratch on:$short_hosts" >&2
-        die "calibration needs its scratch laid out before it can measure; free space under the destination, shrink the CAL_*_TOTAL_MIB working sets, or drop -a cal"
+        die "calibration needs its scratch laid out before it can measure; free space under the destination, shrink FILESIZE_MIB or the file counts, or drop -a cal"
     fi
     if [ ${#seedrun[@]} -eq 0 ]; then
         log "cal: the scratch on every host already satisfies every ladder -- no seeding needed"
@@ -2525,7 +2511,7 @@ cal_ladders() {   # cal_ladders <ladders>
     local ladders=$1
     local type dirn todo qd host
     # THE LADDERS. nrfiles and filesize come from the tables (cal_nr,
-    # cal_total_mib); iodepth is MEASURED, one ladder per (type, direction),
+    # FILESIZE_MIB per file); iodepth is MEASURED, one ladder per (type, direction),
     # because the knees genuinely differ by direction (saving-calf: iops
     # write knee 4 vs read knee 16 on UDP backends). numjobs comes from
     # cal_cpus_nj -- the same rule the staged jobs use.
@@ -2574,7 +2560,7 @@ cal_ladders() {   # cal_ladders <ladders>
             [ "$wrote" -eq 0 ] || sleep "$CAL_SETTLE"
             wrote=0
             nrn=$(cal_nr "$type" "$dirn")
-            nrfsz="$(( $(cal_total_mib "$type") / nrn ))M"
+            nrfsz="${FILESIZE_MIB}M"
             for host in "${todo[@]}"; do
                 rm -f "$WORK_DIR/cal/shape-$type-$dirn.$host" \
                       "$WORK_DIR/cal/hist-$type-$dirn.$host" \
@@ -2723,8 +2709,7 @@ CANDEOF
                         [ "$nr2" -ne "$nrn" ] || continue
                         for qd in $allwins; do
                             cal_cell "$type" "$dirn" "$qd" "$nr2" \
-                                "$(( $(cal_total_mib "$type") / nr2 ))M" \
-                                "nrt-$type-$dirn-n$nr2" ".n"
+                                "${FILESIZE_MIB}M" "nrt-$type-$dirn-n$nr2" ".n"
                         done
                     done
                 fi
@@ -2762,26 +2747,33 @@ calibrate() {
     fi
     echo
     log "calibrating ($AUTO_LEVEL) on ${#HOSTS[@]} host(s): $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
-    # NOT local: stage_cal_step and cal_seed_scratch both read it, and the
-    # whole point is that one shape serves the seed, every rung, and the
-    # directories they need
-    CAL_FMT=$(cal_scratch_fmt "$capdir") \
-        || die "cannot derive the calibration name shape from $capdir"
-    case "$CAL_FMT" in
-        ('$jobnum.$filenum') ;;
-        (*) log "cal: CAL_FMT_PARITY: mirroring the workload's file layout in the scratch (filename_format=$CAL_FMT) -- the scratch is now shape-specific, so a set with a different layout re-seeds" ;;
-    esac
+    # NOT local: stage_cal_step and cal_seed_scratch all read these, and the
+    # whole point is that one namespace serves the seed, every cell, and the
+    # staged jobs. CAL_NS_DIR is the subdirectory under each host's
+    # destination ("" = the destination itself); CAL_SEP joins host to format
+    # in every filename.
+    local nsline
+    nsline=$(cal_namespace "$capdir") \
+        || die "cannot derive the calibration namespace from $capdir"
+    read -r CAL_NS CAL_FMT <<<"$nsline"
+    if [ "$CAL_NS" = unified ]; then
+        CAL_NS_DIR=""; CAL_SEP="."
+        log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- the seed lays out exactly what the staged jobs run on"
+    else
+        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
+        log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
+    fi
     local host i pids hs
     pids=(); hs=()
     mkdir -p "$WORK_DIR/cal"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     for host in "${HOSTS[@]}"; do
-        run_host "$host" "mkdir -p '$(host_dir "$host")/$CAL_SCRATCH'" &
+        run_host "$host" "mkdir -p '$(host_dir "$host")${CAL_NS_DIR-/$CAL_SCRATCH}'" &
         pids+=($!); hs+=("$host")
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "cannot create the calibration scratch dir on ${hs[$i]}"
+        wait "${pids[$i]}" || die "cannot create the calibration namespace dir on ${hs[$i]}"
     done
 
     local type dirn todo qd cmd
@@ -2900,16 +2892,41 @@ PYEOF
     # workload's own data files.
     pids=(); hs=()
     if [ "$UNLINK" -eq 1 ]; then
+        local ucmd
         for host in "${HOSTS[@]}"; do
-            run_host "$host" "rm -rf '$(host_dir "$host")/$CAL_SCRATCH'" &
+            if [ -z "$CAL_NS_DIR" ]; then
+                # unified: the dataset is the workload's namespace at the
+                # destination -- delete by the same glob the sweep uses, then
+                # prune the directories the names implied
+                ucmd=$(pyrun "$host" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")" <<'UNLEOF'
+import re
+import sys
+
+host, sep, fmt, hd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+pat = host + sep + fmt
+glob = re.sub(r"\$\w+", "*", pat)
+depth = 1 + glob.count("/")
+cmd = f"find '{hd}' -maxdepth {depth} -type f -path '{hd}/{glob}' -delete"
+if "/" in glob:
+    dglob = glob.rsplit("/", 1)[0]
+    cmd += f" && find '{hd}' -maxdepth {depth - 1} -type d -path '{hd}/{dglob}' -empty -delete"
+print(cmd)
+UNLEOF
+                ) || die "$host: cannot derive the dataset removal command"
+                run_host "$host" "$ucmd" &
+            else
+                run_host "$host" "rm -rf '$(host_dir "$host")$CAL_NS_DIR'" &
+            fi
             pids+=($!); hs+=("$host")
         done
         for i in "${!pids[@]}"; do
             wait "${pids[$i]}" \
-                || log "WARNING: could not remove the calibration scratch on ${hs[$i]}" >&2
+                || log "WARNING: could not remove the calibration dataset on ${hs[$i]}" >&2
         done
+    elif [ -z "$CAL_NS_DIR" ]; then
+        log "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
     else
-        log "cal: keeping the calibration scratch ($CAL_SCRATCH under each destination) so the next calibration reuses it; -u removes it"
+        log "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2

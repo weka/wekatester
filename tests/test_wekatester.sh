@@ -1300,9 +1300,9 @@ t_assert "cal_seed_sizes: brutal sizes the union by its widest nrfiles" bash -c 
             cal_seed_sizes "bw read
 iops write") | tr "\n" " " )
     [ "$out" = "0 1024 1 1024 2 1024 3 1024 " ] || { echo "$out" >&2; false; }
-    # and cal is untouched: constant working set, split across the tabled files
+    # cal seeds the same normalized per-file size at the tabled file count
     out=$( (source ./wekatester; cal_seed_sizes "bw read") | tr "\n" " " )
-    [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
+    [ "$out" = "0 5120 1 5120 " ] || { echo "$out" >&2; false; }'
 t_assert "brutal_shortlist: the N cells that reached the highest values, across nj levels" bash -c '
     d=$(mktemp -d)
     printf "read 1 1 100\nread 1 2 900\nread 2 1 500\nread 2 2 700\n" > "$d/grid-bw-read-p100.h1"
@@ -2939,7 +2939,7 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
     esac &&
     case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
     # the winning tuple lands in cal.results with numjobs left derived
-    grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+    grep -qx "h1 2 2 5120M - - - - - - - - - - - - -" "$d/cal.results"'
 # The numjobs axis: the full grid runs once per BRUTAL_NJ level, a 2x cell is
 # staged with twice the jobs, and a 2x winner records its actual job count so
 # the staged test runs what measured best.
@@ -2975,9 +2975,9 @@ t_assert "brutal_grids: a 2x-numjobs winner records its job count; a 1x winner a
     }
     # 2x pool reached higher -> winner is qd=2 with nj recorded as 8
     # (4 usable cpus x 200%)
-    run_nj 1200 | grep -qx "h1 2 1 1024M 8 - - - - - - - - - - - -" &&
+    run_nj 1200 | grep -qx "h1 2 1 5120M 8 - - - - - - - - - - - -" &&
     # 1x pool higher -> same qd, nj stays a dash (numjobs derived as always)
-    run_nj 900 | grep -qx "h1 2 1 1024M - - - - - - - - - - - - -"'
+    run_nj 900 | grep -qx "h1 2 1 5120M - - - - - - - - - - - - -"'
 # A BRUTAL_NJ level above 100 needs seed files for the extra jobs: job n
 # opens file n, and a 2x cell with only 1x seed files reads short.
 t_assert "cal_seed_scratch: BRUTAL_NJ above 100 widens the seed to the extra jobs" bash -c '
@@ -3101,11 +3101,11 @@ t_assert "calibrate: the pick is the shallowest rung on the plateau" bash -c '
      esac; }
      calibrate) 2>&1 )
     case "$out" in
-        *"bw-read: qd=8 -- plateau qd=8 >=98.5% of best"*"at qd=8 (n=3, cv<=0.0%)"*"[nrfiles=2 fs=1024M]"*) true;;
+        *"bw-read: qd=8 -- plateau qd=8 >=98.5% of best"*"at qd=8 (n=3, cv<=0.0%)"*"[nrfiles=2 fs=5120M]"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     # nj is a dash: no split re-test won, so numjobs stays operator-owned
-    grep -q "^h1 8 2 1024M - - - - - - - - - - - - -$" "$d/cal.results" &&
+    grep -q "^h1 8 2 5120M - - - - - - - - - - - - -$" "$d/cal.results" &&
     # early stop: qd=16 and qd=32 both fail to beat 2100 by >CAL_SHAPE_THR,
     # so qd=64 is never staged
     [ ! -f "$d/cal/h1/cal-bw-read-qd64-nr2.job" ] &&
@@ -3115,18 +3115,18 @@ t_assert "calibrate: the pick is the shallowest rung on the plateau" bash -c '
     grep -q "^filename_format=h1.cal" "$d/cal/h1/cal-bw-read-qd8-nr2.job"'
 # The seed is the union of what every ladder needs: file f at the largest
 # size any (type, direction) table entry asks of it.
-t_assert "cal_seed_sizes: the union is the largest size any ladder asks per file" bash -c '
+t_assert "cal_seed_sizes: one normalized size, the union is just the widest file count" bash -c '
     out=$( (source ./wekatester; cal_seed_sizes "bw read
 bw write
 iops read") | tr "\n" " " )
-    [ "$out" = "0 1024 1 1024 " ] || { echo "$out" >&2; false; }'
-t_assert "cal_seed_sizes: iops alone needs a quarter of the bw working set" bash -c '
+    [ "$out" = "0 5120 1 5120 " ] || { echo "$out" >&2; false; }'
+t_assert "cal_seed_sizes: iops seeds the same normalized size as bw" bash -c '
     out=$( (source ./wekatester; cal_seed_sizes "iops read") | tr "\n" " " )
-    [ "$out" = "0 256 1 256 " ] || { echo "$out" >&2; false; }'
-t_assert "cal_seed_sizes: a latency-only set still gets a plan" bash -c '
+    [ "$out" = "0 5120 1 5120 " ] || { echo "$out" >&2; false; }'
+t_assert "cal_seed_sizes: a latency-only set still gets a plan, at the one size" bash -c '
     out=$( (source ./wekatester; cal_seed_sizes "lat read
 lat write") | tr "\n" " " )
-    [ "$out" = "0 64 1 64 " ] || { echo "$out" >&2; false; }'
+    [ "$out" = "0 5120 1 5120 " ] || { echo "$out" >&2; false; }'
 # Incremental: a file already at or above the needed size is left alone, so a
 # warm scratch seeds nothing and a cold one seeds exactly the union.
 t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the union" bash -c '
@@ -3146,7 +3146,7 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
     [ "$(grep -ac "^\[seed-" "$d/cal/h1/cal-seed.job")" = 4 ] || { echo "sections: $(grep -ac "^.seed-" "$d/cal/h1/cal-seed.job")" >&2; exit 1; }
     grep -q "^filename=h1.cal.0.0:h1.cal.0.1$" "$d/cal/h1/cal-seed.job" || exit 1
     grep -q "^nrfiles=2$" "$d/cal/h1/cal-seed.job" || exit 1
-    grep -q "^filesize=1024M$" "$d/cal/h1/cal-seed.job" || exit 1
+    grep -q "^filesize=5120M$" "$d/cal/h1/cal-seed.job" || exit 1
     # warm: every file already present and big enough -> no fio invocation
     rm -f "$d/ran"
     (source ./wekatester
@@ -3157,7 +3157,7 @@ t_assert "cal_seed_scratch: a warm scratch seeds nothing, a cold one seeds the u
      run_host() { case "$2" in
          (*df*) echo "wekafs 999999999 99999999"; return 0;;
          (*find*) for j in 0 1 2 3; do for f in 0 1; do
-                      echo "h1.cal.$j.$f 2147483648"; done; done; return 0;;
+                      echo "h1.cal.$j.$f 5368709120"; done; done; return 0;;
      esac; echo "$2" >> "$d/ran"; }
      cal_seed_scratch h1) >/dev/null 2>&1
     [ ! -f "$d/ran" ] || { echo "warm scratch still ran: $(cat "$d/ran")" >&2; exit 1; }
@@ -3174,14 +3174,14 @@ t_assert "cal_seed_scratch: shared-filesystem seeds are summed against the share
      DIRECTORY=/mnt/weka; AUTH_DIR=""
      ladders="bw read"
      copy_to_master() { :; }
-     # per host: 2 jobs x 2 files x 1024M = 4096MiB, exactly the free space
+     # per host: 2 jobs x 2 files x 5120M = 20480MiB against 4096MiB free
      run_host() { case "$2" in
          (*df*) echo "wekafs 999999 4096"; return 0;;
          (*) return 0;;
      esac; }
      cal_seed_scratch h1 h2) 2>&1 )
     case "$out" in
-        *"need=8192MiB avail=4096MiB on h1 h2"*) true;;
+        *"need=40960MiB avail=4096MiB on h1 h2"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     # a host-local source (/dev/*) is never grouped: the same shape passes
@@ -3191,7 +3191,7 @@ t_assert "cal_seed_scratch: shared-filesystem seeds are summed against the share
      ladders="bw read"
      copy_to_master() { :; }
      run_host() { case "$2" in
-         (*df*) echo "/dev/nvme0n1 999999 4096"; return 0;;
+         (*df*) echo "/dev/nvme0n1 999999 20480"; return 0;;
          (*cal-seed.job*) printf "{ \"client_stats\": [ { \"jobname\": \"s\", \"hostname\": \"h1\", \"error\": 0, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"read\": { \"bw_bytes\": 0, \"iops\": 0, \"total_ios\": 0, \"io_bytes\": 0 } } ] }\n";;
          (*) return 0;;
      esac; }
@@ -3304,7 +3304,7 @@ t_assert "calibrate: noisy repeats warn and still record, they do not void the l
         *) echo "$out" >&2; false;;
     esac &&
     # recorded, not discarded
-    grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+    grep -qx "h1 2 2 5120M - - - - - - - - - - - - -" "$d/cal.results"'
 # A rung is worth its BEST reading, not the average of its repeats: averaging
 # credits it with less than it demonstrably did, and pushes whichever rung
 # caught a busy window off the plateau.
@@ -3464,9 +3464,9 @@ t_assert "calibrate: a split that wins is recorded as numjobs, one that does not
     }
     # pick is qd=1 at 1000 with a 1% bar; the split runs 2 jobs at qd=2
     # a 3% win is real -> numjobs 2 recorded beside qd=2
-    run_split 1030 | grep -qx "h1 2 2 1024M 2 - - - - - - - - - - - -" &&
+    run_split 1030 | grep -qx "h1 2 2 5120M 2 - - - - - - - - - - - -" &&
     # a 0.5% win is inside the bar -> nothing changes, nj stays a dash
-    run_split 1005 | grep -qx "h1 1 2 1024M - - - - - - - - - - - - -"'
+    run_split 1005 | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -"'
 # One shape for the whole scratch, taken from the workload: a set whose files
 # live in subdirectories is measured on files in subdirectories.
 # The WIDENING direction of CAL_SPLIT: more jobs than usable cpus at a
@@ -3503,7 +3503,7 @@ t_assert "calibrate: CAL_SPLIT_PCT above 100 seeds the wider job count and runs 
         *"numjobs at 200% with qd=1 beats the pick by +20.0%"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    grep -qx "h1 1 2 1024M 8 - - - - - - - - - - - -" "$d/cal.results"'
+    grep -qx "h1 1 2 5120M 8 - - - - - - - - - - - -" "$d/cal.results"'
 # The shipped verdict against the ladders that motivated it: four runs of the
 # same command on one client (iscg001, 2026-08-21/22), replayed through
 # cal_verdict itself rather than through an analysis script.
@@ -3578,22 +3578,22 @@ t_assert "cal_seed_scratch: sufficiency is the only test, at any shape" bash -c 
         got=$(grep "^filename=" "$d/cal/h1/cal-seed.job" | sed "s/^filename=//" | tr "\n" " ")
         printf "%s" "${got:-NONE}"
     }
-    # iops read at nr=2 is 512MiB total -> two 256M files per job, two jobs
-    warm="h1.cal.0/0 268435456
-h1.cal.1/0 268435456
-h1.cal.0/1 268435456
-h1.cal.1/1 268435456
+    # iops read at nr=2 -> two 5G files per job, two jobs
+    warm="h1.cal.0/0 5368709120
+h1.cal.1/0 5368709120
+h1.cal.0/1 5368709120
+h1.cal.1/1 5368709120
 "
-    short="h1.cal.0/0 268435456
+    short="h1.cal.0/0 5368709120
 h1.cal.1/0 100
-h1.cal.0/1 268435456
-h1.cal.1/1 268435456
+h1.cal.0/1 5368709120
+h1.cal.1/1 5368709120
 "
-    big=$(printf "%s" "$warm" | sed "s/268435456/1073741824/")
-    flat="h1.cal.0.0 268435456
-h1.cal.0.1 268435456
-h1.cal.1.0 268435456
-h1.cal.1.1 268435456
+    big=$(printf "%s" "$warm" | sed "s/5368709120/10737418240/")
+    flat="h1.cal.0.0 5368709120
+h1.cal.0.1 5368709120
+h1.cal.1.0 5368709120
+h1.cal.1.1 5368709120
 "
     nested="\$filenum/\$jobnum"
     a=$(plan "$nested" "$warm")   # every file big enough -> nothing to do
@@ -3607,19 +3607,47 @@ h1.cal.1.1 268435456
     [ "$e" = "h1.cal.0/0:h1.cal.1/0 h1.cal.0/1:h1.cal.1/1 " ] \
                                  || { echo "cross-shape planned: [$e]" >&2; rc=1; }
     exit $rc'
-# The scratch keeps ONE stable shape by default, whatever the workload does:
-# its names are reused on purpose, and a shape that follows the set would
-# re-seed on every switch between sets that spell their layout differently.
-t_assert "cal_scratch_fmt: the scratch shape is stable by default, mirrored only on request" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/set" "$d/flat"
+# ONE dataset for calibration and execution: a set whose filename_format can
+# address the grid ($filenum AND $jobnum, no $jobname) is measured on the
+# workload's own files; anything else falls back to the private scratch.
+t_assert "cal_namespace: grid-addressable formats unify, the rest fall back to the scratch" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set" "$d/flat" "$d/named"
     printf "# report iops\n[global]\nfilename_format=\$filenum/\$jobnum\n[a]\nrw=randread\n" > "$d/set/031-a.job"
     printf "# report iops\n[global]\n[a]\nrw=randread\n" > "$d/flat/031-a.job"
-    a=$( (source ./wekatester; cal_scratch_fmt "$d/set") )
-    b=$( (source ./wekatester; cal_scratch_fmt "$d/flat") )
-    c=$( (source ./wekatester; CAL_FMT_PARITY=1; cal_scratch_fmt "$d/set") )
-    e=$( (source ./wekatester; CAL_FMT_PARITY=1; cal_scratch_fmt "$d/flat") )
-    [ "$a" = "\$jobnum.\$filenum" ] && [ "$b" = "\$jobnum.\$filenum" ] &&
-    [ "$c" = "\$filenum/\$jobnum" ] && [ "$e" = "\$jobnum.\$filenum" ]'
+    printf "# report iops\n[global]\nfilename_format=\$jobname.\$jobnum.\$filenum\n[a]\nrw=randread\n" > "$d/named/031-a.job"
+    a=$( (source ./wekatester; cal_namespace "$d/set") )
+    b=$( (source ./wekatester; cal_namespace "$d/flat") )
+    c=$( (source ./wekatester; cal_namespace "$d/named") )
+    [ "$a" = "unified \$filenum/\$jobnum" ] || { echo "set: $a" >&2; false; }
+    [ "$b" = "scratch \$jobnum.\$filenum" ] || { echo "flat: $b" >&2; false; }
+    [ "$c" = "scratch \$jobnum.\$filenum" ] || { echo "named: $c" >&2; false; }'
+# The unified namespace measures on the exact files the staged jobs run:
+# same destination directory, same host-prefixed format, no .wekatester-cal.
+t_assert "calibrate: a unified set measures on the workload's own files" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac; cal_json 1000; }
+     calibrate) 2>&1 )
+    case "$out" in
+        *"measuring on the workload"*"own files"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    f=$(ls "$d/cal/h1/"cal-bw-read-qd1*.job | head -1) &&
+    grep -q "^directory=/mnt/weka$" "$f" &&
+    grep -q "^filename_format=h1.\$filenum/\$jobnum$" "$f" &&
+    # the seed names the same files the staged jobs will open
+    grep -q "^filename=h1.0/0:h1.1/0$" "$d/cal/h1/cal-seed.job" &&
+    grep -q "^directory=/mnt/weka$" "$d/cal/h1/cal-seed.job" &&
+    grep -q "^filesize=5120M$" "$d/cal/h1/cal-seed.job"'
 t_assert "cal_scratch_dirs: every directory the names imply, once" bash -c '
     out=$( (source ./wekatester; cal_scratch_dirs h1 "\$filenum/\$jobnum" 3 1) | tr "\n" " " )
     [ "$out" = "h1.cal.0 h1.cal.1 " ] || { echo "$out" >&2; false; }
