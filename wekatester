@@ -1257,7 +1257,15 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             printf '[global]\n'
             printf 'directory=%s%s\n' "$hd" "${CAL_NS_DIR-/$CAL_SCRATCH}"
             printf 'unique_filename=0\n'
-            printf 'filename_format=%s%s%s\n' "$host" "${CAL_SEP:-.cal.}" "${CAL_FMT:-\$jobnum.\$filenum}"
+            # unified reads measure the SHARED dataset -- every client reads
+            # the same files, which is both the realistic fleet workload and
+            # what lets one dense read set serve any number of clients.
+            # Writes always own their files per client (leases).
+            if [ "${CAL_NS_DIR-unset}" = "" ] && [ "$dirn" = read ]; then
+                printf 'filename_format=shared.%s\n' "${CAL_FMT:-\$jobnum.\$filenum}"
+            else
+                printf 'filename_format=%s%s%s\n' "$host" "${CAL_SEP:-.cal.}" "${CAL_FMT:-\$jobnum.\$filenum}"
+            fi
             printf 'ioengine=%s\n' "$eng"
             printf 'direct=1\n'
             printf 'bs=%s\n' "$bs"
@@ -2294,6 +2302,48 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         wait "${pids[$i]}" \
             || die "${hs[$i]}: cannot inspect the calibration scratch or its free space"
     done
+    # In the unified namespace the READ union is a fleet-shared dataset:
+    # every client's read cells and staged read tests open the same
+    # "shared." files, so the set must cover the WIDEST job count any
+    # participating host runs, and its seeding is SLICED evenly across the
+    # seeding hosts -- N clients each write 1/N of it, in parallel.
+    local unified=0 seeders=0 sidx widen_nj shared_nj=1 rl wl rsizes wsizes dense_write tlist
+    [ "${CAL_NS_DIR-unset}" != "" ] || unified=1
+    widen_nj() {   # widen_nj <nj> -> the split/level-widened count
+        local w=$1 spct
+        if [ "${CAL_SPLIT:-0}" -eq 1 ] && ! brutal_mode; then
+            for spct in $CAL_SPLIT_PCT; do
+                case "$spct" in (""|*[!0-9]*) continue ;; esac
+                [ "$spct" -gt 100 ] || continue
+                [ $(( $1 * spct / 100 )) -le "$w" ] || w=$(( $1 * spct / 100 ))
+            done
+        fi
+        if brutal_mode; then
+            for spct in $BRUTAL_NJ; do
+                case "$spct" in (""|*[!0-9]*) continue ;; esac
+                [ "$spct" -gt 100 ] || continue
+                [ $(( $1 * spct / 100 )) -le "$w" ] || w=$(( $1 * spct / 100 ))
+            done
+        fi
+        printf '%s\n' "$w"
+    }
+    if [ "$unified" -eq 1 ]; then
+        # fleet max over every RUN host (a geometry-cached host still runs
+        # its staged read tests against the shared set), read ladders only
+        for host in "${HOSTS[@]:-$@}"; do
+            while read -r sty sdi; do
+                [ "$sdi" = read ] || continue
+                spair=$(cal_cpus_nj "$host" "$sty" "$sdi") \
+                    || die "$host: cannot size the shared read set"
+                read -r scpus snj <<<"$spair"
+                snj=$(widen_nj "$snj")
+                [ "$snj" -le "$shared_nj" ] || shared_nj=$snj
+            done <<SHAREDNJEOF
+$ladders
+SHAREDNJEOF
+        done
+    fi
+    seeders=$#; sidx=0
     for host in "$@"; do
         # The ladders THIS host still needs (its seedplan, written by
         # calibrate); a direct caller without a plan seeds the set-wide
@@ -2304,12 +2354,29 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         else
             hl=$ladders
         fi
-        sizes=$(cal_seed_sizes "$hl") || die "$host: cannot compute the calibration seed plan"
+        # Two unions now. Reads: the set-wide union (the shared dataset is
+        # fleet property, not this host's). Writes: this host's own plan --
+        # per-client files, because concurrent cross-client writes to shared
+        # files measure lease arbitration, not the client.
+        if [ "$unified" -eq 1 ]; then
+            rl=$(printf '%s\n' "$ladders" | grep " read$" || true)
+        else
+            rl=$(printf '%s\n' "$hl" | grep " read$" || true)
+        fi
+        wl=$(printf '%s\n' "$hl" | grep " write$" || true)
+        rsizes=""; wsizes=""
+        [ -z "$rl" ] || rsizes=$(cal_seed_sizes "$rl") \
+            || die "$host: cannot compute the read seed plan"
+        [ -z "$wl" ] || wsizes=$(cal_seed_sizes "$wl") \
+            || die "$host: cannot compute the write seed plan"
+        # Truncate-seeding for the write set "where appropriate": sequential
+        # writes measure the same over a truncated sparse file as a dense one
+        # (isca224 A/B 2026-08-25: -0.8%, within the run-to-run band), but 4k
+        # random writes pay the extent-map insert on every hole (-6.7%), so
+        # any 4k-random write phase in the plan forces the dense seed.
+        dense_write=0
+        printf '%s\n' "$wl" | grep -qE "^(iops|lat) write$" && dense_write=1
         hd=$(host_dir "$host")
-        # The seed creates files for the WIDEST job count any planned ladder
-        # will run -- nj is per (type, direction) now, because the host file
-        # can pin it per slot, and a rung whose files stop at job 45 measures
-        # a short read on job 46.
         cpus=""; nj=1
         while read -r sty sdi; do
             [ -n "$sty" ] || continue
@@ -2321,26 +2388,7 @@ cal_seed_scratch() {   # cal_seed_scratch <host>...
         done <<SEEDNJEOF2
 $hl
 SEEDNJEOF2
-        # A CAL_SPLIT percentage above 100 runs MORE jobs than cores at the
-        # winning depth, and job n needs file n: seed the widest split too, or
-        # the widening test measures short files instead of wide parallelism.
-        if [ "${CAL_SPLIT:-0}" -eq 1 ] && ! brutal_mode; then
-            for spct in $CAL_SPLIT_PCT; do
-                case "$spct" in (""|*[!0-9]*) continue ;; esac
-                [ "$spct" -gt 100 ] || continue
-                [ $(( nj * spct / 100 )) -le "$nj" ] || nj=$(( nj * spct / 100 ))
-            done
-        fi
-        # brutal runs the whole grid once per BRUTAL_NJ level, and a level
-        # above 100% runs more jobs than cores -- job n needs file n, so the
-        # seed has to cover the widest level or those cells read short files
-        if brutal_mode; then
-            for spct in $BRUTAL_NJ; do
-                case "$spct" in (""|*[!0-9]*) continue ;; esac
-                [ "$spct" -gt 100 ] || continue
-                [ $(( nj * spct / 100 )) -le "$nj" ] || nj=$(( nj * spct / 100 ))
-            done
-        fi
+        nj=$(widen_nj "$nj")
         eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
         if [ -z "$eng" ] && [ -f "$WORK_DIR/engine.results" ]; then
             eng=$(awk -v h="$host" '$1 == h && $3 == "ok" {print $2; exit}' \
@@ -2351,10 +2399,15 @@ SEEDNJEOF2
         # fio never mkdirs. A flat shape needs nothing beyond the scratch
         # root (already created); a subdirectory shape needs its directories
         # before the seed writes a single file into them.
-        maxf=$(printf '%s\n' "$sizes" | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
+        maxf=$(printf '%s\n' "$rsizes" "$wsizes" | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
         subdirs=$(cal_scratch_dirs "$host" "${CAL_SEP:-.cal.}" \
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
             || die "$host: cannot derive the calibration namespace directories"
+        if [ "$unified" -eq 1 ] && [ -n "$rsizes" ]; then
+            subdirs="$subdirs
+$(cal_scratch_dirs shared "." "$CAL_FMT" "$shared_nj" "$maxf")" \
+                || die "$host: cannot derive the shared dataset directories"
+        fi
         if [ -n "$subdirs" ]; then
             # one mkdir -p with every directory as an argument -- the earlier
             # sed/tr chain left a trailing "&&" that no field run had ever
@@ -2370,32 +2423,88 @@ SUBDIREOF
             run_host "$host" "$cmd" \
                 || die "$host: cannot create the calibration namespace subdirectories"
         fi
-        want=$(python3 - "$host" "$nj" "$sizes" \
+        tlist="$WORK_DIR/cal/$host/truncate.list"
+        want=$(python3 - "$host" "$nj" "$rsizes" "$wsizes" \
                    "$hd${CAL_NS_DIR-/$CAL_SCRATCH}" "$eng" "$cpus" \
                    "$WORK_DIR/cal/$host/cal-seed.job" \
                    "$WORK_DIR/cal/$host/scratch.list" \
-                   "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" <<'PYEOF'
+                   "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" \
+                   "$unified" "$shared_nj" "$sidx" "$seeders" \
+                   "$dense_write" "$tlist" <<'PYEOF'
 import sys
 
-host, nj, sizes_raw, directory, eng, cpus, outpath, listpath, fmt, sep = sys.argv[1:11]
-need = {}
-for line in sizes_raw.splitlines():
-    f, mib = line.split()
-    need[int(f)] = int(mib)
+(host, nj, rsizes_raw, wsizes_raw, directory, eng, cpus, outpath, listpath,
+ fmt, sep, unified, shared_nj, sidx, seeders, dense_write,
+ tlistpath) = sys.argv[1:18]
+
+def union(raw):
+    out = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        f, mib = line.split()
+        out[int(f)] = int(mib)
+    return out
+
+rneed, wneed = union(rsizes_raw), union(wsizes_raw)
 have = {}
 for line in open(listpath):
     p = line.split()
     if len(p) == 2 and p[1].isdigit():
         have[p[0]] = int(p[1])
-todo, mib_total = [], 0
+
+def name_for(prefix, j, f):
+    return (prefix + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
+
+todo, mib_total, trunc = [], 0, []
+# The SHARED read dataset, sliced evenly across the seeding hosts: every
+# host checks the whole set for sufficiency but seeds only every Nth file,
+# so N clients lay it out together at the fleet's aggregate write bandwidth.
+if unified == "1" and rneed:
+    i = 0
+    for j in range(int(shared_nj)):
+        for f, mib in sorted(rneed.items()):
+            name = name_for("shared.", j, f)
+            mine = (i % int(seeders)) == int(sidx)
+            i += 1
+            if not mine or have.get(name, 0) >= mib * 1024 * 1024:
+                continue
+            todo.append((j, f, name, mib))
+            mib_total += mib
+elif rneed:
+    # scratch fallback: reads stay on this host's own files, as ever
+    for j in range(int(nj)):
+        for f, mib in sorted(rneed.items()):
+            name = name_for(host + sep, j, f)
+            if have.get(name, 0) >= mib * 1024 * 1024:
+                continue
+            todo.append((j, f, name, mib))
+            mib_total += mib
+# This host's WRITE set. Dense when any 4k-random write phase uses it (the
+# extent-map insert costs a measured 6.7% on holes); truncate-seeded
+# otherwise -- sequential writes measure the same over sparse (-0.8%, in
+# the noise), and truncation is a metadata op, not a 40-minute layout.
 for j in range(int(nj)):
-    for f, mib in sorted(need.items()):
-        name = (host + sep + fmt).replace("$jobnum", str(j)) \
-                                  .replace("$filenum", str(f))
+    for f, mib in sorted(wneed.items()):
+        name = name_for(host + sep, j, f)
         if have.get(name, 0) >= mib * 1024 * 1024:
-            continue          # already big enough: a cell just uses a prefix
-        todo.append((j, f, name, mib))
-        mib_total += mib
+            continue
+        if unified == "1" and dense_write == "0":
+            trunc.append((name, mib))
+        else:
+            todo.append((j, f, name, mib))
+            mib_total += mib
+with open(tlistpath, "w") as fh:
+    fh.write("".join(f"{n} {m}\n" for n, m in trunc))
+# dedupe: a file can appear in both unions only in the scratch fallback,
+# where read and write phases still share this host's files
+seen, dedup = set(), []
+for j, f, name, mib in todo:
+    if name in seen:
+        continue
+    seen.add(name)
+    dedup.append((j, f, name, mib))
+todo = dedup
 # fallocate=none: see generate_layout. The incremental skip below trusts
 # size, which is only sound if a partial write leaves a short file.
 out = ["[global]", "directory=%s" % directory, "unique_filename=0",
@@ -2428,13 +2537,29 @@ if sections > 4000:
              "4096 jobs; narrow BRUTAL_NRS or seed in stages" % sections)
 with open(outpath, "w") as fh:
     fh.write("\n".join(out) + "\n")
-print(len(todo), mib_total)
+print(len(todo), mib_total, len(trunc))
 PYEOF
               ) || die "$host: cannot build the calibration seed"
         # NB: no "set --" here -- it would clobber the host list in "$@"
-        nfiles=${want%% *}; nmib=${want##* }
+        read -r nfiles nmib ntrunc <<<"$want"
         [ "${nfiles:-0}" -eq 0 ] || seedrun+=("$host")
-        debug "cal: $host: seed needs ${nfiles:-0} file(s), ${nmib:-0} MiB"
+        debug "cal: $host: seed needs ${nfiles:-0} dense file(s), ${nmib:-0} MiB, ${ntrunc:-0} truncate(s)"
+        if [ "${ntrunc:-0}" -gt 0 ]; then
+            # sparse write canvases: st_size set by truncate, bytes land as
+            # the write cells put them there. Chunked so the command string
+            # stays small; the size is uniform (one normalized FILESIZE_MIB).
+            tmib=$(awk 'NR==1 {print $2}' "$tlist")
+            awk '{print $1}' "$tlist" | while IFS= read -r tn || [ -n "$tn" ]; do
+                printf "'%s' " "$tn"
+            done | xargs -n 64 | while IFS= read -r tchunk; do
+                run_host "$host" "cd '$hd${CAL_NS_DIR-/$CAL_SCRATCH}' && truncate -s ${tmib}M $tchunk" \
+                    || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
+            done
+            [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
+                || die "$host: cannot truncate-seed the write set"
+            log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
+        fi
+        sidx=$((sidx + 1))
         if [ "${nmib:-0}" -gt 0 ]; then
             read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
             case "$availmib" in
@@ -2765,8 +2890,11 @@ calibrate() {
         || die "cannot derive the calibration namespace from $capdir"
     read -r CAL_NS CAL_FMT <<<"$nsline"
     if [ "$CAL_NS" = unified ]; then
+        for host in "${HOSTS[@]}"; do
+            [ "$host" != shared ] || die "the host name 'shared' is reserved for the fleet-shared read dataset"
+        done
         CAL_NS_DIR=""; CAL_SEP="."
-        log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- the seed lays out exactly what the staged jobs run on"
+        log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
     else
         CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
         log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
@@ -2903,9 +3031,28 @@ PYEOF
         local ucmd
         for host in "${HOSTS[@]}"; do
             if [ -z "$CAL_NS_DIR" ]; then
-                # unified: the dataset is the workload's namespace at the
-                # destination -- delete by the same glob the sweep uses, then
-                # prune the directories the names implied
+                # unified: this host's write set, and -- from the first host
+                # only -- the fleet-shared read set, deleted by the same glob
+                # derivation the sweep uses
+                if [ "$host" = "${HOSTS[0]}" ]; then
+                    ucmd=$(pyrun shared "." "$CAL_FMT" "$(host_dir "$host")" <<'UNLSEOF'
+import re
+import sys
+
+host, sep, fmt, hd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+pat = host + sep + fmt
+glob = re.sub(r"\$\w+", "*", pat)
+depth = 1 + glob.count("/")
+cmd = f"find '{hd}' -maxdepth {depth} -type f -path '{hd}/{glob}' -delete"
+if "/" in glob:
+    dglob = glob.rsplit("/", 1)[0]
+    cmd += f" && find '{hd}' -maxdepth {depth - 1} -type d -path '{hd}/{dglob}' -empty -delete"
+print(cmd)
+UNLSEOF
+                    ) || die "cannot derive the shared dataset removal command"
+                    run_host "$host" "$ucmd" \
+                        || log "WARNING: could not remove the shared dataset" >&2
+                fi
                 ucmd=$(pyrun "$host" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")" <<'UNLEOF'
 import re
 import sys
@@ -3691,6 +3838,10 @@ src, work, tier, directory = sys.argv[1:5]
 # max's rules with measured knees layered on top -- printing "max" there
 # read as the wrong mode being used)
 label = os.environ.get("WEKATESTER_TIER_LABEL") or tier
+# the unified namespace splits the STAGED jobs the same way it splits the
+# calibration cells: read-only jobs run on the fleet-shared dataset, anything
+# that writes runs on this host's own files
+ns_unified = os.environ.get("WEKATESTER_NS", "").startswith("unified")
 ignore_capacity = sys.argv[5] == "1"
 targets_path = sys.argv[6]
 hosts = sys.argv[7:]
@@ -3853,6 +4004,13 @@ def derive_layout_variant(h):
         if j in layout_set: continue
         vlines = open(os.path.join(work, "jobs", h, j)).read().splitlines()
         fmt = first_value(vlines, "filename_format")
+        # the shared dataset is laid out ONCE: only the first host's layout
+        # job carries its sections, or N clients would race to create (and
+        # the sweep to credit) the same files N times over
+        if fmt and fmt.startswith("shared.") and h != hosts[0]:
+            eng = first_value(vlines, "ioengine")
+            if eng: engines[eng] = engines.get(eng, 0) + 1
+            continue
         if fmt:
             key, section, out_fmt = fmt, None, fmt
         else:
@@ -3925,6 +4083,13 @@ for job in jobs:
         # host file still keeps the list AS WRITTEN; only what executes is
         # declared here, so calibration and measurement cannot disagree.
         out = override(out, "cpus_allowed", fmt_cpulist(usable_for(h)))
+        if ns_unified and file_directions(lines) == {"read"}:
+            # a read-only job measures the SHARED dataset: same files for
+            # every client, exactly the files the read cells calibrated on.
+            # stamp_unique_names leaves "shared." formats alone.
+            _fmt = first_value(lines, "filename_format")
+            out = override(out, "filename_format",
+                           "shared." + (_fmt or "$jobname.$jobnum.$filenum"))
 
         is_latency = "latency" in items
         is_bw = "bandwidth" in items and not is_latency
@@ -4144,6 +4309,8 @@ for h in hosts:
             layout_total += layout_footprint(p)
             continue
         ns = job_value(p, "filename_format", "") or f"__default__:{job}"
+        if ns.startswith("shared.") and h != hosts[0]:
+            continue   # the fleet-shared dataset is priced once, on host one
         namespaces[ns] = max(namespaces.get(ns, 0), footprint(p))
     required = max(sum(namespaces.values()), layout_total)
     # bytes the sweep verified as already laid out serve both the layout and
@@ -5178,6 +5345,7 @@ stage_variants() {
         tuner_tier=$AUTO_LEVEL
         cal_mode && tuner_tier=max
         WEKATESTER_TIER_LABEL=$AUTO_LEVEL \
+        WEKATESTER_NS="$(cal_namespace "$srcdir")" \
         auto_tune "$srcdir" "$WORK_DIR" "$tuner_tier" "$DIRECTORY" \
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
@@ -5344,7 +5512,7 @@ for name in sorted(os.listdir(jobsdir)):
         s = l.strip()
         if s.startswith("filename_format="):
             val = s.split("=", 1)[1]
-            if "$clientuid" not in val:
+            if "$clientuid" not in val and not val.startswith("shared."):
                 l = "filename_format=" + host + "." + val
         elif s.startswith("unique_filename="):
             continue   # replaced by the forced 0 below

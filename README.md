@@ -441,13 +441,29 @@ pins its own `fs` still wins, as host files always do.
 
 **Calibration measures on the workload's own files** whenever the set's
 `filename_format` can address the grid (both `$filenum` and `$jobnum`, no
-`$jobname`): the seed lays out the exact files the staged jobs will run —
-same directory, same host-prefixed names, same size — so the staged layout
-pass finds everything in place, the sweep credits it (one normalized size
-means no file is ever smaller than a section expects), and the capacity check
-counts it once. Sets whose format cannot express the grid fall back to the
-private `.wekatester-cal` scratch exactly as before. `-u` removes whichever
-dataset the run measured on.
+`$jobname`), and the dataset splits along the read/write line:
+
+- **Reads — one fleet-shared dataset** (`shared.<fmt>`). Every client's read
+  cells and staged read tests open the *same* files: that is the realistic
+  fleet workload, it lets one dense set serve any number of clients, and its
+  seeding is **sliced evenly across the participating clients** — N clients
+  lay it out together at the fleet's aggregate write bandwidth. The set is
+  sized by the widest job count any participating host runs. The layout job
+  carries its sections on the first host only, so N clients never race to
+  create (or the capacity check to price) the same files N times. The host
+  name `shared` is reserved.
+- **Writes — per-client sets** (`<host>.<fmt>`), because concurrent
+  cross-client writes to shared files measure lease arbitration, not the
+  client. Seeding is **truncate where appropriate**: a plan whose write
+  phases are all sequential gets sparse truncate-created files (measured on
+  isca224 2026-08-25: −0.8% vs dense, inside the run-to-run band — a metadata
+  op instead of a layout), while any 4k-random write phase (iops-write,
+  lat-write) forces the dense seed (holes cost a measured 6.7% on the
+  extent-map insert).
+
+Sets whose format cannot express the grid fall back to the private
+`.wekatester-cal` scratch exactly as before. `-u` removes the per-client
+sets, and — from the first host — the shared dataset.
 
 **The calibration dataset is seeded once, incrementally, and kept.** Every
 rung of every ladder reads `<host>.cal.<job>.<filenum>` (or the workload's own

@@ -2997,6 +2997,84 @@ t_assert "cal_seed_scratch: BRUTAL_NJ above 100 widens the seed to the extra job
     grep -q "^\[seed-3-" "$d/cal/h1/cal-seed.job" &&
     ! grep -q "^\[seed-4-" "$d/cal/h1/cal-seed.job"'
 
+# Write cells stay per-client even in the unified namespace: concurrent
+# cross-client writes to shared files measure lease arbitration, not the
+# client. And a sequential-write-only plan truncate-seeds its write set,
+# while any 4k-random write phase forces the dense seed (the measured 6.7%
+# extent-map insert penalty).
+t_assert "calibrate: unified write cells are per-host; bw-only write sets truncate-seed" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-a.job"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { echo "RH: $2" >> "$d/oplog"; case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac; cal_json 1000; }
+     calibrate) 2>&1 )
+    f=$(ls "$d/cal/h1/"cal-bw-write-qd1*.job | head -1) &&
+    grep -q "^filename_format=h1.\$filenum/\$jobnum$" "$f" &&
+    # no dense sections were seeded; the write canvas was truncated instead
+    [ "$(grep -c "^\[seed-" "$d/cal/h1/cal-seed.job")" = 0 ] &&
+    grep -q "^h1.0/0 5120$" "$d/cal/h1/truncate.list" &&
+    grep -q "truncate -s 5120M" "$d/oplog" &&
+    case "$out" in
+        *"truncate-seeded 8 write file(s)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "calibrate: a 4k-random write phase forces the dense write seed" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report iops\n[global]\nfilename_format=\$filenum/\$jobnum\nbs=4k\n[a]\nrw=randwrite\n" > "$d/set/032-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac; cal_json 1000; }
+     calibrate) >/dev/null 2>&1
+    # dense sections for the host write set, and nothing truncated
+    grep -q "^filename=h1.0/0:h1.1/0$" "$d/cal/h1/cal-seed.job" &&
+    [ ! -s "$d/cal/h1/truncate.list" ]'
+# The shared read set is seeded ONCE, sliced evenly across the seeding hosts.
+t_assert "cal_seed_scratch: the shared read set is sliced evenly across seeders" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal/h1" "$d/cal/h2"
+    printf "ncpus 2\n" > "$d/probe/h1"; printf "ncpus 2\n" > "$d/probe/h2"
+    printf "bw read\n" > "$d/cal/seedplan.h1"; printf "bw read\n" > "$d/cal/seedplan.h2"
+    (source ./wekatester
+     WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka; CAL_SETTLE=0
+     CAL_NS_DIR=""; CAL_SEP="."; CAL_FMT="\$jobnum.\$filenum"
+     HOSTS=(h1 h2); ladders="bw read"
+     run_host() { case "$2" in
+         (*find*) return 0;;
+         (*df*)   echo "wekafs 99999999999 999999999";;
+         (*)      return 0;;
+     esac; }
+     cal_seed_scratch h1 h2) >/dev/null 2>&1
+    a=$(grep -h "^filename=" "$d/cal/h1/cal-seed.job" | tr "\n" " ")
+    b=$(grep -h "^filename=" "$d/cal/h2/cal-seed.job" | tr "\n" " ")
+    # 2 jobs x 2 files = 4 shared names, dealt alternately: no overlap, full cover
+    [ "$a" = "filename=shared.0.0 filename=shared.1.0 " ] || { echo "h1: [$a]" >&2; false; }
+    [ "$b" = "filename=shared.0.1 filename=shared.1.1 " ] || { echo "h2: [$b]" >&2; false; }'
+# Staged read-only jobs run on the shared dataset; write jobs stay host-owned.
+t_assert "tuner: unified staging sends read-only jobs to the shared dataset" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nrw=read\n" > "$FIX/src/011-r.job"
+    printf "# report bandwidth\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nrw=write\n" > "$FIX/src/012-w.job"
+    (source ./wekatester
+     WEKATESTER_NS="unified \$filenum/\$jobnum" \
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "" h1 h2) >/dev/null 2>&1
+    grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h1/011-r.job" &&
+    grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h2/011-r.job" &&
+    grep -q "^filename_format=\$filenum/\$jobnum$" "$FIX/jobs/h1/012-w.job"'
+
 # A write cell leaves a destage backlog, and the next cell starts inside it:
 # on the first field runs every read surface was smooth while the write
 # surfaces carried the previous cell's debt. Write cells settle; reads never.
@@ -3634,22 +3712,26 @@ t_assert "calibrate: a unified set measures on the workload's own files" bash -c
      copy_to_master() { :; }
      run_host() {
          # every command must at least be valid shell: the subdir mkdir once
-         # carried a trailing && that only a real bash would have rejected
-         command bash -nc "$2" || { echo "MALFORMED COMMAND: $2" >&2; return 1; }
+         # carried a trailing && that only a real bash would have rejected.
+         # Plain bash, NOT `command bash`: the command builtin before an
+         # external in a backgrounded group exec-replaces the subshell and
+         # silently skips everything after it (found the hard way).
+         bash -nc "$2" || { echo "MALFORMED COMMAND: $2" >&2; return 1; }
          case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
          (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac; cal_json 1000; }
      calibrate) 2>&1 )
     case "$out" in
-        *"measuring on the workload"*"own files"*) true;;
+        *"measuring on the workload"*"reads on the shared dataset"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     f=$(ls "$d/cal/h1/"cal-bw-read-qd1*.job | head -1) &&
     grep -q "^directory=/mnt/weka$" "$f" &&
-    grep -q "^filename_format=h1.\$filenum/\$jobnum$" "$f" &&
-    # the seed names the same files the staged jobs will open
-    grep -q "^filename=h1.0/0:h1.1/0$" "$d/cal/h1/cal-seed.job" &&
+    # read cells measure the fleet-shared dataset, not per-host files
+    grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$f" &&
+    # and the seed lays out exactly those shared names, densely, at 5G
+    grep -q "^filename=shared.0/0:shared.1/0$" "$d/cal/h1/cal-seed.job" &&
     grep -q "^directory=/mnt/weka$" "$d/cal/h1/cal-seed.job" &&
     grep -q "^filesize=5120M$" "$d/cal/h1/cal-seed.job"'
 t_assert "cal_scratch_dirs: every directory the names imply, once" bash -c '
