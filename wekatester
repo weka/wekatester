@@ -2356,10 +2356,18 @@ SEEDNJEOF2
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
             || die "$host: cannot derive the calibration namespace directories"
         if [ -n "$subdirs" ]; then
-            cmd=$(printf '%s\n' "$subdirs" \
-                  | sed "s|^|mkdir -p '$hd${CAL_NS_DIR-/$CAL_SCRATCH}/|;s|\$|' \&\&|" \
-                  | tr '\n' ' ')
-            run_host "$host" "${cmd% &&}" \
+            # one mkdir -p with every directory as an argument -- the earlier
+            # sed/tr chain left a trailing "&&" that no field run had ever
+            # executed (the scratch's flat names imply no subdirectories), and
+            # the first unified run died on the syntax error
+            cmd="mkdir -p"
+            while IFS= read -r sd; do
+                [ -n "$sd" ] || continue
+                cmd="$cmd '$hd${CAL_NS_DIR-/$CAL_SCRATCH}/$sd'"
+            done <<SUBDIREOF
+$subdirs
+SUBDIREOF
+            run_host "$host" "$cmd" \
                 || die "$host: cannot create the calibration namespace subdirectories"
         fi
         want=$(python3 - "$host" "$nj" "$sizes" \

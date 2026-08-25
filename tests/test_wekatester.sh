@@ -3632,7 +3632,11 @@ t_assert "calibrate: a unified set measures on the workload's own files" bash -c
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; CAL_SPLIT=0
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
-     run_host() { case "$2" in
+     run_host() {
+         # every command must at least be valid shell: the subdir mkdir once
+         # carried a trailing && that only a real bash would have rejected
+         command bash -nc "$2" || { echo "MALFORMED COMMAND: $2" >&2; return 1; }
+         case "$2" in
          (*mkdir*|*rm\ -rf*|*find*) return 0;;
          (*df*) echo "wekafs 999999999 99999999"; return 0;;
      esac; cal_json 1000; }
