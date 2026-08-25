@@ -319,6 +319,16 @@ having drawn a contended window on its single pass &mdash; not a correction to
 the winner's number, which needs none. Set it to 0 and the grid's own maximum
 stands.
 
+**Write cells settle.** A write cell leaves a destage backlog, and without a
+settle the next cell starts inside it. The first field runs showed exactly
+that: every read surface was smooth, while the write surfaces carried the
+previous cell's debt — the cell after a deep-queue write read 2% of best, and
+at 5-second cells an entire write grid came back as a checkerboard. Every
+write cell (grid and confirm) now settles `CAL_SETTLE` (10s) before the next,
+which adds ~11 minutes per write grid at the defaults. Do not run brutal's
+write grids with very short cells even so — at `:5` the measured window is
+barely longer than the ramp.
+
 **The in-flight guard.** A cell holds `numjobs &times; iodepth &times; bs` of
 buffers &mdash; at the deep corner of a bandwidth grid that is real memory
 (52 jobs &times; qd 128 &times; 1MiB is 6.7GiB). A cell needing more than

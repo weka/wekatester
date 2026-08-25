@@ -1994,6 +1994,15 @@ brutal_grids() {   # brutal_grids <ladders>
                     fi
                     cal_cell "$type" "$dirn" "$qd" "$nr" "$fsz" "grid-$type-$dirn" ""
                     cells=$((cells + 1))
+                    # a write cell leaves a destage backlog, and the next cell
+                    # starts inside it. Measured on both field hosts
+                    # (2026-08-24): every read surface was smooth, while the
+                    # write surfaces carried the previous cell's debt -- on
+                    # iscg001 the row after nr1's qd128 cell read 2% of best,
+                    # and at 5s cells the whole bw-write grid was a
+                    # checkerboard. Settle after every write cell so each
+                    # cell measures the client, not its predecessor.
+                    [ "$dirn" != write ] || sleep "$CAL_SETTLE"
                 done
             done
 
@@ -2016,6 +2025,8 @@ brutal_grids() {   # brutal_grids <ladders>
                     cal_cell "$type" "$dirn" "$pairq" "$pairn" "$fsz" \
                         "grid-$type-$dirn" ".c" reuse
                     cells=$((cells + 1))
+                    # same backlog rule as the grid cells above
+                    [ "$dirn" != write ] || sleep "$CAL_SETTLE"
                 done
             fi
 
@@ -2030,7 +2041,8 @@ brutal_grids() {   # brutal_grids <ladders>
                 brutal_surface "$WORK_DIR/cal/grid-$type-$dirn.$host" "$type" \
                     | while IFS= read -r rest; do log "brutal:   $rest"; done
             done
-            [ "$dirn" != write ] || wrote=1
+            # a write grid ends already settled (every write cell settles
+            # above), so it owes the next block nothing -- wrote stays 0
         done
     done
     log "brutal: $cells cell(s) measured${skipped:+, $skipped skipped}"

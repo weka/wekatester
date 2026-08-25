@@ -2934,6 +2934,52 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
     case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
     # the winning tuple lands in cal.results with numjobs left derived
     grep -qx "h1 2 2 1024M - - - - - - - - - - - - -" "$d/cal.results"'
+# A write cell leaves a destage backlog, and the next cell starts inside it:
+# on the first field runs every read surface was smooth while the write
+# surfaces carried the previous cell's debt. Write cells settle; reads never.
+t_assert "brutal_grids: every write cell settles, read cells never do" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
+     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     sleep() { echo "settle $1" >> "$d/settles"; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+         (*MemTotal*) echo 8388608; return 0;;
+     esac; cal_json 1000; }
+     calibrate) >/dev/null 2>&1
+    # the cold seed settles once, then 4 grid cells + 1 confirm, all write,
+    # one settle each -- and nothing else: a settled write grid owes the next
+    # block no settle of its own
+    [ "$(grep -c "^settle 7$" "$d/settles")" = 6 ] ||
+        { echo "settles: $(cat "$d/settles")" >&2; false; }'
+t_assert "brutal_grids: a read-only grid never settles" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
+     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     sleep() { echo "settle $1" >> "$d/settles"; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+         (*MemTotal*) echo 8388608; return 0;;
+     esac; cal_json 1000; }
+     calibrate) >/dev/null 2>&1
+    # exactly the cold seed settle -- no read cell adds one
+    [ "$(grep -c "^settle 7$" "$d/settles")" = 1 ] ||
+        { echo "settled: $(cat "$d/settles")" >&2; false; }'
+
 # The deep corner of a bw grid can ask for more in-flight buffers than a small
 # client has. Skipping is fine; skipping SILENTLY is not.
 t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, not hidden" bash -c '
