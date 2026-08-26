@@ -1328,17 +1328,17 @@ t_assert "brutal_verdict: the highest reading wins, not the steadiest average" b
     d=$(mktemp -d); mkdir -p "$d/cal"
     printf "read 1 2 1000\nread 1 2 700\nread 2 2 900\nread 2 2 900\nread 1 1 100\n" \
         > "$d/cal/grid-bw-read-p100.h1"
-    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
+    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M 4) )
     case "$out" in
         "2 1 100 nrfiles=1 iodepth=2 -> "*"(best of 2 samples; runner-up nrfiles=2 qd=2 at 90.0%; grid spans 10-100% of best over 3 cells)"*) true;;
         *) echo "$out" >&2; false;;
     esac
     # a 2x-numjobs cell that reached higher takes the whole verdict, and the
-    # verdict says which level it came from
+    # verdict names the actual job count, never a percentage
     printf "read 1 2 1050\n" > "$d/cal/grid-bw-read-p200.h1"
-    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M) )
+    out=$( (source ./wekatester; WORK_DIR=$d; brutal_verdict h1 bw read 1024M 4) )
     case "$out" in
-        "2 1 200 nrfiles=1 iodepth=2 at 200% numjobs -> "*) true;;
+        "2 1 200 nrfiles=1 iodepth=2 numjobs=8 (2x available cores: 4) -> "*) true;;
         *) echo "2x: $out" >&2; false;;
     esac'
 t_assert "brutal_surface: the grid as percent-of-best, each cell at its best" bash -c '
@@ -3144,7 +3144,7 @@ t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, n
      calibrate) 2>&1 )
     # 4 jobs x qd128 x 1MiB = 512MiB in flight, past 25% of a 1GiB host
     case "$out" in
-        *"bw-read nr=1 qd=128 nj=100% SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
+        *"bw-read nr=1 qd=128 nj=4 SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     ! grep -q "qd128" "$d/cells" &&
@@ -3578,7 +3578,7 @@ t_assert "calibrate: CAL_SPLIT_PCT above 100 seeds the wider job count and runs 
     grep -q "^\[seed-7-" "$d/cal/h1/cal-seed.job" &&
     grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd1-nr2-nj200.job" &&
     case "$out" in
-        *"numjobs at 200% with qd=1 beats the pick by +20.0%"*) true;;
+        *"numjobs 8 (200% of available cores: 4) with qd=1 beats the pick by +20.0%"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     grep -qx "h1 1 2 5120M 8 - - - - - - - - - - - -" "$d/cal.results"'

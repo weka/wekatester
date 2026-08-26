@@ -1852,15 +1852,18 @@ VERDICTEOF
 # finding. This is the one honest use of a measured spread -- as a
 # significance threshold on a DIFFERENCE, never as a band below a peak.
 cal_refine_verdict() {   # cal_refine_verdict <host> <type> <dirn> <pick_qd> <nr> <fs>
-    python3 - "$WORK_DIR/cal" "$1" "$2" "$3" "$4" "$5" "$6" <<'REFINEEOF'
+    local rnj
+    read -r _ rnj <<<"$(cal_cpus_nj "$1" "$2" "$3")" \
+        || die "$1: cannot resolve the $2 $3 numjobs"
+    python3 - "$WORK_DIR/cal" "$1" "$2" "$3" "$4" "$5" "$6" "$rnj" <<'REFINEEOF'
 import glob
 import os
 import re
 import statistics as st
 import sys
 
-caldir, host, ctype, cdirn, pick, nr, fs = sys.argv[1:8]
-pick, nr = int(pick), int(nr)
+caldir, host, ctype, cdirn, pick, nr, fs, base_nj = sys.argv[1:9]
+pick, nr, base_nj = int(pick), int(nr), int(base_nj)
 
 def rungs(path):
     """{qd: [values]} from a "<dirn> <nr> <qd> <value>" sink."""
@@ -1908,7 +1911,7 @@ for path in sorted(glob.glob(os.path.join(caldir, f"split-{ctype}-{cdirn}-p*.{ho
         continue
     got = max(vals)
     cands.append(((got - base) / base * 100, qd2, nr, pct,
-                  f"numjobs at {pct}% with qd={qd2}"))
+                  f"numjobs {base_nj * pct // 100} ({pct}% of available cores: {base_nj}) with qd={qd2}"))
 for path in sorted(glob.glob(os.path.join(caldir, f"nrt-{ctype}-{cdirn}-n*.{host}"))):
     m = re.search(r"-n(\d+)\.", os.path.basename(path))
     if not m:
@@ -1975,7 +1978,7 @@ brutal_memtotal() {   # brutal_memtotal <host> -> MiB, or nothing if unreadable
 brutal_grids() {   # brutal_grids <ladders>
     local ladders=$1
     local type dirn host qd nr fsz bskib nj mem cap need skip pick rest
-    local njpct qds fnj pct
+    local njpct qds fnj pct bnj
     local cells=0 skipped=0
     local -a todo
     for type in bw iops; do
@@ -2029,7 +2032,7 @@ brutal_grids() {   # brutal_grids <ladders>
                             || skip="$host (${need}MiB in flight vs ${cap}MiB allowed)"
                     done
                     if [ -n "$skip" ]; then
-                        log "brutal: $type-$dirn nr=$nr qd=$qd nj=${njpct}% SKIPPED -- $skip; raise BRUTAL_MEM_FRAC to measure it anyway" >&2
+                        log "brutal: $type-$dirn nr=$nr qd=$qd nj=$(( nj * njpct / 100 )) SKIPPED -- $skip; raise BRUTAL_MEM_FRAC to measure it anyway" >&2
                         skipped=$((skipped + 1))
                         continue
                     fi
@@ -2088,24 +2091,30 @@ brutal_grids() {   # brutal_grids <ladders>
             fi
 
             for host in "${todo[@]}"; do
-                pick=$(brutal_verdict "$host" "$type" "$dirn" "$fsz") \
+                read -r _ bnj <<<"$(cal_cpus_nj "$host" "$type" "$dirn")" \
+                    || die "$host: cannot resolve the $type $dirn numjobs"
+                pick=$(brutal_verdict "$host" "$type" "$dirn" "$fsz" "$bnj") \
                     || die "$host: cannot pick the $type $dirn grid winner"
                 read -r qd nr pct rest <<<"$pick"
                 # a winner from a >100% level records its actual job count --
                 # that count IS part of the winning combination; a 100% winner
                 # leaves nj derived from the usable cores, as always
                 fnj="-"
-                if [ "$pct" -ne 100 ]; then
-                    read -r _ fnj <<<"$(cal_cpus_nj "$host" "$type" "$dirn")" \
-                        || die "$host: cannot resolve the $type $dirn numjobs"
-                    fnj=$(( fnj * pct / 100 ))
-                fi
+                [ "$pct" -eq 100 ] || fnj=$(( bnj * pct / 100 ))
                 printf '%s %s %s %s\n' "$qd" "$nr" "$fsz" "$fnj" \
                     > "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
                 log "brutal: $host $type-$dirn: $rest"
                 for njpct in $BRUTAL_NJ; do
                     [ -s "$WORK_DIR/cal/grid-$type-$dirn-p$njpct.$host" ] || continue
-                    log "brutal:   numjobs at ${njpct}%:"
+                    # headings name the actual job count -- percentages made
+                    # the operator do the arithmetic
+                    if [ "$njpct" -eq 100 ]; then
+                        log "brutal:   numjobs $bnj:"
+                    elif [ $(( njpct % 100 )) -eq 0 ]; then
+                        log "brutal:   numjobs $(( bnj * njpct / 100 )) ($(( njpct / 100 ))x available cores: $bnj):"
+                    else
+                        log "brutal:   numjobs $(( bnj * njpct / 100 )) (${njpct}% of available cores: $bnj):"
+                    fi
                     brutal_surface "$WORK_DIR/cal/grid-$type-$dirn-p$njpct.$host" "$type" \
                         | while IFS= read -r rest; do log "brutal:   $rest"; done
                 done
@@ -2150,9 +2159,9 @@ SHORTEOF
 # can only raise a cell's best, never lower it, so re-measuring the shortlist
 # can promote a cell whose first sample landed in a contended window -- it can
 # never demote one. Prints "<qd> <nr> <njpct> <message>".
-brutal_verdict() {   # brutal_verdict <host> <bw|iops> <read|write> <fsz>
-    local host=$1 ctype=$2 cdirn=$3 fsz=$4
-    python3 - "$WORK_DIR/cal" "$ctype" "$cdirn" "$host" "$fsz" <<'BVEOF'
+brutal_verdict() {   # brutal_verdict <host> <bw|iops> <read|write> <fsz> <base-nj>
+    local host=$1 ctype=$2 cdirn=$3 fsz=$4 bnj=$5
+    python3 - "$WORK_DIR/cal" "$ctype" "$cdirn" "$host" "$fsz" "$bnj" <<'BVEOF'
 import glob
 import os
 import re
@@ -2160,6 +2169,7 @@ import sys
 
 caldir, mode, cdirn, host, fsz = (sys.argv[1], sys.argv[2], sys.argv[3],
                                   sys.argv[4], sys.argv[5])
+base_nj = int(sys.argv[6])
 cells = {}
 for path in sorted(glob.glob(os.path.join(caldir, f"grid-{mode}-{cdirn}-p*.{host}"))):
     m = re.search(r"-p(\d+)\.", os.path.basename(path))
@@ -2187,7 +2197,13 @@ def human(v):
     return "%s/s" % format(int(v), ",")
 
 def njtag(p):
-    return "" if p == 100 else " at %d%% numjobs" % p
+    # actual job counts, never percentages: "numjobs=64 (2x available
+    # cores: 32)" reads without arithmetic
+    if p == 100:
+        return ""
+    if p % 100 == 0:
+        return " numjobs=%d (%dx available cores: %d)" % (base_nj * p // 100, p // 100, base_nj)
+    return " numjobs=%d (%d%% of available cores: %d)" % (base_nj * p // 100, p, base_nj)
 
 runner = ""
 if len(ranked) > 1:
