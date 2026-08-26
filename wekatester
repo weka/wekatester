@@ -1482,20 +1482,17 @@ CAL_NR_CANDIDATES=${CAL_NR_CANDIDATES:-"1 4 8"}   # the nrfiles CAL_NR_RETEST tr
 # (cal_cpus_nj: the host file's cpu list minus weka's pinned cores). Sweeping
 # it as well would multiply a 64-cell grid by another eight and measure
 # combinations that cannot occur in a staged run.
-# The axes are PRUNED from the first field grids (iscg001 and isca224,
-# 2026-08-24, 64 cells per ladder each), not from theory:
-#   - nrfiles was the flattest axis on every surface -- reads within a few
-#     points across all eight rows -- so it keeps its endpoints and a log
-#     spread (1 2 8 32 128) rather than every doubling.
-#   - bw peaked shallow on both hosts (qd1-16) and qd64/128 never beat the
-#     qd16-32 cells by more than a tie, so bw stops at 32.
-#   - iops at qd1/qd2 never reached 25% of best anywhere, so iops starts at 4.
-# BRUTAL_QDS (unset by default) overrides BOTH per-type lists at once; every
-# pruned value is one env var away from coming back.
-BRUTAL_NRS=${BRUTAL_NRS:-"1 2 8 32 128"}
-BRUTAL_BW_QDS=${BRUTAL_BW_QDS:-"1 2 4 8 16 32"}
-BRUTAL_IOPS_QDS=${BRUTAL_IOPS_QDS:-"4 8 16 32 64 128"}
-BRUTAL_NJ=${BRUTAL_NJ:-"100 200"}   # numjobs levels, percent of one job per
+# The grid is a DIAGONAL: nrfiles and iodepth move together (nr = qd = each
+# BRUTAL_STEPS value) against the numjobs levels. Two field grids of the full
+# (nrfiles x iodepth) cross product (iscg001 and isca224, 2026-08-24/25)
+# showed nrfiles to be the flattest axis at every depth and both iops
+# directions collapsing past qd16 -- and once numjobs multiplies, the peak
+# moves shallower still (qd8 at 2x on isca224). Scaling the two together
+# keeps the informative trend (more concurrent streams per job with more in
+# flight per stream) at a quarter of the cells; numjobs is the axis that
+# actually moves the answer, so it gets the levels.
+BRUTAL_STEPS=${BRUTAL_STEPS:-"1 2 4 8 16"}
+BRUTAL_NJ=${BRUTAL_NJ:-"100 200 300"}   # numjobs levels, percent of one job per
                          # usable cpu: the FULL grid runs once per level, so
                          # the default measures every cell at one job per cpu
                          # and again at two. Whether a second job per cpu buys
@@ -1548,19 +1545,6 @@ cal_nr() {   # cal_nr <bw|iops> <read|write>
 
 cal_qds() {   # cal_qds <bw|iops>
     [ "$1" = bw ] && echo "$CAL_BW_QDS" || echo "$CAL_IOPS_QDS"
-}
-
-brutal_qds() {   # brutal_qds <bw|iops>
-    # BRUTAL_QDS overrides BOTH per-type lists, and it is read here rather
-    # than folded into their defaults so setting it after the script is
-    # sourced (tests, wrappers) still takes effect
-    if [ -n "${BRUTAL_QDS:-}" ]; then
-        echo "$BRUTAL_QDS"
-    elif [ "$1" = bw ]; then
-        echo "$BRUTAL_BW_QDS"
-    else
-        echo "$BRUTAL_IOPS_QDS"
-    fi
 }
 
 # Fill '-' geometry in targets.final from the measured knees, one precedence
@@ -1659,7 +1643,7 @@ cal_seed_sizes() {   # cal_seed_sizes <ladders> -> "<filenum> <MiB>" lines
                           # every file the widest grid cell opens: one union
                           # serves every cell and a warm dataset the next run
                           nr=1; fs=$BRUTAL_FILESIZE
-                          for nr2 in $BRUTAL_NRS; do
+                          for nr2 in $BRUTAL_STEPS; do
                               [ "$nr2" -le "$nr" ] || nr=$nr2
                           done
                       else
@@ -2000,21 +1984,21 @@ brutal_grids() {   # brutal_grids <ladders>
             wrote=0
             fsz="${BRUTAL_FILESIZE}M"
             [ "$type" = bw ] && bskib=1024 || bskib=4
-            qds=$(brutal_qds "$type")
             for host in "${todo[@]}"; do
                 rm -f "$WORK_DIR/cal/grid-$type-$dirn-p"*".$host" \
                       "$WORK_DIR/cal/short-$type-$dirn.$host" \
                       "$WORK_DIR/cal/dirwin-$type-$dirn.$host"
             done
-            log "brutal: $type $dirn: $(printf '%s' "$BRUTAL_NRS" | wc -w | tr -d ' ') x $(printf '%s' "$qds" | wc -w | tr -d ' ') cells x $(printf '%s' "$BRUTAL_NJ" | wc -w | tr -d ' ') numjobs level(s) at ${CAL_RUNTIME}s, nrfiles x iodepth, ${BRUTAL_FILESIZE}M per file"
+            log "brutal: $type $dirn: $(printf '%s' "$BRUTAL_STEPS" | wc -w | tr -d ' ') matched nr=qd step(s) x $(printf '%s' "$BRUTAL_NJ" | wc -w | tr -d ' ') numjobs level(s) at ${CAL_RUNTIME}s, ${BRUTAL_FILESIZE}M per file"
 
             # the FULL grid once per numjobs level: whether a second job per
             # cpu buys throughput is the one axis the staged jobs can never
             # explore on their own, because numjobs is otherwise derived
             for njpct in $BRUTAL_NJ; do
               case "$njpct" in (""|*[!0-9]*|0) die "BRUTAL_NJ: not a percentage: $njpct" ;; esac
-              for nr in $BRUTAL_NRS; do
-                for qd in $qds; do
+              for nr in $BRUTAL_STEPS; do
+                qd=$nr   # the diagonal: file count and depth move together
+                {
                     # in-flight guard: numjobs x iodepth x bs of buffers has to
                     # fit, or fio dies at the corner of the grid instead of
                     # reporting it. Cells run fleet-wide, so one host that
@@ -2054,7 +2038,7 @@ brutal_grids() {   # brutal_grids <ladders>
                     # checkerboard. Settle after every write cell so each
                     # cell measures the client, not its predecessor.
                     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
-                done
+                }
               done
             done
 
@@ -2244,13 +2228,22 @@ if best <= 0:
     raise SystemExit(0)
 nrs = sorted({k[0] for k in cells})
 qds = sorted({k[1] for k in cells})
-print("        " + "".join("%6s" % ("qd" + str(q)) for q in qds))
-for nr in nrs:
+if all(nr == qd for nr, qd in cells):
+    # the diagonal grid: one row, each column a matched nr=qd step
+    print("        " + "".join("%7s" % ("nr=qd" + str(q)) for q in qds))
     row = ""
     for q in qds:
-        v = cells.get((nr, q))
-        row += "%6s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
-    print("nr%-5d%s" % (nr, row))
+        v = cells.get((q, q))
+        row += "%7s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
+    print("       %s" % row)
+else:
+    print("        " + "".join("%6s" % ("qd" + str(q)) for q in qds))
+    for nr in nrs:
+        row = ""
+        for q in qds:
+            v = cells.get((nr, q))
+            row += "%6s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
+        print("nr%-5d%s" % (nr, row))
 SURFEOF
 }
 
@@ -2550,7 +2543,7 @@ for (j, mib), names in sorted(groups.items()):
                 "filesize=%dM" % mib]
 if sections > 4000:
     sys.exit("ERROR: the seed needs %d fio sections and fio caps a run at "
-             "4096 jobs; narrow BRUTAL_NRS or seed in stages" % sections)
+             "4096 jobs; narrow BRUTAL_STEPS or seed in stages" % sections)
 with open(outpath, "w") as fh:
     fh.write("\n".join(out) + "\n")
 print(len(todo), mib_total, len(trunc))

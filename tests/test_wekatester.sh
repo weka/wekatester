@@ -1218,6 +1218,7 @@ t_assert "cal_seed_scratch: a brutal-width seed stays far below the fio 4096-job
     printf "bw read\niops read\n" > "$d/cal/seedplan.h1"
     (source ./wekatester
      AUTO_LEVEL=brutal; WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka
+     BRUTAL_STEPS="1 2 4 8 16 32 64 128"; BRUTAL_NJ=100
      CAL_SETTLE=0; ladders=$(printf "bw read\niops read\n")
      run_host() { case "$2" in
          (*find*) return 0;;
@@ -1296,7 +1297,7 @@ t_assert "parse: -a brutal sets the level, and :secs sets the cell duration" bas
 # the largest nrfiles reaches, at the fixed per-file size.
 t_assert "cal_seed_sizes: brutal sizes the union by its widest nrfiles" bash -c '
     out=$( (source ./wekatester; AUTO_LEVEL=brutal
-            BRUTAL_NRS="1 2 4"; BRUTAL_FILESIZE=1024
+            BRUTAL_STEPS="1 2 4"; BRUTAL_FILESIZE=1024
             cal_seed_sizes "bw read
 iops write") | tr "\n" " " )
     [ "$out" = "0 1024 1 1024 2 1024 3 1024 " ] || { echo "$out" >&2; false; }
@@ -2912,7 +2913,7 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
      AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
-     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_STEPS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
      BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
@@ -2924,20 +2925,18 @@ t_assert "brutal_grids: every cell measured, the winner recorded, the surface lo
      echo "$2" >> "$d/cells"
      case "$2" in
          (*qd2-nr2.job*) cal_json 4000;;
-         (*qd2-nr1.job*) cal_json 3000;;
-         (*qd1-nr2.job*) cal_json 2000;;
          (*)             cal_json 1000;;
      esac; }
      calibrate) 2>&1 )
-    # 2x2 grid plus one confirm cell on the winner
-    [ "$(grep -c "qd[0-9]*-nr[0-9]*\.job" "$d/cells")" = 5 ] || { echo "cells: $(grep -c "qd..nr..job" "$d/cells")" >&2; false; }
+    # the 2-step diagonal plus one confirm cell on the winner
+    [ "$(grep -c "qd[0-9]*-nr[0-9]*\.job" "$d/cells")" = 3 ] || { echo "cells: $(grep -c "qd..nr..job" "$d/cells")" >&2; false; }
     grep -q "cal-bw-read-qd1-nr1.job" "$d/cells" &&
     grep -q "cal-bw-read-qd2-nr2.job" "$d/cells" &&
     case "$out" in
-        *"bw-read: nrfiles=2 iodepth=2 -> "*"(best of 2 samples"*"grid spans 25-100% of best over 4 cells"*) true;;
+        *"bw-read: nrfiles=2 iodepth=2 -> "*"(best of 2 samples; runner-up nrfiles=1 qd=1 at 25.0%)"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    case "$out" in *"nr2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
+    case "$out" in *"nr=qd2"*"100%"*) true;; *) echo "no surface table" >&2; false;; esac &&
     # the winning tuple lands in cal.results with numjobs left derived
     grep -qx "h1 2 2 5120M - - - - - - - - - - - - -" "$d/cal.results"'
 # The numjobs axis: the full grid runs once per BRUTAL_NJ level, a 2x cell is
@@ -2952,7 +2951,7 @@ t_assert "brutal_grids: a 2x-numjobs winner records its job count; a 1x winner a
          AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
          TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
          SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
-         BRUTAL_NRS="1"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
+         BRUTAL_STEPS="1 2"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
          BRUTAL_NJ="100 200"
          printf "ncpus 4\n" > "$d/probe/h1"
          copy_to_master() { :; }
@@ -2963,21 +2962,21 @@ t_assert "brutal_grids: a 2x-numjobs winner records its job count; a 1x winner a
          esac
          echo "$2" >> "$d/cells"
          case "$2" in
-             (*qd2-nr1-nj200.job*) cal_json "$v200";;
-             (*qd2-nr1.job*)       cal_json 1000;;
+             (*qd2-nr2-nj200.job*) cal_json "$v200";;
+             (*qd2-nr2.job*)       cal_json 1000;;
              (*)                   cal_json 500;;
          esac; }
          calibrate) > "$d/log" 2>&1
         # the 2x cells must have been staged with doubled jobs
-        grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nr1-nj200.job" || return 1
+        grep -q "^numjobs=8$" "$d/cal/h1/cal-bw-read-qd2-nr2-nj200.job" || return 1
         [ "$(grep -c "nj200.job" "$d/cells")" = 2 ] || return 1
         cat "$d/cal.results"
     }
     # 2x pool reached higher -> winner is qd=2 with nj recorded as 8
     # (4 usable cpus x 200%)
-    run_nj 1200 | grep -qx "h1 2 1 5120M 8 - - - - - - - - - - - -" &&
+    run_nj 1200 | grep -qx "h1 2 2 5120M 8 - - - - - - - - - - - -" &&
     # 1x pool higher -> same qd, nj stays a dash (numjobs derived as always)
-    run_nj 900 | grep -qx "h1 2 1 5120M - - - - - - - - - - - - -"'
+    run_nj 900 | grep -qx "h1 2 2 5120M - - - - - - - - - - - - -"'
 # A BRUTAL_NJ level above 100 needs seed files for the extra jobs: job n
 # opens file n, and a 2x cell with only 1x seed files reads short.
 t_assert "cal_seed_scratch: BRUTAL_NJ above 100 widens the seed to the extra jobs" bash -c '
@@ -2986,7 +2985,7 @@ t_assert "cal_seed_scratch: BRUTAL_NJ above 100 widens the seed to the extra job
     printf "bw read\n" > "$d/cal/seedplan.h1"
     (source ./wekatester
      AUTO_LEVEL=brutal; WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka
-     CAL_SETTLE=0; ladders="bw read"; BRUTAL_NRS="1 2"; BRUTAL_NJ="100 200"
+     CAL_SETTLE=0; ladders="bw read"; BRUTAL_STEPS="1 2"; BRUTAL_NJ="100 200"
      run_host() { case "$2" in
          (*find*) return 0;;
          (*df*)   echo "wekafs 99999999999 999999999";;
@@ -3085,7 +3084,7 @@ t_assert "brutal_grids: every write cell settles, read cells never do" bash -c '
      AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
-     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_STEPS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
      BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
@@ -3096,10 +3095,10 @@ t_assert "brutal_grids: every write cell settles, read cells never do" bash -c '
          (*MemTotal*) echo 8388608; return 0;;
      esac; cal_json 1000; }
      calibrate) >/dev/null 2>&1
-    # the cold seed settles once, then 4 grid cells + 1 confirm, all write,
-    # one settle each -- and nothing else: a settled write grid owes the next
-    # block no settle of its own
-    [ "$(grep -c "^settle 7$" "$d/settles")" = 6 ] ||
+    # the cold seed settles once, then the 2-step diagonal + 1 confirm, all
+    # write, one settle each -- and nothing else: a settled write grid owes
+    # the next block no settle of its own
+    [ "$(grep -c "^settle 7$" "$d/settles")" = 4 ] ||
         { echo "settles: $(cat "$d/settles")" >&2; false; }'
 t_assert "brutal_grids: a read-only grid never settles" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
@@ -3108,7 +3107,7 @@ t_assert "brutal_grids: a read-only grid never settles" bash -c '
      AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=7
-     BRUTAL_NRS="1 2"; BRUTAL_QDS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
+     BRUTAL_STEPS="1 2"; BRUTAL_CONFIRM=1; CAL_RUNTIME=10
      BRUTAL_NJ=100
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
@@ -3132,7 +3131,7 @@ t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, n
      AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
-     BRUTAL_NRS="1"; BRUTAL_QDS="1 128"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
+     BRUTAL_STEPS="1 128"; BRUTAL_CONFIRM=0; CAL_RUNTIME=10
      BRUTAL_NJ=100; BRUTAL_MEM_FRAC=25
      printf "ncpus 4\n" > "$d/probe/h1"
      copy_to_master() { :; }
@@ -3144,7 +3143,7 @@ t_assert "brutal_grids: a cell that cannot fit its in-flight buffers is named, n
      calibrate) 2>&1 )
     # 4 jobs x qd128 x 1MiB = 512MiB in flight, past 25% of a 1GiB host
     case "$out" in
-        *"bw-read nr=1 qd=128 nj=4 SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
+        *"bw-read nr=128 qd=128 nj=4 SKIPPED"*"512MiB in flight vs 256MiB allowed"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
     ! grep -q "qd128" "$d/cells" &&

@@ -281,18 +281,19 @@ number. The default axes are pruned from the first field grids, not from
 theory &mdash; nrfiles was the flattest axis on every surface, bw never won
 deep, iops never won shallow:
 
-| axis | default | pruned away |
-|---|---|---|
-| `BRUTAL_NRS` | 1 2 8 32 128 | 4, 16, 64 (flattest axis everywhere) |
-| `BRUTAL_BW_QDS` | 1 2 4 8 16 32 | 64, 128 (never beat qd16&ndash;32 by more than a tie) |
-| `BRUTAL_IOPS_QDS` | 4 8 16 32 64 128 | 1, 2 (never reached 25% of best) |
-| `BRUTAL_NJ` | 100 200 | &mdash; the full grid at one job per cpu AND at two |
+| axis | default |
+|---|---|
+| `BRUTAL_STEPS` | 1 2 4 8 16 — **nrfiles and iodepth move together** (nr = qd = step) |
+| `BRUTAL_NJ` | 100 200 300 — the diagonal at one, two and three jobs per cpu |
 
-`BRUTAL_QDS` overrides both per-type lists at once, and every pruned value is
-one env var away from coming back. That is 30 cells per (ladder, numjobs
-level), **60 per ladder, 240 for a full set** &mdash; about the wall clock of
-the old 64-cell single-level grid, with the numjobs axis included.
-`-a brutal:10` sets the measured seconds per cell.
+The full cross product ran twice in the field and earned its own retirement:
+nrfiles was the flattest axis at every depth, both iops directions collapsed
+past qd16, and once numjobs multiplies the peak moves shallower still. The
+matched diagonal keeps the informative trend — more concurrent streams per
+job with more in flight per stream — at a quarter of the cells, and numjobs,
+the axis that actually moves the answer, gets the levels. That is **15 cells
+per ladder, 60 for a full set** (~18 min of measuring at `:15` with the write
+settles), and a fourth level is `BRUTAL_NJ="100 200 300 400"` away.
 
 **Why numjobs is an axis here and nowhere else.** Everywhere else numjobs is
 derived &mdash; one job per usable cpu &mdash; because a derived value cannot go
