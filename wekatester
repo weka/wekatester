@@ -2230,11 +2230,13 @@ nrs = sorted({k[0] for k in cells})
 qds = sorted({k[1] for k in cells})
 if all(nr == qd for nr, qd in cells):
     # the diagonal grid: one row, each column a matched nr=qd step
-    print("        " + "".join("%7s" % ("nr=qd" + str(q)) for q in qds))
+    # width 9 fits "nr=qd128" with a separating space -- at %7s the qd8 and
+    # qd16 headers ran together ("nr=qd8nr=qd16")
+    print("        " + "".join("%9s" % ("nr=qd" + str(q)) for q in qds))
     row = ""
     for q in qds:
         v = cells.get((q, q))
-        row += "%7s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
+        row += "%9s" % ("-" if not v else "%d%%" % round(max(v) * 100 / best))
     print("       %s" % row)
 else:
     print("        " + "".join("%6s" % ("qd" + str(q)) for q in qds))
