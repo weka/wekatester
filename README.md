@@ -400,12 +400,11 @@ settled, two single-axis re-tests run at the winning depth:
   curve.
 
 Both are single-axis moves off the same baseline — the pick's own
-decision-pass mean — and **at most one is adopted**: compounding two
+decision-pass best — and **at most one is adopted**: compounding two
 one-sample measurements would claim a joint optimum neither of them measured.
-The bar is the decision pass's own worst CV, floored at 1%: a refinement has
-to beat the winner by more than the box could have wobbled, or it is not a
-finding. This is the one honest use of a measured spread — as a significance
-threshold on a *difference*, never as a band below a peak. A split that wins
+Any measured gain wins: the recorded parameters should be whatever produced
+the best reading, and a significance bar would only defend the incumbent —
+the pick holds no seniority over a cell that beat it. A split that wins
 is recorded as `numjobs` in the host file; otherwise `numjobs` stays the
 operator's, one job per usable cpu.
 

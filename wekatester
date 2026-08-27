@@ -1827,14 +1827,13 @@ VERDICTEOF
 # plateau pick? Prints "<qd> <nr> <fs> <njpct> <note>".
 #
 # Both refinements are single-axis moves off the SAME baseline -- the pick's
-# own decision-pass mean -- and at most one is adopted, the largest gain that
-# clears the bar. Compounding two one-sample measurements would be claiming a
-# joint optimum neither of them measured.
+# own decision-pass best -- and at most one is adopted, the largest gain.
+# Compounding two one-sample measurements would be claiming a joint optimum
+# neither of them measured.
 #
-# The bar is the decision pass's own worst CV, floored at 1%: a refinement has
-# to beat the winner by more than the box could have wobbled, or it is not a
-# finding. This is the one honest use of a measured spread -- as a
-# significance threshold on a DIFFERENCE, never as a band below a peak.
+# ANY measured gain wins: the recorded parameters should be whatever produced
+# the best reading, and a significance bar only defends the incumbent -- the
+# pick holds no seniority over a cell that beat it.
 cal_refine_verdict() {   # cal_refine_verdict <host> <type> <dirn> <pick_qd> <nr> <fs>
     local rnj
     read -r _ rnj <<<"$(cal_cpus_nj "$1" "$2" "$3")" \
@@ -1843,7 +1842,6 @@ cal_refine_verdict() {   # cal_refine_verdict <host> <type> <dirn> <pick_qd> <nr
 import glob
 import os
 import re
-import statistics as st
 import sys
 
 caldir, host, ctype, cdirn, pick, nr, fs, base_nj = sys.argv[1:9]
@@ -1871,13 +1869,6 @@ if pick not in hist:
 base = max(hist[pick])
 if base <= 0:
     sys.exit(f"ERROR: {host}: the decision pass measured nothing at qd={pick}")
-
-def cv(v):
-    # sum/len, not statistics.fmean (3.8+; the workers are python 3.6)
-    m = sum(v) / len(v)
-    return st.stdev(v) / m * 100 if len(v) > 1 and m > 0 else 0.0
-
-bar = max(max(cv(v) for v in hist.values()), 1.0)
 
 # (gain%, qd, nr, njpct, label) for every refinement that measured something
 cands = []
@@ -1915,13 +1906,13 @@ if not cands:
 cands.sort(key=lambda c: -c[0])
 gain, qd2, nr2, pct, label = cands[0]
 tried = ", ".join(f"{c[4]} {c[0]:+.1f}%" for c in cands)
-if gain <= bar:
+if gain <= 0:
     print(pick, nr, fs, 100,
-          f"refine: nothing beat the pick by more than the {bar:.1f}% bar ({tried})")
+          f"refine: nothing beat the pick ({tried})")
     raise SystemExit(0)
 # fs is per file and normalized, so a different file count keeps it
 print(qd2, nr2, fs, pct,
-      f"refine: {label} beats the pick by {gain:+.1f}% (bar {bar:.1f}%; {tried})")
+      f"refine: {label} beats the pick by {gain:+.1f}% ({tried})")
 REFINEEOF
 }
 

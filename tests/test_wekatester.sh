@@ -3512,8 +3512,8 @@ t_assert "calibrate: shape cells are short, decision cells are full length" bash
      calibrate) >/dev/null 2>&1
     # the shape cell saw runtime=7, a later decision cell saw runtime=30
     head -1 "$d/rt" | grep -qx "runtime=7" && grep -qx "runtime=30" "$d/rt"'
-# CAL_SPLIT re-tests the winning OUTSTANDING io at a different split, and only
-# adopts one that beats the pick by more than the decision pass wobbled.
+# CAL_SPLIT re-tests the winning OUTSTANDING io at a different split, and
+# adopts ANY split that beats the pick -- there is no significance bar.
 t_assert "calibrate: a split that wins is recorded as numjobs, one that does not is not" bash -c '
     run_split() {   # run_split <split-value> -> the cal.results row
         # named, not $1: inside run_host, $1 is run_host`s own parameter
@@ -3539,11 +3539,15 @@ t_assert "calibrate: a split that wins is recorded as numjobs, one that does not
          calibrate) >/dev/null 2>&1
         cat "$d/cal.results"
     }
-    # pick is qd=1 at 1000 with a 1% bar; the split runs 2 jobs at qd=2
-    # a 3% win is real -> numjobs 2 recorded beside qd=2
+    # pick is qd=1 at 1000; the split runs 2 jobs at qd=2
+    # a 3% win -> numjobs 2 recorded beside qd=2
     run_split 1030 | grep -qx "h1 2 2 5120M 2 - - - - - - - - - - - -" &&
-    # a 0.5% win is inside the bar -> nothing changes, nj stays a dash
-    run_split 1005 | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -"'
+    # ANY win is a win: 0.5% better is recorded too
+    run_split 1005 | grep -qx "h1 2 2 5120M 2 - - - - - - - - - - - -" &&
+    # a tie is not a win -> nothing changes, nj stays a dash
+    run_split 1000 | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -" &&
+    # neither is a loss
+    run_split 995  | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -"'
 # One shape for the whole scratch, taken from the workload: a set whose files
 # live in subdirectories is measured on files in subdirectories.
 # The WIDENING direction of CAL_SPLIT: more jobs than usable cpus at a
