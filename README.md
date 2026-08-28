@@ -385,12 +385,14 @@ client iops-read saturated at 52×32 = 1,664 outstanding while iops-write
 needed 52×128 = 6,656 and collapsed 9% at 13,312. So once the depth is
 settled, two single-axis re-tests run at the winning depth:
 
-- **`CAL_SPLIT`** (on) re-measures the same outstanding IO at a different
-  split. `CAL_SPLIT_PCT` (`50`) halves the jobs and doubles the depth, which
-  is free because the seed already created files for every job. Adding `200`
-  tests the widening direction — more jobs than usable cpus — which needs the
-  seed to cover twice the jobs, so it doubles the calibration scratch and the
-  seed pass. Opt-in, not a default.
+- **`CAL_SPLIT`** re-measures the same outstanding IO at a different split,
+  at the percentages of usable cores `CAL_SPLIT_PCT` names — and it names
+  none by default: there is no reason to test fewer jobs than usable cores
+  (a sub-percent "win" at half the cores buys half the parallelism for
+  noise), and the widening direction needs extra seed. `50` halves the jobs
+  and doubles the depth (free — the seed already covers every job); `200`
+  tests more jobs than usable cpus, which doubles the calibration scratch
+  and the seed pass. Both are operator opt-ins.
 - **`CAL_NR_RETEST`** (off) re-measures `CAL_NR_CANDIDATES` (`1 4 8`) file
   counts at the winning `(numjobs, iodepth)`. Off for capacity, not doubt:
   covering nr=8 means the seed union carries 8 files per job as well as 2,

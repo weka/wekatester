@@ -1479,14 +1479,18 @@ CAL_SPLIT=${CAL_SPLIT:-1}   # after the plateau verdict, re-test the winning
                          # 52x128 = 6,656 and collapsed 9% at 13,312. Whether
                          # the same outstanding is better spent on more jobs
                          # or deeper queues is a measurement, not a guess.
-CAL_SPLIT_PCT=${CAL_SPLIT_PCT:-"50"}   # numjobs percentages to try at constant
-                         # outstanding (iodepth scales inversely). 50 halves
-                         # the jobs and doubles the depth -- free, because the
-                         # seed already created files for every job. Adding
-                         # 200 tests the WIDENING direction (more jobs than
-                         # usable cores), which needs the seed to cover twice
-                         # the jobs: it doubles the calibration scratch and
-                         # the seed pass, so it is opt-in, not a default.
+                         # The mechanism; CAL_SPLIT_PCT names the cells.
+CAL_SPLIT_PCT=${CAL_SPLIT_PCT:-""}   # numjobs percentages to try at constant
+                         # outstanding (iodepth scales inversely). EMPTY by
+                         # default: there is no reason to test fewer jobs
+                         # than usable cores -- a sub-percent "win" at 50
+                         # buys half the parallelism for noise, and it is
+                         # not a geometry the staged tests should record.
+                         # 50 (halve the jobs, double the depth; free, the
+                         # seed already covers every job) and 200 (the
+                         # WIDENING direction, more jobs than usable cores;
+                         # doubles the calibration scratch and the seed
+                         # pass) are both operator opt-ins.
 CAL_NR_RETEST=${CAL_NR_RETEST:-0}   # re-test nrfiles at the WINNING (nj, qd)
                          # instead of trusting the table. Off by default for
                          # capacity, not doubt: covering nr=8 means the seed

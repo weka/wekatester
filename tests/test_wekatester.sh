@@ -3592,6 +3592,8 @@ t_assert "calibrate: shape cells are short, decision cells are full length" bash
     head -1 "$d/rt" | grep -qx "runtime=7" && grep -qx "runtime=30" "$d/rt"'
 # CAL_SPLIT re-tests the winning OUTSTANDING io at a different split, and
 # adopts ANY split that beats the pick -- there is no significance bar.
+# The split percentages are operator opt-ins (CAL_SPLIT_PCT is empty by
+# default; this harness enables 50 explicitly).
 t_assert "calibrate: a split that wins is recorded as numjobs, one that does not is not" bash -c '
     run_split() {   # run_split <split-value> -> the cal.results row
         # named, not $1: inside run_host, $1 is run_host`s own parameter
@@ -3626,6 +3628,27 @@ t_assert "calibrate: a split that wins is recorded as numjobs, one that does not
     run_split 1000 | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -" &&
     # neither is a loss
     run_split 995  | grep -qx "h1 1 2 5120M - - - - - - - - - - - - -"'
+# There is no reason to test fewer jobs than usable cores: a sub-percent
+# split "win" buys half the parallelism for noise. CAL_SPLIT_PCT names no
+# cells unless the operator asks, so a default run measures no split at all.
+t_assert "calibrate: no split cells by default -- numjobs stays one job per cpu" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/set"
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    (source ./tests/helpers.sh; source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     printf "ncpus 4\n" > "$d/probe/h1"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*mkdir*|*rm\ -rf*|*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;;
+     esac
+     echo "$2" >> "$d/cells"
+     case "$2" in (*qd1-nr2.job*) cal_json 1000;; (*) cal_json 900;; esac; }
+     calibrate) >/dev/null 2>&1
+    ! grep -q -- "-nj[0-9]" "$d/cells" &&
+    grep -qx "h1 1 2 5120M - - - - - - - - - - - - -" "$d/cal.results"'
 # One shape for the whole scratch, taken from the workload: a set whose files
 # live in subdirectories is measured on files in subdirectories.
 # The WIDENING direction of CAL_SPLIT: more jobs than usable cpus at a
