@@ -1510,6 +1510,11 @@ t_assert "usable_cores: an unreadable probe is an error, not a zero" \
     uc_fails usable_cores
 t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
     uc_fails "no usable cpus" 'engines psync '
+t_assert "usable_cores: a list naming cpus the host does not have is trimmed" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    printf "ncpus 8\n" > "$d/probe/h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "0-11") )
+    [ "$out" = "0,1,2,3,4,5,6,7" ]'
 
 # --- stage_cal_step: one ladder step, staged per host ---
 # The step file is the whole measurement contract: geometry (bs/filesize/
@@ -2608,6 +2613,18 @@ t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per ho
     grep -q "^cpus_allowed=4$" "$v1" &&
     grep -q "^numjobs=3$" "$v1" && grep -q "^filesize=2G$" "$v1" && grep -q "^iodepth=9$" "$v1" &&
     grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=io_uring$" "$v2"'
+# The STAGED jobs must never name a cpu the host does not have: the fio
+# SERVER rejects the jobfile and its error text is lost, so the layout dies
+# with "the jobs did not run" and nothing else (iscg001 2026-08-28 -- the
+# cal ladders ran on the trimmed auth/<host>.cpus while the staged variants
+# still carried the host file's phantoms).
+t_assert "tuner: staged cpus_allowed drops cpus the host does not have" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    { printf "h1\t-\t-\t2,4,9-12\t-"
+      for i in $(seq 6 29); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+    (source ./wekatester
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    grep -q "^cpus_allowed=4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "host_dir: targets dir when resolved, global -d otherwise" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

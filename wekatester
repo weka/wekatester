@@ -1018,6 +1018,8 @@ for line in open(path):
         if len(cpuset) == 1:      # single-cpu mask = a dedicated io thread
             weka |= cpuset
 base = parse_cpulist(sys.argv[3]) if sys.argv[3] else set(range(ncpus))
+if ncpus:
+    base &= set(range(ncpus))   # never a cpu the host does not have
 usable = sorted(base - weka) or sorted(base) or list(range(ncpus))
 if not usable:
     sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
@@ -1161,8 +1163,26 @@ NJCOLEOF
 # Copy a failed seed's evidence into the run dir so it lands in the bundle:
 # the workdir is on /dev/shm and is removed on exit, so anything left there
 # is gone before anyone can read the path the error printed.
+# The error text from a server-side jobfile rejection never reaches the
+# operator: fio --client exits 0 and the daemonized server's stderr is gone,
+# so the run dies with "the jobs did not run" and nothing else. Ask the
+# host's own fio to re-parse the jobfile it just ran (or refused): a dirty
+# parse names the bad option here and now; a clean parse means the jobs died
+# at setup, not at option parsing. The output lands in the run bundle.
+fio_parse_postmortem() {   # fio_parse_postmortem <what> <host> <remote-jobfile> <outfile>
+    local what=$1 host=$2 jf=$3 outf=$4 l
+    if run_host "$host" "'$FIO_BIN' --parse-only '$jf'" > "$outf" 2>&1; then
+        log "note: $host: the $what jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
+    else
+        log "ERROR: $host: the host's own fio rejects the $what jobfile (full text: ${outf##*/} in the run bundle):" >&2
+        head -5 "$outf" | while IFS= read -r l; do
+            log "ERROR: $host:   $l" >&2
+        done
+    fi
+}
+
 seed_evidence() {   # seed_evidence <host>...
-    local h l
+    local h
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     mkdir -p "$RUN_DIR/cal" || return 0
     [ ! -s "$WORK_DIR/cal/res-seed.json" ] \
@@ -1171,22 +1191,10 @@ seed_evidence() {   # seed_evidence <host>...
         [ ! -s "$WORK_DIR/cal/$h/cal-seed.job" ] \
             || cp "$WORK_DIR/cal/$h/cal-seed.job" "$RUN_DIR/cal/cal-seed.$h.job" || true
     done
-    # The error text from a server-side jobfile rejection never reaches the
-    # operator: fio --client exits 0 and the daemonized server's stderr is
-    # gone. So ask each host's own fio to re-parse the jobfile it just ran
-    # (or refused): a dirty parse names the bad option here and now; a clean
-    # parse means the jobs died at setup, not at option parsing.
     for h in "$@"; do
         [ -s "$WORK_DIR/cal/$h/cal-seed.job" ] || continue
-        if run_host "$h" "'$FIO_BIN' --parse-only '$TARGET_DIR.cal/$h/cal-seed.job'" \
-               > "$RUN_DIR/cal/parse.$h.out" 2>&1; then
-            log "note: $h: the seed jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
-        else
-            log "ERROR: $h: the host's own fio rejects the seed jobfile (full text: cal/parse.$h.out in the run bundle):" >&2
-            head -5 "$RUN_DIR/cal/parse.$h.out" | while IFS= read -r l; do
-                log "ERROR: $h:   $l" >&2
-            done
-        fi
+        fio_parse_postmortem seed "$h" "$TARGET_DIR.cal/$h/cal-seed.job" \
+            "$RUN_DIR/cal/parse.$h.out"
     done
 }
 
@@ -3958,13 +3966,19 @@ if len({len(f["weka"]) for f in facts.values()}) > 1:
 common_engines = [e for e in ENGINE_ORDER
                   if all(e in f["engines"] for f in facts.values())]
 def usable_for(h):
-    # the nj contract: the operator's cpu list minus weka's pinned cores
-    # when the host file gives one; every cpu minus weka's otherwise
+    # the nj contract: the operator's cpu list, minus cpus the host does not
+    # have (check_cpu_pinning noted them; a staged cpus_allowed naming one
+    # is rejected by the fio SERVER, whose error text is lost), minus weka's
+    # pinned cores; every cpu minus weka's when the file gives none
     c = target(h, "cpus")
     if not c:
         return facts[h]["usable"]
-    cs = parse_cpulist(c) - set(facts[h]["weka"])
-    return sorted(cs) or sorted(parse_cpulist(c))
+    cs = parse_cpulist(c)
+    if facts[h]["ncpus"]:
+        cs &= set(range(facts[h]["ncpus"]))
+    real = sorted(cs)
+    cs -= set(facts[h]["weka"])
+    return sorted(cs) or real or sorted(parse_cpulist(c))
 
 min_usable = min(len(usable_for(h)) for h in hosts)
 
@@ -6096,8 +6110,13 @@ run_jobs() {
             t0=$(date +%s)
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "layout failed for $job (partial output in $outfile)"
-            check_fio_errors "$outfile" layout \
-                || die "layout $job failed -- the files were not created (raw output in $outfile)"
+            if ! check_fio_errors "$outfile" layout; then
+                for host in "${HOSTS[@]}"; do
+                    fio_parse_postmortem layout "$host" "$TARGET_DIR/$host/$job" \
+                        "$RUN_DIR/parse.${job%.job}.$host.out"
+                done
+                die "layout $job failed -- the files were not created (raw output in $outfile)"
+            fi
             t1=$(date +%s)
             log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
             echo
