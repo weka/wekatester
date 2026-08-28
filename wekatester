@@ -1162,7 +1162,7 @@ NJCOLEOF
 # the workdir is on /dev/shm and is removed on exit, so anything left there
 # is gone before anyone can read the path the error printed.
 seed_evidence() {   # seed_evidence <host>...
-    local h
+    local h l
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     mkdir -p "$RUN_DIR/cal" || return 0
     [ ! -s "$WORK_DIR/cal/res-seed.json" ] \
@@ -1170,6 +1170,23 @@ seed_evidence() {   # seed_evidence <host>...
     for h in "$@"; do
         [ ! -s "$WORK_DIR/cal/$h/cal-seed.job" ] \
             || cp "$WORK_DIR/cal/$h/cal-seed.job" "$RUN_DIR/cal/cal-seed.$h.job" || true
+    done
+    # The error text from a server-side jobfile rejection never reaches the
+    # operator: fio --client exits 0 and the daemonized server's stderr is
+    # gone. So ask each host's own fio to re-parse the jobfile it just ran
+    # (or refused): a dirty parse names the bad option here and now; a clean
+    # parse means the jobs died at setup, not at option parsing.
+    for h in "$@"; do
+        [ -s "$WORK_DIR/cal/$h/cal-seed.job" ] || continue
+        if run_host "$h" "'$FIO_BIN' --parse-only '$TARGET_DIR.cal/$h/cal-seed.job'" \
+               > "$RUN_DIR/cal/parse.$h.out" 2>&1; then
+            log "note: $h: the seed jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
+        else
+            log "ERROR: $h: the host's own fio rejects the seed jobfile (full text: cal/parse.$h.out in the run bundle):" >&2
+            head -5 "$RUN_DIR/cal/parse.$h.out" | while IFS= read -r l; do
+                log "ERROR: $h:   $l" >&2
+            done
+        fi
     done
 }
 
@@ -2611,11 +2628,11 @@ PYEOF
     # workdir cleanup: the die message used to point into /dev/shm/wt.*,
     # which is wiped on exit, so the operator could not even show the error
     if ! run_host "$MASTER" "$cmd" > "$WORK_DIR/cal/res-seed.json"; then
-        seed_evidence "$@"
+        seed_evidence "${seedrun[@]}"
         die "calibration seed failed (res-seed.json and the per-host cal-seed jobfiles are in the run bundle under cal/)"
     fi
     if ! check_fio_errors "$WORK_DIR/cal/res-seed.json" layout; then
-        seed_evidence "$@"
+        seed_evidence "${seedrun[@]}"
         die "calibration seed errored on a host (res-seed.json and the per-host cal-seed jobfiles are in the run bundle under cal/)"
     fi
     sleep "$CAL_SETTLE"   # let the seed's write backlog destage
@@ -3651,7 +3668,7 @@ finalize_targets() {
 # operator explicitly chose those cpus). The winning launch decision lands
 # in $WORK_DIR/auth/<host>.priv + <host>.cpus for the fio server lifecycle.
 check_cpu_pinning() {
-    local host req cur weka priv verdict
+    local host req cur weka priv verdict ncpus
     # local mode never ran establish_connections; the lifecycle still reads
     # the same per-host files
     [ -n "$AUTH_DIR" ] || { AUTH_DIR="$WORK_DIR/auth"; mkdir -p "$AUTH_DIR"; }
@@ -3661,8 +3678,9 @@ check_cpu_pinning() {
         cur=$(awk '$1 == "taskset" {print $2; exit}' "$WORK_DIR/probe/$host")
         weka=$(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")
         iso=$(awk '$1 == "isolated" {print $2; exit}' "$WORK_DIR/probe/$host")
+        ncpus=$(awk '$1 == "ncpus" {print $2; exit}' "$WORK_DIR/probe/$host")
         priv=$(host_priv "$host")
-        verdict=$(python3 - "$req" "${cur:-}" "${weka% }" "${iso:-}" <<'PYEOF'
+        verdict=$(python3 - "$req" "${cur:-}" "${weka% }" "${iso:-}" "${ncpus:-0}" <<'PYEOF'
 import sys
 def expand(s):
     out = set()
@@ -3676,6 +3694,7 @@ def expand(s):
     return out
 req, cur = expand(sys.argv[1]), expand(sys.argv[2])
 iso = expand(sys.argv[4]) if len(sys.argv) > 4 else set()
+ncpus = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 0
 # same rule as the tuner: weka pins each dedicated io thread to exactly one
 # CPU; wide masks are floating utility threads and MUST be ignored, or the
 # union covers every CPU and everything "overlaps" (seen live)
@@ -3694,11 +3713,21 @@ def fmt(cpus):
         i = j + 1
     return ",".join(out)
 
-# the EFFECTIVE set is the request minus weka's dedicated cores: the host
-# file keeps the operator's list as written, execution never touches
-# weka's own cpus
-eff = sorted(req - weka)
+# cpus the host does not have. fio rejects a cpus_allowed naming one -- and
+# with --client that rejection happens on the daemonized SERVER, whose error
+# text is lost: the client exits 0 with an empty client_stats and the run
+# dies later with "the jobs did not run". Trimmed here, where the row is
+# resolved, with a note naming them -- same contract as the weka overlap:
+# the host file keeps the list as written, execution runs on what exists.
+# Only when the probe carries ncpus (0 = unprobed, nothing to judge against).
 flags = []
+phantom = sorted(req - set(range(ncpus))) if ncpus else []
+if phantom:
+    flags.append("phantom")
+# the EFFECTIVE set is the request minus weka's dedicated cores and the
+# cpus the host does not have: the host file keeps the operator's list as
+# written, execution never touches weka's own cpus
+eff = sorted(req - weka - set(phantom))
 if iso and (req & iso) and (req - iso):
     # a mask mixing isolated and housekeeping cpus silently collapses onto
     # the housekeeping partition -- worse than failing, it runs WRONG
@@ -3714,16 +3743,25 @@ if req & weka:
     flags.append("overlap")
 print("dedicated=" + (",".join(map(str, sorted(weka))) or "none"),
       "effective=" + (fmt(eff) or "none"),
+      "phantom=" + (fmt(phantom) or "none"),
       " ".join(flags) or "ok")
 PYEOF
 )
-        local dedicated effective vflags
+        local dedicated effective phantom vflags
         set -- $verdict
-        dedicated=${1#dedicated=}; effective=${2#effective=}; shift 2
+        dedicated=${1#dedicated=}; effective=${2#effective=}
+        phantom=${3#phantom=}; shift 3
         vflags="$*"
         case "$vflags" in
             (*allweka*)
+                if [ "$phantom" != none ]; then
+                    die "$host: no requested cpu ($req) is usable -- each is a weka dedicated core or a cpu this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1)))"
+                fi
                 die "$host: every requested cpu ($req) is a weka dedicated core -- nothing left to run fio on" ;;
+        esac
+        case "$vflags" in
+            (*phantom*)
+                log "note: $host: requested cpus ($req) name cpus this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1))); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*mixed*)

@@ -2489,6 +2489,67 @@ t_assert "pinning: an in-mask request with no escalator records cpus and proceed
      printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-7" ] && test ! -s "$d/auth/h1.priv"'
+# A cpu the host does not have would be rejected by fio -- on the SERVER,
+# whose error text is lost, so the run dies later with "the jobs did not
+# run" and no evidence (iscg001 2026-08-28: host file said 0-128 on a 64-cpu
+# box). Trimmed at row resolution with a note naming them, same contract as
+# the weka overlap: the host file keeps the list as written.
+t_assert "pinning: cpus the host does not have are trimmed with a note, file untouched" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        printf "ncpus 64\ntaskset 0-63\nweka_allowed 52\nweka_allowed 53\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t0-128\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 )
+    case "$out" in
+        *"note"*"cpus this host does not have (64-128; the host has 64 cpus: 0-63); executing on the remainder (0-51,54-63)"*) true;;
+        *) echo "$out" >&2; exit 1;;
+    esac && [ "$(cat "$d/auth/h1.cpus")" = "0-51,54-63" ]'
+t_assert "pinning: a list with no real cpu at all still dies" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+        printf "ncpus 64\ntaskset 0-63\n" > "$d/probe/h1"
+        printf "h1\t-\t-\t100-128\t-\n" > "$d/targets.final"
+        check_cpu_pinning) 2>&1 >/dev/null )
+    case "$err" in
+        *"no requested cpu (100-128) is usable"*"(100-128; the host has 64 cpus: 0-63)"*) true;;
+        *) echo "$err" >&2; exit 1;;
+    esac && test ! -f "$d/auth/h1.cpus"'
+t_assert "pinning: a valid list on a probed host still proceeds" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
+     printf "ncpus 16\ntaskset 0-15\n" > "$d/probe/h1"
+     printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
+     check_cpu_pinning)
+    [ "$(cat "$d/auth/h1.cpus")" = "4-7" ]'
+# The postmortem for a seed whose jobs did not run: fio --client exits 0 and
+# the daemonized server keeps the rejection text, so seed_evidence asks the
+# host fio to re-parse the jobfile -- a dirty parse is surfaced verbatim, a
+# clean one says the death was at setup, and both land in the bundle.
+t_assert "seed_evidence: a failed seed asks the host fio why (dirty and clean parse)" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1" "$r"
+    echo "{}" > "$d/cal/res-seed.json"
+    printf "[global]\ncpus_allowed=0-128\n" > "$d/cal/h1/cal-seed.job"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst
+        run_host() { echo "fio: CPU 128 too large (max=63)"; return 1; }
+        seed_evidence h1) 2>&1 )
+    case "$out" in
+        (*"rejects the seed jobfile"*"CPU 128 too large"*) true;;
+        (*) echo "$out" >&2; exit 1;;
+    esac
+    grep -q "CPU 128 too large" "$r/cal/parse.h1.out" || exit 1
+    [ -f "$r/cal/cal-seed.h1.job" ] || exit 1
+    out2=$( (source ./wekatester
+        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst
+        run_host() { return 0; }
+        seed_evidence h1) 2>&1 )
+    case "$out2" in
+        (*"parses cleanly on its host"*"died at setup"*) true;;
+        (*) echo "$out2" >&2; exit 1;;
+    esac'
 t_assert "kill_fio_cmd: priv prefixes kill/rm/pkill and the anchor survives" bash -c '
     out=$(source ./wekatester; FIO_BIN=/usr/bin/fio; FIO_PIDFILE=/dev/shm/x.pid
           kill_fio_cmd sudo)
