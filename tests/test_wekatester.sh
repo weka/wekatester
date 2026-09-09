@@ -1250,8 +1250,8 @@ t_assert "cal_seed_scratch: the space estimate is printed per host and in total 
          (*)      return 0;;
      esac; }
      cal_seed_scratch h1) 2>&1 )
-    est=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: h1: [0-9][0-9]* dense file(s) = [0-9.]* GiB to write, 0 sparse truncate(s); free 1024.0 GiB at /mnt/weka ([0-9]*% of it)" | cut -d: -f1 | head -1)
-    tot=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: total [0-9.]* GiB dense on wekafs (free 1024.0 GiB, [0-9]*% of it) across h1" | cut -d: -f1 | head -1)
+    est=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: h1: [0-9][0-9]* dense file(s) = [0-9.]* GiB to write, 0 sparse truncate(s); free 1.0 TiB at /mnt/weka ([0-9.]*% of it)" | cut -d: -f1 | head -1)
+    tot=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: total [0-9.]* GiB dense on wekafs (free 1.0 TiB, [0-9.]*% of it) across h1" | cut -d: -f1 | head -1)
     seed=$(printf "%s\n" "$out" | grep -n "cal: seeding the calibration scratch" | cut -d: -f1 | head -1)
     [ -n "$est" ] && [ -n "$tot" ] && [ -n "$seed" ] && [ "$est" -lt "$tot" ] && [ "$tot" -lt "$seed" ] ||
         { printf "%s\n" "$out" >&2; false; }'
@@ -1259,8 +1259,86 @@ t_assert "seed_estimate_line: complete scratch, unknown free space, and the shar
     source ./wekatester
     [ "$(seed_estimate_line 0 0 0 1000 /d)" = "scratch already complete, nothing to write" ] &&
     [ "$(seed_estimate_line 4 2048 0 "" /d)" = "4 dense file(s) = 2.0 GiB to write, 0 sparse truncate(s); free space at /d unknown" ] &&
-    [ "$(seed_estimate_line 4 2048 6 8192 /d)" = "4 dense file(s) = 2.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (25% of it)" ] &&
-    [ "$(seed_estimate_line 0 0 6 8192 /d)" = "0 dense file(s) = 0.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (0% of it)" ]'
+    [ "$(seed_estimate_line 4 2048 6 8192 /d)" = "4 dense file(s) = 2.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (25.0% of it)" ] &&
+    [ "$(seed_estimate_line 0 0 6 8192 /d)" = "0 dense file(s) = 0.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (0.0% of it)" ] &&
+    [ "$(seed_estimate_line 192 983040 0 402733363 /d)" = "192 dense file(s) = 960.0 GiB to write, 0 sparse truncate(s); free 384.1 TiB at /d (0.2% of it)" ] &&
+    [ "$(seed_estimate_line 4 2097152 0 4194304 /d)" = "4 dense file(s) = 2.0 TiB to write, 0 sparse truncate(s); free 4.0 TiB at /d (50.0% of it)" ]'
+
+# A failed rung used to die pointing at /dev/shm/wt.*, wiped on exit (seen
+# live: weka-xcpu-344, brutal bw-write qd=1 nr=1). Evidence goes in the
+# bundle now, and fio's own error text is said at once.
+t_assert "cal_evidence: a failed rung leaves fio output and jobfiles in the bundle and says why" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1"
+    printf "[global]\nrw=write\n" > "$d/cal/h1/cal-bw-write-qd1-nr1.job"
+    printf "<h1> fio: pid=0, err=28/file:filesetup.c:233, func=write, error=No space left on device\nfio: client: all clients gone\n" > "$d/cal/res-bw-write-qd1-nr1.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1
+            run_host() { return 0; }
+            cal_evidence "rung bw-write qd=1 nr=1" "$d/cal/res-bw-write-qd1-nr1.json" cal-bw-write-qd1-nr1.job say h1) 2>&1 )
+    [ -s "$r/cal/res-bw-write-qd1-nr1.json" ] && [ -s "$r/cal/cal-bw-write-qd1-nr1.h1.job" ] && [ -e "$r/cal/parse.h1.out" ] &&
+    case "$out" in
+        *"ERROR: rung bw-write qd=1 nr=1: fio said: <h1> fio: pid=0, err=28"*"No space left on device"*"parses cleanly"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in *"all clients gone"*) echo "surfaced a non-error line: $out" >&2; false;; *) true;; esac'
+# fio --client stages jobfiles on the master only; a WORKER's fio can parse
+# only what the worker has. The postmortem stages the worker's copy first,
+# and leaves the master (which already holds it) alone.
+t_assert "cal_evidence: a non-master worker gets its jobfile staged before its fio parses it" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1" "$d/cal/h2"
+    printf "[global]\nrw=write\n" > "$d/cal/h1/x.job"; cp "$d/cal/h1/x.job" "$d/cal/h2/x.job"
+    printf "{}\n" > "$d/cal/res-x.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1; LOCAL_MODE=0
+            run_host() { echo "RUN[$1] $2" >&2; return 0; }
+            copy_to_host() { echo "COPY[$1] ${2##*/} -> $3" >&2; return 0; }
+            cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1 h2) 2>&1 )
+    case "$out" in *"COPY[h1]"*|*"RUN[h1] mkdir"*) echo "staged onto the master: $out" >&2; false;; *) true;; esac &&
+    case "$out" in
+        *"RUN[h2] mkdir -p '"'"'/dev/shm/x.cal/h2'"'"'"*"COPY[h2] x.job -> /dev/shm/x.cal/h2/"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    # the parse call itself is captured into the per-host parse file
+    grep -q "RUN\[h2\] '"'"'fio'"'"' --parse-only '"'"'/dev/shm/x.cal/h2/x.job'"'"'" "$r/cal/parse.h2.out" &&
+    grep -q "RUN\[h1\] '"'"'fio'"'"' --parse-only '"'"'/dev/shm/x.cal/h1/x.job'"'"'" "$r/cal/parse.h1.out"'
+t_assert "cal_evidence: a worker that cannot be staged is warned about, and the others still get parsed" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1" "$d/cal/h2"
+    printf "[global]\nrw=write\n" > "$d/cal/h1/x.job"; cp "$d/cal/h1/x.job" "$d/cal/h2/x.job"
+    printf "{}\n" > "$d/cal/res-x.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1; LOCAL_MODE=0
+            run_host() { case "$1:$2" in (h2:mkdir*) return 1;; esac; echo "RUN[$1]" >&2; return 0; }
+            copy_to_host() { echo "COPY[$1]" >&2; return 0; }
+            cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1 h2) 2>&1 )
+    case "$out" in *"COPY[h2]"*) echo "copied after a failed mkdir: $out" >&2; false;; *) true;; esac &&
+    case "$out" in *"WARNING: h2: cannot stage the rung x jobfile"*) true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "RUN\[h1\]" "$r/cal/parse.h1.out" && [ ! -e "$r/cal/parse.h2.out" ]'
+t_assert "cal_evidence: quiet copies but does not repeat what check_fio_errors already said" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1"
+    printf "[global]\nrw=write\n" > "$d/cal/h1/x.job"
+    printf "fio: failed to create dir\n{}\n" > "$d/cal/res-x.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1
+            run_host() { return 0; }
+            cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1) 2>&1 )
+    [ -s "$r/cal/res-x.json" ] && [ -s "$r/cal/x.h1.job" ] &&
+    case "$out" in *"fio said"*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "cal_cell: a rung failure files its evidence and dies pointing at the bundle, not /dev/shm" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    err=$( (source ./wekatester
+            WORK_DIR=$d; MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+            todo=(h1)
+            stage_cal_step() { :; }
+            cal_push() { :; }
+            run_host() { echo "fio: client: h1 connection failed" ; return 1; }
+            cal_evidence() { echo "EVIDENCE[$1|${2##*/}|$3|$4|$5]" >&2; }
+            cal_cell bw write 1 1 5120M hist-bw-write "") 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        *"EVIDENCE[rung bw-write qd=1 nr=1|res-bw-write-qd1-nr1.json|cal-bw-write-qd1-nr1.job|say|h1]"*"rung bw-write qd=1 nr=1 failed (res-bw-write-qd1-nr1.json and the per-host rung jobfiles are in the run bundle under cal/)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
+    case "$err" in *"/dev/shm"*|*"output in"*) echo "still points at tmpfs: $err" >&2; false;; *) true;; esac'
 
 # --- python floor: the workers are older than this laptop ---
 # The inline python has to run on the WORKERS, and a Weka client is commonly
@@ -2619,9 +2697,9 @@ t_assert "seed_evidence: a failed seed asks the host fio why (dirty and clean pa
     echo "{}" > "$d/cal/res-seed.json"
     printf "[global]\ncpus_allowed=0-128\n" > "$d/cal/h1/cal-seed.job"
     out=$( (source ./wekatester
-        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst
+        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst; MASTER=h1
         run_host() { echo "fio: CPU 128 too large (max=63)"; return 1; }
-        seed_evidence h1) 2>&1 )
+        seed_evidence quiet h1) 2>&1 )
     case "$out" in
         (*"rejects the seed jobfile"*"CPU 128 too large"*) true;;
         (*) echo "$out" >&2; exit 1;;
@@ -2629,12 +2707,23 @@ t_assert "seed_evidence: a failed seed asks the host fio why (dirty and clean pa
     grep -q "CPU 128 too large" "$r/cal/parse.h1.out" || exit 1
     [ -f "$r/cal/cal-seed.h1.job" ] || exit 1
     out2=$( (source ./wekatester
-        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst
+        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst; MASTER=h1
         run_host() { return 0; }
-        seed_evidence h1) 2>&1 )
+        seed_evidence quiet h1) 2>&1 )
     case "$out2" in
         (*"parses cleanly on its host"*"died at setup"*) true;;
         (*) echo "$out2" >&2; exit 1;;
+    esac
+    # the fio --client exit-nonzero path (the 05:17 weka-xcpu-344 seed death)
+    # says fio'"'"'s own error line, not just "died at setup"
+    printf "<h1> fio: pid=0, err=28/file:filesetup.c:233, func=write, error=No space left on device\n{}\n" > "$d/cal/res-seed.json"
+    out3=$( (source ./wekatester
+        WORK_DIR=$d; RUN_DIR=$r; FIO_BIN=fio; TARGET_DIR=/dst; MASTER=h1
+        run_host() { return 0; }
+        seed_evidence say h1) 2>&1 )
+    case "$out3" in
+        (*"ERROR: seed: fio said: <h1> fio: pid=0, err=28"*"No space left on device"*"parses cleanly on its host"*) true;;
+        (*) echo "$out3" >&2; exit 1;;
     esac'
 t_assert "kill_fio_cmd: priv prefixes kill/rm/pkill and the anchor survives" bash -c '
     out=$(source ./wekatester; FIO_BIN=/usr/bin/fio; FIO_PIDFILE=/dev/shm/x.pid
