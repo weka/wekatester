@@ -3453,6 +3453,7 @@ verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
     local host line verdict failed=() mode_fail=0 write_fail=0 hd anc i
     local missing=() missing_dirs=() missing_parents=()
+    local cached_hosts=() cached_modes=() mode who n
     for host in "${HOSTS[@]}"; do
         hd=$(host_dir "$host")
         anc=""
@@ -3476,7 +3477,9 @@ verify_mount_mode() {
                   fi
                   debug "$host: $hd is not wekafs; guard skipped" ;;
             fail*) if [ "$FAST_TRACK" -eq 1 ]; then
-                       warn_prerun "$host: wekafs mounted ${verdict#fail } (need forcedirect); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                       # said once per MODE after the loop: 111 identical
+                       # lines is noise, not information (yqb01, 2026-09-09)
+                       cached_hosts+=("$host"); cached_modes+=("${verdict#fail }")
                    else
                        failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
                        mode_fail=1
@@ -3491,6 +3494,24 @@ verify_mount_mode() {
             || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                  write_fail=1; }
     done
+    # The -r warning, one line per distinct cached mode: the host alone when
+    # it is one host, "all N" when it is every host, the list otherwise.
+    if [ ${#cached_hosts[@]} -gt 0 ]; then
+        for mode in $(printf '%s\n' "${cached_modes[@]}" | sort -u); do
+            who=""; n=0
+            for i in "${!cached_hosts[@]}"; do
+                [ "${cached_modes[$i]}" = "$mode" ] || continue
+                who="$who${who:+ }${cached_hosts[$i]}"; n=$((n + 1))
+            done
+            if [ "$n" -eq 1 ]; then
+                warn_prerun "$who: wekafs mounted $mode (need forcedirect); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+            elif [ "$n" -eq ${#HOSTS[@]} ]; then
+                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; -r continues anyway -- the client cache is in the IO path and the numbers include it"
+            else
+                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+            fi
+        done
+    fi
     # Missing destinations are created only when nothing else is wrong: no
     # mutation on a run that is about to stop anyway.
     if [ ${#missing[@]} -gt 0 ]; then
@@ -3608,19 +3629,40 @@ start_fio_servers() {
 # does not imply the fio port is open (host firewalls commonly allow only 22).
 # fio itself treats an unreachable client as a warning and silently benchmarks
 # the survivors, so we refuse to run instead.
+# The remote side of the port check: probe every worker's fio port from the
+# master, all at once, inside ONE shell. Each probe is a single statement on
+# purpose -- bash does not exit on a failed exec redirection, so a compound
+# probe would mask the connect failure -- and prints "FAIL <host>" when it
+# cannot connect. DONE last proves the snippet ran to the end; without it
+# the caller knows the SESSION failed, which is not a firewall. The wait is
+# the remote shell's, over its own children only.
+port_probe_cmd() {   # port_probe_cmd <host>... -> remote snippet
+    local h cmd="pids=''; for h in"
+    for h in "$@"; do cmd="$cmd '$h'"; done
+    cmd="$cmd; do ( timeout 3 bash -c \": </dev/tcp/\$h/$FIO_PORT\" || echo \"FAIL \$h\" ) & pids=\"\$pids \$!\"; done; wait \$pids; echo DONE"
+    printf '%s' "$cmd"
+}
+
+# One ssh session to the master, N probes inside it. One session PER WORKER
+# used to fan N sessions into the master's single multiplexed connection:
+# sshd refuses the 11th (MaxSessions, default 10), ssh drops to fresh
+# connections, and MaxStartups (10:30:100) then resets the burst -- so on
+# 111 workers 39 probes never ran and were reported as firewalls (yqb01,
+# 2026-09-09). Every other phase is one session per DISTINCT host, which is
+# fine; this was the only place that concentrated N sessions on one host.
 verify_fio_ports() {
     log "verifying fio port $FIO_PORT reachability from $MASTER..."
-    local pids=() failed=() host i hint
-    for host in "${HOSTS[@]}"; do
-        # single statement on purpose: bash does not exit on a failed exec
-        # redirection, so a compound probe would mask the connect failure
-        run_host "$MASTER" \
-            "timeout 3 bash -c ': </dev/tcp/$host/$FIO_PORT'" &
-        pids+=($!)
-    done
-    for i in "${!HOSTS[@]}"; do
-        wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
-    done
+    local out rc failed=() host hint line
+    out=$(run_host "$MASTER" "$(port_probe_cmd "${HOSTS[@]}")"); rc=$?
+    case "$out" in
+        (*DONE*) ;;   # the session ran to its end; FAIL lines, not rc, carry the verdict
+        (*) die "cannot run the fio port check on $MASTER -- the ssh session to the master failed (rc=$rc), which says nothing about port $FIO_PORT" ;;
+    esac
+    while IFS= read -r line; do
+        case "$line" in ("FAIL "*) failed+=("${line#FAIL }") ;; esac
+    done <<PORTEOF
+$out
+PORTEOF
     if [ ${#failed[@]} -gt 0 ]; then
         # A firewall is the overwhelmingly likely cause between two machines,
         # but never on loopback: there the usual culprit is the name resolving

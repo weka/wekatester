@@ -681,7 +681,7 @@ t_assert "mount guard: one real mode failure outweighs a findmnt failure" bash -
 t_assert "port check: local mode blames loopback resolution, not a firewall" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
-            run_host() { return 1; }
+            run_host() { echo "FAIL localhost"; echo DONE; }
             verify_fio_ports) 2>&1 >/dev/null )
     case "$err" in
         *"cannot reach localhost:8765 (loopback resolution?"*) true;;
@@ -690,12 +690,66 @@ t_assert "port check: local mode blames loopback resolution, not a firewall" bas
 t_assert "port check: remote mode still blames the firewall" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-2); MASTER=vega-1
-            run_host() { return 1; }
+            run_host() { echo "FAIL vega-2"; echo DONE; }
             verify_fio_ports) 2>&1 >/dev/null )
     case "$err" in
         *"vega-1 cannot reach vega-2:8765 (host firewall?)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+# 111 workers, one master: one ssh session per worker piled 111 sessions onto
+# the master'"'"'s multiplexed connection, sshd refused past MaxSessions, and 39
+# probes that never ran were reported as firewalls (yqb01, 2026-09-09). The
+# check is ONE session now, and a session that fails is said to be that.
+t_assert "port check: one ssh session to the master however many workers there are" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=0; MASTER=h1; HOSTS=(h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12)
+     run_host() { echo "$1" >> "$d/sessions"; echo DONE; }
+     verify_fio_ports) >/dev/null &&
+    [ "$(wc -l < "$d/sessions")" -eq 1 ] && [ "$(cat "$d/sessions")" = h1 ]'
+t_assert "port check: a failed ssh session to the master is not a firewall" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(vega-1 vega-2); MASTER=vega-1
+            run_host() { echo "mux_client_request_session: session request failed" >&2; return 255; }
+            verify_fio_ports) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *firewall*|*"cannot reach"*) echo "blamed a firewall for a dead session: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"cannot run the fio port check on vega-1"*"ssh session to the master failed (rc=255)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "port check: the remote snippet names every worker, the port, and ends with DONE" bash -c '
+    (source ./wekatester; FIO_PORT=8765
+     s=$(port_probe_cmd h1 h2 h3)
+     case "$s" in
+         *"for h in '"'"'h1'"'"' '"'"'h2'"'"' '"'"'h3'"'"';"*"</dev/tcp/\$h/8765"*"echo \"FAIL \$h\""*"wait \$pids; echo DONE") true;;
+         *) echo "$s" >&2; false;;
+     esac)'
+# The snippet is run for real, on this box: a port nothing listens on must
+# yield a FAIL line, a port something listens on must not, and DONE ends both.
+t_assert "port check: the rendered snippet really probes -- closed port FAILs, open port passes, DONE either way" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester; FIO_PORT=1
+     out=$(bash -c "$(port_probe_cmd 127.0.0.1)" 2>&1)
+     case "$out" in *"FAIL 127.0.0.1"*DONE) true;; *) echo "closed port: $out" >&2; false;; esac) &&
+    { python3 -c "import socket,time
+s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(5); print(s.getsockname()[1], flush=True); time.sleep(20)" > "$d/port" & echo $! > "$d/pid"; } &&
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$d/port" ] && break; sleep 0.25; done &&
+    [ -s "$d/port" ] &&
+    out=$( (source ./wekatester; FIO_PORT=$(cat "$d/port"); bash -c "$(port_probe_cmd 127.0.0.1 127.0.0.1)" 2>&1) ); rc=$?
+    kill "$(cat "$d/pid")"
+    [ "$rc" -eq 0 ] &&
+    case "$out" in *FAIL*) echo "open port: $out" >&2; false;; *DONE) true;; *) echo "open port: $out" >&2; false;; esac'
+t_assert "port check: a FAIL line for one worker leaves the others reachable" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(vega-1 vega-2 vega-3); MASTER=vega-1
+            run_host() { echo "FAIL vega-2"; echo DONE; }
+            verify_fio_ports) 2>&1 >/dev/null )
+    case "$err" in
+        *"vega-1 cannot reach vega-2:8765"*"failed on 1 of 3 host(s)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
+    case "$err" in *"vega-3"*) echo "blamed a reachable host: $err" >&2; false;; *) true;; esac'
 
 # --- local mode: staging end to end (no ssh, no sshd) ---
 # The staging dir is redirected at a tmp dir through the real environment
@@ -3336,8 +3390,39 @@ t_assert "mount guard: -r makes a cached mount mode a warning and still probes w
             run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (p=*) echo probed >&2;; (*) return 1;; esac; }
             verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
     case "$out" in *"must be mounted with forcedirect"*) echo "died: $out" >&2; false;; *) true;; esac &&
+    # the warning is said after the loop (one line per mode across hosts), so
+    # it may follow the probe; both must have happened, in either order
     case "$out" in
-        *"WARNING: localhost: wekafs mounted writecache (need forcedirect); -r continues anyway"*"client cache"*probed*"rc=0 kept=1"*) true;;
+        *"WARNING: localhost: wekafs mounted writecache (need forcedirect); -r continues anyway"*"client cache"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in *probed*"rc=0 kept=1"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "mount guard: -r says a fleet-wide cached mode once, not once per host" bash -c '
+    out=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka; FAST_TRACK=1
+            run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (*) return 0;; esac; }
+            verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
+    [ "$(printf "%s\n" "$out" | grep -c "WARNING")" -eq 1 ] &&
+    case "$out" in
+        *"WARNING: wekafs mounted writecache (need forcedirect) on all 4 hosts; -r continues anyway"*"rc=0 kept=1"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "mount guard: -r names the hosts when only some are cached, one line per mode" bash -c '
+    out=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka; FAST_TRACK=1
+            run_host() { case "$1:$2" in
+                (h1:findmnt*|h3:findmnt*) echo "wekafs rw,writecache";;
+                (h2:findmnt*) echo "wekafs rw,readcache";;
+                (h4:findmnt*) echo "wekafs rw,forcedirect";;
+                (*) return 0;; esac; }
+            verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
+    [ "$(printf "%s\n" "$out" | grep -c "WARNING")" -eq 2 ] &&
+    case "$out" in
+        *"WARNING: h2: wekafs mounted readcache (need forcedirect); -r continues anyway"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    case "$out" in
+        *"WARNING: wekafs mounted writecache (need forcedirect) on 2 of 4 hosts (h1 h3); -r continues anyway"*"rc=0 kept=2"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c '
@@ -4440,11 +4525,16 @@ t_assert "calibrate: a unified set measures on the workload's own files" bash -c
     grep -q "^filename=shared.0/0:shared.1/0$" "$d/cal/h1/cal-seed.job" &&
     grep -q "^directory=/mnt/weka$" "$d/cal/h1/cal-seed.job" &&
     grep -q "^filesize=5120M$" "$d/cal/h1/cal-seed.job"'
+# (This test once called the function with its pre-<sep> arity and asserted
+# on separate lines, so a Python traceback and an empty result still counted
+# as a pass: the LAST line's status is the bash -c status. Chained now.)
 t_assert "cal_scratch_dirs: every directory the names imply, once" bash -c '
-    out=$( (source ./wekatester; cal_scratch_dirs h1 "\$filenum/\$jobnum" 3 1) | tr "\n" " " )
-    [ "$out" = "h1.cal.0 h1.cal.1 " ] || { echo "$out" >&2; false; }
-    out=$( (source ./wekatester; cal_scratch_dirs h1 "\$jobnum.\$filenum" 3 1) )
-    [ -z "$out" ] || { echo "$out" >&2; false; }'
+    out=$( (source ./wekatester; cal_scratch_dirs h1 .cal. "\$filenum/\$jobnum" 3 1) 2>&1 | tr "\n" " " ) &&
+    { [ "$out" = "h1.cal.0 h1.cal.1 " ] || { echo "$out" >&2; false; }; } &&
+    out=$( (source ./wekatester; cal_scratch_dirs h1 .cal. "\$jobnum.\$filenum" 3 1) 2>&1 ) &&
+    { [ -z "$out" ] || { echo "$out" >&2; false; }; } &&
+    out=$( (source ./wekatester; cal_scratch_dirs shared . "\$filenum/\$jobnum" 2 1) 2>&1 | tr "\n" " " ) &&
+    { [ "$out" = "shared.0 shared.1 " ] || { echo "$out" >&2; false; }; }'
 # One rule for (cpus, numjobs), used by the rungs, the seed and the staged
 # jobs alike: 52 jobs in a 46-cpu mask is the bug this prevents.
 t_assert "cal_cpus_nj: the effective mask and one job per cpu in it" bash -c '
