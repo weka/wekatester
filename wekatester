@@ -17,7 +17,7 @@
 # written to disk are the results_*.json outputs in the output directory
 # (./results by default, -o/--output to choose another).
 
-VERSION="2026-08-17"
+VERSION="2026-09-09"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -110,6 +110,18 @@ IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 log()   { echo "$(date '+%H:%M:%S') $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
+
+# A warning raised before the run log exists (the mount guard runs long
+# before start_run_log) would otherwise be console-only. It is kept and
+# replayed once the log is open, so the bundle carries every caveat that
+# applies to its numbers -- a reader of the archive never sees the console.
+PRERUN_WARNINGS=()
+warn_prerun() { log "WARNING: $*" >&2; PRERUN_WARNINGS+=("$*"); }
+replay_prerun_warnings() {
+    local w
+    [ ${#PRERUN_WARNINGS[@]} -gt 0 ] || return 0
+    for w in "${PRERUN_WARNINGS[@]}"; do log "WARNING: $w" >&2; done
+}
 
 # --- transport ----------------------------------------------------------------
 # The only two places that know whether a host is remote. Every phase --
@@ -382,7 +394,8 @@ give them are not (-Cmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
-  -d directory   target directory on the workers for test files (default: $DIRECTORY)
+  -d directory   target directory on the workers for test files (default: $DIRECTORY);
+                 created on request when it is missing under a wekafs mount
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
   -f fio_bin     fio binary on the workers (default: $FIO_BIN)
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
@@ -423,7 +436,8 @@ attaching is the way to pass a value that starts with a dash.
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
   -r             fast track: no prompts and no editors -- create whatever is
-                 needed and run
+                 needed and run; a wekafs destination that is not mounted
+                 forcedirect is a warning instead of a stop
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
@@ -3212,33 +3226,129 @@ classify_mount_line() {
     esac
 }
 
+# Remote snippet for a destination that does not exist: print its nearest
+# existing ancestor on one line and that ancestor's findmnt FSTYPE,OPTIONS on
+# the next. Exits nonzero when the destination DOES exist (the caller's plain
+# findmnt then failed for some other reason, and the old message stands) or
+# when nothing on the way up exists. dirname rather than ${p%/*}: it handles
+# a trailing slash and stops at /.
+missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
+    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; findmnt -T \"\$p\" -n -o FSTYPE,OPTIONS"
+}
+
+# One probe file, created and removed, as the same user fio will run as. On
+# a shared filesystem the directory's owner/mode is a property of the
+# filesystem itself, so one failing host usually means all do.
+probe_writable() {   # probe_writable <host> <dir>
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\""
+}
+
+write_fix_hint() {   # write_fix_hint <dir> -> how to fix a directory the login user cannot write
+    printf '%s' "fix the root's owner/mode (a one-time 'sudo chmod 1777 $1' on any host persists in the filesystem) or run as a user that can write"
+}
+
+# The one prompt of the mount pass, asked once for every host that lacks the
+# destination. -r/-n: 5s, default create, unattended without a terminal (the
+# -t host file precedent); otherwise a terminal is required and only a yes
+# creates.
+confirm_create_dirs() {   # confirm_create_dirs <count>
+    local msg="create the missing destination directory on $1 host(s)?"
+    if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+        if try_interactive; then
+            confirm_timed 5 yes "$msg" \
+                || die "destination directory does not exist on $1 host(s)"
+        else
+            log "destination directory does not exist on $1 host(s); creating it (unattended)"
+        fi
+    else
+        require_interactive "creating the destination directory" "create it yourself, or use -r"
+        confirm_timed 0 no "$msg [y = create, n = quit]" \
+            || die "destination directory does not exist on $1 host(s)"
+    fi
+}
+
 # All workers: -d must not be a cached-mode wekafs mount, and it must be
 # writable by the login user -- fio creates every data file there, and its
 # client mode reports a worker-side EACCES so quietly that without this probe
 # the run "succeeds" with zero IO.
+#
+# A destination that does not exist yet is not a fault when its nearest
+# existing ancestor is a wekafs mount: the operator is asked once, for every
+# host that lacks it, and the directory is created as the login user (so it
+# is theirs, and the probe then proves it) before anything runs. Anything
+# else that is missing stays a hard stop -- with wekafs not mounted the
+# ancestor is the root filesystem, and a mistyped -d created there would
+# benchmark the boot disk. Under -r a cached mount mode is a WARNING rather
+# than a stop: the client cache is then in the IO path, the numbers include
+# it, and the warning is replayed into the run log so the bundle says so.
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
-    local host line verdict failed=() mode_fail=0 write_fail=0 hd
+    local host line verdict failed=() mode_fail=0 write_fail=0 hd anc i
+    local missing=() missing_dirs=() missing_parents=()
     for host in "${HOSTS[@]}"; do
         hd=$(host_dir "$host")
-        line=$(run_host "$host" "findmnt -T '$hd' -n -o FSTYPE,OPTIONS") \
-            || { failed+=("$host: findmnt failed for $hd -- does it exist? (wrong -d?)")
-                 continue; }
+        anc=""
+        if ! line=$(run_host "$host" "findmnt -T '$hd' -n -o FSTYPE,OPTIONS"); then
+            # findmnt fails for a path that does not exist: classify the
+            # nearest ancestor that does, and remember that hd is missing
+            if line=$(run_host "$host" "$(missing_dir_probe_cmd "$hd")") \
+                    && [ "$line" != "${line#*$'\n'}" ]; then
+                anc=${line%%$'\n'*}; line=${line#*$'\n'}
+            else
+                failed+=("$host: findmnt failed for $hd -- does it exist? (wrong -d?)")
+                continue
+            fi
+        fi
         verdict=$(classify_mount_line "$line")
         case "$verdict" in
             ok)   ;;
-            skip) debug "$host: $hd is not wekafs; guard skipped" ;;
-            fail*) failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
-                   mode_fail=1
-                   continue ;;
+            skip) if [ -n "$anc" ]; then
+                      failed+=("$host: $hd does not exist, and $anc is not a wekafs mount -- create it yourself, or check that -d names the right directory")
+                      continue
+                  fi
+                  debug "$host: $hd is not wekafs; guard skipped" ;;
+            fail*) if [ "$FAST_TRACK" -eq 1 ]; then
+                       warn_prerun "$host: wekafs mounted ${verdict#fail } (need forcedirect); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                   else
+                       failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
+                       mode_fail=1
+                       continue
+                   fi ;;
         esac
-        # One probe file, created and removed, as the same user fio will run
-        # as. On a shared filesystem the mount root's owner/mode is a property
-        # of the filesystem itself, so one failing host usually means all do.
-        run_host "$host" "p='$hd'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"" \
-            || { failed+=("$host: cannot create files in $hd -- fix the root's owner/mode (a one-time 'sudo chmod 1777 $hd' on any host persists in the filesystem) or run as a user that can write")
+        if [ -n "$anc" ]; then
+            missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc")
+            continue   # created below, once the operator agrees, then probed
+        fi
+        probe_writable "$host" "$hd" \
+            || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                  write_fail=1; }
     done
+    # Missing destinations are created only when nothing else is wrong: no
+    # mutation on a run that is about to stop anyway.
+    if [ ${#missing[@]} -gt 0 ]; then
+        if [ ${#failed[@]} -gt 0 ]; then
+            for i in "${!missing[@]}"; do
+                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; not created while other checks fail"
+            done
+        else
+            for i in "${!missing[@]}"; do
+                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is a wekafs mount"
+            done
+            confirm_create_dirs "${#missing[@]}"
+            for i in "${!missing[@]}"; do
+                host=${missing[$i]}; hd=${missing_dirs[$i]}
+                if ! run_host "$host" "mkdir -p -- '$hd'"; then
+                    failed+=("$host: cannot create $hd -- $(write_fix_hint "${missing_parents[$i]}")")
+                    write_fail=1
+                    continue
+                fi
+                log "$host: created $hd"
+                probe_writable "$host" "$hd" \
+                    || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
+                         write_fail=1; }
+            done
+        fi
+    fi
     if [ ${#failed[@]} -gt 0 ]; then
         for line in "${failed[@]}"; do log "ERROR: $line" >&2; done
         # Only advise a remount when a mount mode was actually the problem. When
@@ -6426,7 +6536,6 @@ main() {
     # no child inherits a readable terminal.
     if [ "$CUSTOMIZE" -eq 1 ]; then
         customize_jobfiles
-        close_interactive
         # The set's host file just became (or was edited as) the active
         # targets file: refresh the pre-auth resolution and re-verify the
         # mounts, since per-host destinations may have changed. Login edits
@@ -6437,6 +6546,9 @@ main() {
             || die "host file resolution failed ($TARGETS_FILE)"
         verify_mount_mode
     fi
+    # Unconditional: -p, a -t host file created on the way, and a destination
+    # created by the mount pass open the prompt fd too, not only -C.
+    close_interactive
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
             probe_workers
@@ -6458,6 +6570,7 @@ main() {
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     start_run_log
+    replay_prerun_warnings
     snapshot_sysinfo
     snapshot_pressure start
     if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then

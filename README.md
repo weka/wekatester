@@ -34,7 +34,8 @@ give them are not (-Cmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
-  -d directory   target directory on the workers for test files (default: /mnt/weka)
+  -d directory   target directory on the workers for test files (default: /mnt/weka);
+                 created on request when it is missing under a wekafs mount
   -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
   -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
@@ -75,7 +76,8 @@ attaching is the way to pass a value that starts with a dash.
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
   -r             fast track: no prompts and no editors -- create whatever is
-                 needed and run
+                 needed and run; a wekafs destination that is not mounted
+                 forcedirect is a warning instead of a stop
   -n             dry run: create/generate, print the files and the run details,
                  execute nothing
   -g             force regeneration of existing layout jobfiles
@@ -152,7 +154,7 @@ With no attached set name, the token after `-C` is assumed to be a client; if it
 
 Unattended forms:
 
-- `-r` — fast track: no prompts, no editors; whatever is needed (set copy, layout) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). Temp sets are kept.
+- `-r` — fast track: no prompts, no editors; whatever is needed (set copy, layout, a missing destination directory under a wekafs mount) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). Temp sets are kept. A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so.
 - `-n` — dry run: everything is resolved, generated and staged, then the full paths of the created files, every staged jobfile's contents, and the would-be run details are printed — and nothing executes. Combine with `-C` to prepare a set for manual editing.
 - `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too).
 
@@ -597,6 +599,7 @@ Any run can be re-summarized later with `-s` — point it at the bundle (no extr
 - TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts, and it refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors).
 - The per-host min/max spread in the summary only appears with 2 or more workers. A run with no host at all is local mode, not an error.
 - Local mode still needs fio on the local host, `/dev/shm`, and fio's port 8765 reachable on loopback — the same phases run, they just run against this machine. It is Linux-only (the mount guard uses `findmnt`, staging uses `/dev/shm`) and refuses to start elsewhere; driving remote workers *from* a non-Linux machine is unaffected.
-- If `-d` is a wekafs mount it must be mounted with `forcedirect`; wekatester refuses to run otherwise. fio's `direct=1` alone does not keep the wekafs client cache fully out of the IO path.
-- The target directory must be writable by the login user on every worker — fio creates its data files there. wekatester probes this before running (one dotfile, created and removed) because fio's client mode reports a worker-side permission failure so quietly that the run would otherwise "succeed" with zero IO. A root-owned mount root is the usual cause; a one-time `chmod` of the root on any host persists in the shared filesystem.
+- If `-d` is a wekafs mount it must be mounted with `forcedirect`; wekatester refuses to run otherwise. fio's `direct=1` alone does not keep the wekafs client cache fully out of the IO path. Under `-r` this is a warning rather than a stop — the numbers then include client-cache effects, and the run log says so.
+- If `-d` does not exist yet, wekatester offers to create it (once, for every worker that lacks it) — but only when the nearest existing parent is a wekafs mount. Without `-r` that takes a terminal and a `y`; with `-r` or `-n` it is a 5-second prompt defaulting to create, or created outright when there is no terminal. A missing directory anywhere else is a hard stop: with wekafs not mounted, the parent is the root filesystem, and a mistyped `-d` created there would benchmark the boot disk.
+- The target directory must be writable by the login user on every worker — fio creates its data files there. wekatester probes this before running (one dotfile, created and removed) because fio's client mode reports a worker-side permission failure so quietly that the run would otherwise "succeed" with zero IO. A root-owned mount root is the usual cause; a one-time `chmod` of the root on any host persists in the shared filesystem. A directory wekatester creates is owned by the login user, so it passes this probe by construction.
 - `fio --client` exits 0 even when jobs fail on the workers, so wekatester reads success out of the results themselves: a job whose stats carry an error, or a measured job that moved zero bytes, aborts the run and names the host — it will not print a summary of zeros.

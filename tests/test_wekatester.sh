@@ -2912,6 +2912,176 @@ t_assert "mount guard: writable non-wekafs -d passes with the probe" bash -c '
      run_host() { case "$2" in findmnt*) echo "xfs rw,noatime";; *) return 0;; esac; }
      verify_mount_mode)'
 
+# -r turns the forcedirect stop into a warning. The write probe still runs
+# (a cached mount that is unwritable is still a zero-IO run), and the warning
+# is kept for replay into the run log, which does not exist yet at this point.
+t_assert "mount guard: -r makes a cached mount mode a warning and still probes writability" bash -c '
+    out=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka; FAST_TRACK=1
+            run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (p=*) echo probed >&2;; (*) return 1;; esac; }
+            verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
+    case "$out" in *"must be mounted with forcedirect"*) echo "died: $out" >&2; false;; *) true;; esac &&
+    case "$out" in
+        *"WARNING: localhost: wekafs mounted writecache (need forcedirect); -r continues anyway"*"client cache"*probed*"rc=0 kept=1"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka; FAST_TRACK=1
+            run_host() { case "$2" in (findmnt*) echo "wekafs rw,readcache";; (*) return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *"must be mounted with forcedirect"*) echo "remount advice under -r: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"WARNING: localhost: wekafs mounted readcache"*"cannot create files in /mnt/weka"*"is not writable on every host"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "prerun warnings: kept before the run log exists and replayed once it does" bash -c '
+    out=$( (source ./wekatester; warn_prerun "a b"; warn_prerun "c d"; replay_prerun_warnings) 2>&1 )
+    [ "$(printf "%s\n" "$out" | grep -c "WARNING: a b")" -eq 2 ] &&
+    [ "$(printf "%s\n" "$out" | grep -c "WARNING: c d")" -eq 2 ] &&
+    (source ./wekatester; replay_prerun_warnings)'
+
+# A missing destination is created when its nearest existing parent is a
+# wekafs mount in an acceptable mode. Stubs discriminate the four remote
+# commands by their leading token: findmnt, the "[ ! -e" ancestor walk,
+# mkdir, and the p= write probe.
+t_assert "mount guard: missing -d under forcedirect wekafs is created unattended under -r, then probed" bash -c '
+    out=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(h1 h2); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\n";;
+                (mkdir*)    echo "MKDIR[$1] $2" >&2;;
+                (p=*)       echo "PROBE[$1]" >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode && echo rc=0) 2>&1 )
+    case "$out" in
+        *"h1: /mnt/weka/wt does not exist; /mnt/weka is a wekafs mount"*"h2: /mnt/weka/wt does not exist"*"does not exist on 2 host(s); creating it (unattended)"*"MKDIR[h1] mkdir -p -- '"'"'/mnt/weka/wt'"'"'"*"h1: created /mnt/weka/wt"*"PROBE[h1]"*"MKDIR[h2]"*"PROBE[h2]"*rc=0*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "mount guard: missing -d without -r needs a terminal and creates nothing" bash -c '
+    err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                (mkdir*)    echo MKDIR >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *MKDIR*) echo "created without a terminal: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"creating the destination directory needs a terminal; create it yourself, or use -r"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: the create prompt -- y creates, n quits without touching the host" bash -c '
+    source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
+    LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
+    run_host() { case "$2" in
+        (findmnt*)  return 1;;
+        ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+        (mkdir*)    echo MKDIR >&2;;
+        (*)         return 0;; esac; }
+    yes_out=$(printf y | { verify_mount_mode; } 2>&1); yes_rc=$?
+    no_out=$(printf n | { verify_mount_mode; } 2>&1); no_rc=$?
+    [ "$yes_rc" -eq 0 ] || { echo "y: rc=$yes_rc $yes_out" >&2; false; } &&
+    case "$yes_out" in *"create the missing destination directory on 1 host(s)? [y = create, n = quit]"*MKDIR*) true;; *) echo "y: $yes_out" >&2; false;; esac &&
+    [ "$no_rc" -ne 0 ] || { echo "n: rc=0 $no_out" >&2; false; } &&
+    case "$no_out" in *MKDIR*) echo "n created: $no_out" >&2; false;; *"destination directory does not exist on 1 host(s)"*) true;; *) echo "n: $no_out" >&2; false;; esac'
+t_assert "mount guard: missing -d whose parent is not wekafs is never created, even under -r" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/wkea; FAST_TRACK=1
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt\nxfs rw,relatime\n";;
+                (mkdir*)    echo MKDIR >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *MKDIR*) echo "created under a non-wekafs parent: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"/mnt/wkea does not exist, and /mnt is not a wekafs mount -- create it yourself"*"-d names the right directory"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: missing -d under a cached-mode parent stops without -r and creates nothing" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
+                (mkdir*)    echo MKDIR >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *MKDIR*) echo "created on a mode failure: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"localhost: wekafs mounted writecache (need forcedirect)"*"must be mounted with forcedirect; remount"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: -r under a cached-mode parent warns, creates and probes" bash -c '
+    out=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
+                (mkdir*)    echo MKDIR >&2;;
+                (p=*)       echo PROBED >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode && echo rc=0) 2>&1 )
+    case "$out" in
+        *"WARNING: localhost: wekafs mounted writecache"*"creating it (unattended)"*MKDIR*PROBED*rc=0*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "mount guard: nothing is created while another host fails" bash -c '
+    err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(h1 h2); DIRECTORY=/mnt/weka/wt; FAST_TRACK=0
+            run_host() { case "$1:$2" in
+                (h1:findmnt*)  echo "wekafs rw,writecache";;
+                (h2:findmnt*)  return 1;;
+                (h2:"[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                (*:mkdir*)     echo MKDIR >&2;;
+                (*)            return 1;; esac; }
+            verify_mount_mode) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *MKDIR*) echo "mutated before a stop: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"h2: /mnt/weka/wt does not exist; not created while other checks fail"*"h1: wekafs mounted writecache"*"must be mounted with forcedirect"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: a failed mkdir dies with the chmod hint naming the parent" bash -c '
+    err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                (mkdir*)    return 1;;
+                (*)         echo PROBED >&2;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in *PROBED*) echo "probed a directory that was not created: $err" >&2; false;; *) true;; esac &&
+    case "$err" in
+        *"localhost: cannot create /mnt/weka/wt -- fix the root'"'"'s owner/mode (a one-time '"'"'sudo chmod 1777 /mnt/weka'"'"'"*"is not writable on every host"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+# The ancestor walk itself, against a real filesystem: findmnt is stubbed to
+# echo its arguments, so the second line pins which path it was asked about.
+t_assert "mount guard: the missing-dir snippet walks up to the nearest existing ancestor" bash -c '
+    tmp=$(mktemp -d); stub=$(mktemp -d)
+    printf "#!/bin/sh\necho \"stubfs rw,opts \$*\"\n" > "$stub/findmnt"; chmod +x "$stub/findmnt"
+    out=$(source ./wekatester; PATH="$stub:$PATH" bash -c "$(missing_dir_probe_cmd "$tmp/a/b/c/")")
+    [ "$out" = "$tmp
+stubfs rw,opts -T $tmp -n -o FSTYPE,OPTIONS" ] || { echo "$out" >&2; false; }'
+t_assert "mount guard: the missing-dir snippet fails when the directory exists" bash -c '
+    tmp=$(mktemp -d)
+    out=$(source ./wekatester; bash -c "$(missing_dir_probe_cmd "$tmp")"); rc=$?
+    [ "$rc" -ne 0 ] && [ -z "$out" ]'
+
 # fio --client exits 0 even when every worker-side job failed; success is read
 # from the results. The lab run "succeeded" in 5s per job with zero IO while
 # every process died on EACCES.
