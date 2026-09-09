@@ -2721,6 +2721,59 @@ t_assert "writeback: -g overwrites without a prompt, but never login or allowed_
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
      writeback_targets) >/dev/null
     tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$"'
+
+# A generic (host-less) row is a default, never the host's own setting. The
+# writeback leaves it byte-for-byte alone and gives the host its own line
+# carrying what actually ran: the executed cpu list (the staged
+# cpus_allowed, i.e. the generic list minus weka's cores), the proven
+# engine and the resolved destination -- not copies of the generic values.
+t_assert "writeback: a generic cpu list stays as written; the host line records the executed list" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "host,user_login,ioengine,allowed_cpus\n,,,0-127,,,,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    [ "$(sed -n 2p "$f")" = ",,,0-127,,,,,,," ] &&
+    ! grep -q "superseded" "$f" &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
+        { cat "$f" >&2; false; }'
+t_assert "writeback: generic engine and dir are defaults too; the host line records the proven and resolved ones" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf ",,psync,0-127,/mnt/g,,,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    [ "$(sed -n 1p "$f")" = ",,psync,0-127,/mnt/g,,,,,," ] &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
+        { cat "$f" >&2; false; }'
+t_assert "writeback: a host row beside a generic one keeps its own cpu list; the generic row is untouched" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf ",,,0-127,,,,,,,\nh1,opc,,9-11,,,,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
+     writeback_targets) >/dev/null
+    [ "$(sed -n 1p "$f")" = ",,,0-127,,,,,,," ] &&
+    grep -q "^# superseded by -a: h1,opc,,9-11" "$f" &&
+    tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$" ||
+        { cat "$f" >&2; false; }'
+t_assert "writeback: a cpu list that differs from the generic one is reason enough for a host line" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    [ "$(sed -n 1p "$f")" = ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32," ] &&
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
+        { cat "$f" >&2; false; }'
+t_assert "resolve_targets: hostonly sees the host row and nothing generic; phase1 still folds generics in" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\n,,,0-127,/mnt/g,,,,,,\nh2,,,4-15,,,,,,,\n" > "$d/hl.csv"
+    (source ./wekatester; WORK_DIR=$d
+     ho=$(resolve_targets hostonly "$d/hl.csv" - - - h1 h2)
+     p1=$(resolve_targets phase1 "$d/hl.csv" - - - h1 h2)
+     col() { printf "%s\n" "$1" | grep "^$2	" | cut -f4,5 | tr "\t" " "; }
+     [ "$(col "$ho" h1)" = "- -" ] && [ "$(col "$ho" h2)" = "4-15 -" ] &&
+     [ "$(col "$p1" h1)" = "0-127 /mnt/g" ] && [ "$(col "$p1" h2)" = "4-15 /mnt/g" ])'
 t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     d=$(wb_fixture); mkdir "$d/set"
     (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null

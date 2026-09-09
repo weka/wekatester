@@ -4899,11 +4899,17 @@ writeback_targets() {
     [ -n "$wb" ] && [ -f "$wb" ] || return 0
     # -g means the derived and measured values WIN -- no prompt. The three
     # columns the operator owns outright (host, login, allowed_cpus) are
-    # protected inside the merge below regardless of mode.
+    # protected inside the merge below regardless of mode -- when the HOST'S
+    # OWN row provides them. A generic (host-less) row is a default for
+    # whoever lacks a value, not that host's setting: it is never edited,
+    # and the host line written beside it records what the run resolved --
+    # the cpu list fio actually executed on (the generic list minus weka's
+    # pinned cores and cpus the host does not have), the proven engine, the
+    # resolved destination -- so the file ends up saying, per host, what ran.
     [ "$REGEN_LAYOUT" -eq 0 ] || mode=overwrite
-    # file-only resolution (no CLI merge): what does the FILE itself provide?
-    resolve_targets phase2 "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
-        > "$WORK_DIR/targets.fileonly" || : > "$WORK_DIR/targets.fileonly"
+    # what does each host's OWN row provide? (no CLI merge, no generic rows)
+    resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
+        > "$WORK_DIR/targets.hostrows" || : > "$WORK_DIR/targets.hostrows"
     local h ident=""
     for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
@@ -4923,7 +4929,7 @@ def load_tsv(path):
                 out[p[0]] = {k: v for k, v in zip(FIELDS, p[1:]) if v != "-"}
     return out
 
-fileonly = load_tsv(os.path.join(work, "targets.fileonly"))
+hostrows = load_tsv(os.path.join(work, "targets.hostrows"))
 
 # derive per-host values: the measured knees first (cal.results is pure
 # measurement -- targets.final would also carry CLI-merged values, which are
@@ -4992,15 +4998,18 @@ for host in hosts:
                         d.setdefault(f"{kind}_{sfx}_{tkey}", v)
     derived[host] = {k: v for k, v in d.items() if v}
 
-# desired host line per host
+# desired host line per host: the host's own row, plus what the run derived
+# for whatever that row left unset (or everything, under -g). Values a
+# generic row supplied are not in `have`, so a host that ran on a generic
+# cpu list gets its own line carrying the list that actually executed.
 updates = {}
 for host in hosts:
-    have = fileonly.get(host, {})
+    have = hostrows.get(host, {})
     want = dict(have)
     for k, v in derived.get(host, {}).items():
         if k in ("login", "cpus") and k in have:
-            continue   # identity, credentials and the operator's cpu list
-                       # are never overwritten, -g included
+            continue   # identity, credentials and the operator's OWN cpu
+                       # list are never overwritten, -g included
         if mode == "overwrite" or k not in have:
             want[k] = v
     if want and want != have:
@@ -5073,7 +5082,11 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
     awk '/^priv /{sub(/^priv /, ""); print; exit}' "$WORK_DIR/probe/$1"
 }
 
-resolve_targets() {   # resolve_targets <phase> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
+# phase1: before the engine tests (engine selectors cannot apply yet);
+# phase2: with engine.results, the finished resolution; hostonly: each
+# host's OWN row and nothing else -- what the writeback merges against, so
+# a generic (host-less) row's defaults are never mistaken for the host's.
+resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") pyrun "$@" <<'PYEOF'
 import csv, os, sys
 
@@ -5176,7 +5189,8 @@ def resolve(host):
                 src[k] = (e["nsel"], e["lineno"])
     login = cfg.get("login", "")
     # host-less lines, most selectors first; ties resolved first-line-wins
-    for e in sorted((e for e in entries if not e["host"]),
+    # (skipped outright in hostonly: their values are defaults, not the host's)
+    for e in sorted((e for e in entries if not e["host"] and phase != "hostonly"),
                     key=lambda e: (-e["nsel"], e["lineno"])):
         if e["sel_login"] and e["sel_login"] != login:
             continue
