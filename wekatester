@@ -116,12 +116,28 @@ die()   { log "ERROR: $*" >&2; exit 1; }
 # before start_run_log) would otherwise be console-only. It is kept and
 # replayed once the log is open, so the bundle carries every caveat that
 # applies to its numbers -- a reader of the archive never sees the console.
+# Kept once per distinct message (the mount guard runs twice under -C and
+# says the same thing both times), and replayed into the log FILE only: the
+# console already saw every warning live, and after start_run_log stderr is
+# tee'd to both, so a replay on stderr showed each warning twice more.
 PRERUN_WARNINGS=()
-warn_prerun() { log "WARNING: $*" >&2; PRERUN_WARNINGS+=("$*"); }
-replay_prerun_warnings() {
+warn_prerun() {
     local w
-    [ ${#PRERUN_WARNINGS[@]} -gt 0 ] || return 0
-    for w in "${PRERUN_WARNINGS[@]}"; do log "WARNING: $w" >&2; done
+    log "WARNING: $*" >&2
+    for w in "${PRERUN_WARNINGS[@]}"; do
+        [ "$w" != "$*" ] || return 0
+    done
+    PRERUN_WARNINGS+=("$*")
+}
+replay_prerun_warnings() {
+    local w f="$RUN_DIR/wekatester.log"
+    # gated on the run DIRECTORY, not the file: start_run_log's tees open
+    # the log in the background and may not have created it yet when this
+    # runs -- >> creates it, and every writer appends, so nothing clobbers
+    [ ${#PRERUN_WARNINGS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
+    for w in "${PRERUN_WARNINGS[@]}"; do
+        log "WARNING (before the run log opened): $w" >> "$f"
+    done
 }
 
 # --- transport ----------------------------------------------------------------
@@ -2325,6 +2341,20 @@ cal_push() {   # cal_push <basename> <host>...
 # against a warm scratch seeds nothing at all. Size is a sufficient test here
 # for the same reason it is for the main layout -- laid-out files cannot be
 # sparse on weka, and the seed job sets fallocate=none.
+# One line of the pre-seed estimate: what this host's seed will write, and
+# against how much free space. MiB in, prose out.
+seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <ntrunc> <availmib|""> <dir>
+    if [ "$1" -eq 0 ] && [ "$3" -eq 0 ]; then
+        printf 'scratch already complete, nothing to write'
+        return 0
+    fi
+    LC_ALL=C awk -v n="$1" -v mib="$2" -v t="$3" -v av="$4" -v d="$5" 'BEGIN {
+        printf "%d dense file(s) = %.1f GiB to write, %d sparse truncate(s)", n, mib / 1024, t
+        if (av == "") printf "; free space at %s unknown", d
+        else printf "; free %.1f GiB at %s (%d%% of it)", av / 1024, d, (av > 0 ? mib * 100 / av : 0)
+    }'
+}
+
 cal_seed_scratch() {   # cal_seed_scratch <host>...
     local sizes host hd hl nj eng cpus f cmd want nfiles nmib availmib short_hosts=""
     local seedrun=() dfline src totkb key pids=() hs=() i
@@ -2591,7 +2621,12 @@ PYEOF
         # NB: no "set --" here -- it would clobber the host list in "$@"
         read -r nfiles nmib ntrunc <<<"$want"
         [ "${nfiles:-0}" -eq 0 ] || seedrun+=("$host")
-        debug "cal: $host: seed needs ${nfiles:-0} dense file(s), ${nmib:-0} MiB, ${ntrunc:-0} truncate(s)"
+        # The estimate goes out BEFORE a byte is written: a seed that dies
+        # on ENOSPC twenty minutes in has at least told the operator what it
+        # was going to need, and against how much free space.
+        read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
+        case "$availmib" in (""|*[!0-9]*) availmib="" ;; esac
+        log "cal: seed estimate: $host: $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "${ntrunc:-0}" "$availmib" "$hd")"
         if [ "${ntrunc:-0}" -gt 0 ]; then
             # sparse write canvases: st_size set by truncate, bytes land as
             # the write cells put them there. Chunked so the command string
@@ -2609,9 +2644,8 @@ PYEOF
         fi
         sidx=$((sidx + 1))
         if [ "${nmib:-0}" -gt 0 ]; then
-            read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
             case "$availmib" in
-                (""|*[!0-9]*) log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2 ;;
+                ("") log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2 ;;
                 (*) # hosts whose destinations sit on the same SHARED
                     # filesystem (same df source and size; /dev/* and tmpfs
                     # are host-local by definition) must fit their seeds in
@@ -2621,7 +2655,7 @@ PYEOF
                         (/dev/*|tmpfs) key="local:$host" ;;
                         (*)            key="$src|$totkb" ;;
                     esac
-                    printf '%s %s %s %s\n' "$key" "$nmib" "$availmib" "$host" \
+                    printf '%s %s %s %s %s\n' "$key" "$nmib" "$availmib" "$host" "$src" \
                         >> "$WORK_DIR/cal/seedspace" ;;
             esac
         fi
@@ -2638,6 +2672,20 @@ PYEOF
     if [ -n "$short_hosts" ]; then
         log "ERROR: not enough free space for the calibration scratch on:$short_hosts" >&2
         die "calibration needs its scratch laid out before it can measure; free space under the destination, shrink FILESIZE_MIB or the file counts, or drop -a cal"
+    fi
+    # The total per filesystem -- hosts sharing one fill it together -- as
+    # the last line before the writes start.
+    if [ -s "$WORK_DIR/cal/seedspace" ]; then
+        LC_ALL=C awk \
+            '{need[$1] += $2
+              if (!($1 in av) || $3 < av[$1]) av[$1] = $3
+              hosts[$1] = hosts[$1] " " $4; src[$1] = $5}
+             END {for (k in need)
+                      printf "total %.1f GiB dense on %s (free %.1f GiB, %d%% of it) across%s\n",
+                          need[k] / 1024, src[k], av[k] / 1024,
+                          (av[k] > 0 ? need[k] * 100 / av[k] : 0), hosts[k]}' \
+            "$WORK_DIR/cal/seedspace" \
+            | while IFS= read -r line; do log "cal: seed estimate: $line"; done
     fi
     if [ ${#seedrun[@]} -eq 0 ]; then
         log "cal: the scratch on every host already satisfies every ladder -- no seeding needed"

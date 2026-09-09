@@ -469,6 +469,12 @@ Sets whose format cannot express the grid fall back to the private
 `.wekatester-cal` scratch exactly as before. `-u` removes the per-client
 sets, and — from the first host — the shared dataset.
 
+**Before the seed writes a byte, its space estimate is printed**: per host,
+the dense files and GiB to write, the sparse truncates, and the free space at
+the destination with the share the seed will take of it; then one total per
+filesystem, since hosts sharing a filesystem fill it together. A seed that
+would not fit stops right there, before anything is written.
+
 **The calibration dataset is seeded once, incrementally, and kept.** Every
 rung of every ladder reads `<host>.cal.<job>.<filenum>` (or the workload's own
 shape under `CAL_FMT_PARITY=1`); ladders differ only

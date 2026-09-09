@@ -1233,6 +1233,35 @@ t_assert "cal_seed_scratch: a brutal-width seed stays far below the fio 4096-job
     # and every filename line stays far below the 4096-byte fio parser buffer
     [ "$(awk "/^filename=/ { if (length(\$0) > m) m = length(\$0) } END { print m }" "$d/cal/h1/cal-seed.job")" -lt 1024 ]'
 
+# -a: the seed's space estimate is the last thing said before writing starts
+# -- per host (before that host's truncates), then the per-filesystem total.
+t_assert "cal_seed_scratch: the space estimate is printed per host and in total before seeding starts" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal/h1"
+    printf "ncpus 4\n" > "$d/probe/h1"
+    printf "bw read\n" > "$d/cal/seedplan.h1"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; AUTH_DIR=$d/auth; DIRECTORY=/mnt/weka
+     MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+     CAL_SETTLE=0; ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in
+         (*find*) return 0;;
+         (*df*)   echo "wekafs 2147483648 1048576";;
+         (*)      return 0;;
+     esac; }
+     cal_seed_scratch h1) 2>&1 )
+    est=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: h1: [0-9][0-9]* dense file(s) = [0-9.]* GiB to write, 0 sparse truncate(s); free 1024.0 GiB at /mnt/weka ([0-9]*% of it)" | cut -d: -f1 | head -1)
+    tot=$(printf "%s\n" "$out" | grep -n "cal: seed estimate: total [0-9.]* GiB dense on wekafs (free 1024.0 GiB, [0-9]*% of it) across h1" | cut -d: -f1 | head -1)
+    seed=$(printf "%s\n" "$out" | grep -n "cal: seeding the calibration scratch" | cut -d: -f1 | head -1)
+    [ -n "$est" ] && [ -n "$tot" ] && [ -n "$seed" ] && [ "$est" -lt "$tot" ] && [ "$tot" -lt "$seed" ] ||
+        { printf "%s\n" "$out" >&2; false; }'
+t_assert "seed_estimate_line: complete scratch, unknown free space, and the share of free space" bash -c '
+    source ./wekatester
+    [ "$(seed_estimate_line 0 0 0 1000 /d)" = "scratch already complete, nothing to write" ] &&
+    [ "$(seed_estimate_line 4 2048 0 "" /d)" = "4 dense file(s) = 2.0 GiB to write, 0 sparse truncate(s); free space at /d unknown" ] &&
+    [ "$(seed_estimate_line 4 2048 6 8192 /d)" = "4 dense file(s) = 2.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (25% of it)" ] &&
+    [ "$(seed_estimate_line 0 0 6 8192 /d)" = "0 dense file(s) = 0.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (0% of it)" ]'
+
 # --- python floor: the workers are older than this laptop ---
 # The inline python has to run on the WORKERS, and a Weka client is commonly
 # RHEL 8, which ships python 3.6. A developer box running 3.9+ will happily
@@ -3041,11 +3070,28 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
         *"WARNING: localhost: wekafs mounted readcache"*"cannot create files in /mnt/weka"*"is not writable on every host"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "prerun warnings: kept before the run log exists and replayed once it does" bash -c '
-    out=$( (source ./wekatester; warn_prerun "a b"; warn_prerun "c d"; replay_prerun_warnings) 2>&1 )
+# Live on the console every time it is raised; kept once per distinct message
+# (the mount guard runs twice under -C); replayed into the run log FILE only,
+# never back onto the console (seen live: one -r warning printed four times).
+t_assert "prerun warnings: logged live, kept deduplicated, replayed into the run log file only" bash -c '
+    d=$(mktemp -d); : > "$d/wekatester.log"
+    out=$( (source ./wekatester; RUN_DIR=$d
+            warn_prerun "a b"; warn_prerun "a b"; warn_prerun "c d"
+            echo "kept=${#PRERUN_WARNINGS[@]}"
+            replay_prerun_warnings) 2>&1 )
     [ "$(printf "%s\n" "$out" | grep -c "WARNING: a b")" -eq 2 ] &&
-    [ "$(printf "%s\n" "$out" | grep -c "WARNING: c d")" -eq 2 ] &&
-    (source ./wekatester; replay_prerun_warnings)'
+    [ "$(printf "%s\n" "$out" | grep -c "WARNING: c d")" -eq 1 ] &&
+    case "$out" in *"kept=2"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ "$(grep -c "WARNING (before the run log opened): a b" "$d/wekatester.log")" -eq 1 ] &&
+    [ "$(grep -c "WARNING (before the run log opened): c d" "$d/wekatester.log")" -eq 1 ] &&
+    (source ./wekatester; RUN_DIR=""; replay_prerun_warnings) &&
+    x=$( (source ./wekatester; RUN_DIR=$d/nope; warn_prerun x; replay_prerun_warnings) 2>&1 ) &&
+    [ ! -e "$d/nope" ] &&
+    # the run dir exists but the tee has not created the log yet: the replay
+    # must create it rather than skip -- the race a real run has every time
+    e=$(mktemp -d) && [ ! -e "$e/wekatester.log" ] &&
+    y=$( (source ./wekatester; RUN_DIR=$e; warn_prerun "e f"; replay_prerun_warnings) 2>&1 ) &&
+    [ "$(grep -c "WARNING (before the run log opened): e f" "$e/wekatester.log")" -eq 1 ]'
 
 # A missing destination is created when its nearest existing parent is a
 # wekafs mount in an acceptable mode. Stubs discriminate the four remote
