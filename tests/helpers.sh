@@ -1,11 +1,24 @@
 # Shared fixtures for tests/test_wekatester.sh.
 
 # --- probe remote snippet stub (Task 4) ---
+# taskset refuses cpus 3 and 5, so the snippet's per-cpu bind test has
+# something to find; sudo always fails, so the escalator sweep is
+# deterministic wherever the suite runs.
 probe_stub() {
     stub=$(mktemp -d)   # leaked on purpose; tests are short-lived
     printf '#!/bin/sh\necho 8\n' > "$stub/getconf"
     printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
     printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
+    printf '#!/bin/sh\nexit 1\n' > "$stub/sudo"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$stub/timeout"
+    cat > "$stub/taskset" <<'TASKSETEOF'
+#!/bin/sh
+case "$1" in
+  -cp) echo "pid $2's current affinity list: 0-7"; exit 0 ;;
+  -c)  case "$2" in 3|5) echo "taskset: failed to set affinity: Invalid argument" >&2; exit 1 ;; esac
+       shift 2; exec "$@" ;;
+esac
+TASKSETEOF
     chmod +x "$stub"/*
     (source ./wekatester; FIO_BIN=fio; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
 }

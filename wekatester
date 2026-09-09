@@ -629,6 +629,39 @@ def pick_slot(kind, dirs, get):
 
 ENGINE_ORDER = ["io_uring", "libaio", "psync"]
 
+def probe_cpu_fact(path, key):
+    """The cpu set on a 'key <list>' probe line, plus whether the line was
+    there at all. "-" means TESTED AND EMPTY; an absent line means the probe
+    could not test, and every caller must then fall back to its own rule
+    rather than treat "nothing" as an answer."""
+    try:
+        fh = open(path)
+    except OSError:
+        return set(), False   # no probe facts at all: caller falls back
+    with fh:
+        for line in fh:
+            f = line.split()
+            if len(f) > 1 and f[0] == key:
+                return (set() if f[1] == "-" else parse_cpulist(f[1])), True
+    return set(), False
+
+def probe_universe(path, ncpus):
+    """The cpus this host actually has: the kernel's own online list when the
+    probe read it, else 0..ncpus-1 -- which assumes the ids are contiguous
+    from zero, and they are not on a box with an offline cpu."""
+    online, ok = probe_cpu_fact(path, "online")
+    return online if (ok and online) else set(range(ncpus))
+
+def probe_unbindable(path, universe):
+    """Cpus in <universe> that this host refuses to bind, as MEASURED by the
+    probe (offline-but-counted, or held by another cgroup's cpuset
+    partition). Empty when the probe could not test -- never a guess."""
+    bind, tested = probe_cpu_fact(path, "bindable")
+    if not tested:
+        return set()
+    bindp, _ = probe_cpu_fact(path, "bindable_priv")
+    return set(universe) - bind - bindp
+
 def pick_engine(tally):
     # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
     # libaio over psync -- instead of to whichever jobfile happened to be
@@ -1062,10 +1095,15 @@ for line in open(path):
         cpuset = parse_cpulist(f[1])
         if len(cpuset) == 1:      # single-cpu mask = a dedicated io thread
             weka |= cpuset
-base = parse_cpulist(sys.argv[3]) if sys.argv[3] else set(range(ncpus))
-if ncpus:
-    base &= set(range(ncpus))   # never a cpu the host does not have
-usable = sorted(base - weka) or sorted(base) or list(range(ncpus))
+universe = probe_universe(path, ncpus)
+unbind = probe_unbindable(path, universe or set(range(ncpus)))
+base = parse_cpulist(sys.argv[3]) if sys.argv[3] else set(universe)
+if universe:
+    base &= universe   # never a cpu the host does not have
+# minus weka's pinned cores, and minus the cpus the host refuses to bind:
+# numjobs is this count, so a cpu fio cannot bind to must not be counted
+usable = (sorted(base - weka - unbind) or sorted(base - weka)
+          or sorted(base) or list(range(ncpus)))
 if not usable:
     sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus (ncpus={ncpus})")
 if sys.argv[2] == "list":
@@ -1246,15 +1284,35 @@ cal_evidence() {   # cal_evidence <what> <results.json> <jobfile-basename> <say|
             || cp "$WORK_DIR/cal/$h/$jf" "$RUN_DIR/cal/${jf%.job}.$h.job" || true
     done
     if [ "$say" = say ] && [ -s "$res" ]; then
+        # One line per DISTINCT error with a job count, not the first five of
+        # a hundred identical ones: how MANY jobs failed the same way is the
+        # most useful fact about the failure, and a flat five-line cap hid it
+        # (seen live: five cpu_set_affinity lines out of an unknown number).
+        # The pid varies per job, so it is normalized for counting only --
+        # the line itself is still shown verbatim, first occurrence.
+        shown=0
         while IFS= read -r l; do
-            case "$l" in ("{"*) break ;; esac
-            case "$l" in
-                (*[Ee]rror*|*ERROR*|*[Ff]ailed*|*"err="*)
-                    log "ERROR: $what: fio said: $l" >&2
-                    shown=$((shown + 1)) ;;
-            esac
-            [ "$shown" -lt 5 ] || break
-        done < "$res"
+            [ -n "$l" ] || continue
+            log "$l" >&2
+            shown=$((shown + 1))
+        done <<EVIDEOF
+$(LC_ALL=C awk -v what="$what" '
+    /^\{/ { exit }
+    /[Ee]rror|ERROR|[Ff]ailed|err=/ {
+        k = $0; gsub(/pid=[0-9]+/, "pid=<n>", k)
+        if (!(k in n)) { order[++d] = k; sample[k] = $0 }
+        n[k]++
+    }
+    END {
+        for (i = 1; i <= d && i <= 5; i++) {
+            k = order[i]
+            printf "ERROR: %s: fio said%s: %s\n", what,
+                (n[k] > 1 ? sprintf(" (%d jobs)", n[k]) : ""), sample[k]
+        }
+        if (d > 5)
+            printf "ERROR: %s: and %d more distinct error line(s) in the fio output\n", what, d - 5
+    }' "$res")
+EVIDEOF
         [ "$shown" -gt 0 ] || log "ERROR: $what: fio printed no error line before exiting; see ${res##*/} in the run bundle under cal/" >&2
     fi
     for h in "$@"; do
@@ -3766,6 +3824,17 @@ probe_remote_cmd() {
     # scanning reported 4-27 where weka's own core_id list is 14-27, and
     # those ten phantom cores were then excluded from every fio job.
     # Interpretation of dedicated vs. floating masks happens in the tuner.
+    #
+    # The last two facts are MEASURED, not inferred: for every online cpu,
+    # can a process on this box actually bind to it (taskset -c <cpu> true),
+    # plainly and, where that fails and an escalator exists, under it? A cpu
+    # can be online, outside weka's pinned set, and still refuse the bind --
+    # offline-but-counted, or held by another cgroup's cpuset partition --
+    # and fio's answer to that is err=22 cpu_set_affinity per job, on the
+    # daemonized server, after the run has already started (seen live on
+    # weka-xcpu-344, 2026-09-09: a brutal bw-write rung died on it). The old
+    # rule assumed every isolated cpu was self-affinable; measuring costs
+    # one fork per cpu, once, and cannot be wrong.
     printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
@@ -3773,7 +3842,18 @@ probe_remote_cmd() {
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
         echo \"isolated \$([ -f /sys/devices/system/cpu/isolated ] && cat /sys/devices/system/cpu/isolated)\"; \
-        for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; break; fi; done; true"
+        echo \"online \$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online)\"; \
+        _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
+        if command -v taskset >/dev/null; then \
+            _on=\$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online); \
+            _ids=\$(printf '%s' \"\${_on:-0-\$(( \$(getconf _NPROCESSORS_ONLN) - 1 ))}\" | awk 'BEGIN {RS = \",\"} {n = split(\$0, a, \"-\"); if (n == 2) {for (i = a[1]; i <= a[2]; i++) print i} else if (length(\$0)) print \$0 + 0}'); \
+            _bd=; _bp=; for c in \$_ids; do \
+                if _o=\$(taskset -c \$c true 2>&1); then _bd=\"\$_bd,\$c\"; \
+                elif [ -n \"\$_pv\" ] && _o=\$(\$_pv taskset -c \$c true 2>&1); then _bp=\"\$_bp,\$c\"; fi; \
+            done; \
+            [ -n \"\$_bd\" ] || _bd=,-; [ -n \"\$_bp\" ] || _bp=,-; \
+            echo \"bindable \${_bd#,}\"; echo \"bindable_priv \${_bp#,}\"; \
+        fi; true"
 }
 
 # Prove each host's ioengine candidates with a REAL one-file job on that
@@ -3912,7 +3992,8 @@ check_cpu_pinning() {
         iso=$(awk '$1 == "isolated" {print $2; exit}' "$WORK_DIR/probe/$host")
         ncpus=$(awk '$1 == "ncpus" {print $2; exit}' "$WORK_DIR/probe/$host")
         priv=$(host_priv "$host")
-        verdict=$(python3 - "$req" "${cur:-}" "${weka% }" "${iso:-}" "${ncpus:-0}" <<'PYEOF'
+        verdict=$(pyrun "$req" "${cur:-}" "${weka% }" "${iso:-}" "${ncpus:-0}" \
+                         "$WORK_DIR/probe/$host" <<'PYEOF'
 import sys
 def expand(s):
     out = set()
@@ -3927,6 +4008,11 @@ def expand(s):
 req, cur = expand(sys.argv[1]), expand(sys.argv[2])
 iso = expand(sys.argv[4]) if len(sys.argv) > 4 else set()
 ncpus = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 0
+probe = sys.argv[6] if len(sys.argv) > 6 else ""
+# MEASURED facts (empty/False when the probe could not test them)
+bind, tested = probe_cpu_fact(probe, "bindable") if probe else (set(), False)
+bindp = probe_cpu_fact(probe, "bindable_priv")[0] if probe else set()
+universe = probe_universe(probe, ncpus) if probe else set(range(ncpus))
 # same rule as the tuner: weka pins each dedicated io thread to exactly one
 # CPU; wide masks are floating utility threads and MUST be ignored, or the
 # union covers every CPU and everything "overlaps" (seen live)
@@ -3953,22 +4039,33 @@ def fmt(cpus):
 # the host file keeps the list as written, execution runs on what exists.
 # Only when the probe carries ncpus (0 = unprobed, nothing to judge against).
 flags = []
-phantom = sorted(req - set(range(ncpus))) if ncpus else []
+phantom = sorted(req - universe) if universe else []
 if phantom:
     flags.append("phantom")
+# Cpus this host REFUSES to bind, measured: fio's answer to one of these in
+# a cpus_allowed is err=22 cpu_set_affinity, per job, raised on the
+# daemonized server after the run has started (weka-xcpu-344, 2026-09-09).
+# Trimmed here on the same contract as the weka overlap.
+unbind = sorted((req - weka - set(phantom)) - bind - bindp) if tested else []
+if unbind:
+    flags.append("unbindable")
 # the EFFECTIVE set is the request minus weka's dedicated cores and the
 # cpus the host does not have: the host file keeps the operator's list as
 # written, execution never touches weka's own cpus
-eff = sorted(req - weka - set(phantom))
+eff = sorted(req - weka - set(phantom) - set(unbind))
 if iso and (req & iso) and (req - iso):
     # a mask mixing isolated and housekeeping cpus silently collapses onto
     # the housekeeping partition -- worse than failing, it runs WRONG
     flags.append("mixed")
 if not eff:
     flags.append("allweka")
-# isolated cpus are self-affinable (fio sets its own per-job affinity there
-# without privilege); only cpus outside BOTH the mask and the isolated set
-# genuinely need an escalator
+# Which cpus need the escalator? MEASURED: the ones the probe could not
+# bind plainly but could under it. Without that measurement, the old rule
+# stands -- isolated cpus assumed self-affinable, so only cpus outside both
+# the current mask and the isolated set need privilege.
+elif tested:
+    if set(eff) - bind:
+        flags.append("outside")
 elif cur and not set(eff) <= (cur | iso):
     flags.append("outside")
 if req & weka:
@@ -3976,20 +4073,28 @@ if req & weka:
 print("dedicated=" + (",".join(map(str, sorted(weka))) or "none"),
       "effective=" + (fmt(eff) or "none"),
       "phantom=" + (fmt(phantom) or "none"),
+      "unbindable=" + (fmt(unbind) or "none"),
       " ".join(flags) or "ok")
 PYEOF
 )
-        local dedicated effective phantom vflags
+        local dedicated effective phantom unbindable vflags
         set -- $verdict
         dedicated=${1#dedicated=}; effective=${2#effective=}
-        phantom=${3#phantom=}; shift 3
+        phantom=${3#phantom=}; unbindable=${4#unbindable=}; shift 4
         vflags="$*"
         case "$vflags" in
             (*allweka*)
+                if [ "$unbindable" != none ]; then
+                    die "$host: no requested cpu ($req) is usable -- each is a weka dedicated core, a cpu this host does not have, or one it refuses to bind ($unbindable)"
+                fi
                 if [ "$phantom" != none ]; then
                     die "$host: no requested cpu ($req) is usable -- each is a weka dedicated core or a cpu this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1)))"
                 fi
                 die "$host: every requested cpu ($req) is a weka dedicated core -- nothing left to run fio on" ;;
+        esac
+        case "$vflags" in
+            (*unbindable*)
+                log "note: $host: requested cpus ($req) include $unbindable, which this host refuses to bind -- offline, or held by another cgroup's cpuset partition; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*phantom*)
@@ -4169,7 +4274,13 @@ for h in hosts:
     # count, and the widest mask won -- fio wants distinct physical cores,
     # and cpus_allowed_policy=split keeps each job on its own cpu even when
     # the mask spans both partitions.
-    usable = sorted(set(range(ncpus)) - weka) or list(range(ncpus))
+    # ... and minus whatever the probe measured as unbindable: a cpu that
+    # refuses the bind is not usable however online it looks.
+    universe = probe_universe(os.path.join(work, "probe", h), ncpus)
+    unbind = probe_unbindable(os.path.join(work, "probe", h),
+                              universe or set(range(ncpus)))
+    usable = (sorted(universe - weka - unbind) or sorted(universe - weka)
+              or sorted(universe) or list(range(ncpus)))
     if nodes and not weka:
         # the pin detection is the only thing keeping fio off weka's cores;
         # if weka is running and none were found, say so rather than
@@ -4178,7 +4289,8 @@ for h in hosts:
              f"detected -- fio will be allowed on every cpu, including "
              f"weka's; check that this weka pins its io threads")
     facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable,
-                "engines": engines, "isolated": sorted(iso)}
+                "engines": engines, "isolated": sorted(iso),
+                "universe": universe, "unbindable": unbind}
 
 if len({f["ncpus"] for f in facts.values()}) > 1:
     warn("system core counts differ between hosts: "
@@ -4198,10 +4310,11 @@ def usable_for(h):
     if not c:
         return facts[h]["usable"]
     cs = parse_cpulist(c)
-    if facts[h]["ncpus"]:
-        cs &= set(range(facts[h]["ncpus"]))
+    if facts[h]["universe"]:
+        cs &= facts[h]["universe"]
     real = sorted(cs)
     cs -= set(facts[h]["weka"])
+    cs -= set(facts[h]["unbindable"])
     return sorted(cs) or real or sorted(parse_cpulist(c))
 
 min_usable = min(len(usable_for(h)) for h in hosts)
