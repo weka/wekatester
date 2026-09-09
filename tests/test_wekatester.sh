@@ -1809,6 +1809,21 @@ t_assert "cal: the calibration seed disables preallocation" bash -c '
          printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"h1\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
      cal_seed_scratch h1) >/dev/null 2>&1
     grep -q "^fallocate=none$" "$d/cal/h1/cal-seed.job"'
+t_assert "cal: a local-mode seed names its files for the box, not localhost" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth" "$d/cal"
+    printf "ncpus 4\n" > "$d/probe/localhost"
+    (source ./wekatester
+     hostname() { echo testbox; }
+     LOCAL_MODE=1; WORK_DIR=$d; HOSTS=(localhost); MASTER=localhost; FIO_BIN=fio; DIRECTORY=/mnt/weka
+     TARGET_DIR=/dev/shm/x; AUTH_DIR=$d/auth; CAL_SETTLE=0
+     ladders="bw read"
+     copy_to_master() { :; }
+     run_host() { case "$2" in (*find*) return 0;;
+         (*df*) echo "wekafs 999999999 99999999"; return 0;; esac
+         printf "{ \"client_stats\": [ { \"jobname\": \"cal-x\", \"hostname\": \"localhost\", \"error\": 0, \"read\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 }, \"write\": { \"bw_bytes\": 1, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": 1 } } ] }\n"; }
+     cal_seed_scratch localhost) >/dev/null 2>&1
+    f="$d/cal/localhost/cal-seed.job"
+    grep -q "^filename=testbox\.cal\." "$f" && ! grep -q "localhost\.cal\." "$f"'
 
 # --- engine ranking: a tie goes to io_uring, never to read order ---
 # max() over a dict returns the first maximum in INSERTION order, so with one
@@ -1873,16 +1888,53 @@ t_assert "stamping: staged variants and the generated layout carry it end to end
     d=$(mktemp -d)
     (WEKATESTER_TARGET_DIR="$d/target"
      source ./wekatester
+     hostname() { echo testbox; }
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
      stage_jobfiles) >/dev/null || exit 1
+    # the staging path keeps the ADDRESS; the data-file prefix is the NAME
     v="$d/target/localhost/011-smoke-readbw.job"
     r="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^unique_filename=0$" "$v" &&
-    grep -q "^filename_format=localhost\." "$v" &&
+    grep -q "^filename_format=testbox\." "$v" &&
     grep -q "^unique_filename=0$" "$r" &&
-    grep -q "^filename_format=localhost\." "$r"'
+    grep -q "^filename_format=testbox\." "$r" &&
+    ! grep -q "localhost\." "$v" && ! grep -q "localhost\." "$r"'
+
+# --- host_name: the data-file prefix is a NAME, never "localhost" ---------
+# Remote workers are named by their address. In local mode the address stays
+# localhost (fio talks to a loopback server) but files on the destination are
+# named for the box: hostname -s, then $HOSTNAME's first label, then hostname.
+t_assert "host_name: remote is the address, local is the short hostname, LOCAL_NAME wins" bash -c '
+    source ./wekatester
+    hostname() { echo testbox; }
+    [ "$(LOCAL_MODE=0; host_name h1)" = h1 ] &&
+    [ "$(LOCAL_MODE=1; host_name localhost)" = testbox ] &&
+    [ "$(LOCAL_MODE=1; LOCAL_NAME=fixed; host_name localhost)" = fixed ]'
+t_assert "host_name: falls back to \$HOSTNAME first label, then hostname, then the address" bash -c '
+    source ./wekatester
+    hostname() { case "$1" in (-s) return 1;; (*) echo longbox;; esac; }
+    [ "$(HOSTNAME=box.example.com; local_short_hostname)" = box ] &&
+    [ "$(HOSTNAME=""; local_short_hostname)" = longbox ] &&
+    hostname() { return 1; } &&
+    [ "$(HOSTNAME=""; local_short_hostname)" = "" ] &&
+    [ "$(HOSTNAME=""; LOCAL_MODE=1; host_name localhost)" = localhost ]'
+t_assert "host_name: a local run fixes the name once in resolve_local_mode" bash -c '
+    source ./tests/helpers.sh; uname_fixture Linux
+    (source ./wekatester
+     hostname() { echo testbox; }
+     HOSTS=(); resolve_local_mode >/dev/null
+     [ "$LOCAL_NAME" = testbox ] && [ "${HOSTS[*]}" = localhost ] && [ "$MASTER" = localhost ])'
+t_assert "stage_cal_step: a local-mode step names its files for the box, not localhost" bash -c '
+    (source ./wekatester
+     WORK_DIR=$CALFIX; AUTH_DIR="$CALFIX/auth"; DIRECTORY=/mnt/weka
+     LOCAL_MODE=1; hostname() { echo testbox; }
+     cal_cpus_nj() { echo "0-3 4"; }
+     stage_cal_step bw read 8 "$CALFIX/cal" localhost) >/dev/null &&
+    f="$CALFIX/cal/localhost/cal-bw-read-qd8.job" &&
+    grep -qxF "filename_format=testbox.cal.\$jobnum.\$filenum" "$f" &&
+    ! grep -q "localhost\." "$f"'
 t_assert "probe: -e engine missing from a worker refuses early, naming it" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester

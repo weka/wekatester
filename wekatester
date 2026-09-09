@@ -101,6 +101,7 @@ AUTH_DIR=""          # $WORK_DIR/auth: per-host winning-credential state
 # the transport below executes directly instead of over ssh. Set by
 # resolve_local_mode() in the run path only.
 LOCAL_MODE=0
+LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with (host_name)
 
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
@@ -192,7 +193,9 @@ resolve_local_mode() {
     LOCAL_MODE=1
     HOSTS=(localhost)
     MASTER=localhost
+    LOCAL_NAME=$(local_short_hostname)
     log "no servers given: running on the local host (no ssh required)"
+    debug "local mode: data files are prefixed ${LOCAL_NAME:-localhost}. (host_name)"
 }
 
 # Split every -i entry into (login, keyfile) pairs, kept in the order given.
@@ -1303,7 +1306,7 @@ stage_cal_step() {   # stage_cal_step <bw|iops> <read|write> <qd> <outdir> <host
             if [ "${CAL_NS_DIR-unset}" = "" ] && [ "$dirn" = read ]; then
                 printf 'filename_format=shared.%s\n' "${CAL_FMT:-\$jobnum.\$filenum}"
             else
-                printf 'filename_format=%s%s%s\n' "$host" "${CAL_SEP:-.cal.}" "${CAL_FMT:-\$jobnum.\$filenum}"
+                printf 'filename_format=%s%s%s\n' "$(host_name "$host")" "${CAL_SEP:-.cal.}" "${CAL_FMT:-\$jobnum.\$filenum}"
             fi
             printf 'ioengine=%s\n' "$eng"
             printf 'direct=1\n'
@@ -2445,7 +2448,7 @@ SEEDNJEOF2
         # root (already created); a subdirectory shape needs its directories
         # before the seed writes a single file into them.
         maxf=$(printf '%s\n' "$rsizes" "$wsizes" | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
-        subdirs=$(cal_scratch_dirs "$host" "${CAL_SEP:-.cal.}" \
+        subdirs=$(cal_scratch_dirs "$(host_name "$host")" "${CAL_SEP:-.cal.}" \
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$nj" "$maxf") \
             || die "$host: cannot derive the calibration namespace directories"
         if [ "$unified" -eq 1 ] && [ -n "$rsizes" ]; then
@@ -2469,7 +2472,7 @@ SUBDIREOF
                 || die "$host: cannot create the calibration namespace subdirectories"
         fi
         tlist="$WORK_DIR/cal/$host/truncate.list"
-        want=$(python3 - "$host" "$nj" "$rsizes" "$wsizes" \
+        want=$(python3 - "$(host_name "$host")" "$nj" "$rsizes" "$wsizes" \
                    "$hd${CAL_NS_DIR-/$CAL_SCRATCH}" "$eng" "$cpus" \
                    "$WORK_DIR/cal/$host/cal-seed.job" \
                    "$WORK_DIR/cal/$host/scratch.list" \
@@ -3098,7 +3101,7 @@ UNLSEOF
                     run_host "$host" "$ucmd" \
                         || log "WARNING: could not remove the shared dataset" >&2
                 fi
-                ucmd=$(pyrun "$host" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")" <<'UNLEOF'
+                ucmd=$(pyrun "$(host_name "$host")" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")" <<'UNLEOF'
 import re
 import sys
 
@@ -4743,17 +4746,19 @@ custom_set_probe_dir() {
 # opens the fresh template), never a stray ./hostlist.csv. Without -C,
 # nothing anywhere creates ./hostlist.csv with the usual confirmation.
 # Without -t no file is ever used (except a -C set's own, always honored).
-# --- host identity: what the host FILE calls a machine ------------------------
+# --- host identity: what the host FILE and the data files call a machine -----
 # Internally a host is an ADDRESS: what ssh connects to, what fio is handed as
-# --client=, a path component under $WORK_DIR, and the prefix of every data
-# file on the worker. None of that may contain a slash, and in local mode it
-# has to stay "localhost" so fio keeps talking to a loopback server.
+# --client=, and a path component under $WORK_DIR. None of that may contain a
+# slash, and in local mode it has to stay "localhost" so fio keeps talking to
+# a loopback server.
 #
-# The host FILE wants something else: "localhost" identifies nothing, and a
-# bare hostname collides the moment two labs share a file. So an
-# automatically written row carries <name>/<machine-id> -- the name is the
-# address (or the real short hostname in local mode), the id is the machine.
-# Rows a person wrote are left exactly as written; the id is never required.
+# The host FILE and the DATA FILES want a NAME instead: "localhost" identifies
+# nothing on a shared filesystem, and two boxes in local mode against the same
+# mount would write (and -u would unlink) each other's localhost.* files. So
+# host_name() is the address for a remote worker and the box's own short
+# hostname in local mode; it prefixes every data file on the destination and
+# names an automatically written host file row as <name>/<machine-id>. Rows a
+# person wrote are left exactly as written; the id is never required.
 #
 # Reading, the id is stripped and the name mapped back to an address, so
 # nothing downstream ever sees it.
@@ -4783,23 +4788,36 @@ host_machine_id() {   # host_machine_id <host>
     cat "$cache"
 }
 
-# The name this host should be called in the host file. Local mode is the
-# whole point: the address is "localhost", the name is what the box calls
-# itself.
-host_ident_name() {   # host_ident_name <host>
-    local host=$1 n
+# The box's own short name: hostname -s first, then bash's HOSTNAME trimmed
+# to its first label (set from gethostname() with no resolution, so it
+# answers where `hostname -s` fails with "Name or service not known"), then
+# a bare hostname. Empty when nothing answers; the caller falls back.
+local_short_hostname() {
+    local n
+    n=$(hostname -s) || n=""
+    [ -n "$n" ] || n=${HOSTNAME%%.*}
+    [ -n "$n" ] || n=$(hostname) || n=""
+    printf '%s' "$n"
+}
+
+# The name this host goes by -- in the host file and as the prefix of its
+# data files. Remote: the address. Local mode: the short hostname, fixed
+# once by resolve_local_mode (LOCAL_NAME) and derived on demand for a
+# caller that runs without it; "localhost" only when the box has no name.
+host_name() {   # host_name <host>
+    local n
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        n=$(hostname -s || hostname || true)
-        printf '%s' "${n:-$host}"
+        n=${LOCAL_NAME:-$(local_short_hostname)}
+        printf '%s' "${n:-$1}"
     else
-        printf '%s' "$host"
+        printf '%s' "$1"
     fi
 }
 
 # "<name>/<machine-id>", or just the name when no id could be read.
 host_identity() {   # host_identity <host>
     local n id
-    n=$(host_ident_name "$1"); id=$(host_machine_id "$1")
+    n=$(host_name "$1"); id=$(host_machine_id "$1")
     [ -n "$id" ] && printf '%s/%s' "$n" "$id" || printf '%s' "$n"
 }
 
@@ -4808,7 +4826,7 @@ host_identity() {   # host_identity <host>
 host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
     local h n out=""
     for h in "$@"; do
-        n=$(host_ident_name "$h")
+        n=$(host_name "$h")
         [ "$n" = "$h" ] || out="$out${out:+,}$n=$h"
     done
     printf '%s' "$out"
@@ -5646,8 +5664,9 @@ override_variant_key() {   # override_variant_key <file> <key> <value>
 # Nothing downstream can work against names it cannot predict -- the
 # pre-created directory grid, the capacity math, the unlink variant and
 # the layout grid sweep all need exact paths. So every staged variant is
-# stamped with unique_filename=0 and an explicit "<host>." prefix on its
-# filename_format: the same collision safety, deterministic on every fio.
+# stamped with unique_filename=0 and an explicit "<name>." prefix on its
+# filename_format (host_name: the address, or the box's short hostname in
+# local mode): the same collision safety, deterministic on every fio.
 # A format carrying $clientuid keeps its own uniqueness scheme untouched;
 # a jobfile with no format at all gets fio's default grid, host-prefixed.
 #
@@ -5665,7 +5684,7 @@ stamp_unique_names() {
     for host in "${HOSTS[@]}"; do
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        python3 - "$WORK_DIR/jobs/$host" "$host" "$cpus" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
+        python3 - "$WORK_DIR/jobs/$host" "$(host_name "$host")" "$cpus" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
 import os, sys
 
 jobsdir, host, cpus = sys.argv[1], sys.argv[2], sys.argv[3]
