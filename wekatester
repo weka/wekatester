@@ -672,6 +672,23 @@ def pick_engine(tally):
     rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
     return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
 
+def override_lines(lines, key, value):
+    """override_variant_key, in python: replace every 'key=' line; else
+    insert 'key=value' right after the first [global]; else create [global]
+    at the top. The staging passes stamp hundreds of files per run and must
+    leave exactly what the bash helper would have."""
+    if any(l.startswith(key + "=") for l in lines):
+        return [key + "=" + value if l.startswith(key + "=") else l for l in lines]
+    if any(l.startswith("[global]") for l in lines):
+        out, done = [], False
+        for l in lines:
+            out.append(l)
+            if not done and l.startswith("[global]"):
+                out.append(key + "=" + value)
+                done = True
+        return out
+    return ["[global]", key + "=" + value] + lines
+
 def first_value(lines, key):
     for l in lines:
         m = re.match(rf"^{key}=(\S+)", l)
@@ -3454,25 +3471,55 @@ verify_mount_mode() {
     local host line verdict failed=() mode_fail=0 write_fail=0 hd anc i
     local missing=() missing_dirs=() missing_parents=()
     local cached_hosts=() cached_modes=() mode who n
-    for host in "${HOSTS[@]}"; do
-        hd=$(host_dir "$host")
-        anc=""
-        if ! line=$(run_host "$host" "findmnt -T '$hd' -n -o FSTYPE,OPTIONS"); then
-            # findmnt fails for a path that does not exist: classify the
-            # nearest ancestor that does, and remember that hd is missing
-            if line=$(run_host "$host" "$(missing_dir_probe_cmd "$hd")") \
-                    && [ "$line" != "${line#*$'\n'}" ]; then
-                anc=${line%%$'\n'*}; line=${line#*$'\n'}
-            else
-                failed+=("$host: findmnt failed for $hd -- does it exist? (wrong -d?)")
-                continue
-            fi
+    # Three fan-outs instead of one serial walk. Every host still receives
+    # the same commands in the same order -- findmnt; the ancestor walk when
+    # that fails; the write probe once the mode passes (or is only a warning
+    # under -r) -- and the messages are collected one per host in host
+    # order, exactly as the walk produced them; only the waiting overlaps.
+    # Serially this was 2 sessions x ~30ms per host, twice under -C: seven
+    # seconds at 111 hosts for a check whose floor is one round trip. A
+    # backgrounded command has nowhere to put its output but a file, so each
+    # round writes per-host files under the work dir (a real run: cleaned up
+    # with it) or a temp dir (the suite calls this phase on its own).
+    local td pids=() hds=() rcs=() lines=() ancs=() msgs=() probe=()
+    td=$(mktemp -d "${WORK_DIR:-${TMPDIR:-/tmp}}/mnt.XXXXXX") \
+        || die "cannot create a scratch dir for the mount check"
+    for i in "${!HOSTS[@]}"; do
+        hds[$i]=$(host_dir "${HOSTS[$i]}")
+        ( run_host "${HOSTS[$i]}" "findmnt -T '${hds[$i]}' -n -o FSTYPE,OPTIONS" > "$td/$i.mnt" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}"; rcs[$i]=$?
+        lines[$i]=$(cat "$td/$i.mnt")
+    done
+    # findmnt fails for a path that does not exist: classify the nearest
+    # ancestor that does, and remember that the destination is missing
+    pids=()
+    for i in "${!HOSTS[@]}"; do
+        [ "${rcs[$i]}" -ne 0 ] || continue
+        ( run_host "${HOSTS[$i]}" "$(missing_dir_probe_cmd "${hds[$i]}")" > "$td/$i.anc" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        [ "${rcs[$i]}" -ne 0 ] || continue
+        if wait "${pids[$i]}" && line=$(cat "$td/$i.anc") \
+                && [ "$line" != "${line#*$'\n'}" ]; then
+            ancs[$i]=${line%%$'\n'*}; lines[$i]=${line#*$'\n'}
+        else
+            msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"
         fi
-        verdict=$(classify_mount_line "$line")
+    done
+    # classification is local; probe[i] marks the hosts that get the write
+    # probe: destination present, mode ok (or -r's warning)
+    for i in "${!HOSTS[@]}"; do
+        [ -z "${msgs[$i]:-}" ] || continue
+        host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
+        verdict=$(classify_mount_line "${lines[$i]}")
         case "$verdict" in
             ok)   ;;
             skip) if [ -n "$anc" ]; then
-                      failed+=("$host: $hd does not exist, and $anc is not a wekafs mount -- create it yourself, or check that -d names the right directory")
+                      msgs[$i]="$host: $hd does not exist, and $anc is not a wekafs mount -- create it yourself, or check that -d names the right directory"
                       continue
                   fi
                   debug "$host: $hd is not wekafs; guard skipped" ;;
@@ -3481,7 +3528,7 @@ verify_mount_mode() {
                        # lines is noise, not information (yqb01, 2026-09-09)
                        cached_hosts+=("$host"); cached_modes+=("${verdict#fail }")
                    else
-                       failed+=("$host: wekafs mounted ${verdict#fail } (need forcedirect)")
+                       msgs[$i]="$host: wekafs mounted ${verdict#fail } (need forcedirect)"
                        mode_fail=1
                        continue
                    fi ;;
@@ -3490,10 +3537,24 @@ verify_mount_mode() {
             missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc")
             continue   # created below, once the operator agrees, then probed
         fi
-        probe_writable "$host" "$hd" \
-            || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
+        probe[$i]=1
+    done
+    pids=()
+    for i in "${!HOSTS[@]}"; do
+        [ "${probe[$i]:-0}" -eq 1 ] || continue
+        ( probe_writable "${HOSTS[$i]}" "${hds[$i]}" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        [ "${probe[$i]:-0}" -eq 1 ] || continue
+        wait "${pids[$i]}" \
+            || { msgs[$i]="${HOSTS[$i]}: cannot create files in ${hds[$i]} -- $(write_fix_hint "${hds[$i]}")"
                  write_fail=1; }
     done
+    for i in "${!HOSTS[@]}"; do
+        [ -z "${msgs[$i]:-}" ] || failed+=("${msgs[$i]}")
+    done
+    rm -rf "$td"
     # The -r warning, one line per distinct cached mode: the host alone when
     # it is one host, "all N" when it is every host, the list otherwise.
     if [ ${#cached_hosts[@]} -gt 0 ]; then
@@ -3867,6 +3928,10 @@ probe_remote_cmd() {
     # those ten phantom cores were then excluded from every fio job.
     # Interpretation of dedicated vs. floating masks happens in the tuner.
     #
+    # "ident" is the machine id (host_machine_id's rule: product_uuid, else
+    # machine-id, else empty), carried here so the host-file writeback never
+    # opens a session of its own per host to fetch it.
+    #
     # The last two facts are MEASURED, not inferred: for every online cpu,
     # can a process on this box actually bind to it (taskset -c <cpu> true),
     # plainly and, where that fails and an escalator exists, under it? A cpu
@@ -3885,6 +3950,7 @@ probe_remote_cmd() {
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
         echo \"isolated \$([ -f /sys/devices/system/cpu/isolated ] && cat /sys/devices/system/cpu/isolated)\"; \
         echo \"online \$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online)\"; \
+        echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
         _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
         if command -v taskset >/dev/null; then \
             _on=\$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online); \
@@ -4022,21 +4088,23 @@ finalize_targets() {
 # operator explicitly chose those cpus). The winning launch decision lands
 # in $WORK_DIR/auth/<host>.priv + <host>.cpus for the fio server lifecycle.
 check_cpu_pinning() {
-    local host req cur weka priv verdict ncpus
+    local host req cur priv ncpus
     # local mode never ran establish_connections; the lifecycle still reads
     # the same per-host files
     [ -n "$AUTH_DIR" ] || { AUTH_DIR="$WORK_DIR/auth"; mkdir -p "$AUTH_DIR"; }
-    for host in "${HOSTS[@]}"; do
-        req=$(targets_field "$host" 4 "$WORK_DIR/targets.final")
-        [ -n "$req" ] || continue
-        cur=$(awk '$1 == "taskset" {print $2; exit}' "$WORK_DIR/probe/$host")
-        weka=$(awk '$1 == "weka_allowed" {printf "%s ", $2}' "$WORK_DIR/probe/$host")
-        iso=$(awk '$1 == "isolated" {print $2; exit}' "$WORK_DIR/probe/$host")
-        ncpus=$(awk '$1 == "ncpus" {print $2; exit}' "$WORK_DIR/probe/$host")
-        priv=$(host_priv "$host")
-        verdict=$(pyrun "$req" "${cur:-}" "${weka% }" "${iso:-}" "${ncpus:-0}" \
-                         "$WORK_DIR/probe/$host" <<'PYEOF'
-import sys
+    # One python for every host, not one per host behind six awks: the
+    # verdict is set arithmetic on the probe file and the host's row, and
+    # ~45ms of process starts per host before any judgment is 20s of serial
+    # nothing at 451 hosts. It writes one line per host that has a request,
+    # in host order: host, the request, the taskset and cpu count the
+    # messages quote back, the four cpu sets, the flags (comma-joined), and
+    # the escalator prefix last (it has spaces) -- "-" for an empty field.
+    # The bash below still speaks per host, unchanged.
+    pyrun "$WORK_DIR/targets.final" "$WORK_DIR/probe" "${HOSTS[@]}" \
+        > "$WORK_DIR/pin.verdicts" <<'PYEOF' || die "cpu pinning check failed"
+import os, sys
+targets, probedir = sys.argv[1], sys.argv[2]
+hosts = sys.argv[3:]
 def expand(s):
     out = set()
     for part in s.split(","):
@@ -4047,22 +4115,6 @@ def expand(s):
         else:
             out.add(int(part))
     return out
-req, cur = expand(sys.argv[1]), expand(sys.argv[2])
-iso = expand(sys.argv[4]) if len(sys.argv) > 4 else set()
-ncpus = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 0
-probe = sys.argv[6] if len(sys.argv) > 6 else ""
-# MEASURED facts (empty/False when the probe could not test them)
-bind, tested = probe_cpu_fact(probe, "bindable") if probe else (set(), False)
-bindp = probe_cpu_fact(probe, "bindable_priv")[0] if probe else set()
-universe = probe_universe(probe, ncpus) if probe else set(range(ncpus))
-# same rule as the tuner: weka pins each dedicated io thread to exactly one
-# CPU; wide masks are floating utility threads and MUST be ignored, or the
-# union covers every CPU and everything "overlaps" (seen live)
-weka = set()
-for mask in sys.argv[3].split():
-    cpus = expand(mask)
-    if len(cpus) == 1:
-        weka |= cpus
 def fmt(cpus):
     out, i = [], 0
     while i < len(cpus):
@@ -4073,57 +4125,95 @@ def fmt(cpus):
         i = j + 1
     return ",".join(out)
 
-# cpus the host does not have. fio rejects a cpus_allowed naming one -- and
-# with --client that rejection happens on the daemonized SERVER, whose error
-# text is lost: the client exits 0 with an empty client_stats and the run
-# dies later with "the jobs did not run". Trimmed here, where the row is
-# resolved, with a note naming them -- same contract as the weka overlap:
-# the host file keeps the list as written, execution runs on what exists.
-# Only when the probe carries ncpus (0 = unprobed, nothing to judge against).
-flags = []
-phantom = sorted(req - universe) if universe else []
-if phantom:
-    flags.append("phantom")
-# Cpus this host REFUSES to bind, measured: fio's answer to one of these in
-# a cpus_allowed is err=22 cpu_set_affinity, per job, raised on the
-# daemonized server after the run has started (weka-xcpu-344, 2026-09-09).
-# Trimmed here on the same contract as the weka overlap.
-unbind = sorted((req - weka - set(phantom)) - bind - bindp) if tested else []
-if unbind:
-    flags.append("unbindable")
-# the EFFECTIVE set is the request minus weka's dedicated cores and the
-# cpus the host does not have: the host file keeps the operator's list as
-# written, execution never touches weka's own cpus
-eff = sorted(req - weka - set(phantom) - set(unbind))
-if iso and (req & iso) and (req - iso):
-    # a mask mixing isolated and housekeeping cpus silently collapses onto
-    # the housekeeping partition -- worse than failing, it runs WRONG
-    flags.append("mixed")
-if not eff:
-    flags.append("allweka")
-# Which cpus need the escalator? MEASURED: the ones the probe could not
-# bind plainly but could under it. Without that measurement, the old rule
-# stands -- isolated cpus assumed self-affinable, so only cpus outside both
-# the current mask and the isolated set need privilege.
-elif tested:
-    if set(eff) - bind:
+# each host's row, first match wins (targets_field's awk exits on the first)
+rows = {}
+if os.path.exists(targets):
+    for line in open(targets):
+        p = line.rstrip("\n").split("\t")
+        rows.setdefault(p[0], p)
+
+for host in hosts:
+    row = rows.get(host, [])
+    req_s = row[3] if len(row) > 3 else ""
+    if req_s in ("", "-"):
+        continue
+    probe = os.path.join(probedir, host)
+    raw = open(probe).read().splitlines() if os.path.exists(probe) else []
+    facts = [l.split() for l in raw]
+    def first(key):   # the first "<key> <value>" line, as the awk did
+        for f in facts:
+            if f and f[0] == key:
+                return f[1] if len(f) > 1 else ""
+        return ""
+    cur_s, iso_s, ncpus_s = first("taskset"), first("isolated"), first("ncpus")
+    # host_priv's rule: the first "priv " line, the rest of it verbatim
+    priv = next((l[len("priv "):] for l in raw if l.startswith("priv ")), "")
+    req, cur, iso = expand(req_s), expand(cur_s), expand(iso_s)
+    ncpus = int(ncpus_s) if ncpus_s.isdigit() else 0
+    # MEASURED facts (empty/False when the probe could not test them)
+    bind, tested = probe_cpu_fact(probe, "bindable")
+    bindp = probe_cpu_fact(probe, "bindable_priv")[0]
+    universe = probe_universe(probe, ncpus)
+    # same rule as the tuner: weka pins each dedicated io thread to exactly
+    # one CPU; wide masks are floating utility threads and MUST be ignored,
+    # or the union covers every CPU and everything "overlaps" (seen live)
+    weka = set()
+    for f in facts:
+        if len(f) > 1 and f[0] == "weka_allowed":
+            cpus = expand(f[1])
+            if len(cpus) == 1:
+                weka |= cpus
+
+    # cpus the host does not have. fio rejects a cpus_allowed naming one -- and
+    # with --client that rejection happens on the daemonized SERVER, whose error
+    # text is lost: the client exits 0 with an empty client_stats and the run
+    # dies later with "the jobs did not run". Trimmed here, where the row is
+    # resolved, with a note naming them -- same contract as the weka overlap:
+    # the host file keeps the list as written, execution runs on what exists.
+    # Only when the probe carries ncpus (0 = unprobed, nothing to judge against).
+    flags = []
+    phantom = sorted(req - universe) if universe else []
+    if phantom:
+        flags.append("phantom")
+    # Cpus this host REFUSES to bind, measured: fio's answer to one of these in
+    # a cpus_allowed is err=22 cpu_set_affinity, per job, raised on the
+    # daemonized server after the run has started (weka-xcpu-344, 2026-09-09).
+    # Trimmed here on the same contract as the weka overlap.
+    unbind = sorted((req - weka - set(phantom)) - bind - bindp) if tested else []
+    if unbind:
+        flags.append("unbindable")
+    # the EFFECTIVE set is the request minus weka's dedicated cores and the
+    # cpus the host does not have: the host file keeps the operator's list as
+    # written, execution never touches weka's own cpus
+    eff = sorted(req - weka - set(phantom) - set(unbind))
+    if iso and (req & iso) and (req - iso):
+        # a mask mixing isolated and housekeeping cpus silently collapses onto
+        # the housekeeping partition -- worse than failing, it runs WRONG
+        flags.append("mixed")
+    if not eff:
+        flags.append("allweka")
+    # Which cpus need the escalator? MEASURED: the ones the probe could not
+    # bind plainly but could under it. Without that measurement, the old rule
+    # stands -- isolated cpus assumed self-affinable, so only cpus outside both
+    # the current mask and the isolated set need privilege.
+    elif tested:
+        if set(eff) - bind:
+            flags.append("outside")
+    elif cur and not set(eff) <= (cur | iso):
         flags.append("outside")
-elif cur and not set(eff) <= (cur | iso):
-    flags.append("outside")
-if req & weka:
-    flags.append("overlap")
-print("dedicated=" + (",".join(map(str, sorted(weka))) or "none"),
-      "effective=" + (fmt(eff) or "none"),
-      "phantom=" + (fmt(phantom) or "none"),
-      "unbindable=" + (fmt(unbind) or "none"),
-      " ".join(flags) or "ok")
+    if req & weka:
+        flags.append("overlap")
+    print(host, req_s, cur_s or "-", ncpus_s or "-",
+          ",".join(map(str, sorted(weka))) or "none",
+          fmt(eff) or "none", fmt(phantom) or "none", fmt(unbind) or "none",
+          ",".join(flags) or "ok", priv or "-")
 PYEOF
-)
-        local dedicated effective phantom unbindable vflags
-        set -- $verdict
-        dedicated=${1#dedicated=}; effective=${2#effective=}
-        phantom=${3#phantom=}; unbindable=${4#unbindable=}; shift 4
-        vflags="$*"
+    local dedicated effective phantom unbindable vflags
+    while read -r host req cur ncpus dedicated effective phantom unbindable vflags priv; do
+        [ "$cur" != "-" ] || cur=""
+        [ "$ncpus" != "-" ] || ncpus=""
+        [ "$priv" != "-" ] || priv=""
+        vflags=${vflags//,/ }
         case "$vflags" in
             (*allweka*)
                 if [ "$unbindable" != none ]; then
@@ -4177,7 +4267,7 @@ PYEOF
         fi
         printf '%s\n' "$effective" > "$AUTH_DIR/$host.cpus"
         debug "$host: fio server will run ${priv:+$([ "$need_priv" -eq 1 ] && printf 'under %s ' "$priv")}taskset -c $effective"
-    done
+    done < "$WORK_DIR/pin.verdicts"
 }
 
 # Run a weka CLI on the master: always try as the login user first; a failure
@@ -5033,12 +5123,19 @@ host_machine_id() {   # host_machine_id <host>
     local host=$1 cache="$WORK_DIR/ident/$1.id" out
     [ -d "$WORK_DIR/ident" ] || mkdir -p "$WORK_DIR/ident"
     if [ ! -f "$cache" ]; then
+        # The probe already carried the id over its own session (probe_workers
+        # runs before every writeback), so read it from there: one awk, no
+        # round trip. A probe without the line, or no probe, asks the host.
         # -r tests instead of stderr suppression: product_uuid is root-only
         # on most kernels and either file may be absent -- both are ordinary,
         # neither is an error. A FAILED run_host, by contrast, is said out
         # loud: an unreachable box degrading to a bare name should be
         # distinguishable from a box that has no readable id.
-        if out=$(run_host "$host" "if [ -r /sys/class/dmi/id/product_uuid ]; \
+        if [ -f "$WORK_DIR/probe/$host" ] && out=$(awk \
+                '$1 == "ident" {print tolower($2); f = 1; exit} END {exit !f}' \
+                "$WORK_DIR/probe/$host"); then
+            printf '%s' "$out" > "$cache"
+        elif out=$(run_host "$host" "if [ -r /sys/class/dmi/id/product_uuid ]; \
                 then cat /sys/class/dmi/id/product_uuid; \
                 elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi"); then
             printf '%s' "$out" | tr -d '[:space:]' | tr 'A-Z' 'a-z' > "$cache"
@@ -5737,66 +5834,9 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # the tuner; plain mode copies with the directory override (variants are
 # identical across hosts, but one layout = one code path).
 
-# Directions a jobfile exercises: each section's effective rw= (its own, else
-# [global]'s). Prints "read", "write", or "read write". Same rule as
-# cal_required's python.
-# Host-file geometry (targets.final: six nj/fs/nr/qd slots, one per type and
-# direction) onto a staged variant, by the jobfile's report type and the
-# direction(s) it exercises. Slot selection is pick_slot -- the SAME resolver
-# the auto path uses, via the shared python layer -- so plain -t and -a can
-# never disagree on which tuple a file takes. One python call reads the
-# host's row once, replacing a per-field awk scan of targets.final (up to 16
-# spawns per host and jobfile). Returns 0 when it changed anything -- the
-# caller re-derives that host's layout from the new grid.
-apply_targets_geometry() {   # apply_targets_geometry <host> <variant-file>
-    local host=$1 f=$2 items kind="" changed=1 pairs key v
-    [ -f "$WORK_DIR/targets.final" ] || return 1
-    items=$(report_directive "$f")
-    case " $items " in
-        (*" latency "*) kind=lat ;;
-        (*" bandwidth "*) kind=bw ;;
-        (*" iops "*) kind=iops ;;
-    esac
-    [ -n "$kind" ] || return 1
-    pairs=$(pyrun "$f" "$host" "$WORK_DIR/targets.final" "$kind" <<'PYEOF'
-import sys
-
-path, host, targets, kind = sys.argv[1:5]
-row = []
-for line in open(targets):
-    p = line.rstrip("\n").split("\t")
-    if p and p[0] == host:
-        row = p
-        break
-
-def get(key):
-    i = 1 + FIELDS.index(key)
-    v = row[i] if i < len(row) else ""
-    return "" if v == "-" else v
-
-if row:
-    slot = pick_slot(kind, file_directions(open(path).read().splitlines()), get)
-    if slot:
-        for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
-                           ("nr", "nrfiles"), ("qd", "iodepth")):
-            v = get(f"{slot}_{tkey}")
-            if v:
-                print(jkey, v)
-PYEOF
-    ) || die "$host: cannot resolve host-file geometry for ${f##*/}"
-    [ -n "$pairs" ] || return 1
-    while read -r key v; do
-        [ -n "$key" ] || continue
-        override_variant_key "$f" "$key" "$v"
-        changed=0
-    done <<GEOMEOF
-$pairs
-GEOMEOF
-    return $changed
-}
 
 stage_variants() {
-    local srcdir=$1 job base host hd heng geo_changed tuner_tier
+    local srcdir=$1 host tuner_tier
     if [ -n "$AUTO_LEVEL" ]; then
         # The calibration engine (tasks 3-6) will layer measured knees on top
         # of max's rules; until it exists, cal must size EXACTLY like
@@ -5812,54 +5852,134 @@ stage_variants() {
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi
-    for host in "${HOSTS[@]}"; do
-        mkdir -p "$WORK_DIR/jobs/$host"
-        hd=$(host_dir "$host")
-        geo_changed=1
-        for job in "$srcdir"/[0-9]*; do
-            base=${job##*/}
-            # override directory= wherever it appears; jobfiles without one get
-            # it inserted right after [global], and jobfiles with no [global]
-            # at all get the section created at the top -- otherwise the
-            # insert matches nothing and fio silently writes to the server's cwd
-            if grep -q '^directory=' "$job"; then
-                awk -v dir="$hd" \
-                    '/^directory=/ { print "directory=" dir; next } { print }' \
-                    "$job" > "$WORK_DIR/jobs/$host/$base"
-            elif grep -q '^\[global\]' "$job"; then
-                awk -v dir="$hd" \
-                    '{ print } /^\[global\]/ && !ins { print "directory=" dir; ins = 1 }' \
-                    "$job" > "$WORK_DIR/jobs/$host/$base"
-            else
-                { printf '[global]\ndirectory=%s\n' "$hd"; cat "$job"; } \
-                    > "$WORK_DIR/jobs/$host/$base"
-            fi
-            is_layout_file "$WORK_DIR/jobs/$host/$base" && continue
-            ! apply_targets_geometry "$host" "$WORK_DIR/jobs/$host/$base" || geo_changed=0
-        done
+    # Plain staging: one python for every host and jobfile does the
+    # directory override and the host-file geometry (pick_slot -- the same
+    # resolver the tuner and apply_targets_geometry use), and names the hosts
+    # whose geometry changed. Per host and jobfile this was 2-3 grep/awk for
+    # the directory, a python plus up to 4 awk/mv for the geometry, then per
+    # host a python for pristineness and a grep/awk/mv per file for the
+    # engine: ~50 process starts per host and jobfile, serial, none of them
+    # waiting on a worker.
+    local changed pristine=""
+    changed=$(pyrun "$srcdir" "$WORK_DIR" "$DIRECTORY" "$LAYOUT_JOB" "$LAYOUT_MARKER" \
+                    "${HOSTS[@]}" <<'PYEOF'
+import os, re, sys
+
+srcdir, work, directory, layout_job, layout_marker = sys.argv[1:6]
+hosts = sys.argv[6:]
+
+def load_rows(path):   # first row per host, as targets_field's awk saw it
+    rows = {}
+    if os.path.exists(path):
+        for line in open(path):
+            p = line.rstrip("\n").split("\t")
+            rows.setdefault(p[0], p)
+    return rows
+
+# host_dir's rule: the finished resolution when it exists, the pre-auth
+# phase otherwise, the global -d as the fallback; geometry needs the
+# finished one
+final = os.path.join(work, "targets.final")
+has_final = os.path.exists(final)
+rows = load_rows(final if has_final else os.path.join(work, "targets.phase1"))
+
+def field(host, n):   # 1-based column; "" for a dash, a missing row or column
+    row = rows.get(host, [])
+    v = row[n - 1] if n - 1 < len(row) else ""
+    return "" if v == "-" else v
+
+def report_words(lines):   # report_directive: '# report <items>' comment lines
+    out = []
+    for l in lines:
+        m = re.match(r"^#\s*report\s+(.*)$", l)
+        if m:
+            out += m.group(1).split()
+    return out
+
+def is_layout(name, lines):   # is_layout_file, on the staged content
+    return name == layout_job or any(l.startswith(layout_marker) for l in lines[:3])
+
+jobs = sorted(f for f in os.listdir(srcdir)
+              if f[:1].isdigit() and os.path.isfile(os.path.join(srcdir, f)))
+changed = []
+for host in hosts:
+    outdir = os.path.join(work, "jobs", host)
+    os.makedirs(outdir, exist_ok=True)
+    hd = field(host, 5) or directory
+    geo_changed = False
+    for base in jobs:
+        lines = open(os.path.join(srcdir, base)).read().splitlines()
+        # override directory= wherever it appears; jobfiles without one get
+        # it inserted right after [global], and jobfiles with no [global]
+        # at all get the section created at the top -- otherwise the
+        # insert matches nothing and fio silently writes to the server's cwd
+        lines = override_lines(lines, "directory", hd)
+        if has_final and host in rows and not is_layout(base, lines):
+            words = report_words(lines)
+            # precedence latency > bandwidth > iops, same as the tuner
+            kind = ("lat" if "latency" in words else "bw" if "bandwidth" in words
+                    else "iops" if "iops" in words else "")
+            if kind:
+                def get(key):
+                    i = 1 + FIELDS.index(key)
+                    v = rows[host][i] if i < len(rows[host]) else ""
+                    return "" if v == "-" else v
+                slot = pick_slot(kind, file_directions(lines), get)
+                if slot:
+                    for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
+                                       ("nr", "nrfiles"), ("qd", "iodepth")):
+                        v = get(f"{slot}_{tkey}")
+                        if v:
+                            lines = override_lines(lines, jkey, v)
+                            geo_changed = True
+        with open(os.path.join(outdir, base), "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+    if geo_changed:
+        changed.append(host)
+print(" ".join(changed))
+PYEOF
+    ) || die "per-host jobfile staging failed"
+    for host in $changed; do
         # host-file geometry changed this host's grid: its layout must
         # describe THAT grid, so re-derive it from the staged variants --
         # unless the operator hand-edited the layout, which is preserved
-        # with the same warning the tuner gives.
-        if [ "$geo_changed" -eq 0 ]; then
-            # pristineness is judged on the SOURCE layout: the staged copy
-            # always differs from its sha (the directory override edits it)
-            if layout_variant_pristine "$srcdir"; then
-                generate_layout "$WORK_DIR/jobs/$host" "$WORK_DIR/jobs/$host" >/dev/null \
-                    || die "per-host layout derivation failed for $host"
-            else
-                log "WARNING: $host: hand-edited layout kept as authored; it may not match the host-file geometry" >&2
-            fi
-        fi
-        # host-file engine (final resolution) applies per host; the global -e
-        # post-pass in stage_jobfiles still runs after this and wins.
-        heng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
-        if [ -n "$heng" ]; then
-            for job in "$WORK_DIR/jobs/$host"/*; do
-                [ -f "$job" ] && override_variant_key "$job" ioengine "$heng"
-            done
+        # with the same warning the tuner gives. Pristineness is judged on
+        # the SOURCE layout, once for the fleet: the staged copies always
+        # differ from its sha (the directory override edits them).
+        [ -n "$pristine" ] || { layout_variant_pristine "$srcdir" && pristine=1 || pristine=0; }
+        if [ "$pristine" -eq 1 ]; then
+            generate_layout "$WORK_DIR/jobs/$host" "$WORK_DIR/jobs/$host" >/dev/null \
+                || die "per-host layout derivation failed for $host"
+        else
+            log "WARNING: $host: hand-edited layout kept as authored; it may not match the host-file geometry" >&2
         fi
     done
+    # host-file engine (final resolution) applies per host, to every staged
+    # file including a re-derived layout; the global -e post-pass in
+    # stage_jobfiles still runs after this and wins. One python for the fleet.
+    [ -f "$WORK_DIR/targets.final" ] || return 0
+    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "per-host engine override failed"
+import os, sys
+
+work, hosts = sys.argv[1], sys.argv[2:]
+rows = {}
+for line in open(os.path.join(work, "targets.final")):
+    p = line.rstrip("\n").split("\t")
+    rows.setdefault(p[0], p)
+for host in hosts:
+    row = rows.get(host, [])
+    eng = row[2] if len(row) > 2 else ""
+    if eng in ("", "-"):
+        continue
+    d = os.path.join(work, "jobs", host)
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not os.path.isfile(path):
+            continue
+        lines = override_lines(open(path).read().splitlines(), "ioengine", eng)
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+PYEOF
 }
 
 # Is the layout file in this staged dir still the generated original?
@@ -5956,53 +6076,61 @@ override_variant_key() {   # override_variant_key <file> <key> <value>
 # the host's list, and any variant with cpus but no explicit policy gets
 # split.
 stamp_unique_names() {
-    local host cpus
+    local host cpus args=()
+    # one python for the fleet (was one per host, ~30ms each, serial): per
+    # host its staged dir, its name, and the recorded cpu list, "-" for none
     for host in "${HOSTS[@]}"; do
         cpus=""
-        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
-        python3 - "$WORK_DIR/jobs/$host" "$(host_name "$host")" "$cpus" <<'PYEOF' || die "cannot stamp deterministic filenames for $host"
+        [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
+        args+=("$WORK_DIR/jobs/$host" "$(host_name "$host")" "${cpus:--}")
+    done
+    [ ${#args[@]} -gt 0 ] || return 0
+    python3 - "${args[@]}" <<'PYEOF' || die "cannot stamp deterministic filenames"
 import os, sys
 
-jobsdir, host, cpus = sys.argv[1], sys.argv[2], sys.argv[3]
-for name in sorted(os.listdir(jobsdir)):
-    path = os.path.join(jobsdir, name)
-    if not os.path.isfile(path):
-        continue
-    lines = open(path).read().splitlines()
-    has_fmt = any(l.strip().startswith("filename_format=") for l in lines)
-    out = []
-    for l in lines:
-        s = l.strip()
-        if s.startswith("filename_format="):
-            val = s.split("=", 1)[1]
-            if "$clientuid" not in val and not val.startswith("shared."):
-                l = "filename_format=" + host + "." + val
-        elif s.startswith("unique_filename="):
-            continue   # replaced by the forced 0 below
-        out.append(l)
-    has_cpus = any(l.strip().startswith("cpus_allowed=") for l in out)
-    has_policy = any(l.strip().startswith("cpus_allowed_policy=") for l in out)
-    ins = ["unique_filename=0"]
-    if not has_fmt:
-        ins.append("filename_format=%s.$jobname.$jobnum.$filenum" % host)
-    if cpus and not has_cpus:
-        ins.append("cpus_allowed=" + cpus)
-        has_cpus = True
-    if has_cpus and not has_policy:
-        ins.append("cpus_allowed_policy=split")
-    if any(l.strip() == "[global]" for l in out):
-        res, done = [], False
-        for l in out:
-            res.append(l)
-            if not done and l.strip() == "[global]":
-                res.extend(ins)
-                done = True
-        out = res
-    else:
-        out = ["[global]"] + ins + out
-    open(path, "w").write("\n".join(out) + "\n")
+argv = sys.argv[1:]
+for i in range(0, len(argv), 3):
+    jobsdir, host, cpus = argv[i:i + 3]
+    if cpus == "-":
+        cpus = ""
+    for name in sorted(os.listdir(jobsdir)):
+        path = os.path.join(jobsdir, name)
+        if not os.path.isfile(path):
+            continue
+        lines = open(path).read().splitlines()
+        has_fmt = any(l.strip().startswith("filename_format=") for l in lines)
+        out = []
+        for l in lines:
+            s = l.strip()
+            if s.startswith("filename_format="):
+                val = s.split("=", 1)[1]
+                if "$clientuid" not in val and not val.startswith("shared."):
+                    l = "filename_format=" + host + "." + val
+            elif s.startswith("unique_filename="):
+                continue   # replaced by the forced 0 below
+            out.append(l)
+        has_cpus = any(l.strip().startswith("cpus_allowed=") for l in out)
+        has_policy = any(l.strip().startswith("cpus_allowed_policy=") for l in out)
+        ins = ["unique_filename=0"]
+        if not has_fmt:
+            ins.append("filename_format=%s.$jobname.$jobnum.$filenum" % host)
+        if cpus and not has_cpus:
+            ins.append("cpus_allowed=" + cpus)
+            has_cpus = True
+        if has_cpus and not has_policy:
+            ins.append("cpus_allowed_policy=split")
+        if any(l.strip() == "[global]" for l in out):
+            res, done = [], False
+            for l in out:
+                res.append(l)
+                if not done and l.strip() == "[global]":
+                    res.extend(ins)
+                    done = True
+            out = res
+        else:
+            out = ["[global]"] + ins + out
+        open(path, "w").write("\n".join(out) + "\n")
 PYEOF
-    done
 }
 
 stage_jobfiles() {
@@ -6072,6 +6200,7 @@ stage_jobfiles() {
     # after every per-host override, before the derived variants inherit it
     stamp_unique_names
     [ "$UNLINK" -eq 0 ] || stage_unlink_variants
+    check_client_cmdline
 
     # A dry run inspects the staged variants without touching the master.
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -6382,47 +6511,66 @@ PYEOF
 # The glob is the filename_format with every $var wildcarded, rooted at the
 # host's destination dir by the caller; maxdepth bounds find to the format's
 # own depth so nothing outside the grid is ever touched.
-layout_grid_spec() {   # layout_grid_spec <staged layout jobfile>
-    pyrun "$1" <<'PYEOF'
-import re, sys
+# layout_grid_spec <staged layout jobfile>          -> the spec on stdout
+# layout_grid_spec -o <dir> <host> <jobfile>...      -> <dir>/<host>.gridspec
+#   per host, one python for the fleet; stdout names each host whose
+#   (non-empty) layout job has no fallocate=none line
+layout_grid_spec() {
+    pyrun "$@" <<'PYEOF'
+import os, re, sys
 
-glb, sections, cur = {}, [], None
-for raw in open(sys.argv[1]):
-    line = raw.strip()
-    if not line or line[0] in "#;":
-        continue
-    if line.startswith("["):
-        name = line[1:-1]
-        cur = glb if name == "global" else {}
-        if name != "global":
-            sections.append((name, cur))
-        continue
-    if "=" in line and cur is not None:
-        k, v = line.split("=", 1)
-        cur[k.strip()] = v.strip()
+def spec(path):
+    glb, sections, cur = {}, [], None
+    lines = open(path).read().splitlines()
+    for raw in lines:
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("["):
+            name = line[1:-1]
+            cur = glb if name == "global" else {}
+            if name != "global":
+                sections.append((name, cur))
+            continue
+        if "=" in line and cur is not None:
+            k, v = line.split("=", 1)
+            cur[k.strip()] = v.strip()
+    out = []
+    for name, sec in sections:
+        def get(key, dflt=None):
+            return sec.get(key, glb.get(key, dflt))
+        fmt = get("filename_format")
+        fsz = get("filesize")
+        if not fmt or not fsz:
+            continue   # nothing statable without both; the fio run still covers it
+        size = parse_size(fsz)
+        nr = int(get("nrfiles", "1"))
+        nj = int(get("numjobs", "1"))
+        fmt = fmt.replace("$jobname", name)
+        # a singleton counter is an EXACT path component, not a wildcard: with
+        # nrfiles=1 the glob $filenum/* would sweep every sibling directory the
+        # namespace's OTHER sections own (seen live: two same-format sections,
+        # 1G x 502 dirs + 10G in dir 0, each deleting the other's files)
+        if nr == 1:
+            fmt = fmt.replace("$filenum", "0")
+        if nj == 1:
+            fmt = fmt.replace("$jobnum", "0")
+        glob = re.sub(r"\$\w+", "*", fmt)
+        depth = 1 + glob.count("/")
+        out.append(f"{size}\t{glob}\t{depth}\t{size * nr * nj}")
+    return out, "fallocate=none" in lines
 
-for name, sec in sections:
-    def get(key, dflt=None):
-        return sec.get(key, glb.get(key, dflt))
-    fmt = get("filename_format")
-    fsz = get("filesize")
-    if not fmt or not fsz:
-        continue   # nothing statable without both; the fio run still covers it
-    size = parse_size(fsz)
-    nr = int(get("nrfiles", "1"))
-    nj = int(get("numjobs", "1"))
-    fmt = fmt.replace("$jobname", name)
-    # a singleton counter is an EXACT path component, not a wildcard: with
-    # nrfiles=1 the glob $filenum/* would sweep every sibling directory the
-    # namespace's OTHER sections own (seen live: two same-format sections,
-    # 1G x 502 dirs + 10G in dir 0, each deleting the other's files)
-    if nr == 1:
-        fmt = fmt.replace("$filenum", "0")
-    if nj == 1:
-        fmt = fmt.replace("$jobnum", "0")
-    glob = re.sub(r"\$\w+", "*", fmt)
-    depth = 1 + glob.count("/")
-    print(f"{size}\t{glob}\t{depth}\t{size * nr * nj}")
+if sys.argv[1] == "-o":
+    outdir, rest = sys.argv[2], sys.argv[3:]
+    for host, path in zip(rest[::2], rest[1::2]):
+        out, has_fallocate = spec(path)
+        with open(os.path.join(outdir, host + ".gridspec"), "w") as fh:
+            fh.write("".join(l + "\n" for l in out))
+        if out and not has_fallocate:
+            print(host)
+else:
+    for l in spec(sys.argv[1])[0]:
+        print(l)
 PYEOF
 }
 
@@ -6450,17 +6598,22 @@ sweep_layout_grid() {
     local lay=${JOBFILES[0]}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
-    local host hd spec cmd sz glob depth tot pids hs i
+    local host hd spec cmd sz glob depth tot pids hs i args=() nofa
     pids=(); hs=()
+    # one python derives every host's grid (was one per host plus a grep,
+    # serial, ahead of a fan-out whose floor is one round trip)
+    for host in "${HOSTS[@]}"; do args+=("$host" "$WORK_DIR/jobs/$host/$lay"); done
+    nofa=$(layout_grid_spec -o "$WORK_DIR/probe" "${args[@]}") \
+        || die "cannot derive the layout grid"
+    # the size test below is only sound under fallocate=none (see
+    # generate_layout); a kept hand-edited or foreign layout job without
+    # it can leave full-size hollow files an interruption would hide
+    for host in $nofa; do
+        log "WARNING: $host: the staged layout job does not set fallocate=none; an interrupted layout could leave full-size hollow files this sweep would credit as complete" >&2
+    done
     for host in "${HOSTS[@]}"; do
-        spec=$(layout_grid_spec "$WORK_DIR/jobs/$host/$lay") \
-            || die "cannot derive the layout grid for $host"
+        spec=$(<"$WORK_DIR/probe/$host.gridspec")
         [ -n "$spec" ] || continue
-        # the size test below is only sound under fallocate=none (see
-        # generate_layout); a kept hand-edited or foreign layout job without
-        # it can leave full-size hollow files an interruption would hide
-        grep -q '^fallocate=none$' "$WORK_DIR/jobs/$host/$lay" \
-            || log "WARNING: $host: the staged layout job does not set fallocate=none; an interrupted layout could leave full-size hollow files this sweep would credit as complete" >&2
         hd=$(host_dir "$host")
         cmd=""
         while IFS="$(printf '\t')" read -r sz glob depth tot; do
@@ -6490,19 +6643,46 @@ SPECEOF
     done
 }
 
+# The coordinator command line for one job: fio on the master, every
+# worker as a "--client=<host> <its jobfile>" pair.
+# --eta=never: we never display ETA (output goes to a file), and the
+# periodic SEND_ETA polls are how a saturated worker gets DROPPED -- a
+# full-rate multi-minute layout write starves the fio server's control
+# thread past the poll timeout (seen live: "timeout on cmd SEND_ETA ...
+# client timed out" 15 minutes into a 3.3TB relayout).
+fio_client_cmd() {   # fio_client_cmd <job>
+    local host cmd="'$FIO_BIN' --output-format=json --eta=never"
+    for host in "${HOSTS[@]}"; do
+        cmd="$cmd --client=$host '$TARGET_DIR/$host/$1'"
+    done
+    printf '%s' "$cmd"
+}
+
+# That command line grows with the fleet, and the master's shell receives
+# the whole of it as ONE argument (ssh hands the remote command over as a
+# single string; local mode runs it through bash -c). Linux caps one
+# argument at MAX_ARG_STRLEN = 128 KiB, and the failure would be an E2BIG
+# from the master's shell -- after the layout had already been staged. At
+# ~65 bytes plus twice the host name per pair that is roughly 1,100 workers
+# of 25-character names, or 700 of 60-character FQDNs. Checked at staging
+# with 8 KiB of headroom for the fio options, so a dry run reports it too.
+CLIENT_CMD_MAX=122880
+check_client_cmdline() {
+    local job cmd n longest=0 worst=""
+    for job in "${JOBFILES[@]}"; do
+        cmd=$(fio_client_cmd "$job")
+        n=${#cmd}
+        [ "$n" -le "$longest" ] || { longest=$n; worst=$job; }
+    done
+    [ "$longest" -gt "$CLIENT_CMD_MAX" ] || return 0
+    die "the fio command line for $worst is $longest bytes with ${#HOSTS[@]} hosts; the master's shell takes it as one argument, which Linux caps at 128 KiB (MAX_ARG_STRLEN) -- run the fleet as two or more host lists"
+}
+
 run_jobs() {
     local job outfile report cmd host t0 t1
     echo
     for job in "${JOBFILES[@]}"; do
-        # --eta=never: we never display ETA (output goes to a file), and the
-        # periodic SEND_ETA polls are how a saturated worker gets DROPPED --
-        # a full-rate multi-minute layout write starves the fio server's
-        # control thread past the poll timeout (seen live: "timeout on cmd
-        # SEND_ETA ... client timed out" 15 minutes into a 3.3TB relayout).
-        cmd="'$FIO_BIN' --output-format=json --eta=never"
-        for host in "${HOSTS[@]}"; do
-            cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
-        done
+        cmd=$(fio_client_cmd "$job")
         # No timestamp in the name: the run directory carries it, and the
         # bundle keeps runs apart better than a filename infix ever did.
         outfile="$RUN_DIR/results_${job%.job}.json"

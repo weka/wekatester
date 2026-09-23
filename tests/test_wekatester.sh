@@ -4783,5 +4783,87 @@ t_assert "README Usage block matches ./wekatester -h byte for byte" bash -c '
     source ./tests/helpers.sh
     diff <(./wekatester -h) <(readme_usage_block README.md)'
 
+# --- efficiency pass (2026-09-23): fan-outs and one-python phases ----------
+# The mount guard used to walk the hosts serially, two sessions each. Now
+# each round is fanned out: every findmnt before any write probe. The stub
+# logs the leading token of each command it receives, in arrival order.
+t_assert "mount guard: the rounds fan out -- every findmnt lands before any write probe" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka
+     run_host() { case "$2" in (findmnt*) echo "F $1" >> "$d/order"; echo "wekafs rw,forcedirect";;
+                              (p=*) echo "P $1" >> "$d/order";; (*) return 1;; esac; }
+     verify_mount_mode) >/dev/null 2>&1 || { echo "guard failed" >&2; exit 1; }
+    [ "$(wc -l < "$d/order")" -eq 6 ] &&
+    [ "$(head -3 "$d/order" | cut -c1 | sort -u)" = F ] &&
+    [ "$(tail -3 "$d/order" | cut -c1 | sort -u)" = P ] || { cat "$d/order" >&2; false; }'
+t_assert "mount guard: per-host failures still come out one per host, in host order" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka
+            run_host() { case "$1:$2" in
+                (h1:findmnt*) echo "wekafs rw,forcedirect";;
+                (h1:p=*)      return 1;;
+                (h2:findmnt*) echo "wekafs rw,readcache";;
+                (h3:*)        return 1;;
+                (*)           return 0;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null )
+    case "$err" in
+        *"ERROR: h1: cannot create files in /mnt/weka"*"ERROR: h2: wekafs mounted readcache"*"ERROR: h3: findmnt failed for /mnt/weka"*"must be mounted with forcedirect"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+# The machine id rides the probe (one line, no session of its own); a probe
+# without the line, or no probe at all, still asks the host as before.
+t_assert "identity: the machine id comes from the probe when it carries one, lowercased" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    printf "ncpus 8\nident 4C4C4544-0042-3510-8054-B4C04F4D3732\n" > "$d/probe/h1"
+    printf "ncpus 8\n" > "$d/probe/h2"
+    (source ./wekatester; WORK_DIR=$d; LOCAL_MODE=0
+     run_host() { echo "SSH[$1]" >&2; return 1; }
+     [ "$(host_machine_id h1)" = "4c4c4544-0042-3510-8054-b4c04f4d3732" ] || { echo "h1: $(cat "$d/ident/h1.id")" >&2; exit 1; }
+     run_host() { echo "DEADBEEF"; }
+     [ "$(host_machine_id h2)" = "deadbeef" ] && [ "$(host_machine_id h3)" = "deadbeef" ]) 2>&1'
+t_assert "identity: an empty ident line is a box with no readable id, not a failure" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    printf "ncpus 8\nident \n" > "$d/probe/h1"
+    out=$( (source ./wekatester; WORK_DIR=$d; LOCAL_MODE=0
+            run_host() { echo "SSH[$1]" >&2; return 1; }
+            printf "[%s]" "$(host_machine_id h1)"; host_identity h1) 2>&1 )
+    [ "$out" = "[]h1" ] || { echo "$out" >&2; false; }'
+# One python judges every host; the bash still speaks per host, in order,
+# and a host without a request is skipped as before.
+t_assert "pinning: one pass over the fleet -- notes in host order, rowless hosts skipped" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 8\ntaskset 0-7\nweka_allowed 2\n" > "$d/probe/h1"
+    printf "ncpus 8\ntaskset 0-7\n" > "$d/probe/h2"
+    printf "ncpus 4\ntaskset 0-3\npriv sudo -n\n" > "$d/probe/h3"
+    printf "h1\t-\t-\t0-3\t-\nh3\t-\t-\t0-7\t-\n" > "$d/targets.final"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1 h2 h3); AUTH_DIR=$d/auth
+        check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    case "$out" in
+        *"note: h1: requested cpus (0-3) overlap weka"*"(2); executing on the remainder (0-1,3)"*"note: h3: requested cpus (0-7) name cpus this host does not have (4-7; the host has 4 cpus: 0-3); executing on the remainder (0-3)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    [ "$(cat "$d/auth/h1.cpus")" = "0-1,3" ] && [ ! -e "$d/auth/h2.cpus" ] &&
+    [ "$(cat "$d/auth/h3.cpus")" = "0-3" ] && [ ! -s "$d/auth/h3.priv" ]'
+# The coordinator line is one shell argument on the master; past 128 KiB it
+# dies at staging with the count that caused it, and a small fleet passes.
+t_assert "staging: a --client list that overflows one shell argument dies before anything runs" bash -c '
+    err=$( (source ./wekatester
+            FIO_BIN=fio; TARGET_DIR=/dev/shm/fio-jobfiles; JOBFILES=(000-wekatester-layout.job 011-bw.job)
+            HOSTS=(); i=0
+            while [ $i -lt 1500 ]; do HOSTS+=("client-node-$i.rack.example.internal"); i=$((i + 1)); done
+            check_client_cmdline) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
+    case "$err" in
+        *"the fio command line for 000-wekatester-layout.job is "*" bytes with 1500 hosts"*"128 KiB"*"two or more host lists"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
+    (source ./wekatester; FIO_BIN=fio; TARGET_DIR=/dev/shm/fio-jobfiles; JOBFILES=(011-bw.job)
+     HOSTS=(h1 h2); check_client_cmdline) &&
+    # run_jobs builds the very line the guard measures
+    c=$( (source ./wekatester; FIO_BIN=/usr/bin/fio; TARGET_DIR=/dev/shm/x; HOSTS=(h1 h2); fio_client_cmd 011-bw.job) ) &&
+    [ "$c" = "'"'"'/usr/bin/fio'"'"' --output-format=json --eta=never --client=h1 '"'"'/dev/shm/x/h1/011-bw.job'"'"' --client=h2 '"'"'/dev/shm/x/h2/011-bw.job'"'"'" ] || { echo "$c" >&2; false; }'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
