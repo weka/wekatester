@@ -178,26 +178,133 @@ editor_fixture() {   # $1 = exit status for the stub (default 0)
     EDITOR="$ED/stub-ed"; unset VISUAL
 }
 
-# --- calibration: probe facts + resolved targets + recorded cpus ---
-# Three hosts, each landing on a different rung of stage_cal_step's per-host
-# resolution:
-#   h1  resolved engine AND dir in targets.final, plus a recorded cpu list
-#       (8 cpus, weka owns 0/1/2 -> 5 usable; the 0,3-4 line is a wide
-#       utility-thread mask and must be ignored)
-#   h2  no targets.final line at all: engine comes from the proven-engine
-#       results (the FIRST ok line, io_uring having failed) and the dir from
-#       the global -d (4 cpus, weka owns 0 -> 3 usable)
-#   h3  no engine anywhere -> psync, no recorded cpus (2 cpus, no weka)
-cal_fixture() {
-    CALFIX=$(mktemp -d)
-    mkdir -p "$CALFIX/probe" "$CALFIX/auth" "$CALFIX/cal"
-    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$CALFIX/probe/h1"
-    printf 'ncpus 4\nweka_allowed 0\nengines libaio psync \n' > "$CALFIX/probe/h2"
-    printf 'ncpus 2\nengines psync \n' > "$CALFIX/probe/h3"
-    printf 'h1\t-\tio_uring\t-\t/data/h1\n' > "$CALFIX/targets.final"
-    printf 'h2 io_uring fail\nh2 libaio ok\nh2 psync ok\n' > "$CALFIX/engine.results"
-    printf '5-7\n' > "$CALFIX/auth/h1.cpus"
+# --- calibration: a fake client that answers every cell from a model ---
+# The planner and the orchestrator are driven against a client whose curve is
+# known, so every verdict can be checked against the answer the model implies.
+# The model, all integers, tuned by CAL_SIM_* variables:
+#   bw    numjobs x effective depth x CAL_SIM_STREAM (1 GiB/s) bytes/s, capped
+#         at CAL_SIM_BWCAP (default 25 GiB/s); psync's effective depth is 1
+#   iops  outstanding x 20,000, capped at CAL_SIM_IOPSCAP (1,000,000), and past
+#         CAL_SIM_IOPSKNEE outstanding (4096) it falls with the overshoot;
+#         nrfiles=CAL_SIM_NRBEST (unset) earns 3%, and every job adds
+#         CAL_SIM_JOBBONUS (0) IOPS -- more jobs at the same outstanding IO win
+#   lat   CAL_SIM_FLOOR us (100) up to CAL_SIM_WIDE jobs (8), then 20us more per
+#         extra job; IOPS = numjobs x 1e6 / latency
+# CAL_SIM_ENGINE_BONUS=<engine> gives that engine 5% more throughput (and 5%
+# less latency).
+cal_fake_value() {   # cal_fake_value <type> <engine> <nj> <qd> <nr> -> "<value> [aux]"
+    local t=$1 e=$2 nj=$3 qd=$4 nr=$5 qe v o lat cap
+    case "$e" in (psync|sync|pvsync|pvsync2|vsync) qe=1 ;; (*) qe=$qd ;; esac
+    case "$t" in
+        (bw)
+            v=$(( nj * qe * ${CAL_SIM_STREAM:-1073741824} ))
+            cap=${CAL_SIM_BWCAP:-26843545600}
+            [ "$v" -le "$cap" ] || v=$cap
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || v=$(( v * 105 / 100 ))
+            echo "$v" ;;
+        (iops)
+            o=$(( nj * qe )); v=$(( o * 20000 ))
+            cap=${CAL_SIM_IOPSCAP:-1000000}
+            [ "$v" -le "$cap" ] || v=$cap
+            if [ "$o" -gt "${CAL_SIM_IOPSKNEE:-4096}" ]; then
+                v=$(( v * ${CAL_SIM_IOPSKNEE:-4096} / o ))
+            fi
+            [ "${CAL_SIM_NRBEST:-0}" != "$nr" ] || v=$(( v * 103 / 100 ))
+            v=$(( v + nj * ${CAL_SIM_JOBBONUS:-0} ))
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || v=$(( v * 105 / 100 ))
+            echo "$v" ;;
+        (lat)
+            lat=${CAL_SIM_FLOOR:-100}
+            [ "$nj" -le "${CAL_SIM_WIDE:-8}" ] || lat=$(( lat + (nj - ${CAL_SIM_WIDE:-8}) * 20 ))
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || lat=$(( lat * 95 / 100 ))
+            echo "$lat $(( nj * 1000000 / lat ))" ;;
+    esac
 }
+export -f cal_fake_value
+
+# fio client JSON for one cell, from the cell jobfile's name
+# (cal-<type>-<dirn>-<engine>-nj<n>-qd<n>-nr<n>-<rt>s.job) on host <host>.
+cal_fake_fio() {   # cal_fake_fio <cell-basename> <host>
+    local b=$1 host=$2 t d e nj qd nr val v a rbw=0 riops=0 rlat=0 wbw=0 wiops=0 wlat=0
+    b=${b%.job}; b=${b#cal-}
+    t=${b%%-*}; b=${b#*-}; d=${b%%-*}; b=${b#*-}
+    e=${b%%-nj*}; b=${b#*-nj}; nj=${b%%-*}; b=${b#*-qd}; qd=${b%%-*}; b=${b#*-nr}; nr=${b%%-*}
+    val=$(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")
+    read -r v a <<<"$val"
+    case "$t:$d" in
+        (bw:read)    rbw=$v; riops=$(( v / 1048576 )) ;;
+        (bw:write)   wbw=$v; wiops=$(( v / 1048576 )) ;;
+        (iops:read)  riops=$v; rbw=$(( v * 4096 )) ;;
+        (iops:write) wiops=$v; wbw=$(( v * 4096 )) ;;
+        (lat:read)   rlat=$(( v * 1000 )); riops=$a; rbw=$(( a * 4096 )) ;;
+        (lat:write)  wlat=$(( v * 1000 )); wiops=$a; wbw=$(( a * 4096 )) ;;
+    esac
+    printf '{ "client_stats": [ { "jobname": "cal-%s-%s", "hostname": "%s", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } }, "write": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } } } ] }\n' \
+        "$t" "$d" "$host" "$rbw" "$riops" "$(( riops * 30 ))" "$(( rbw * 30 ))" "$rlat" \
+        "$wbw" "$wiops" "$(( wiops * 30 ))" "$(( wbw * 30 ))" "$wlat"
+}
+export -f cal_fake_fio
+
+# A run_host stand-in for calibration runs: the dataset listing answers
+# "empty, plenty of room", a seed succeeds, a cell answers from the model,
+# everything else (mkdir, rm, truncate) succeeds. Every command is appended
+# to $SIMLOG when it is set.
+cal_sim_host() {   # cal_sim_host <host> <command>
+    local jf h
+    [ -z "${SIMLOG:-}" ] || printf '%s|%s\n' "$1" "$2" >> "$SIMLOG"
+    case "$2" in
+        (*WEKATESTER_DF*)
+            echo WEKATESTER_DF; echo "wekafs 999999999 ${CAL_SIM_FREE_MIB:-99999999}" ;;
+        (*cal-seed-*)
+            h=${2#*--client=}; h=${h%% *}
+            printf '{ "client_stats": [ { "jobname": "seed-0-0", "hostname": "%s", "error": 0, "read": { "total_ios": 0, "io_bytes": 0 }, "write": { "total_ios": 10, "io_bytes": 10485760 } } ] }\n' "$h" ;;
+        (*--client=*)
+            h=${2#*--client=}; h=${h%% *}
+            jf=${2##*/}; jf=${jf%\'}
+            cal_fake_fio "$jf" "$h" ;;
+    esac
+    return 0
+}
+export -f cal_sim_host
+
+# A calibration work dir: one probe file per host argument ("h1" or
+# "h1:<ncpus>:<speedMb>"), every host a weka client on one mlx5 NIC.
+cal_sim_fixture() {   # cal_sim_fixture <dir> <host[:ncpus[:speed]]>...
+    local d=$1 spec h n sp
+    shift
+    mkdir -p "$d/probe" "$d/auth" "$d/set"
+    for spec in "$@"; do
+        IFS=: read -r h n sp <<<"$spec"
+        { printf 'ncpus %s\nweka_allowed 0\nengines io_uring libaio psync\n' "${n:-4}"
+          printf 'cpu_model Test CPU %s-core\nmemtotal_kb 263921664\n' "${n:-4}"
+          printf 'nic ens1 %sMb/s 0000:3b:00.0 mlx5_core 0x15b3:0x101d\n' "${sp:-100000}"
+          printf 'weka_net client [{"name": "ens1", "identifier": "0000:3b:00.0"}]\n'
+        } > "$d/probe/$h"
+    done
+}
+export -f cal_sim_fixture
+
+# Drive cal_plan to its verdict against the model: prints the verdict line;
+# every cell it asked for lands in <dir>/asked as "<phase> <nj> <qd> <nr>".
+plan_sim() {   # plan_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
+    local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act phase nj qd nr rt n=0 knobs
+    shift 7
+    knobs="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=2 nrc=1,4 bwqd=128 iopsqd=256 njmaxpct=200 floorreps=3 $*"
+    : > "$d/hist"; : > "$d/asked"
+    while [ "$n" -lt 300 ]; do
+        act=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED"; return 1; }
+        case "$act" in
+            ("cell "*) read -r _ phase nj qd nr rt <<<"$act"
+                       echo "$phase $nj $qd $nr" >> "$d/asked"
+                       echo "$phase $e $nj $qd $nr $rt $(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")" >> "$d/hist"
+                       n=$((n + 1)) ;;
+            (*) printf '%s\n' "$act"; return 0 ;;
+        esac
+    done
+    echo "NO VERDICT"; return 1
+}
+export -f plan_sim
 
 # --- calibration: one ladder step's fio client_stats -------------------------
 # Same shape as fio's client-mode output and the same traps: a create-phase
