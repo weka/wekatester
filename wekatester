@@ -48,6 +48,7 @@ DRY_RUN=0           # -n: create/generate and print what would run; execute noth
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
+LOAD_CHECK=0        # -l: check each calibrated bandwidth/iops setting under load
 
 # -C/--customize: copy a workload set, edit it, run it.
 CUSTOMIZE=0
@@ -414,7 +415,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-C[set]] [-b] [-l] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
@@ -473,6 +474,11 @@ attaching is the way to pass a value that starts with a dash.
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a cal/brutal the 1MiB test
                  gets its own calibrated job count)
+  -l, --load     with -a cal or brutal: before each bandwidth and iops test
+                 runs, run its setting on every client at once; if they
+                 deliver under 90% of their solo results added up, try each
+                 client one notch lighter and heavier and run the test on the
+                 better one -- or report the cluster as the limit
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -1101,6 +1107,7 @@ parse_args() {
             -g) REGEN_LAYOUT=1; shift ;;
             -u|--unlink) UNLINK=1; shift ;;
             -b|--bulk) BULK=1; shift ;;
+            -l|--load) LOAD_CHECK=1; shift ;;
             -a|--auto)
                 AUTO_LEVEL="max"
                 # The level is a keyword, not a value, so it is matched
@@ -1185,6 +1192,9 @@ parse_args() {
         # hostname, so name the change instead.
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
+    fi
+    if [ "$LOAD_CHECK" -eq 1 ] && ! cal_mode; then
+        usage >&2; die "-l checks the calibrated settings under load: it needs -a cal or -a brutal"
     fi
 }
 
@@ -3017,6 +3027,222 @@ UNLEOF
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
 }
 
+# --- -l: the calibrated settings, checked under load (Frank, 2026-09-25) -----
+# Calibration measures each shape ALONE; the test then runs every client at
+# once, sharing the cluster. Before each bandwidth and iops test runs for
+# real, -l runs its staged setting for CAL_RUNTIME seconds on each shape's
+# representative alone, then on every client together. If the clients
+# together deliver CAL_FLEET_PCT (90) percent of what they did alone, added
+# up, the setting stands. Short of that they are getting in each other's way
+# at the cluster, so -l tries every client one notch lighter (half the
+# iodepth, or half the jobs at iodepth 1) and one notch heavier (twice the
+# iodepth), re-measures the better one, and runs the test on it if it still
+# wins by more than CAL_SHAPE_THR percent. If neither notch moves the total,
+# the cluster is the limit, and the log says that total is the cluster's
+# number for the test -- the answer the run exists to show. Lab 2
+# (2026-09-25) had both cases: an iops-read setting 2% faster solo lost 18%
+# with all five clients running, and random writes topped out below one
+# client's solo number whatever the setting. Latency tests are left alone:
+# their rise under load IS the measurement (the one-job twins give the
+# single-stream baseline). The host file keeps the solo calibration; -l
+# adjusts this run's staged jobs only, and the bundle's copy of them.
+CAL_FLEET_PCT=${CAL_FLEET_PCT:-90}
+
+# Every host's variant of <job> for one kind of check cell, into
+# $WORK_DIR/lchk/<notch>/<host>/<job>: the staged variant with runtime
+# CAL_RUNTIME, and for light/heavy the notch applied per host. With "apply"
+# the notch is written into the staged variants themselves instead, runtime
+# untouched. Prints one "<host> <numjobs> <iodepth>" line per host that the
+# notch changed; nothing when no host can take it.
+lchk_stage() {   # lchk_stage <job> <base|light|heavy> [apply]
+    pyrun "$WORK_DIR" "$1" "$2" "${3:-}" "$CAL_RUNTIME" "${HOSTS[@]}" <<'PYEOF' || return 1
+import os, sys
+
+work, job, notch, apply, rt = sys.argv[1:6]
+hosts = sys.argv[6:]
+SYNC = ("psync", "sync", "pvsync", "pvsync2", "vsync")
+rows = {}
+final = os.path.join(work, "targets.final")
+if os.path.exists(final):
+    for line in open(final):
+        p = line.rstrip("\n").split("\t")
+        rows.setdefault(p[0], p)
+
+def cpus_of(h):
+    row = rows.get(h, [])
+    i = 1 + FIELDS.index("cpus")
+    v = row[i] if i < len(row) else ""
+    return "" if v == "-" else v
+
+for h in hosts:
+    src = os.path.join(work, "jobs", h, job)
+    lines = open(src).read().splitlines()
+    nj = int(first_value(lines, "numjobs") or 1)
+    qd = int(first_value(lines, "iodepth") or 1)
+    nj2, qd2 = nj, qd
+    if notch == "light":
+        if qd >= 2:
+            qd2 = qd // 2
+        elif nj >= 2:
+            nj2 = nj // 2
+    elif notch == "heavy" and first_value(lines, "ioengine") not in SYNC:
+        qd2 = qd * 2    # a sync engine keeps one IO in flight: no heavier notch
+    if (nj2, qd2) != (nj, qd):
+        print(h, nj2, qd2)
+        lines = override_lines(lines, "numjobs", str(nj2))
+        lines = override_lines(lines, "iodepth", str(qd2))
+        if nj2 != nj:
+            # the job count moved, so the cpu set may too (N/2 and N on one
+            # thread per physical core, more on the siblings as well)
+            c = probe_cores(os.path.join(work, "probe", h), cpus_of(h))
+            if c["n"] >= 1:
+                lines = override_lines(lines, "cpus_allowed", fmt_cpulist(
+                    c["phys"] if nj2 <= c["n"] else c["all"]))
+    if apply:
+        dst = src
+    else:
+        lines = override_lines(override_lines(lines, "runtime", rt), "time_based", "1")
+        dst = os.path.join(work, "lchk", notch, h, job)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+PYEOF
+}
+
+# The measured value per host of one check cell: the last client_stats entry
+# per host (the workload runs after the create section), read + write,
+# bytes/s for bw and IOPS for iops. Prints "<host> <value>" lines.
+lchk_values() {   # lchk_values <json> <bw|iops>
+    python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+
+path, mode = sys.argv[1], sys.argv[2]
+KEY = "bw_bytes" if mode == "bw" else "iops"
+raw = open(path).read()
+start = raw.find("{")
+if start < 0:
+    sys.exit(f"ERROR: lchk_values: no JSON in {path}")
+try:
+    data = json.loads(raw[start:])
+except ValueError as exc:
+    sys.exit(f"ERROR: lchk_values: cannot parse fio JSON in {path}: {exc}")
+last = {}
+for s in data.get("client_stats", []):
+    if s.get("jobname") == "All clients":
+        continue
+    last[s.get("hostname", s.get("jobname", "?"))] = s
+if not last:
+    sys.exit(f"ERROR: lchk_values: {path} carries no client stats")
+for h in sorted(last):
+    s = last[h]
+    print(h, int(sum(float((s.get(d) or {}).get(KEY) or 0) for d in ("read", "write"))))
+PYEOF
+}
+
+# One check cell: <job>'s <notch> variant on <host>... at once. Leaves the
+# total in $WORK_DIR/lchk/total; the JSON goes to the run bundle.
+LCHK_CELLS=0
+lchk_run() {   # lchk_run <job> <notch> <bw|iops> <label> <host>...
+    local job=$1 notch=$2 kind=$3 label=$4 json cmd h vals
+    shift 4
+    cmd="'$FIO_BIN' --output-format=json --eta=never"
+    for h in "$@"; do
+        cmd="$cmd --client=$h '$TARGET_DIR.lchk/$notch/$h/$job'"
+    done
+    LCHK_CELLS=$((LCHK_CELLS + 1))
+    json="$RUN_DIR/lchk/$LCHK_CELLS-${job%.job}-$notch-$label.json"
+    run_host "$MASTER" "$cmd" > "$json" \
+        || die "load check: $job ($notch, $label) failed (output in $json)"
+    check_fio_errors "$json" measured \
+        || die "load check: $job ($notch, $label) errored on a host (output in $json)"
+    vals=$(lchk_values "$json" "$kind") || die "load check: cannot read $json"
+    printf '%s\n' "$vals" | awk '{t += $2} END {printf "%d\n", t}' > "$WORK_DIR/lchk/total"
+    debug "load check: $job $notch $label: $(tr '\n' ' ' <<<"$vals")"
+    [ "$LCHK_WRITES" -eq 0 ] || sleep "$CAL_SETTLE"
+}
+
+lchk_human() {   # lchk_human <bw|iops> <value>
+    if [ "$1" = bw ]; then
+        awk -v v="$2" 'BEGIN {printf "%.2f GiB/s", v / 1073741824}'
+    else
+        awk -v v="$2" 'BEGIN {s = sprintf("%d", v); o = ""
+            while (length(s) > 3) { o = "," substr(s, length(s) - 2) o; s = substr(s, 1, length(s) - 3) }
+            printf "%s%s IOPS", s, o}'
+    fi
+}
+
+LCHK_WRITES=0
+load_check() {   # load_check <job>: see the block comment above
+    local job=$1 items kind sid rep rest members m solo=0 total light=0 heavy=0 v pick="" pv=0 again changed
+    items=" $(report_directive "$SET_DIR/$job") "
+    case "$items" in
+        (*" latency "*) return 0 ;;
+        (*" bandwidth "*) kind=bw ;;
+        (*" iops "*) kind=iops ;;
+        (*) return 0 ;;
+    esac
+    [ ${#HOSTS[@]} -gt 1 ] || return 0
+    [ -s "$WORK_DIR/cal/shapes" ] || {
+        log "load check: $job: no calibration shapes to compare against; skipped" >&2
+        return 0
+    }
+    LCHK_WRITES=$(pyrun "$SET_DIR/$job" <<'PYEOF'
+import sys
+print(1 if "write" in file_directions(open(sys.argv[1]).read().splitlines()) else 0)
+PYEOF
+    ) || die "load check: cannot read $job"
+    mkdir -p "$WORK_DIR/lchk" "$RUN_DIR/lchk"
+    rm -rf "$WORK_DIR/lchk/base" "$WORK_DIR/lchk/light" "$WORK_DIR/lchk/heavy"
+    run_host "$MASTER" "rm -rf '$TARGET_DIR.lchk' && mkdir -p '$TARGET_DIR.lchk'" \
+        || die "cannot create $TARGET_DIR.lchk on $MASTER"
+    lchk_stage "$job" base >/dev/null || die "load check: cannot stage $job"
+    copy_to_master "$WORK_DIR/lchk/base" "$TARGET_DIR.lchk/" || die "load check: cannot copy $job to $MASTER"
+    # alone: each shape's representative, counted once per member
+    while IFS=$'\t' read -r sid rep rest <&3; do
+        members=${rest##*$'\t'}
+        m=$(printf '%s\n' $members | wc -l | tr -d ' ')
+        lchk_run "$job" base "$kind" "solo-$rep" "$rep"
+        read -r v < "$WORK_DIR/lchk/total"
+        solo=$((solo + v * m))
+    done 3< "$WORK_DIR/cal/shapes"
+    lchk_run "$job" base "$kind" fleet "${HOSTS[@]}"
+    read -r total < "$WORK_DIR/lchk/total"
+    if [ $((total * 100)) -ge $((solo * CAL_FLEET_PCT)) ]; then
+        log "load check: $job holds under load: $(lchk_human "$kind" "$total") across ${#HOSTS[@]} clients = $((solo > 0 ? total * 100 / solo : 0))% of their solo sum, $(lchk_human "$kind" "$solo")"
+        run_host "$MASTER" "rm -rf '$TARGET_DIR.lchk'" || log "WARNING: could not remove $TARGET_DIR.lchk on $MASTER" >&2
+        return 0
+    fi
+    log "load check: $job: $(lchk_human "$kind" "$total") across ${#HOSTS[@]} clients is $((solo > 0 ? total * 100 / solo : 0))% of their solo sum ($(lchk_human "$kind" "$solo")), under ${CAL_FLEET_PCT}% -- trying one notch lighter and one heavier per client"
+    for v in light heavy; do
+        changed=$(lchk_stage "$job" "$v") || die "load check: cannot stage the $v notch of $job"
+        [ -n "$changed" ] || { log "load check: $job: no client can go $v"; continue; }
+        copy_to_master "$WORK_DIR/lchk/$v" "$TARGET_DIR.lchk/" || die "load check: cannot copy $job to $MASTER"
+        lchk_run "$job" "$v" "$kind" fleet "${HOSTS[@]}"
+        read -r again < "$WORK_DIR/lchk/total"
+        if [ "$v" = light ]; then light=$again; else heavy=$again; fi
+        if [ "$again" -gt "$pv" ]; then pick=$v; pv=$again; fi
+    done
+    if [ -n "$pick" ] && [ $((pv * 100)) -gt $((total * (100 + CAL_SHAPE_THR))) ]; then
+        # one more reading of the winner before the run is changed on it
+        lchk_run "$job" "$pick" "$kind" confirm "${HOSTS[@]}"
+        read -r again < "$WORK_DIR/lchk/total"
+        [ "$again" -le "$pv" ] || pv=$again
+    fi
+    if [ -n "$pick" ] && [ $((pv * 100)) -gt $((total * (100 + CAL_SHAPE_THR))) ]; then
+        changed=$(lchk_stage "$job" "$pick" apply) || die "load check: cannot apply the $pick notch to $job"
+        copy_to_master "$WORK_DIR"/jobs/* "$TARGET_DIR/" \
+            || die "load check: cannot copy the adjusted $job to $MASTER"
+        for h in "${HOSTS[@]}"; do
+            [ ! -d "$RUN_DIR/fio-jobfiles/$h" ] || cp "$WORK_DIR/jobs/$h/$job" "$RUN_DIR/fio-jobfiles/$h/$job" \
+                || log "WARNING: could not update the bundle's copy of $h/$job" >&2
+        done
+        log "load check: $job runs one notch $([ "$pick" = light ] && echo lighter || echo heavier) ($(printf '%s' "$changed" | awk '{printf "%s%s numjobs=%s iodepth=%s", (NR > 1 ? ", " : ""), $1, $2, $3}')): $(lchk_human "$kind" "$pv") against $(lchk_human "$kind" "$total") at the calibrated setting (lighter $(lchk_human "$kind" "$light"), heavier $(lchk_human "$kind" "$heavy")); the host file keeps the solo calibration"
+    else
+        log "load check: $job is cluster-bound: $(lchk_human "$kind" "$total") across ${#HOSTS[@]} clients whatever each client runs (lighter $(lchk_human "$kind" "$light"), heavier $(lchk_human "$kind" "$heavy")) -- that is the cluster's number for this test"
+    fi
+    run_host "$MASTER" "rm -rf '$TARGET_DIR.lchk'" || log "WARNING: could not remove $TARGET_DIR.lchk on $MASTER" >&2
+}
+
 # --- phase 1: preflight --------------------------------------------------------
 # Verify every host is reachable over ssh and has $FIO_BIN installed (local mode:
 # just the fio check -- there is no connection to test).
@@ -3929,10 +4155,17 @@ for host in hosts:
     unbind = sorted((req - weka - set(phantom)) - bind - bindp) if tested else []
     if unbind:
         flags.append("unbindable")
-    # the EFFECTIVE set is the request minus weka's dedicated cores and the
-    # cpus the host does not have: the host file keeps the operator's list as
-    # written, execution never touches weka's own cpus
-    eff = sorted(req - weka - set(phantom) - set(unbind))
+    # core 0 of socket 0 and its sibling always stay with the OS (Frank,
+    # 2026-09-25): fio never runs there, whatever the list says
+    topo = probe_topology(probe)
+    pair = set(topo[0][1]) if 0 in topo else {0}
+    os0 = sorted(req & pair)
+    if os0:
+        flags.append("core0")
+    # the EFFECTIVE set is the request minus weka's dedicated cores, core 0's
+    # pair and the cpus the host does not have: the host file keeps the
+    # operator's list as written, execution never touches those cpus
+    eff = sorted(req - weka - set(phantom) - set(unbind) - pair)
     if iso and (req & iso) and (req - iso):
         # a mask mixing isolated and housekeeping cpus silently collapses onto
         # the housekeeping partition -- worse than failing, it runs WRONG
@@ -3953,10 +4186,10 @@ for host in hosts:
     print(host, req_s, cur_s or "-", ncpus_s or "-",
           ",".join(map(str, sorted(weka))) or "none",
           fmt(eff) or "none", fmt(phantom) or "none", fmt(unbind) or "none",
-          ",".join(flags) or "ok", priv or "-")
+          fmt(os0) or "none", ",".join(flags) or "ok", priv or "-")
 PYEOF
-    local dedicated effective phantom unbindable vflags
-    while read -r host req cur ncpus dedicated effective phantom unbindable vflags priv; do
+    local dedicated effective phantom unbindable os0 vflags
+    while read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
         [ "$cur" != "-" ] || cur=""
         [ "$ncpus" != "-" ] || ncpus=""
         [ "$priv" != "-" ] || priv=""
@@ -3968,6 +4201,9 @@ PYEOF
                 fi
                 if [ "$phantom" != none ]; then
                     die "$host: no requested cpu ($req) is usable -- each is a weka dedicated core or a cpu this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1)))"
+                fi
+                if [ "$os0" != none ]; then
+                    die "$host: no requested cpu ($req) is usable -- core 0 and its sibling ($os0) stay with the OS, and the rest are weka dedicated cores"
                 fi
                 die "$host: every requested cpu ($req) is a weka dedicated core -- nothing left to run fio on" ;;
         esac
@@ -3987,6 +4223,10 @@ PYEOF
                 # mixed RANGE collapsing onto housekeeping) needed shared
                 # masks, which no staged variant uses any more.
                 log "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
+        esac
+        case "$vflags" in
+            (*core0*)
+                log "note: $host: requested cpus ($req) include core 0's pair ($os0), which stays with the OS; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*overlap*)
@@ -4158,9 +4398,6 @@ for h in hosts:
     unbind = probe_unbindable(os.path.join(work, "probe", h),
                               universe or set(range(ncpus)))
     cores = probe_cores(os.path.join(work, "probe", h))
-    if cores["n"] < 1:
-        sys.exit(f"ERROR: {h}: no cpus left for fio -- {cores_summary(cores)}; "
-                 f"mount weka with fewer cores or use a larger client")
     if cores["weka_core0"]:
         warn(f"{h}: weka has pinned a dedicated core on core 0 -- that core "
              f"and its sibling belong to the OS; fio stays off it regardless")
@@ -4195,6 +4432,11 @@ def cores_for(h):
     if h not in _cores_for:
         c = target(h, "cpus")
         if not c:
+            if facts[h]["cores"]["n"] < 1:
+                sys.exit(f"ERROR: {h}: no cpus left for fio -- "
+                         f"{cores_summary(facts[h]['cores'])}; mount weka with "
+                         f"fewer cores, use a larger client, or name the cpus "
+                         f"in the host file")
             _cores_for[h] = facts[h]["cores"]
         else:
             cc = probe_cores(os.path.join(work, "probe", h), c)
@@ -5608,6 +5850,7 @@ dry_run_report() {
         else
             log "-a $AUTO_LEVEL: nothing to calibrate in this set"
         fi
+        [ "$LOAD_CHECK" -eq 0 ] || log "-l would check each bandwidth and iops setting on every client at once before its test runs (${CAL_FLEET_PCT}% of the solo sum holds)"
     fi
     if [ -n "$SET_DIR_OVERRIDE" ]; then
         log "custom set files (edit these, then re-run without -n):"
@@ -6640,6 +6883,7 @@ run_jobs() {
             echo
             continue
         fi
+        [ "$LOAD_CHECK" -eq 0 ] || load_check "$job"
         report=$(report_directive "$SET_DIR/$job")
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         debug "running on $MASTER: $cmd"

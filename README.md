@@ -22,7 +22,7 @@ wekatester uses fio's native client/server mode:
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-C[set]] [-b] [-l] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        wekatester -s results.json
        wekatester --version
@@ -81,6 +81,11 @@ attaching is the way to pass a value that starts with a dash.
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a cal/brutal the 1MiB test
                  gets its own calibrated job count)
+  -l, --load     with -a cal or brutal: before each bandwidth and iops test
+                 runs, run its setting on every client at once; if they
+                 deliver under 90% of their solo results added up, try each
+                 client one notch lighter and heavier and run the test on the
+                 better one -- or report the cluster as the limit
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -124,6 +129,8 @@ With no server given, the test runs on the local host -- no ssh required.
 `-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout job (so it always matches the exact file grid that was laid out, whatever auto tuning or hand edits did) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
 
 `-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a cal` and `-a brutal` the 1 MiB test gets its own calibrated job count, recorded in its own host-file columns (`latency1mR`, `latency1mW`).
+
+`-l/--load` — with `-a cal` or `-a brutal`, check each calibrated bandwidth and IOPS setting under load before its test runs. See *Checking the settings under load* below.
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -339,6 +346,28 @@ the peak instead of the first rung at line rate. With the default ladders that
 is about 120 IOPS cells, 35 bandwidth cells and 12 latency cells per direction,
 some 330 per shape, or about three hours at 30s cells. Use `cal` for the answer
 cheaply, and `brutal` when the stopping rules themselves are the suspect.
+
+### Checking the settings under load: `-l`
+
+Calibration finds each client's best settings while that client runs
+**alone**. The real test runs **every client at once**, sharing the cluster.
+With `-l`, before each bandwidth and IOPS test runs for real:
+
+1. Its staged setting runs for `CAL_RUNTIME` seconds on each shape's
+   representative alone, then on every client together.
+2. If the clients together deliver at least 90% (`CAL_FLEET_PCT`) of what they
+   did alone, added up, the setting stands.
+3. Short of that, the clients are getting in each other's way at the cluster.
+   `-l` tries every client one notch lighter (half the iodepth, or half the
+   jobs at iodepth 1) and one notch heavier (twice the iodepth), re-measures
+   the better one, and runs the test on it if it still wins by more than 2%.
+4. If neither notch moves the total, the cluster itself is the limit, and the
+   log says that total is the cluster's number for the test.
+
+A check costs a few 30s cells per test. Latency tests are left alone: their
+rise under load is the measurement, next to the one-job twins' single-stream
+baseline. The host file keeps the solo calibration; `-l` adjusts only this
+run's staged jobs, and the bundle's copy of them.
 
 ### Calibration measures what the test will run
 

@@ -2529,10 +2529,10 @@ bindable_priv -
 " > "$d/targets.final"
         check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
     case "$out" in
-        *"note: h1: requested cpus (0-7) include 3,5, which this host refuses to bind"*"cgroup"*"executing on the remainder (0-2,4,6-7)"*"keeps the list as written"*) true;;
+        *"note: h1: requested cpus (0-7) include 3,5, which this host refuses to bind"*"cgroup"*"executing on the remainder (1-2,4,6-7)"*"keeps the list as written"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "0-2,4,6-7" ] &&
+    [ "$(cat "$d/auth/h1.cpus")" = "1-2,4,6-7" ] &&
     [ ! -f "$d/auth/h1.priv" ]'
 t_assert "pinning: a cpu bindable only under the escalator escalates, it is not trimmed" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
@@ -2549,7 +2549,7 @@ priv sudo -n
 " > "$d/targets.final"
         check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
     case "$out" in *"refuses to bind"*) echo "trimmed a cpu the escalator can reach: $out" >&2; false;; *) true;; esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "0-7" ] &&
+    [ "$(cat "$d/auth/h1.cpus")" = "1-7" ] &&
     [ "$(cat "$d/auth/h1.priv")" = "sudo -n" ]'
 t_assert "pinning: bindable only under an escalator that does not exist dies, naming all three" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
@@ -2566,7 +2566,7 @@ bindable_priv 4,5,6,7
         check_cpu_pinning) 2>&1 >/dev/null ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in
-        *"effective cpus_allowed: 0-7"*"current taskset:        0-3"*"outside the current taskset and no passwordless escalator"*) true;;
+        *"effective cpus_allowed: 1-7"*"current taskset:        0-3"*"outside the current taskset and no passwordless escalator"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 t_assert "pinning: every requested cpu refusing the bind dies naming them, not the weka message" bash -c '
@@ -2599,7 +2599,7 @@ isolated 2-7
 " > "$d/targets.final"
         check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
     case "$out" in *"refuses to bind"*) echo "invented a measurement: $out" >&2; false;; *) true;; esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "0-7" ] && [ ! -f "$d/auth/h1.priv" ]'
+    [ "$(cat "$d/auth/h1.cpus")" = "1-7" ] && [ ! -f "$d/auth/h1.priv" ]'
 t_assert "pinning: full weka overlap dies; partial runs on the remainder, file untouched" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
@@ -2636,9 +2636,9 @@ t_assert "pinning: cpus the host does not have are trimmed with a note, file unt
         printf "h1\t-\t-\t0-128\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 )
     case "$out" in
-        *"note"*"cpus this host does not have (64-128; the host has 64 cpus: 0-63); executing on the remainder (0-51,54-63)"*) true;;
+        *"note"*"cpus this host does not have (64-128; the host has 64 cpus: 0-63); executing on the remainder (1-51,54-63)"*) true;;
         *) echo "$out" >&2; exit 1;;
-    esac && [ "$(cat "$d/auth/h1.cpus")" = "0-51,54-63" ]'
+    esac && [ "$(cat "$d/auth/h1.cpus")" = "1-51,54-63" ]'
 t_assert "pinning: a list with no real cpu at all still dies" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
@@ -3024,7 +3024,7 @@ t_assert "pinning: a mixed isolated+housekeeping list is allowed with a note (sp
         *"span isolated and housekeeping"*"split affinity"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "0-15" ] && test ! -s "$d/auth/h1.priv"'
+    [ "$(cat "$d/auth/h1.cpus")" = "1-15" ] && test ! -s "$d/auth/h1.priv"'
 t_assert "pinning: a pure-isolated request needs no escalator (self-affinable)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
@@ -3686,6 +3686,28 @@ t_assert "tuner: a job count at or below N runs one job per physical core; above
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1 &&
     grep -qx "cpus_allowed=4-11" "$FIX/jobs/h1/011-bw.job"'
 
+t_assert "tuner: a host-file cpu list rescues a client the default rule leaves no cpus" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    # 8 cores, 6 of them weka DPDK: the default reserve takes the last two
+    topo_fixture "$FIX/probe/h1" 16 adjacent 4 6 8 10 12 14; cp "$FIX/probe/h1" "$FIX/probe/h2"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$err" in *"h1: no cpus left for fio"*"or name the cpus in the host file"*) true;; *) echo "$err" >&2; exit 1;; esac
+    { printf "h1\t-\t-\t2-3\t-"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"
+      printf "h2\t-\t-\t2-3\t-"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1 &&
+    grep -qx "cpus_allowed=2-3" "$FIX/jobs/h1/011-bw.job"'
+t_assert "pinning: core 0 and its sibling never execute, whatever the host-file list says" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    topo_fixture "$d/probe/h1" 8 adjacent 6
+    printf "taskset 0-7\n" >> "$d/probe/h1"
+    printf "h1\t-\t-\t0-5\t-\n" > "$d/targets.final"
+    out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) 2>&1 )
+    [ "$(cat "$d/auth/h1.cpus")" = "2-5" ] &&
+    case "$out" in *"requested cpus (0-5) include core 0'"'"'s pair (0-1), which stays with the OS; executing on the remainder (2-5)"*) true;; *) echo "$out" >&2; false;; esac &&
+    printf "h1\t-\t-\t0-1\t-\n" > "$d/targets.final" &&
+    err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) 2>&1 ); [ $? -ne 0 ] &&
+    case "$err" in *"core 0 and its sibling (0-1) stay with the OS"*) true;; *) echo "$err" >&2; false;; esac'
+
 # --- -b: every latency test also at 1MiB; -a cal/brutal: a one-job twin beside each ---
 t_assert "-b sets bulk; off by default" bash -c '
     source ./wekatester; parse_args h1; [ "$BULK" -eq 0 ] &&
@@ -3773,6 +3795,73 @@ t_assert "calibrate: under -b a latency set also measures the 1MiB test, into it
     case "$out" in *"lat-read: floor 100.0 us"*"lat1m-read: 1MiB floor 1000.0 us"*) true;; *) printf "%s\n" "$out" >&2; false;; esac &&
     # the 4k test holds the floor to N=5 jobs, the 1MiB test to 2N=10
     [ "$(cut -d" " -f11-14,27-30 "$d/cal.results")" = "1 1 5120M 5 1 1 5120M 10" ] || { cat "$d/cal.results" >&2; false; }'
+
+# --- -l: the calibrated settings checked under load ---
+# load_check against a fake fleet: three clients of one shape, a staged iops
+# job at numjobs=8 iodepth=16, and a master whose fio answers per client from
+# LCHK_SOLO (alone) or LCHK_BASE / LCHK_LIGHT / LCHK_HEAVY (all at once)
+lchk_fixture() {
+    LD=$(mktemp -d); mkdir -p "$LD/set" "$LD/run/fio-jobfiles" "$LD/cal" "$LD/target"
+    printf "# report ${1:-iops}\n[global]\nnumjobs=8\niodepth=16\nioengine=io_uring\nruntime=60\ntime_based=1\n[j]\nrw=randread\n" > "$LD/set/031-iopsR.job"
+    for h in h1 h2 h3; do mkdir -p "$LD/jobs/$h" "$LD/run/fio-jobfiles/$h"
+        cp "$LD/set/031-iopsR.job" "$LD/jobs/$h/"; cp "$LD/set/031-iopsR.job" "$LD/run/fio-jobfiles/$h/"; done
+    printf "1\th1\t7\t18,20\t18-31\t0\tio_uring\t-\t0\t-\th1 h2 h3\n" > "$LD/cal/shapes"
+    export LD
+}
+lchk_fake() {   # a fake master fio: one client_stats entry per --client
+    local cmd=$1 n notch v h out=""
+    n=$(printf "%s" "$cmd" | grep -o -- "--client=" | wc -l | tr -d " ")
+    case "$cmd" in (*".lchk/light/"*) notch=light ;; (*".lchk/heavy/"*) notch=heavy ;; (*) notch=base ;; esac
+    if [ "$n" -eq 1 ]; then v=$LCHK_SOLO
+    else case $notch in (light) v=$LCHK_LIGHT ;; (heavy) v=$LCHK_HEAVY ;; (*) v=$LCHK_BASE ;; esac; fi
+    for h in $(printf "%s" "$cmd" | grep -o -- "--client=[a-z0-9]*" | cut -d= -f2); do
+        out="$out${out:+, }{ \"jobname\": \"j\", \"hostname\": \"$h\", \"error\": 0, \"read\": { \"iops\": $v, \"total_ios\": 100 }, \"write\": { \"iops\": 0, \"total_ios\": 0 } }"
+    done
+    printf "{ \"client_stats\": [ %s ] }\n" "$out"
+    printf "%s\n" "$cmd" >> "$LD/fiolog"
+}
+lchk_go() {   # load_check on the fixture; prints its log
+    (source ./wekatester
+     WORK_DIR=$LD; SET_DIR=$LD/set; RUN_DIR=$LD/run; HOSTS=(h1 h2 h3); MASTER=h1
+     LOCAL_MODE=1; TARGET_DIR=$LD/target; FIO_BIN=fio; CAL_RUNTIME=30; CAL_SETTLE=0
+     run_host() { case "$2" in (*--client=*) lchk_fake "$2" ;; (*) bash -c "$2" ;; esac; }
+     load_check 031-iopsR.job) 2>&1
+}
+export -f lchk_fixture lchk_fake lchk_go
+t_assert "-l needs -a cal or -a brutal, and sets the load check with either" bash -c '
+    err=$( (source ./wekatester; parse_args -l h1) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$err" in *"-l checks the calibrated settings under load: it needs -a cal or -a brutal"*) true;; *) echo "$err" >&2; false;; esac &&
+    (source ./wekatester; parse_args -a cal -l h1; [ "$LOAD_CHECK" -eq 1 ]) &&
+    (source ./wekatester; parse_args -a brutal --LOAD h1; [ "$LOAD_CHECK" -eq 1 ])'
+t_assert "load check: a setting that holds under load stands, measured solo then fleet-wide" bash -c '
+    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=95000
+    out=$(lchk_go)
+    case "$out" in *"load check: 031-iopsR.job holds under load: 285,000 IOPS across 3 clients = 95% of their solo sum, 300,000 IOPS"*) true;; *) echo "$out" >&2; exit 1;; esac
+    # one solo cell on the representative, one fleet cell, both CAL_RUNTIME
+    # long; nothing changed, and nothing left behind on the master
+    grep -qx "iodepth=16" "$LD/jobs/h2/031-iopsR.job" &&
+    [ "$(grep -c -- "--client=" "$LD/fiolog")" = 2 ] && head -1 "$LD/fiolog" | grep -q "lchk/base/h1/" &&
+    grep -qx "runtime=30" "$LD/lchk/base/h3/031-iopsR.job" && [ ! -d "$LD/target.lchk" ]'
+t_assert "load check: short of 90%, the better notch is re-measured, and the run uses it" bash -c '
+    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=40000 LCHK_LIGHT=70000 LCHK_HEAVY=45000
+    out=$(lchk_go)
+    case "$out" in *"is 40% of their solo sum (300,000 IOPS), under 90% -- trying one notch lighter and one heavier"*"runs one notch lighter (h1 numjobs=8 iodepth=8, h2 numjobs=8 iodepth=8, h3 numjobs=8 iodepth=8): 210,000 IOPS against 120,000 IOPS at the calibrated setting (lighter 210,000 IOPS, heavier 135,000 IOPS); the host file keeps the solo calibration"*) true;;
+        *) echo "$out" >&2; exit 1;; esac
+    # the staged jobs and the bundle copy carry the notch; the runtime is the run'"'"'s own
+    grep -qx "iodepth=8" "$LD/jobs/h3/031-iopsR.job" && grep -qx "runtime=60" "$LD/jobs/h3/031-iopsR.job" &&
+    grep -qx "iodepth=8" "$LD/run/fio-jobfiles/h1/031-iopsR.job" &&
+    grep -qx "iodepth=8" "$LD/target/h2/031-iopsR.job" &&
+    [ "$(grep -c "lchk/light/" "$LD/fiolog")" = 2 ]'
+t_assert "load check: when no notch moves the total, the cluster is the limit and the setting stays" bash -c '
+    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=50000 LCHK_LIGHT=50500 LCHK_HEAVY=49000
+    out=$(lchk_go)
+    case "$out" in *"load check: 031-iopsR.job is cluster-bound: 150,000 IOPS across 3 clients whatever each client runs (lighter 151,500 IOPS, heavier 147,000 IOPS) -- that is the cluster'"'"'s number for this test"*) true;;
+        *) echo "$out" >&2; exit 1;; esac
+    grep -qx "iodepth=16" "$LD/jobs/h1/031-iopsR.job" && ! grep -q "confirm" "$LD/fiolog"'
+t_assert "load check: latency tests are left alone" bash -c '
+    lchk_fixture latency; export LCHK_SOLO=1 LCHK_BASE=1
+    out=$(lchk_go)
+    [ -z "$out" ] && [ ! -e "$LD/fiolog" ] || { echo "$out" >&2; false; }'
 
 # --- engine choice: one per shape, from the type winners ---
 t_assert "cal_engine_pick: per-type winners, ties to io_uring, the tally picks the shape engine" bash -c '
@@ -4402,11 +4491,11 @@ t_assert "pinning: one pass over the fleet -- notes in host order, rowless hosts
         WORK_DIR=$d; HOSTS=(h1 h2 h3); AUTH_DIR=$d/auth
         check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
     case "$out" in
-        *"note: h1: requested cpus (0-3) overlap weka"*"(2); executing on the remainder (0-1,3)"*"note: h3: requested cpus (0-7) name cpus this host does not have (4-7; the host has 4 cpus: 0-3); executing on the remainder (0-3)"*) true;;
+        *"note: h1: requested cpus (0-3) overlap weka"*"(2); executing on the remainder (1,3)"*"note: h3: requested cpus (0-7) name cpus this host does not have (4-7; the host has 4 cpus: 0-3); executing on the remainder (1-3)"*) true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "0-1,3" ] && [ ! -e "$d/auth/h2.cpus" ] &&
-    [ "$(cat "$d/auth/h3.cpus")" = "0-3" ] && [ ! -s "$d/auth/h3.priv" ]'
+    [ "$(cat "$d/auth/h1.cpus")" = "1,3" ] && [ ! -e "$d/auth/h2.cpus" ] &&
+    [ "$(cat "$d/auth/h3.cpus")" = "1-3" ] && [ ! -s "$d/auth/h3.priv" ]'
 # The coordinator line is one shell argument on the master; past 128 KiB it
 # dies at staging with the count that caused it, and a small fleet passes.
 t_assert "staging: a --client list that overflows one shell argument dies before anything runs" bash -c '
