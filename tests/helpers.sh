@@ -28,10 +28,12 @@ export -f probe_stub
 tuner_fixture() {   # $1 = extra probe content variant
     FIX=$(mktemp -d)
     mkdir -p "$FIX/probe" "$FIX/jobs" "$FIX/src"
-    # weka's dedicated io threads are single-CPU task masks (0, 1, 2 here);
-    # the 0,3-4 line is a wide utility-thread mask and must be ignored.
-    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
-    printf 'ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
+    # weka's dedicated io threads are single-CPU task masks (5, 6, 7 here:
+    # weka takes the last cores); the 0,3-4 line is a wide utility-thread
+    # mask and must be ignored. With cpus 0 and 1 the OS reserve, fio gets
+    # 2-4 (N=3).
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
     printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 1073741824 0 1073741824 1%% /mnt/weka\n' > "$FIX/probe/_df"
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n' > "$FIX/src/011-bw.job"
 }
@@ -189,7 +191,9 @@ editor_fixture() {   # $1 = exit status for the stub (default 0)
 #         nrfiles=CAL_SIM_NRBEST (unset) earns 3%, and every job adds
 #         CAL_SIM_JOBBONUS (0) IOPS -- more jobs at the same outstanding IO win
 #   lat   CAL_SIM_FLOOR us (100) up to CAL_SIM_WIDE jobs (8), then 20us more per
-#         extra job; IOPS = numjobs x 1e6 / latency
+#         extra job (CAL_SIM_LATSTEP); nrfiles=CAL_SIM_LATNRBEST (unset) takes
+#         10% off; IOPS = numjobs x 1e6 / latency. lat1m the same from
+#         CAL_SIM_FLOOR1M (800)
 # CAL_SIM_ENGINE_BONUS=<engine> gives that engine 5% more throughput (and 5%
 # less latency).
 cal_fake_value() {   # cal_fake_value <type> <engine> <nj> <qd> <nr> -> "<value> [aux]"
@@ -213,9 +217,11 @@ cal_fake_value() {   # cal_fake_value <type> <engine> <nj> <qd> <nr> -> "<value>
             v=$(( v + nj * ${CAL_SIM_JOBBONUS:-0} ))
             [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || v=$(( v * 105 / 100 ))
             echo "$v" ;;
-        (lat)
+        (lat|lat1m)
             lat=${CAL_SIM_FLOOR:-100}
-            [ "$nj" -le "${CAL_SIM_WIDE:-8}" ] || lat=$(( lat + (nj - ${CAL_SIM_WIDE:-8}) * 20 ))
+            [ "$t" = lat ] || lat=${CAL_SIM_FLOOR1M:-800}
+            [ "$nj" -le "${CAL_SIM_WIDE:-8}" ] || lat=$(( lat + (nj - ${CAL_SIM_WIDE:-8}) * ${CAL_SIM_LATSTEP:-20} ))
+            [ "${CAL_SIM_LATNRBEST:-0}" != "$nr" ] || lat=$(( lat * 90 / 100 ))
             [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || lat=$(( lat * 95 / 100 ))
             echo "$lat $(( nj * 1000000 / lat ))" ;;
     esac
@@ -238,6 +244,8 @@ cal_fake_fio() {   # cal_fake_fio <cell-basename> <host>
         (iops:write) wiops=$v; wbw=$(( v * 4096 )) ;;
         (lat:read)   rlat=$(( v * 1000 )); riops=$a; rbw=$(( a * 4096 )) ;;
         (lat:write)  wlat=$(( v * 1000 )); wiops=$a; wbw=$(( a * 4096 )) ;;
+        (lat1m:read)  rlat=$(( v * 1000 )); riops=$a; rbw=$(( a * 1048576 )) ;;
+        (lat1m:write) wlat=$(( v * 1000 )); wiops=$a; wbw=$(( a * 1048576 )) ;;
     esac
     printf '{ "client_stats": [ { "jobname": "cal-%s-%s", "hostname": "%s", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } }, "write": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } } } ] }\n' \
         "$t" "$d" "$host" "$rbw" "$riops" "$(( riops * 30 ))" "$(( rbw * 30 ))" "$rlat" \
@@ -268,14 +276,16 @@ cal_sim_host() {   # cal_sim_host <host> <command>
 export -f cal_sim_host
 
 # A calibration work dir: one probe file per host argument ("h1" or
-# "h1:<ncpus>:<speedMb>"), every host a weka client on one mlx5 NIC.
+# "h1:<ncpus>:<speedMb>"), every host a weka client on one mlx5 NIC with one
+# DPDK core, the last cpu (no topology lines: every cpu is its own core, so
+# with cpus 0 and 1 the OS reserve, an 8-cpu host has N=5, fio on 2-6).
 cal_sim_fixture() {   # cal_sim_fixture <dir> <host[:ncpus[:speed]]>...
     local d=$1 spec h n sp
     shift
     mkdir -p "$d/probe" "$d/auth" "$d/set"
     for spec in "$@"; do
         IFS=: read -r h n sp <<<"$spec"
-        { printf 'ncpus %s\nweka_allowed 0\nengines io_uring libaio psync\n' "${n:-4}"
+        { printf 'ncpus %s\nweka_allowed %s\nengines io_uring libaio psync\n' "${n:-4}" "$(( ${n:-4} - 1 ))"
           printf 'cpu_model Test CPU %s-core\nmemtotal_kb 263921664\n' "${n:-4}"
           printf 'nic ens1 %sMb/s 0000:3b:00.0 mlx5_core 0x15b3:0x101d\n' "${sp:-100000}"
           printf 'weka_net client [{"name": "ens1", "identifier": "0000:3b:00.0"}]\n'
@@ -289,7 +299,7 @@ export -f cal_sim_fixture
 plan_sim() {   # plan_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
     local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act phase nj qd nr rt n=0 knobs
     shift 7
-    knobs="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=2 nrc=1,4 bwqd=128 iopsqd=256 njmaxpct=200 floorreps=3 $*"
+    knobs="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 floorreps=3 $*"
     : > "$d/hist"; : > "$d/asked"
     while [ "$n" -lt 300 ]; do
         act=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \

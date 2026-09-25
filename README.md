@@ -22,7 +22,7 @@ wekatester uses fio's native client/server mode:
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        wekatester -s results.json
        wekatester --version
@@ -46,7 +46,8 @@ attaching is the way to pass a value that starts with a dash.
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: group the clients into hardware shapes and,
-                          solo on one client per shape, search numjobs,
+                          solo on one client per shape, search numjobs
+                          (N/2, N, 2N, 4N of N usable physical cores),
                           iodepth, nrfiles and the ioengine per test type:
                           bandwidth toward NIC line rate, the most iops,
                           the most jobs at the latency floor
@@ -77,6 +78,9 @@ attaching is the way to pass a value that starts with a dash.
                           on request), then run it;
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
+  -b, --bulk     run every latency test at 1MiB blocks too, as a separate
+                 test listed on its own (under -a cal/brutal the 1MiB test
+                 gets its own calibrated job count)
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -118,6 +122,8 @@ With no server given, the test runs on the local host -- no ssh required.
 `-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
 
 `-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout job (so it always matches the exact file grid that was laid out, whatever auto tuning or hand edits did) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
+
+`-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a cal` and `-a brutal` the 1 MiB test gets its own calibrated job count, recorded in its own host-file columns (`latency1mR`, `latency1mW`).
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -208,7 +214,13 @@ what the cluster can do.
 - **Latency** — the floor, one job at queue depth 1, and then as many jobs as
   keep the latency within 5% of it (`CAL_FLOOR_PCT`). That is the most IOPS
   the client does *at* the floor, not a knee. The shipped latency jobs report
-  IOPS beside latency for that reason.
+  IOPS beside latency for that reason. With `-b` the same again at 1 MiB.
+
+Under `-a cal` and `-a brutal` every latency test also runs as a **one-job
+twin** (`021-latencyR-1job.job`, just before its original): numjobs, iodepth
+and nrfiles all 1 on every client, with the same data per job. The run then
+shows one single-threaded stream's latency across the fleet next to every
+client's latency at its calibrated load.
 
 ### Client shapes
 
@@ -222,10 +234,10 @@ Hosts are grouped by their hardware:
 The probe reads weka's NICs from `weka local resources net`, which needs root.
 It runs that command as the login user when that user is root, and otherwise
 under the passwordless escalator the probe already found. Line rate is the sum
-of those NICs' link speeds. Two more things split a shape, because a job count
-or an engine measured on one host would not describe the other: the usable cpu
-count, the engines that passed their test, and an engine pinned by `-e` or the
-host file.
+of those NICs' link speeds. More things split a shape, because a job count or
+an engine measured on one host would not describe the other: N and the number
+of usable threads (see below), the engines that passed their test, and an
+engine pinned by `-e` or the host file.
 
 When line rate cannot be known, calibration warns and runs the bandwidth search
 to its peak instead. That happens when there is no weka CLI, no root and no
@@ -239,13 +251,40 @@ Shapes run one after another. The answer is written for every member of the
 shape. The run log names each shape, its hosts, its NICs and line rate, and
 says up front the most cells the shape can take and roughly how long.
 
+### Usable cores: N
+
+Job counts are counted in **physical cores**. The probe reads every cpu's
+socket, core and SMT siblings from sysfs, and N is what is left for fio:
+
+- **weka's DPDK cores go whole.** Weka pins each dedicated io thread to one cpu
+  and keeps that core's sibling idle on purpose, so both threads are weka's.
+- **core 0 of socket 0 and its sibling always stay with the OS**, and a reserve
+  of more cores stays with them, for the OS and weka's own non-DPDK processes:
+  2 cores on a host of up to 24 physical cores, 4 above, plus one for every 4
+  DPDK cores past 4 (5–8 DPDK cores add 1, 9–12 add 2), at most 12 and never
+  more than half the cores. The reserve takes core 0 first, then one core at a
+  time round-robin over the sockets starting at socket 1, the lowest free core
+  of each: two sockets reserve core 0 and the next core of socket 0 plus the
+  first two of socket 1; one socket reserves its next cores.
+- **N = physical cores − DPDK cores − reserved cores.** An operator cpu list
+  in the host file is the operator's own reserve: only weka's cores and core
+  0's pair come out of it. A client with N < 1 stops the run with the numbers.
+
+The searches use four job counts: **N/2 and N run one job per physical core
+with the siblings idle; 2N and 4N put the siblings to work too**, which is how
+a search finds out whether they help or hurt. Every cell and every staged job
+declares its cpu set with split affinity, and a job count at or below N gets
+the one-thread-per-core set. The log prints each shape's arithmetic, for
+example `8 physical core(s) - 2 weka DPDK - 2 reserved for the OS (0-1 2-3) =
+N=4`.
+
 ### The search
 
 **The engine comes first.** Short comparison cells (`CAL_ENGINE_RUNTIME`,
 10s) run once per test type and per candidate engine, meaning whichever of
-io_uring, libaio and psync passed its test job. Bandwidth runs at one job per
-usable cpu and queue depth 1, IOPS at queue depth 16, and latency at one job
-and queue depth 1. Each type's best reading wins, or its lowest latency. A tie
+io_uring, libaio and psync passed its test job. Bandwidth runs at N jobs and
+queue depth 1, IOPS at N jobs and queue depth 16, and latency at one job and
+queue depth 1. Each type's best reading wins, or its lowest latency. A tie
 inside the band goes to io_uring, then libaio, then psync. The type winners
 are tallied into **one engine per shape**, because the host file carries one
 engine per host, and every search then runs on that engine. An engine pinned
@@ -255,25 +294,27 @@ engine.
 **Then one search per test type and direction** the set runs, with cells of
 `CAL_RUNTIME` seconds (30 by default; `-a cal:15` shortens them):
 
-- **Bandwidth** walks numjobs 1, 2, 4 … up to the usable cpus at queue depth 1.
-  The first rung at 95% of line rate is the answer. If none reaches it, a queue
-  ladder runs at the best job count, where a sync engine widens numjobs
-  instead, and again the first rung at 95% is the answer. If nothing reaches
+**At or below N there is no queue or file ladder**: every cell runs iodepth 1
+and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
+for bandwidth (`CAL_BW_QD_LADDER`) and 1–512 for IOPS (`CAL_IOPS_QD_LADDER`) —
+run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs that
+fail to beat the best by 2%, and 4N runs only when 2N beat N.
+
+- **Bandwidth** walks numjobs 1, 2, 4 … N/2, N. The first rung at 95% of line
+  rate is the answer. If none reaches it, 2N and 4N walk iodepth for every
+  nrfiles, and again the first cell at 95% is the answer. If nothing reaches
   line rate, or line rate is unknown, the peak rule below decides. A reading
   more than 5% *above* line rate means line rate is not this client's ceiling,
   and the search falls back to the peak.
-- **IOPS** walks queue depth 1 … 256 (`CAL_IOPS_QD_MAX`) at one job per usable
-  cpu until the curve flattens, meaning two rungs that fail to beat the best
-  by 2%. It then re-splits the same outstanding IO over fewer jobs with deeper
-  queues and over more jobs with shallower ones, up to two jobs per cpu
-  (`CAL_NJ_MAX_PCT`). Each direction continues while it wins. Next it re-tests
-  nrfiles 1 and 4 at the winner (`CAL_NR_CANDIDATES`), and the peak rule
-  decides.
+- **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
+  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at that count's
+  winning iodepth and one step deeper. The peak rule decides.
 - **Latency** takes three readings of one job at queue depth 1, and the floor
   is the *lowest*, because contention only ever adds latency. Numjobs then
-  widens 2, 4 … up to the usable cpus at queue depth 1 while the latency stays
-  within 5% of the floor. A rung that leaves the band is re-measured once
-  before it is believed. The answer is the last rung inside the band.
+  widens 2, 4 … N/2, N, and on to 2N and 4N with each nrfiles, at queue depth
+  1, while the latency stays within 5% of the floor. A rung that leaves the
+  band is re-measured once before it is believed. The answer is the last rung
+  inside the band. With `-b` the 1 MiB latency test gets the same search.
 
 **The peak rule.** The top three cells (`CAL_CONFIRM`) get a second reading.
 Contention only subtracts, so a second chance can raise a cell and never lower
@@ -291,31 +332,33 @@ MemTotal is not run, and the log says so.
 
 ### `-a brutal`
 
-`-a brutal` runs the same search with every early stop disabled. Every rung of
-every ladder is measured, the re-splits run to their caps (three jobs per cpu,
-`BRUTAL_NJ_MAX_PCT`), nrfiles 1, 4 and 8 are re-tested (`BRUTAL_NR_CANDIDATES`),
+`-a brutal` runs the same search with every early stop disabled: every
+combination of job count, iodepth and nrfiles the ladders define is measured,
 and the top five cells get a second reading (`BRUTAL_CONFIRM`). Bandwidth takes
-the peak instead of the first rung at line rate. Use `cal` for the answer
-cheaply, and `brutal` when the stopping rules themselves are the suspect. The
-earlier brutal grid, an nrfiles = iodepth diagonal measured under fleet
-contention, is retired: nrfiles and numjobs are separate axes of the one
-search now.
+the peak instead of the first rung at line rate. With the default ladders that
+is about 120 IOPS cells, 35 bandwidth cells and 12 latency cells per direction,
+some 330 per shape, or about three hours at 30s cells. Use `cal` for the answer
+cheaply, and `brutal` when the stopping rules themselves are the suspect.
 
 ### Calibration measures what the test will run
 
 A value measured under a parallelism, an engine or a file layout the staged
 jobs will not reproduce is not the test's ceiling. So:
 
-- **cpus** come from one rule for the cells and the staged jobs alike: the
-  operator's cpu list minus weka's pinned cores and minus any cpu the host
-  refuses to bind, or every cpu minus those when no list is given. Every cell
-  and every staged job declares that set with split affinity.
+- **cpus** come from one rule for the cells and the staged jobs alike, N and
+  its two cpu sets (see Usable cores), minus any cpu the host refuses to bind.
+  A job count at or below N runs one job per physical core; a wider one
+  spreads over the siblings too.
 - **the engine** a shape was measured on is the engine its staged jobs run.
-- **one dataset, one size.** Every calibration cell, every seeded file, and,
-  through the recorded tuples, every staged test runs on `FILESIZE_MIB` (5G)
-  files. Sizes are part of the measurement: the same staged iops-write geometry
-  delivered 7.5% differently at 256M vs 1024M files, purely from the working
-  set. A host file that pins its own `fs` still wins.
+- **one amount of data per job.** Every seeded file is `FILESIZE_MIB` (5G),
+  and every calibration cell and, through the recorded tuples, every staged
+  test gives each job 5G of data split over its files: nrfiles 2 runs two
+  2560M regions, nrfiles 4 four 1280M ones, each the leading part of a 5G
+  file. The working set is part of the measurement — the same staged
+  iops-write geometry delivered 7.5% differently at 256M vs 1024M files, and
+  WEKAPP-289548 saw 4k random reads lose 30% from 1M files to 3G files — so
+  the file ladder changes the file count and nothing else. A host file that
+  pins its own `fs` still wins.
 
 **Calibration measures on the workload's own files** whenever the set's
 `filename_format` can address the grid, meaning it has both `$filenum` and
@@ -337,9 +380,9 @@ Sets whose format cannot express the grid fall back to the private
 `.wekatester-cal` scratch.
 
 **Only the representatives seed, and incrementally.** Before its first cell, a
-shape's representative gets the files one job per usable cpu needs. A wider
-cell, such as a re-split to more jobs or a higher nrfiles, seeds its own extra
-files first. A file already at or above `FILESIZE_MIB` is left alone. Size is
+shape's representative gets the files N jobs need. A wider cell, such as 4N
+jobs or a higher nrfiles, seeds its own extra files first; 4N jobs at nrfiles
+4 is 16N files of 5G, which the seed estimate prices before writing. A file already at or above `FILESIZE_MIB` is left alone. Size is
 a sufficient test **because the seed job sets `fallocate=none`**: a partial
 create leaves a short file that fails the test, never a full-size hollow one
 that passes it. Before a byte is written the seed prints its estimate: the
@@ -352,7 +395,9 @@ nothing; `-u` removes it, exactly as it removes the workload's own files.
 
 Each measured direction records its whole tuple, (numjobs, filesize, nrfiles,
 iodepth), into its own host-file column: `bandwidthR`, `bandwidthW`,
-`latencyR`, `latencyW`, `iopsR`, `iopsW`. The shape's engine goes into
+`latencyR`, `latencyW`, `iopsR`, `iopsW`, and with `-b` `latency1mR` and
+`latency1mW`, which come last so a file written before they existed still
+lines up. The shape's engine goes into
 `ioengine`. `numjobs` is always recorded for a measured direction, because
 bandwidth's answer *is* a job count, and so is latency's. The rules are the
 usual ones: calibration fills empty fields only, and overwrites them under
@@ -416,7 +461,7 @@ Remember that `BatchMode` means keys must be usable without a passphrase prompt 
 One CSV assigns per-host settings without a jobfile set per client:
 
 ```
-host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd
 client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,12/10G//4,1///1,1///1,12/1G/2/64,12/1G/2/16
 ,,io_uring,,,,,,,,
 ```

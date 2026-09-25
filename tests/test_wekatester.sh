@@ -129,21 +129,24 @@ t_assert "usable_cores: cpus the probe measured as unbindable are excluded" bash
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nonline 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/probe/h1"
     (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1 count)" = 6 ] || { echo "count: $(usable_cores h1 count)" >&2; false; } &&
-     [ "$(usable_cores h1 list)" = "0,1,2,4,6,7" ] || { echo "list: $(usable_cores h1 list)" >&2; false; } &&
-     [ "$(usable_cores h1 count 0-3)" = 3 ] &&
-     [ "$(usable_cores h1 list 0-3)" = "0,1,2" ])'
+     # 0 and 1 are the OS reserve; 3 and 5 refuse the bind
+     [ "$(usable_cores h1 count)" = 4 ] || { echo "count: $(usable_cores h1 count)" >&2; false; } &&
+     [ "$(usable_cores h1 list)" = "2,4,6,7" ] || { echo "list: $(usable_cores h1 list)" >&2; false; } &&
+     # an operator list is its own reserve: only core 0 comes out of it
+     [ "$(usable_cores h1 count 0-3)" = 2 ] &&
+     [ "$(usable_cores h1 list 0-3)" = "1,2" ])'
 t_assert "usable_cores: weka cores and unbindable cpus are both excluded" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nonline 0-7\nweka_allowed 1\nweka_allowed 2\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/probe/h1"
     (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1 list)" = "0,4,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
+     # weka owns 1 and 2, so the reserve is 0 and 3; 5 refuses the bind
+     [ "$(usable_cores h1 list)" = "4,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
 t_assert "usable_cores: an offline cpu id is not conjured from the count" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     # 6 online cpus, ids 0-3 and 6-7: the count alone would have said 0-5
     printf "ncpus 6\nonline 0-3,6-7\nbindable 0,1,2,3,6,7\nbindable_priv -\n" > "$d/probe/h1"
     (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1 list)" = "0,1,2,3,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
+     [ "$(usable_cores h1 list)" = "2,3,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
 
 # --- probe remote snippet ---
 t_assert "probe snippet emits ncpus"   bash -c 'probe_stub | grep -q "ncpus 8"'
@@ -186,13 +189,13 @@ t_assert "directory override applied" bash -c '
 t_assert "cpus_allowed excludes weka cores" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
-    grep -q "^cpus_allowed=3-7$" "$FIX/jobs/h1/011-bw.job"'
+    grep -q "^cpus_allowed=2-4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "wide-only weka_allowed masks are ignored (utility threads)" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
     printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
-    grep -q "^cpus_allowed=0-7$" "$FIX/jobs/h1/011-bw.job"'
+    grep -q "^cpus_allowed=2-7$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "core mismatch warns" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "ncpus 16\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
@@ -202,14 +205,14 @@ t_assert "core mismatch warns" bash -c '
 # --- tuner: tier rules (Task 6) ---
 t_assert "safe: numjobs = min usable cores" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 6\nweka_allowed 3\nweka_allowed 4\nweka_allowed 5\nengines io_uring libaio \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^numjobs=3$" "$FIX/jobs/h1/011-bw.job"'   # h2 usable=3 is the min
+    grep -q "^numjobs=1$" "$FIX/jobs/h1/011-bw.job"'   # h2: 6 cores - 3 weka - 2 reserved = 1, the min
 t_assert "max: numjobs per host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 6\nweka_allowed 3\nweka_allowed 4\nweka_allowed 5\nengines io_uring libaio \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^numjobs=5$" "$FIX/jobs/h1/011-bw.job" && grep -q "^numjobs=3$" "$FIX/jobs/h2/011-bw.job"'
+    grep -q "^numjobs=3$" "$FIX/jobs/h1/011-bw.job" && grep -q "^numjobs=1$" "$FIX/jobs/h2/011-bw.job"'
 t_assert "max: bw ioengine upgraded to io_uring" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
@@ -249,7 +252,7 @@ t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
     printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/012-mixed-bw.job"
-    grep -q "^numjobs=5$" "$v" && grep -q "^filesize=10G$" "$v" && ! grep -q "wt-small" "$v"'
+    grep -q "^numjobs=3$" "$v" && grep -q "^filesize=10G$" "$v" && ! grep -q "wt-small" "$v"'
 
 # --- capacity check (universal: every run, per host, from staged variants) ---
 cap() {   # cap <tier> <ignore 0|1> <host>... -- stages via auto_tune, then checks
@@ -292,9 +295,9 @@ t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     out=$( cap max 0 h1 h2 2>&1 )
-    # bw: 5 jobs x 1 file x 10G = 50GiB; iops (2 files/job): 5 jobs x 2 files x 1G
-    # = 10GiB -- distinct namespaces, so the two sum to 60GiB
-    case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    # bw: 3 jobs x 1 file x 10G = 30GiB; iops (2 files/job): 3 jobs x 2 files x 1G
+    # = 6GiB -- distinct namespaces, so the two sum to 36GiB
+    case "$out" in *"capacity: h1 needs ~36.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "garbage\n" > "$FIX/probe/_df"
@@ -404,7 +407,7 @@ t_assert "auto staging creates [global] when the jobfile has none" bash -c '
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/011-bw.job"
     grep -q "^\[global\]$" "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
-    grep -q "^cpus_allowed=3-7$" "$v" && grep -q "^\[job1\]$" "$v"'
+    grep -q "^cpus_allowed=2-4$" "$v" && grep -q "^\[job1\]$" "$v"'
 t_assert "an existing [global] is never duplicated" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
@@ -419,19 +422,19 @@ t_assert "capacity: jobfiles without filename_format sum, not max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/012-bw2.job"
     out=$( cap safe 0 h1 2>&1 )
-    case "$out" in *"capacity: h1 needs ~100.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: jobfiles sharing one filename_format take the max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     j="# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nfilename_format=shared.\$jobnum.\$filenum\nioengine=libaio\n[j]\nrw=read\n"
     printf "$j" > "$FIX/src/011-bw.job"
     printf "$j" > "$FIX/src/012-bw2.job"
     out=$( cap safe 0 h1 2>&1 )
-    case "$out" in *"capacity: h1 needs ~50.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~30.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: size= without filesize counts numjobs x size" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nsize=4G\nnrfiles=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
     out=$( cap safe 0 h1 2>&1 )
-    case "$out" in *"capacity: h1 needs ~20.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~12.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: a percentage size= contributes 0 instead of crashing" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nsize=50%%\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
@@ -972,7 +975,7 @@ t_assert "tuner: pristine layout at max is re-derived per host (tuned geometry)"
     v="$FIX/jobs/h1/000-wekatester-layout.job"
     grep -q "re-derived by wekatester auto\[max\]" "$v" &&
     ! grep -q "wt-small" "$v" && grep -q "^nrfiles=2$" "$v" &&
-    grep -q "^cpus_allowed=3-7$" "$v"'
+    grep -q "^cpus_allowed=2-4$" "$v"'
 t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
@@ -985,7 +988,7 @@ t_assert "tuner capacity: layout job does not double the required total" bash -c
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     out=$( cap safe 0 h1 h2 2>/dev/null )
-    case "$out" in *"capacity: h1 needs ~50.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~30.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 
 # --- customize workflow ---
 t_assert "resolve: bare name creates under ./fio-jobfiles and copies" bash -c '
@@ -1099,7 +1102,7 @@ t_assert "tuner: pristine layout re-derived at SAFE tier too (tuned numjobs)" ba
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     v="$FIX/jobs/h1/000-wekatester-layout.job"
-    grep -q "re-derived by wekatester auto\[safe\]" "$v" && grep -q "^numjobs=5$" "$v" &&
+    grep -q "re-derived by wekatester auto\[safe\]" "$v" && grep -q "^numjobs=3$" "$v" &&
     ! grep -q "^numjobs=4$" "$v"'
 t_assert "capacity: layout union raises required above per-namespace max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -1108,10 +1111,10 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\nioengine=libaio\ndirectory=/orig\n[b]\nrw=read\niodepth=1\n" > "$FIX/src/012-b.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     out=$( cap safe 0 h1 h2 2>/dev/null )
-    # a: numjobs=5 nrfiles=1 -> 5 files; b: numjobs=5 nrfiles=27 -> 135 files;
-    # union = 135G/host; namespace max = 135G -- equal here, so assert the
+    # a: numjobs=3 nrfiles=1 -> 3 files; b: numjobs=3 nrfiles=27 -> 81 files;
+    # union = 81G/host; namespace max = 81G -- equal here, so assert the
     # per-host requirement is the union value, proving layout_footprint runs
-    case "$out" in *"capacity: h1 needs ~135.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~81.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
     source ./tests/helpers.sh
     tmp=$(mktemp -d); cd "$tmp"
@@ -1604,42 +1607,41 @@ uc_fails() {   # uc_fails <pattern> [probe-file-content]; empty = no probe file
 }
 t_assert "usable_cores: weka's single-cpu masks are dedicated cores" \
     test "$(uc 'ncpus 8
-weka_allowed 0
-weka_allowed 1
-weka_allowed 2')" = 5
+weka_allowed 5
+weka_allowed 6
+weka_allowed 7')" = 3
 t_assert "usable_cores: a wide utility-thread mask owns nothing" \
     test "$(uc 'ncpus 8
 weka_allowed 0,3-4
-weka_allowed 0-7')" = 8
-t_assert "usable_cores: no weka at all leaves every core usable" \
-    test "$(uc 'ncpus 4')" = 4
-# isolcpus does NOT narrow the set: weka's pinned cores are the only thing
-# subtracted (saving-calf 2026-08-20 -- isolating cost 4-7% write iops and the
-# widest mask won; split affinity makes a cross-partition mask safe).
+weka_allowed 0-7')" = 6
+t_assert "usable_cores: no weka at all leaves every core but the OS reserve" \
+    test "$(uc 'ncpus 4')" = 2
+# isolcpus does NOT narrow the set: weka's cores and the OS reserve are all
+# that is subtracted (saving-calf 2026-08-20 -- confining the OS cost 4-7%
+# write iops; split affinity makes a cross-partition mask safe).
 t_assert "usable_cores: isolcpus does not narrow the set" \
     test "$(uc 'ncpus 8
 isolated 4-7
 weka_allowed 4
-weka_allowed 0
-weka_allowed 1')" = 5
+weka_allowed 5')" = 4
 t_assert "usable_cores: weka owning every isolated cpu just leaves the rest" \
     test "$(uc 'ncpus 8
 isolated 4-7
 weka_allowed 4
 weka_allowed 5
 weka_allowed 6
-weka_allowed 7')" = 4
+weka_allowed 7')" = 2
 # An empty answer is not a count: fio has no valid numjobs=0, so a probe that
 # cannot be read has to fail loudly rather than size a ladder at zero jobs.
 t_assert "usable_cores: an unreadable probe is an error, not a zero" \
     uc_fails usable_cores
 t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
-    uc_fails "no usable cpus" 'engines psync '
+    uc_fails "leaves fio no cpus" 'engines psync '
 t_assert "usable_cores: a list naming cpus the host does not have is trimmed" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\n" > "$d/probe/h1"
     out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "0-11") )
-    [ "$out" = "0,1,2,3,4,5,6,7" ]'
+    [ "$out" = "1,2,3,4,5,6,7" ]'
 
 # --- cal_values: per-client rung values from fio client JSON ---
 # Grammar consumed verbatim by the orchestrator: "<host> <value>", one line
@@ -2120,8 +2122,8 @@ numjobs=44"
 # The file cannot say whether the operator wrote it, so the run warns.
 t_assert "apply_cal_results: an old tuple without numjobs is re-measured, kept, and warned about" bash -c '
     d=$(mktemp -d)
-    printf "h1 - 4 2 5120M 6 - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
-    { printf "h1"; for i in $(seq 2 29); do
+    printf "h1 - 4 2 5120M 6 - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
+    { printf "h1"; for i in $(seq 2 37); do
           case $i in (7) printf "\t1G";; (8) printf "\t2";; (9) printf "\t8";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$d/targets.final"
     cp "$d/targets.final" "$d/orig"
@@ -2141,10 +2143,10 @@ t_assert "apply_cal_results: -g lets measured tuples and the engine overwrite ho
     (source ./wekatester
      WORK_DIR=$d; REGEN_LAYOUT=1
      # cal.results: host, engine, then (qd nr fs nj) x (bw_r bw_w lat_r lat_w iops_r iops_w)
-     printf "h1 libaio 4 2 1024M 2 2 2 1024M 6 1 2 1024M 3 - - - - 32 2 256M 6 16 2 256M 6\n" > "$d/cal.results"
-     # 29 columns; the engine (col 3), bw_r_qd (col 9) and iops_r_qd (col 25) carry old values
+     printf "h1 libaio 4 2 1024M 2 2 2 1024M 6 1 2 1024M 3 - - - - 32 2 256M 6 16 2 256M 6 - - - - - - - -\n" > "$d/cal.results"
+     # 37 columns; the engine (col 3), bw_r_qd (col 9) and iops_r_qd (col 25) carry old values
      { printf "h1"
-       for i in $(seq 2 29); do
+       for i in $(seq 2 37); do
           case $i in (3) printf "\tpsync";; (9) printf "\t8";; (25) printf "\t64";; (*) printf "\t-";; esac
        done; printf "\n"; } > "$d/targets.final"
      apply_cal_results)
@@ -2252,7 +2254,7 @@ t_assert "targets: geometry columns parse with or without the type: prefix" bash
     f=$(mktemp)
     printf "h1,,,,,bandwidthR:12/10G//8,12/10G//4,latencyR:1///1,,iopsR:4/1G/56/64,\n" > "$f"
     out=$(rt phase1 "$f" - - - h1)
-    want="h1	-	-	-	-	12	10G	-	8	12	10G	-	4	1	-	-	1	-	-	-	-	4	1G	56	64	-	-	-	-"
+    want="h1	-	-	-	-	12	10G	-	8	12	10G	-	4	1	-	-	1	-	-	-	-	4	1G	56	64	-	-	-	-	-	-	-	-	-	-	-	-"
     [ "$out" = "$want" ] || { echo "got:  $out" >&2; echo "want: $want" >&2; false; }'
 t_assert "targets: a wrong type: prefix in a geometry column is fatal" bash -c '
     f=$(mktemp)
@@ -2723,11 +2725,11 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
      printf "# report iops\n[global]\nfilename_format=x/\$jobnum\ndirectory=/orig\nfilesize=10G\nnumjobs=32\nioengine=libaio\n[j]\nrw=randread\niodepth=8\n" > "$d/set/031-i.job"
      (source ./wekatester; generate_layout "$d/set" "$d/set") >/dev/null
      { printf "h1\t-\tpsync\t-\t/mnt/one"
-       for i in $(seq 6 29); do
+       for i in $(seq 6 37); do
           case $i in (22) printf "\t4";; (23) printf "\t1G";; (24) printf "\t2";;
                      (25) printf "\t16";; (*) printf "\t-";; esac
        done; printf "\n"
-       printf "h2"; for i in $(seq 2 29); do printf "\t-"; done; printf "\n"
+       printf "h2"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"
      } > "$d/targets.final"
      stage_variants "$d/set"
      v1=$d/jobs/h1/031-i.job; v2=$d/jobs/h2/031-i.job; l1=$d/jobs/h1/000-wekatester-layout.job
@@ -2740,15 +2742,15 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
 t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     { printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9"
-      for i in $(seq 10 29); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+      for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     v1="$FIX/jobs/h1/011-bw.job"; v2="$FIX/jobs/h2/011-bw.job"
     grep -q "^directory=/mnt/pin$" "$v1" && grep -q "^directory=/mnt/weka$" "$v2" &&
     # the host file keeps the operator spelling "2,4"; the STAGED job declares
-    # what actually executes, and this fixture pins weka on cpus 0-2, so only
-    # cpu 4 survives -- the same effective set the calibration ladder measures
-    grep -q "^cpus_allowed=4$" "$v1" &&
+    # what actually executes: weka owns 5-7 and core 0 is the OS, so 2 and 4
+    # survive -- the same effective set the calibration ladder measures
+    grep -q "^cpus_allowed=2,4$" "$v1" &&
     grep -q "^numjobs=3$" "$v1" && grep -q "^filesize=2G$" "$v1" && grep -q "^iodepth=9$" "$v1" &&
     grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=io_uring$" "$v2"'
 # The STAGED jobs must never name a cpu the host does not have: the fio
@@ -2759,10 +2761,10 @@ t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per ho
 t_assert "tuner: staged cpus_allowed drops cpus the host does not have" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     { printf "h1\t-\t-\t2,4,9-12\t-"
-      for i in $(seq 6 29); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+      for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
-    grep -q "^cpus_allowed=4$" "$FIX/jobs/h1/011-bw.job"'
+    grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "host_dir: targets dir when resolved, global -d otherwise" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -2877,7 +2879,7 @@ t_assert "writeback: measured tuples land per direction, numjobs and all; a mixe
     printf "ubuntu\n" > "$d/auth/h1.user"
     printf "# report bandwidth\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1024M\nnrfiles=2\niodepth=32\nrw=rw\n" > "$d/jobs/h1/011-b.job"
     : > "$d/engine.results"
-    printf "h1 libaio 32 2 1024M 4 4 2 1024M 2 - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
+    printf "h1 libaio 32 2 1024M 4 4 2 1024M 2 - - - - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
@@ -2913,19 +2915,19 @@ t_assert "tuner: an unbindable cpu never reaches a staged cpus_allowed" bash -c 
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h1"
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    # weka owns 0-2 in this fixture, so 3-7 was usable; 3 and 5 refuse the bind
-    grep -q "^cpus_allowed=4,6-7$" "$FIX/jobs/h1/011-bw.job" ||
+    # weka owns 5-7 and the OS 0-1, so 2-4 was usable; 3 refuses the bind
+    grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job" ||
         { grep "^cpus_allowed=" "$FIX/jobs/h1/011-bw.job" >&2; false; }'
 t_assert "tuner: a host-file cpu list is narrowed by the measurement too" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h1"
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h2"
     { printf "h1\t-\t-\t2-5\t-"
-      for i in $(seq 6 29); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+      for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
-    # asked for 2-5: 2 is weka'"'"'s, 3 and 5 refuse the bind, 4 is left
-    grep -q "^cpus_allowed=4$" "$FIX/jobs/h1/011-bw.job" ||
+    # asked for 2-5: 5 is weka'"'"'s, 3 refuses the bind, 2 and 4 are left
+    grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job" ||
         { grep "^cpus_allowed=" "$FIX/jobs/h1/011-bw.job" >&2; false; }'
 
 # --- isolcpus awareness (field: isca224, isolcpus=domain,4-55) ---
@@ -2935,7 +2937,7 @@ t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" b
     printf "isolated 4-7\n" >> "$FIX/probe/h2"
     out=$( (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
-    grep -q "^cpus_allowed=3-7$" "$FIX/jobs/h1/011-bw.job" &&
+    grep -q "^cpus_allowed=2-4$" "$FIX/jobs/h1/011-bw.job" &&
     case "$out" in *"span isolated and housekeeping"*) true;; *) echo "$out" >&2; false;; esac'
 # The pin detection is now the ONLY thing keeping fio off weka's cores, so a
 # detection that comes back empty while weka is running has to be audible.
@@ -2957,7 +2959,7 @@ t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
     case "$out" in
         *"no pinned cores detected"*) echo "$out" >&2; false;;
-        *) grep -q "^cpus_allowed=0-7$" "$FIX/jobs/h1/011-bw.job";;
+        *) grep -q "^cpus_allowed=2-7$" "$FIX/jobs/h1/011-bw.job";;
     esac'
 # Field regression (isca224, 2026-08-21): weka owned cores 14-27 by its own
 # core_id list, but the probe scanned /proc/<pid>/task/*/status and unioned
@@ -2980,25 +2982,29 @@ t_assert "pinning: only the cores weka's node processes own are excluded (isca22
 t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash -c '
     source ./wekatester
     a=$(pyrun <<< "print(len(FIELDS), slot_base(\"bw_r\"), slot_base(\"iops_w\"), len(CAL_SLOTS), CAL_HEAD, CAL_COLS)") &&
-    [ "$a" = "28 5 25 6 2 26" ] &&
+    [ "$a" = "36 5 25 8 2 34" ] &&
     c=$(pyrun <<< "print(\" \".join(CAL_SLOTS))") &&
-    [ "$c" = "bw_r bw_w lat_r lat_w iops_r iops_w" ] &&
+    [ "$c" = "bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w" ] &&
     d=$(mktemp -d) && write_targets_template "$d/t.csv" >/dev/null &&
-    head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd$" &&
+    head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd$" &&
     b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
     [ "$b" = "read write" ]'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
     (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1)" = 6 ] &&
-     [ "$(usable_cores h1 count "0-3")" = 3 ] &&
-     [ "$(usable_cores h1 list "0-3")" = "0,1,3" ] &&
-     [ "$(usable_cores h1 count "2,5")" = 2 ])'
+     # no list: 8 - weka 2,5 - the reserve 0,1 = 4
+     [ "$(usable_cores h1)" = 4 ] &&
+     # a list: minus weka and core 0 only
+     [ "$(usable_cores h1 count "0-3")" = 2 ] &&
+     [ "$(usable_cores h1 list "0-3")" = "1,3" ] &&
+     # nothing left is an error naming the arithmetic, never a guess
+     ! err=$(usable_cores h1 count "2,5" 2>&1) &&
+     case "$err" in (*"leaves fio no cpus"*) true ;; (*) echo "$err" >&2; false ;; esac)'
 t_assert "usable_cores: a node's auxiliary threads are not extra weka cores (isca224)" \
     test "$(uc "ncpus 56
 weka_allowed 0-3
-$(for c in $(seq 14 27); do printf 'weka_allowed %s\n' "$c"; done)")" = 42
+$(for c in $(seq 14 27); do printf 'weka_allowed %s\n' "$c"; done)")" = 35
 # The regression was in WHERE the probe looks, so pin that down directly.
 t_assert "probe: weka cpu masks come from the process, not its threads" bash -c '
     out=$(source ./wekatester; probe_remote_cmd)
@@ -3411,7 +3417,7 @@ t_assert "stage_cal_cell: a bw read cell is exactly this, no more" bash -c '
      stage_cal_cell "$d/c.job" /mnt/weka h1 "1-3" bw read io_uring 3 2 2 30)
     printf "%s\n" "[global]" "directory=/mnt/weka/.wekatester-cal" "unique_filename=0" \
         "filename_format=h1.cal.\$jobnum.\$filenum" "ioengine=io_uring" "direct=1" "bs=1Mi" \
-        "filesize=5120M" "nrfiles=2" "numjobs=3" "iodepth=2" "time_based=1" "runtime=30" \
+        "filesize=2560M" "nrfiles=2" "numjobs=3" "iodepth=2" "time_based=1" "runtime=30" \
         "ramp_time=2" "group_reporting=1" "cpus_allowed=1-3" "cpus_allowed_policy=split" \
         "[cal-bw-read]" "rw=read" > "$d/want"
     diff -u "$d/want" "$d/c.job"'
@@ -3446,118 +3452,327 @@ t_assert "stage_cal_cell: a bad type, direction, engine or number dies" bash -c 
     ! f bw read "" 1 1 2 30 && f bw read io_uring 1 1 2 30'
 
 # --- cal_plan: the search rules, driven against a client with a known curve ---
-t_assert "cal_plan bw: the first numjobs at 95% of line rate is the answer, nothing after it" bash -c '
+# N is the shape's usable PHYSICAL cores; the job counts are Frank's
+# (2026-09-25): N/2 and N one job per physical core at iodepth=1 nrfiles=1 --
+# no queue or file ladder at or below N -- then 2N and 4N with the siblings
+# in, where the iodepth and nrfiles ladders run.
+K='exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 floorreps=3'
+export K
+t_assert "cal_plan bw: the first numjobs at 95% of line rate is the answer, one job per physical core, nothing after it" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_STREAM=2147483648 CAL_SIM_BWCAP=12670000000 plan_sim "$d" bw read io_uring 16 12500000000 0)
     case "$out" in
-        "done 8 1 2 numjobs=8 iodepth=1 nrfiles=2 -> 11.80 GiB/s = 101.4% of the 11.64 GiB/s line rate (first numjobs at >= 95% of line rate)") true;;
+        "done 8 1 1 numjobs=8 iodepth=1 nrfiles=1 -> 11.80 GiB/s = 101.4% of the 11.64 GiB/s line rate (the first numjobs at >= 95% of line rate, one job per physical core)") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 2;numjobs 2 1 2;numjobs 4 1 2;numjobs 8 1 2;" ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;" ] ||
         { cat "$d/asked" >&2; false; }'
-t_assert "cal_plan bw: short of line rate, the queue ladder runs at the best numjobs, then the peak" bash -c '
+t_assert "cal_plan bw: short of line rate, 2N walks iodepth for every nrfiles; 2N not beating N skips 4N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=9663676416 plan_sim "$d" bw write libaio 16 12500000000 0)
     case "$out" in
-        "done 16 1 2 numjobs=16 iodepth=1 nrfiles=2 -> 9.00 GiB/s (best of 2) = 77.3% of the 11.64 GiB/s line rate (never reached 95% of line rate; the peak)") true;;
+        "done 16 1 1 numjobs=16 iodepth=1 nrfiles=1 -> 9.00 GiB/s (best of 2) = 77.3% of the 11.64 GiB/s line rate (never reached 95% of line rate; the peak, one job per physical core); 2N (32 jobs, siblings in) did not beat N; 4N was not tried") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 2;numjobs 2 1 2;numjobs 4 1 2;numjobs 8 1 2;numjobs 16 1 2;iodepth 16 2 2;iodepth 16 4 2;confirm 16 1 2;confirm 16 2 2;confirm 16 4 2;" ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;numjobs 16 1 1;wide 32 1 1;wide 32 2 1;wide 32 4 1;wide 32 1 2;wide 32 2 2;wide 32 4 2;wide 32 1 4;wide 32 2 4;wide 32 4 4;confirm 16 1 1;confirm 32 1 1;confirm 32 1 2;" ] ||
         { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan bw: no line rate, the job ladder stops where it flattens" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=4294967296 plan_sim "$d" bw read io_uring 32 0 0)
-    case "$out" in "done 4 1 2 numjobs=4 iodepth=1 nrfiles=2 -> 4.00 GiB/s (best of 2) (the peak)") true;;
+    case "$out" in "done 4 1 1 numjobs=4 iodepth=1 nrfiles=1 -> 4.00 GiB/s (best of 2) (the peak, one job per physical core); 2N (64 jobs, siblings in) did not beat N; 4N was not tried") true;;
         *) echo "$out" >&2; false;; esac &&
     ! grep -q "^numjobs 32 " "$d/asked" && grep -q "^numjobs 16 " "$d/asked" &&
-    grep -q "^iodepth 4 2 2$" "$d/asked"'
+    grep -q "^wide 64 1 1$" "$d/asked" && ! grep -q "^wide 128 " "$d/asked"'
 t_assert "cal_plan bw: a reading well above line rate means line rate is not the ceiling" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" bw read io_uring 16 12500000000 0)
     case "$out" in
-        "done 16 2 2 "*"(the peak); a reading beat the NIC line rate by more than 5%, so line rate is not this client"*) true;;
+        "done 32 1 1 "*"(the peak, siblings in); a reading beat the NIC line rate by more than 5%, so line rate is not this client"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "cal_plan bw: the memory guard ends the queue ladder and says so" bash -c '
+t_assert "cal_plan bw: the memory guard ends a queue ladder and says so, once per job count and depth" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=9663676416 plan_sim "$d" bw read io_uring 4 12500000000 8388608)
-    grep -q "^iodepth 4 2 2$" "$d/asked" && ! grep -q "^iodepth 4 4 " "$d/asked" &&
-    case "$out" in *"the queue ladder stopped short of numjobs=4 iodepth=4 nrfiles=2: its in-flight buffers exceed the memory guard (CAL_MEM_PCT)"*) true;;
-        *) echo "$out" >&2; false;; esac'
-t_assert "cal_plan iops: queue ladder, same-outstanding re-split both ways, nrfiles, then the peak" bash -c '
+    grep -q "^wide 8 1 4$" "$d/asked" && ! grep -q "^wide 8 2 " "$d/asked" && ! grep -q "^wide 16 " "$d/asked" &&
+    case "$out" in *"the queue ladder stopped short of numjobs=8 iodepth=2: its in-flight buffers exceed the memory guard (CAL_MEM_PCT); the queue ladder stopped short of numjobs=16 iodepth=1: its"*) true;;
+        *) echo "$out" >&2; false;; esac &&
+    [ "$(printf "%s" "$out" | grep -o "numjobs=8 iodepth=2:" | wc -l | tr -d " ")" = 1 ]'
+t_assert "cal_plan iops: N/2 and N at qd1, then 2N and 4N walk the queue ladder, nrfiles at each winner, then the peak" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" iops read io_uring 16 0 0)
     case "$out" in
-        "done 8 8 2 numjobs=8 iodepth=8 nrfiles=2 -> 1,000,000 IOPS (best of 2) (iodepth ladder peaked at numjobs=16 iodepth=4 nrfiles=2; re-split at the same outstanding IO: 8x8 +0.0%, 32x2 +0.0%; nrfiles: 1 +0.0%, 4 +0.0%)") true;;
+        "done 32 2 1 numjobs=32 iodepth=2 nrfiles=1 -> 1,000,000 IOPS (best of 2) (8 jobs 160,000 IOPS at iodepth 1, 16 jobs 320,000 IOPS at iodepth 1, 32 jobs 1,000,000 IOPS at iodepth 2 nrfiles 1, 64 jobs 1,000,000 IOPS at iodepth 1 nrfiles 1; siblings in)") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(cut -d" " -f1 "$d/asked" | uniq | tr "\n" " ")" = "iodepth resplit nrfiles confirm " ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 1;numjobs 16 1 1;iodepth 32 1 1;iodepth 32 2 1;iodepth 32 4 1;iodepth 32 8 1;nrfiles 32 2 2;nrfiles 32 4 2;nrfiles 32 2 4;nrfiles 32 4 4;iodepth 64 1 1;iodepth 64 2 1;iodepth 64 4 1;nrfiles 64 1 2;nrfiles 64 2 2;nrfiles 64 1 4;nrfiles 64 2 4;confirm 32 2 1;confirm 32 2 2;confirm 32 2 4;" ] ||
         { cat "$d/asked" >&2; false; }'
-t_assert "cal_plan iops: a re-split that wins keeps going to its cap" bash -c '
+t_assert "cal_plan iops: no queue or file ladder at or below N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
-    # every job adds 5,000 IOPS at the same outstanding IO: more jobs win
-    out=$(CAL_SIM_JOBBONUS=5000 plan_sim "$d" iops read io_uring 16 0 0)
-    case "$out" in "done 32 2 2 numjobs=32 iodepth=2 nrfiles=2 -> 1,160,000 IOPS"*"re-split at the same outstanding IO: 8x8 -3.7%, 32x2 +7.4%"*) true;;
-        *) echo "$out" >&2; false;; esac &&
-    ! grep -q "^resplit 64 " "$d/asked"'
+    plan_sim "$d" iops write io_uring 16 0 0 >/dev/null
+    ! awk "\$2 <= 16 && (\$3 != 1 || \$4 != 1)" "$d/asked" | grep -q . ||
+        { awk "\$2 <= 16" "$d/asked" >&2; false; }'
 t_assert "cal_plan iops: a file count that wins is recorded" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_IOPSKNEE=64 CAL_SIM_NRBEST=4 plan_sim "$d" iops write io_uring 16 0 0)
-    case "$out" in "done 8 8 4 "*"nrfiles: 1 +0.0%, 4 +3.0%)") true;; *) echo "$out" >&2; false;; esac'
-t_assert "cal_plan iops: a sync engine widens numjobs instead of the queue" bash -c '
+    case "$out" in "done 32 2 4 numjobs=32 iodepth=2 nrfiles=4 -> 1,030,000 IOPS"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cal_plan iops: 2N that does not beat N ends the search before 4N" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(CAL_SIM_IOPSCAP=100000 plan_sim "$d" iops read io_uring 16 0 0)
+    case "$out" in "done 8 1 1 "*"2N (32 jobs, siblings in) did not beat N; 4N was not tried") true;; *) echo "$out" >&2; false;; esac &&
+    ! grep -q " 64 " "$d/asked"'
+t_assert "cal_plan iops: a sync engine keeps iodepth at 1 and still walks the job counts and files" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" iops read psync 8 0 0)
-    case "$out" in "done 16 1 2 numjobs=16 iodepth=1 nrfiles=2 -> 320,000 IOPS"*) true;; *) echo "$out" >&2; false;; esac &&
-    ! grep -q "^resplit" "$d/asked" && ! grep -q "^iodepth" "$d/asked" &&
-    grep -q "^numjobs 8 1 2$" "$d/asked" && grep -q "^numjobs 16 1 2$" "$d/asked"'
-t_assert "cal_plan lat: floor from three readings, widen while inside 5%, the last rung inside wins" bash -c '
+    case "$out" in "done 32 1 1 numjobs=32 iodepth=1 nrfiles=1 -> 640,000 IOPS"*) true;; *) echo "$out" >&2; false;; esac &&
+    ! awk "\$3 != 1" "$d/asked" | grep -q . &&
+    grep -q "^numjobs 4 1 1$" "$d/asked" && grep -q "^nrfiles 16 1 4$" "$d/asked"'
+t_assert "cal_plan lat: floor from three readings, widen at nrfiles=1 while inside 5%, the last rung inside wins" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" lat read io_uring 16 0 0)
     case "$out" in
-        "done 8 1 2 floor 100.0 us (lowest of 3 at numjobs=1), band <= 105.0 us; numjobs=8 stays at the floor: 100.0 us, 80,000 IOPS; numjobs=16 left the band at 260.0 us (re-measured)") true;;
+        "done 8 1 1 floor 100.0 us (lowest of 3 at numjobs=1), band <= 105.0 us; numjobs=8 nrfiles=1 stays at the floor (one job per physical core): 100.0 us, 80,000 IOPS; numjobs=16 left the band at 260.0 us (re-measured)") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(tr "\n" ";" < "$d/asked")" = "floor 1 1 2;floor 1 1 2;floor 1 1 2;widen 2 1 2;widen 4 1 2;widen 8 1 2;widen 16 1 2;recheck 16 1 2;" ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "floor 1 1 1;floor 1 1 1;floor 1 1 1;widen 2 1 1;widen 4 1 1;widen 8 1 1;widen 16 1 1;recheck 16 1 1;" ] ||
         { cat "$d/asked" >&2; false; }'
+t_assert "cal_plan lat: past N every nrfiles is tried, and the one that stays at the floor wins" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    # 16 jobs (2N) are 10us out of the band at one file per job; two files
+    # per job take 10% off and bring 16 jobs back inside it
+    out=$(CAL_SIM_WIDE=14 CAL_SIM_LATSTEP=5 CAL_SIM_LATNRBEST=2 plan_sim "$d" lat read io_uring 8 0 0)
+    case "$out" in
+        "done 16 1 2 floor 100.0 us (lowest of 3 at numjobs=1), band <= 105.0 us; numjobs=16 nrfiles=2 stays at the floor (siblings in): 99.0 us, 161,616 IOPS; numjobs=32 left the band at 171.0 us (re-measured); numjobs=16: nrfiles 1 110.0 us, nrfiles 2 99.0 us, nrfiles 4 110.0 us; numjobs=32: nrfiles 1 190.0 us, nrfiles 2 171.0 us, nrfiles 4 190.0 us") true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    ! awk "\$2 <= 8 && \$4 != 1" "$d/asked" | grep -q .'
+t_assert "cal_plan lat1m: the same search at 1MiB, with a floor of its own" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(plan_sim "$d" lat1m write io_uring 4 0 0)
+    case "$out" in "done 8 1 1 1MiB floor 800.0 us (lowest of 3 at numjobs=1), band <= 840.0 us; numjobs=8 nrfiles=1 stays at the floor (siblings in)"*) true;;
+        *) echo "$out" >&2; false;; esac'
 # Hand-built histories pin the decisions that a smooth model never exercises.
 t_assert "cal_plan lat: the floor is the lowest reading, and a rung that leaves the band gets one re-measure" bash -c '
     d=$(mktemp -d)
-    K="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=2 nrc=1,4 bwqd=128 iopsqd=256 njmaxpct=200 floorreps=3"
-    printf "floor psync 1 1 2 30 130 7000\nfloor psync 1 1 2 30 100 9000\nfloor psync 1 1 2 30 120 8000\nwiden psync 2 1 2 30 140 14000\n" > "$d/h"
+    printf "floor psync 1 1 1 30 130 7000\nfloor psync 1 1 1 30 100 9000\nfloor psync 1 1 1 30 120 8000\nwiden psync 2 1 1 30 140 14000\n" > "$d/h"
     a=$(source ./wekatester; cal_plan next lat read psync 8 0 0 "$d/h" $K)
-    [ "$a" = "cell recheck 2 1 2 30" ] || { echo "a=$a" >&2; exit 1; }
+    [ "$a" = "cell recheck 2 1 1 30" ] || { echo "a=$a" >&2; exit 1; }
     # the re-measure came back inside 105us of the 100us floor: keep widening
-    printf "recheck psync 2 1 2 30 104 19000\n" >> "$d/h"
+    printf "recheck psync 2 1 1 30 104 19000\n" >> "$d/h"
     b=$(source ./wekatester; cal_plan next lat read psync 8 0 0 "$d/h" $K)
-    [ "$b" = "cell widen 4 1 2 30" ] || { echo "b=$b" >&2; exit 1; }
+    [ "$b" = "cell widen 4 1 1 30" ] || { echo "b=$b" >&2; exit 1; }
     # 4 is out twice: the answer is 2, with the IOPS it did at the floor
-    printf "widen psync 4 1 2 30 150 25000\nrecheck psync 4 1 2 30 151 25000\n" >> "$d/h"
+    printf "widen psync 4 1 1 30 150 25000\nrecheck psync 4 1 1 30 151 25000\n" >> "$d/h"
     c=$(source ./wekatester; cal_plan next lat read psync 8 0 0 "$d/h" $K)
-    case "$c" in "done 2 1 2 floor 100.0 us (lowest of 3 at numjobs=1), band <= 105.0 us; numjobs=2 stays at the floor: 104.0 us, 19,000 IOPS; numjobs=4 left the band at 150.0 us (re-measured)") true;;
+    case "$c" in "done 2 1 1 floor 100.0 us (lowest of 3 at numjobs=1), band <= 105.0 us; numjobs=2 nrfiles=1 stays at the floor (one job per physical core): 104.0 us, 19,000 IOPS; numjobs=4 left the band at 150.0 us (re-measured)") true;;
         *) echo "c=$c" >&2; false;; esac'
 t_assert "cal_plan: a confirm reading never reopens a step that is already decided" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     plan_sim "$d" iops read io_uring 16 0 0 >/dev/null
-    K="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=2 nrc=1,4 bwqd=128 iopsqd=256 njmaxpct=200 floorreps=3"
     # a late, much higher confirm reading for a ladder cell changes the pick,
-    # but the planner must not go back and measure more ladder or split cells
-    printf "confirm io_uring 16 16 2 30 2000000\n" >> "$d/hist"
+    # but the planner must not go back and measure more ladder or file cells
+    printf "confirm io_uring 32 4 1 30 2000000\n" >> "$d/hist"
     a=$(source ./wekatester; cal_plan next iops read io_uring 16 0 0 "$d/hist" $K)
-    case "$a" in "done 16 16 2 "*) true;; *) echo "a=$a" >&2; false;; esac'
-t_assert "cal_plan brutal: no early stops -- every rung is measured, and bandwidth takes the peak" bash -c '
+    case "$a" in "done 32 4 1 "*) true;; *) echo "a=$a" >&2; false;; esac'
+t_assert "cal_plan brutal: every combination the ladders define is measured, and bandwidth takes the peak" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_STREAM=2147483648 CAL_SIM_BWCAP=12670000000 plan_sim "$d" bw read io_uring 16 12500000000 0 exh=1 confirm=5)
-    grep -q "^numjobs 16 1 2$" "$d/asked" && grep -q "^iodepth 8 128 2$" "$d/asked" &&
-    case "$out" in "done 8 1 2 "*"(the peak of every rung measured)") true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "^numjobs 16 1 1$" "$d/asked" && grep -q "^wide 64 16 4$" "$d/asked" &&
+    [ "$(grep -c "^wide " "$d/asked")" = 30 ] &&
+    case "$out" in "done 8 1 1 "*"(the peak of every rung measured, one job per physical core)") true;; *) echo "$out" >&2; false;; esac &&
+    out=$(plan_sim "$d" iops read io_uring 16 0 0 exh=1 confirm=5) &&
+    [ "$(grep -c -v "^confirm " "$d/asked")" = 62 ] &&
     out=$(plan_sim "$d" lat read io_uring 32 0 0 exh=1) &&
-    grep -q "^widen 32 1 2$" "$d/asked" &&
-    case "$out" in "done 8 1 2 "*"numjobs=16 left the band"*) true;; *) echo "$out" >&2; false;; esac'
+    grep -q "^widen 32 1 1$" "$d/asked" && grep -q "^nrfiles 128 1 4$" "$d/asked" &&
+    case "$out" in "done 8 1 1 "*"numjobs=16 left the band"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "cal_plan budget: the most cells a search can take" bash -c '
-    K="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=2 nrc=1,4 bwqd=128 iopsqd=256 njmaxpct=200 floorreps=3"
     a=$(source ./wekatester; cal_plan budget bw read x 16 0 0 /dev/null $K)
     b=$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K)
     c=$(source ./wekatester; cal_plan budget iops read x 16 0 0 /dev/null $K)
-    [ "$a" = 15 ] && [ "$b" = 11 ] && [ "$c" = 21 ] || { echo "bw=$a lat=$b iops=$c" >&2; false; }'
+    e=$(source ./wekatester; cal_plan budget iops read x 16 0 0 /dev/null $K exh=1 confirm=5)
+    [ "$a" = 38 ] && [ "$b" = 23 ] && [ "$c" = 33 ] && [ "$e" = 67 ] ||
+        { echo "bw=$a lat=$b iops=$c brutal-iops=$e" >&2; false; }'
+
+# --- N from physical cores (Frank, 2026-09-25): topology, the reserve, placement ---
+# topo_fixture <file> <ncpus> <adjacent|split> <weka cpus...>: a probe file with
+# one core per sibling pair, numbered 2i/2i+1 (adjacent, as OCI VMs do) or
+# i/i+n/2 (split, as most x86 servers do), one socket
+topo_fixture() {
+    local f=$1 n=$2 how=$3 c k; shift 3
+    { printf "ncpus %s\nonline 0-%s\nengines io_uring libaio psync \n" "$n" "$((n - 1))"
+      for c in "$@"; do printf "weka_allowed %s\n" "$c"; done
+      for c in $(seq 0 $((n - 1))); do
+          if [ "$how" = adjacent ]; then k="$(( c / 2 * 2 ))-$(( c / 2 * 2 + 1 ))"
+          else k="$(( c % (n / 2) )),$(( c % (n / 2) + n / 2 ))"; fi
+          printf "topo_physical_package_id %s 0\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s\n" "$c" "$c" "$c" "$c" "$k"
+      done; } > "$f"
+}
+export -f topo_fixture
+t_assert "probe_cores: N counts physical cores; weka's DPDK cores leave with their siblings, core 0's pair stays with the OS" bash -c '
+    d=$(mktemp -d); topo_fixture "$d/p" 16 adjacent 12 14
+    (source ./wekatester; pyrun "$d/p" <<"EOF"
+import sys
+c = probe_cores(sys.argv[1])
+assert c["n"] == 4 and c["ncores"] == 8 and c["dpdk"] == 2, c
+assert c["phys"] == [4, 6, 8, 10] and c["all"] == list(range(4, 12)), c
+assert c["reserved"] == [[0, 1], [2, 3]] and c["smt"] and c["topo"], c
+EOF
+    )'
+t_assert "probe_cores: siblings numbered i and i+8 are found from the topology, not by adjacency" bash -c '
+    d=$(mktemp -d); topo_fixture "$d/p" 16 split 6 7
+    (source ./wekatester; pyrun "$d/p" <<"EOF"
+import sys
+c = probe_cores(sys.argv[1])
+assert c["n"] == 4 and c["phys"] == [2, 3, 4, 5], c
+assert c["all"] == [2, 3, 4, 5, 10, 11, 12, 13], c
+assert c["reserved"] == [[0, 8], [1, 9]], c
+EOF
+    )'
+t_assert "probe_cores: two sockets reserve core 0 and the next of socket 0, then the first two of socket 1; 5-8 DPDK cores add one" bash -c '
+    d=$(mktemp -d)
+    { printf "ncpus 64\nonline 0-63\n"
+      for c in $(seq 24 31); do printf "weka_allowed %s\n" "$c"; done
+      for c in $(seq 0 63); do k=$(( c % 32 ))
+          printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s,%s\n" $c $(( k / 16 )) $c $k $c $k $(( k + 32 )); done; } > "$d/p"
+    (source ./wekatester; pyrun "$d/p" <<"EOF"
+import sys
+c = probe_cores(sys.argv[1])
+assert c["ncores"] == 32 and c["dpdk"] == 8 and c["sockets"] == 2, c
+assert [t[0] for t in c["reserved"]] == [0, 16, 1, 17, 2], c["reserved"]
+assert c["n"] == 32 - 8 - 5, c
+EOF
+    )'
+t_assert "reserve rules: 2 up to 24 cores, 4 above, +1 per 4 DPDK past 4, at most 12 and half; round-robin placement" bash -c '
+    (source ./wekatester; pyrun <<"EOF"
+assert reserve_count(8, 2) == 2 and reserve_count(24, 4) == 2 and reserve_count(25, 4) == 4
+assert reserve_count(64, 5) == 5 and reserve_count(64, 8) == 5 and reserve_count(64, 9) == 6
+assert reserve_count(200, 64) == 12, "at most 12"
+assert reserve_count(4, 8) == 2, "never more than half the cores"
+assert reserve_count(2, 0) == 1, "core 0 always"
+order = list(range(8))
+one = dict((k, 0) for k in order)
+assert place_reserve(order, one, set(), 0, 4) == [0, 1, 2, 3]
+four = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3}
+assert place_reserve(order, four, set(), 0, 4) == [0, 2, 4, 6], "one core per socket"
+assert place_reserve(order, one, {0, 1}, 0, 2) == [2, 3], "a DPDK core is never reserved, not even core 0"
+EOF
+    )'
+t_assert "usable_cores: a client too small for its DPDK cores stops, naming the arithmetic" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    # lab 3 as built: 8 cores, 6 of them weka DPDK -- the reserve wants 3, gets 2
+    topo_fixture "$d/probe/h1" 16 adjacent 4 6 8 10 12 14
+    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$err" in *"leaves fio no cpus: 8 physical core(s) - 6 weka DPDK - 2 reserved for the OS (0-1 2-3) = N=0"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "probe: the cpu topology comes from sysfs as topo lines" bash -c '
+    d=$(mktemp -d); r=$d/root
+    for c in 0 1; do mkdir -p "$r/sys/devices/system/cpu/cpu$c/topology"
+        echo 0 > "$r/sys/devices/system/cpu/cpu$c/topology/physical_package_id"
+        echo 0 > "$r/sys/devices/system/cpu/cpu$c/topology/core_id"
+        echo 0-1 > "$r/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list"; done
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
+    out=$(WEKATESTER_SYSROOT=$r bash -c "$cmd" 2>&1)
+    printf "%s\n" "$out" | grep -qx "topo_thread_siblings_list 1 0-1" &&
+    printf "%s\n" "$out" | grep -qx "topo_core_id 0 0" &&
+    printf "%s\n" "$out" | grep -qx "topo_physical_package_id 1 0" || { printf "%s\n" "$out" >&2; false; }'
+t_assert "tuner: a job count at or below N runs one job per physical core; above N the siblings join" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    topo_fixture "$FIX/probe/h1" 16 adjacent 12 14; cp "$FIX/probe/h1" "$FIX/probe/h2"
+    row() { printf "h1\t-\t-\t-\t-\t%s\t-\t-\t-" "$1"; for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; }
+    row 4 > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    grep -qx "cpus_allowed=4,6,8,10" "$FIX/jobs/h1/011-bw.job" || { grep cpus_allowed "$FIX/jobs/h1/011-bw.job" >&2; exit 1; }
+    # h2 has no host-file row: max runs a job on every usable thread, 8 > N
+    grep -qx "numjobs=8" "$FIX/jobs/h2/011-bw.job" && grep -qx "cpus_allowed=4-11" "$FIX/jobs/h2/011-bw.job" &&
+    row 8 > "$FIX/targets.final" &&
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1 &&
+    grep -qx "cpus_allowed=4-11" "$FIX/jobs/h1/011-bw.job"'
+
+# --- -b: every latency test also at 1MiB; -a cal/brutal: a one-job twin beside each ---
+t_assert "-b sets bulk; off by default" bash -c '
+    source ./wekatester; parse_args h1; [ "$BULK" -eq 0 ] &&
+    parse_args -b h1 && [ "$BULK" -eq 1 ] && parse_args --BULK h1 && [ "$BULK" -eq 1 ]'
+t_assert "stage_bulk_twins: every 4k latency file gains a 1MiB twin right after it; nothing else does" bash -c '
+    d=$(mktemp -d)
+    printf "# report latency iops\n[global]\nfilename_format=\$filenum/\$jobnum\n[c]\nblocksize=1Mi\ncreate_only=1\n[l]\nbs=4k\nrw=randread\n" > "$d/021-latencyR.job"
+    printf "# report latency\n[global]\n[l]\nrw=randwrite\n" > "$d/022-latencyW.job"
+    printf "# report iops\n[global]\n[i]\nbs=4k\nrw=randread\n" > "$d/031-iopsR.job"
+    printf "# report latency\n[global]\nbs=1Mi\n[l]\nrw=randread\n" > "$d/023-big.job"
+    out=$(source ./wekatester; stage_bulk_twins "$d")
+    [ "$out" = "021b-latencyR-1M.job 022b-latencyW-1M.job" ] || { echo "out=$out" >&2; exit 1; }
+    t="$d/021b-latencyR-1M.job"; u="$d/022b-latencyW-1M.job"
+    grep -qx "bs=1Mi" "$t" && ! grep -q "^bs=4k" "$t" && grep -qx "blocksize=1Mi" "$t" &&
+    grep -qx "filename_format=\$filenum/\$jobnum" "$t" && grep -qx "rw=randread" "$t" &&
+    grep -qx "bs=1Mi" "$u" && [ ! -e "$d/031b-iopsR-1M.job" ] && [ ! -e "$d/023b-big-1M.job" ] &&
+    (source ./wekatester; discover_jobfiles "$d"; [ "${JOBFILES[*]}" = "021-latencyR.job 021b-latencyR-1M.job 022-latencyW.job 022b-latencyW-1M.job 023-big.job 031-iopsR.job" ])'
+t_assert "stage_floor_twins: every latency file gains a one-job twin that runs just before it" bash -c '
+    d=$(mktemp -d)
+    printf "# report latency iops\n[global]\n[l]\nbs=4k\nrw=randread\n" > "$d/021-latencyR.job"
+    printf "# report iops\n[global]\n[i]\nrw=randread\n" > "$d/031-iopsR.job"
+    out=$(source ./wekatester; stage_floor_twins "$d")
+    [ "$out" = "021-latencyR-1job.job" ] && [ ! -e "$d/031-iopsR-1job.job" ] &&
+    head -1 "$d/021-latencyR-1job.job" | grep -q "^# wekatester-floor: 021-latencyR.job" &&
+    (source ./wekatester; discover_jobfiles "$d"; [ "${JOBFILES[*]}" = "021-latencyR-1job.job 021-latencyR.job 031-iopsR.job" ])'
+t_assert "tuner: a one-job latency twin runs numjobs=iodepth=nrfiles=1 with its original's data per job" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    rm -f "$FIX/src/011-bw.job"
+    printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
+    (source ./wekatester; stage_floor_twins "$FIX/src") >/dev/null
+    # the calibrated lat_r tuple: 3 jobs, 4 files of 1280M, qd 1 (cols 14-17)
+    { printf "h1"; for i in $(seq 2 37); do
+          case $i in (14) printf "\t3";; (15) printf "\t1280M";; (16) printf "\t4";; (17) printf "\t1";; (*) printf "\t-";; esac
+      done; printf "\n"; } > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    v="$FIX/jobs/h1/021-lat.job"; f="$FIX/jobs/h1/021-lat-1job.job"
+    grep -qx "numjobs=3" "$v" && grep -qx "filesize=1280M" "$v" && grep -qx "nrfiles=4" "$v" &&
+    grep -qx "numjobs=1" "$f" && grep -qx "iodepth=1" "$f" && grep -qx "nrfiles=1" "$f" &&
+    grep -qx "filesize=5120M" "$f" && grep -qx "cpus_allowed=2-4" "$f" || { cat "$f" >&2; false; }'
+t_assert "stage_cal_cell: a lat1m cell reads 1MiB blocks at random, and a job's data is split over its files" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     stage_cal_cell "$d/l.job" /mnt/weka h1 "" lat1m read io_uring 2 1 4 30)
+    grep -qx "bs=1Mi" "$d/l.job" && grep -qx "rw=randread" "$d/l.job" &&
+    grep -qx "filesize=1280M" "$d/l.job" && grep -qx "nrfiles=4" "$d/l.job" &&
+    grep -qx "\[cal-lat1m-read\]" "$d/l.job" && ! grep -q "^disable_lat" "$d/l.job"'
+t_assert "cal_required: -b adds a 1MiB latency search beside every 4k one; a 1MiB latency file is its own" bash -c '
+    d=$(mktemp -d)
+    printf "# report latency\n[global]\n[a]\nbs=4k\nrw=randread\n" > "$d/021-r.job"
+    a=$(source ./wekatester; cal_required "$d" | tr "\n" ";")
+    b=$(source ./wekatester; cal_required "$d" 1 | tr "\n" ";")
+    printf "# report latency\n[global]\nbs=1Mi\n[a]\nrw=randwrite\n" > "$d/022-w.job"
+    c=$(source ./wekatester; cal_required "$d" | tr "\n" ";")
+    [ "$a" = "lat read;" ] && [ "$b" = "lat read;lat1m read;" ] && [ "$c" = "lat read;lat1m write;" ] ||
+        { echo "a=$a b=$b c=$c" >&2; false; }'
+t_assert "targets: the 1MiB latency columns come last, and an 11-column row still parses" bash -c '
+    f=$(mktemp)
+    printf "h1,,,,,,,,,,,latency1mR:2/5120M/1/1,latency1mW:4/5120M/2/1\nh2,,,,,12/10G//8,,,,,\n" > "$f"
+    out=$(rt phase1 "$f" - - - h1 h2)
+    a=$(printf "%s\n" "$out" | awk -F"\t" "\$1==\"h1\" {print \$30, \$31, \$32, \$33, \$34, \$35, \$36, \$37}")
+    b=$(printf "%s\n" "$out" | awk -F"\t" "\$1==\"h2\" {print NF, \$6, \$30}")
+    [ "$a" = "2 5120M 1 1 4 5120M 2 1" ] && [ "$b" = "37 12 -" ] || { echo "a=$a b=$b" >&2; false; }'
+t_assert "writeback: a measured 1MiB latency tuple lands in its own column" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/auth"
+    : > "$d/engine.results"
+    printf "h1 libaio - - - - - - - - - - - - - - - - - - - - - - - - 1 1 5120M 6 - - - -\n" > "$d/cal.results"
+    f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     writeback_targets) >/dev/null
+    tail -1 "$f" | grep -qx "h1,,,,,,,,,,,6/5120M/1/1" || { tail -1 "$f" >&2; false; }'
+t_assert "calibrate: under -b a latency set also measures the 1MiB test, into its own slot" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8
+    printf "# report latency\n[global]\nfilename_format=\$filenum/\$jobnum\n[a]\nbs=4k\nrw=randread\n" > "$d/set/021-r.job"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=cal; BULK=1; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; ENGINE=io_uring
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     export CAL_SIM_FLOOR1M=1000
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -q "cal-lat1m-read-" "$d/simlog" &&
+    case "$out" in *"lat-read: floor 100.0 us"*"lat1m-read: 1MiB floor 1000.0 us"*) true;; *) printf "%s\n" "$out" >&2; false;; esac &&
+    # the 4k test holds the floor to N=5 jobs, the 1MiB test to 2N=10
+    [ "$(cut -d" " -f11-14,27-30 "$d/cal.results")" = "1 1 5120M 5 1 1 5120M 10" ] || { cat "$d/cal.results" >&2; false; }'
 
 # --- engine choice: one per shape, from the type winners ---
 t_assert "cal_engine_pick: per-type winners, ties to io_uring, the tally picks the shape engine" bash -c '
@@ -3581,36 +3796,36 @@ t_assert "cal_shapes: identical hardware is one shape on its first host, differe
     out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3); REGEN_LAYOUT=0; AUTH_DIR=""
             cal_shapes "$d/shapes" "bw read") 2>&1 )
     [ "$(wc -l < "$d/shapes" | tr -d " ")" = 2 ] &&
-    a=$(cut -f1,2,3,4,5,6,7 "$d/shapes" | head -1 | tr "\t" "|") &&
-    [ "$a" = "1|h1|7|1-7|12500000000|io_uring,libaio,psync|-" ] || { echo "a=$a" >&2; exit 1; }
-    [ "$(head -1 "$d/shapes" | cut -f10)" = "h1 h2" ] && [ "$(sed -n 2p "$d/shapes" | cut -f2,5,10 | tr "\t" "|")" = "h3|25000000000|h3" ] &&
+    a=$(cut -f1-8 "$d/shapes" | head -1 | tr "\t" "|") &&
+    [ "$a" = "1|h1|5|2-6|2-6|12500000000|io_uring,libaio,psync|-" ] || { echo "a=$a" >&2; exit 1; }
+    [ "$(head -1 "$d/shapes" | cut -f11)" = "h1 h2" ] && [ "$(sed -n 2p "$d/shapes" | cut -f2,6,11 | tr "\t" "|")" = "h3|25000000000|h3" ] &&
     case "$out" in
-        *"shape 1 of 2: 2 host(s), calibrated on h1 -- Test CPU 8-core, 8 cpus (1 pinned by weka, 7 for fio), 252 GiB, weka NICs ens1: 1 x mlx5_core [0x15b3:0x101d] 100 Gb/s -> line rate 11.64 GiB/s"*"hosts: h1 h2"*"shape 2 of 2"*) true;;
+        *"shape 1 of 2: 2 host(s), calibrated on h1 -- Test CPU 8-core, 8 cpus, 252 GiB, weka NICs ens1: 1 x mlx5_core [0x15b3:0x101d] 100 Gb/s -> line rate 11.64 GiB/s"*"cores: 8 physical core(s) (no topology: one per cpu) - 1 weka DPDK - 2 reserved for the OS (0 1) = N=5: N/2 and N jobs on 2-6, 2N and 4N on 2-6"*"hosts: h1 h2"*"shape 2 of 2"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 t_assert "cal_shapes: a rep's complete tuple is cached for its shape; partial ones and -g are not" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
     # bw_r nj/fs/nr/qd are cols 6-9; iops_r only has its qd (col 25)
-    { printf "h1"; for i in $(seq 2 29); do
+    { printf "h1"; for i in $(seq 2 37); do
           case $i in (6) printf "\t4";; (7) printf "\t5120M";; (8) printf "\t2";; (9) printf "\t1";; (25) printf "\t32";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; AUTH_DIR=""
      cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") >/dev/null 2>&1
-    [ "$(cut -f9 "$d/shapes")" = "bw_r=1/2/5120M/4" ] || { cut -f9 "$d/shapes" >&2; exit 1; }
+    [ "$(cut -f10 "$d/shapes")" = "bw_r=1/2/5120M/4" ] || { cut -f10 "$d/shapes" >&2; exit 1; }
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=1; AUTH_DIR=""
      cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
-    [ "$(cut -f9 "$d/shapes")" = "-" ]'
+    [ "$(cut -f10 "$d/shapes")" = "-" ]'
 t_assert "cal_shapes: an engine pinned by -e or the host file splits nothing but is carried" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "h1\t-\tlibaio\t-\t-\nh2\t-\t-\t-\t-\n" > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); REGEN_LAYOUT=0; AUTH_DIR=""
      cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
-    [ "$(cut -f2,7 "$d/shapes" | tr "\t" "|" | tr "\n" " ")" = "h1|libaio h2|- " ] || { cat "$d/shapes" >&2; exit 1; }
+    [ "$(cut -f2,8 "$d/shapes" | tr "\t" "|" | tr "\n" " ")" = "h1|libaio h2|- " ] || { cat "$d/shapes" >&2; exit 1; }
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); REGEN_LAYOUT=0; AUTH_DIR=""; ENGINE=psync
      cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
-    [ "$(cut -f7 "$d/shapes")" = "psync" ]'
+    [ "$(cut -f8 "$d/shapes")" = "psync" ]'
 t_assert "cal_shapes: no weka CLI, no root, or UDP mode means no line rate, and a warning says why" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2:6 h3
@@ -3619,7 +3834,7 @@ t_assert "cal_shapes: no weka CLI, no root, or UDP mode means no line rate, and 
     sed -i.b "s/^weka_net client .*/weka_net client []/" "$d/probe/h3"
     err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3); REGEN_LAYOUT=0; AUTH_DIR=""
             cal_shapes "$d/shapes" "bw read") 2>&1 >/dev/null )
-    [ "$(cut -f5 "$d/shapes" | tr "\n" " ")" = "0 0 0 " ] &&
+    [ "$(cut -f6 "$d/shapes" | tr "\n" " ")" = "0 0 0 " ] &&
     case "$err" in
         *"shape 1 (h1): no weka CLI on the host -- the bandwidth search has no line-rate target"*"shape 2 (h2): weka local resources could not be read (client: needs root"*"shape 3 (h3): weka uses no dedicated NIC here (UDP mode)"*) true;;
         *) echo "$err" >&2; false;;
@@ -3700,20 +3915,23 @@ t_assert "calibrate: each shape is measured solo on its first host, the answer l
     ! grep -- "--client=" "$d/simlog" | grep -q -- "--client=.*--client=" &&
     # h1 and h2 share the shape, and so its answer
     [ "$(grep "^h1 " "$d/cal.results" | cut -d" " -f2-)" = "$(grep "^h2 " "$d/cal.results" | cut -d" " -f2-)" ] &&
-    grep -qx "h1 io_uring 2 2 5120M 7 2 2 5120M 7 1 2 5120M 7 1 2 5120M 7 8 2 5120M 7 8 2 5120M 7" "$d/cal.results" &&
-    grep -qx "h3 io_uring 1 2 5120M 15 1 2 5120M 15 1 2 5120M 8 1 2 5120M 8 8 2 5120M 7 8 2 5120M 7" "$d/cal.results" &&
+    # h1 (8 cpus, weka on 7, the OS on 0-1): N=5, so bandwidth reaches line
+    # rate only at 2N with the siblings in, iops peaks at 2N, latency holds
+    # the floor to N; h3 (16 cpus): N=13, bandwidth tops out at N
+    grep -qx "h1 io_uring 2 1 5120M 10 2 1 5120M 10 1 1 5120M 5 1 1 5120M 5 8 1 5120M 10 8 1 5120M 10 - - - - - - - -" "$d/cal.results" &&
+    grep -qx "h3 io_uring 1 1 5120M 13 1 1 5120M 13 1 1 5120M 8 1 1 5120M 8 2 1 5120M 26 2 1 5120M 26 - - - - - - - -" "$d/cal.results" &&
     # the engine and the tuples reach targets.final, which staging reads
     t=$(awk -F"\t" "\$1==\"h2\" {print \$3, \$6, \$9, \$14, \$17}" "$d/targets.final") &&
-    [ "$t" = "io_uring 7 2 7 1" ] &&
+    [ "$t" = "io_uring 10 2 5 1" ] &&
     case "$out" in
-        *"shape 1 of 2: 2 host(s), calibrated on h1"*"shape 1: ioengine io_uring"*"shape 1 bw-write: numjobs=7 iodepth=2"*"shape 1 lat-read: floor 100.0 us"*"shape 2: measuring"*"solo on h3"*) true;;
+        *"shape 1 of 2: 2 host(s), calibrated on h1"*"N=5"*"shape 1: ioengine io_uring"*"shape 1 bw-write: numjobs=10 iodepth=2"*"siblings in that did"*"shape 1 lat-read: floor 100.0 us"*"shape 2: measuring"*"solo on h3"*) true;;
         *) printf "%s\n" "$out" >&2; false;;
     esac'
 t_assert "calibrate: a rep that already carries a direction reuses it for the whole shape" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
-    { printf "h1"; for i in $(seq 2 29); do
+    { printf "h1"; for i in $(seq 2 37); do
           case $i in (6) printf "\t3";; (7) printf "\t5120M";; (8) printf "\t2";; (9) printf "\t4";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$d/targets.final"
     out=$( (source ./wekatester
@@ -3724,7 +3942,7 @@ t_assert "calibrate: a rep that already carries a direction reuses it for the wh
      run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 )
     ! grep -q -- "--client=" "$d/simlog" &&
-    grep -qx "h2 - 4 2 5120M 3 - - - - - - - - - - - - - - - - - - - -" "$d/cal.results" &&
+    grep -qx "h2 - 4 2 5120M 3 - - - - - - - - - - - - - - - - - - - - - - - - - - - -" "$d/cal.results" &&
     case "$out" in *"shape 1: h1 already carries bw read geometry (qd/nr/fs/nj 4/2/5120M/3) -- the whole shape reuses it"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "calibrate: only representatives seed; unified reads seed the shared set, bw-only writes truncate" bash -c '
@@ -3740,11 +3958,13 @@ t_assert "calibrate: only representatives seed; unified reads seed the shared se
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    # 4 cpus, weka on 3, the OS on 0-1: N=1, one file per job, and the 2N
+    # cells widen the shared read set to two jobs
     ! grep -q "^h2|" "$d/simlog" &&
-    grep -qx "filename=shared.0/0:shared.1/0" "$d/cal/h1/cal-seed-read.job" &&
-    grep -q "^h1.0/0 5120$" "$d/cal/h1/truncate.list" &&
+    grep -qx "filename=shared.0/0" "$d/cal/h1/cal-seed-read.job" &&
+    grep -qx "filename=shared.0/1" "$d/cal/h1/cal-seed-read.job" &&
     grep -q "truncate -s 5120M" "$d/simlog" &&
-    case "$out" in *"cal: seed estimate: h1 (shared read set, 3x2 read + 0x0 write jobs x files): 6 dense file(s) = 30.0 GiB to write"*"truncate-seeded 6 write file(s)"*) true;;
+    case "$out" in *"cal: seed estimate: h1 (shared read set, 1x1 read + 0x0 write jobs x files): 1 dense file(s) = 5.0 GiB to write"*"truncate-seeded 1 write file(s)"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "calibrate: a 4k-random write search forces the dense write seed" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -3788,7 +4008,7 @@ t_assert "calibrate: a cell failure files its evidence and dies pointing at the 
             calibrate) 2>&1 >/dev/null ); rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
-        *"EVIDENCE[cell bw-read libaio numjobs=1 iodepth=1 nrfiles=2|cal-bw-read-libaio-nj1-qd1-nr2-30s.job|say|h1]"*"calibration cell bw-read libaio numjobs=1 iodepth=1 nrfiles=2 failed on h1 ("*"in the run bundle under cal/)"*) true;;
+        *"EVIDENCE[cell bw-read libaio numjobs=1 iodepth=1 nrfiles=1|cal-bw-read-libaio-nj1-qd1-nr1-30s.job|say|h1]"*"calibration cell bw-read libaio numjobs=1 iodepth=1 nrfiles=1 failed on h1 ("*"in the run bundle under cal/)"*) true;;
         *) echo "$err" >&2; false;;
     esac &&
     case "$err" in *"/dev/shm/wt"*) echo "points at tmpfs: $err" >&2; false;; *) true;; esac'
@@ -3882,8 +4102,8 @@ t_assert "tuner: the shared read set is laid out for the widest reader, on the f
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\n[a]\nrw=read\n" > "$FIX/src/011-bw.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null 2>&1
     # h2 reads the shared set with 9 jobs, h1 with 3
-    { printf "h1"; for i in $(seq 2 29); do case $i in (6) printf "\t3";; (*) printf "\t-";; esac; done; printf "\n"
-      printf "h2"; for i in $(seq 2 29); do case $i in (6) printf "\t9";; (*) printf "\t-";; esac; done; printf "\n"; } > "$FIX/targets.final"
+    { printf "h1"; for i in $(seq 2 37); do case $i in (6) printf "\t3";; (*) printf "\t-";; esac; done; printf "\n"
+      printf "h2"; for i in $(seq 2 37); do case $i in (6) printf "\t9";; (*) printf "\t-";; esac; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester; WEKATESTER_NS="unified \$filenum/\$jobnum" \
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     l1=$FIX/jobs/h1/000-wekatester-layout.job; l2=$FIX/jobs/h2/000-wekatester-layout.job
@@ -3977,9 +4197,9 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
      WORK_DIR=$d
      # h1: bw_r measured (qd 4, nr 8, fs 64M) and iops_r measured (32/2/256M)
      # h2: only bw_r measured (8/1/2048M); neither carries an engine
-     printf "h1 - 4 8 64M - - - - - - - - - - - - - 32 2 256M - - - - -\nh2 - 8 1 2048M - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
+     printf "h1 - 4 8 64M - - - - - - - - - - - - - 32 2 256M - - - - - - - - - - - - -\nh2 - 8 1 2048M - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
      # h1 already carries an operator iops_r_qd=64 (col 25): fill must keep it
-     { printf "h1"; for i in $(seq 2 29); do
+     { printf "h1"; for i in $(seq 2 37); do
           case $i in (25) printf "\t64";; (*) printf "\t-";; esac
        done; printf "\n"; } > "$d/targets.final"
      apply_cal_results)
@@ -3988,10 +4208,10 @@ t_assert "apply_cal_results: fills only dashes, operator values survive, synthes
     [ "$a" = "4 8 64M 64 2 256M" ] && [ "$b" = "8 1 2048M" ] || { echo "a=$a b=$b" >&2; false; }
     (source ./wekatester
      WORK_DIR=$d; rm -f "$d/targets.final"
-     printf "h3 - 16 2 1024M - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
+     printf "h3 - 16 2 1024M - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
      apply_cal_results)
     c=$(awk -F"\t" "\$1==\"h3\" {print NF, \$9}" "$d/targets.final")
-    [ "$c" = "29 16" ]'
+    [ "$c" = "37 16" ]'
 
 # --- sysinfo capture: per-host box context in every bundle ---
 t_assert "sysinfo: one file per item per host, missing tools say so" bash -c '

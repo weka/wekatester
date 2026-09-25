@@ -47,6 +47,7 @@ FAST_TRACK=0        # -r: no prompts, no editors -- create what is needed and ru
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
+BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 
 # -C/--customize: copy a workload set, edit it, run it.
 CUSTOMIZE=0
@@ -413,7 +414,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
@@ -437,7 +438,8 @@ attaching is the way to pass a value that starts with a dash.
                           derive system-specific fio options from the workers
                           (default level when omitted: max)
                           cal: group the clients into hardware shapes and,
-                          solo on one client per shape, search numjobs,
+                          solo on one client per shape, search numjobs
+                          (N/2, N, 2N, 4N of N usable physical cores),
                           iodepth, nrfiles and the ioengine per test type:
                           bandwidth toward NIC line rate, the most iops,
                           the most jobs at the latency floor
@@ -468,6 +470,9 @@ attaching is the way to pass a value that starts with a dash.
                           on request), then run it;
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
+  -b, --bulk     run every latency test at 1MiB blocks too, as a separate
+                 test listed on its own (under -a cal/brutal the 1MiB test
+                 gets its own calibrated job count)
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -587,11 +592,55 @@ def file_directions(lines):
         out.update(rw_directions(sec["rw"] or glob))
     return out
 
-# The host-file schema: the host, four identity columns, then six nj/fs/nr/qd
-# geometry slots, one per (type, direction).
-GEOM_SLOTS = ("bw_r", "bw_w", "lat_r", "lat_w", "iops_r", "iops_w")
+def job_bs(lines):
+    """The block size the file's MEASURED section runs, in bytes: the last
+    job section's bs=/blocksize=, else [global]'s, else fio's 4k. The
+    workload runs last in every jobfile (create sections come first), and a
+    split value ("4k,8k": read,write) is read by its first entry."""
+    glob, last, in_job = "", "", False
+    for line in lines:
+        m = re.match(r"^\[(.+)\]\s*$", line)
+        if m:
+            in_job = m.group(1).strip() != "global"
+            if in_job:
+                last = ""
+            continue
+        m = re.match(r"^(?:bs|blocksize)=(\S+)", line)
+        if m:
+            if in_job:
+                last = m.group(1)
+            else:
+                glob = m.group(1)
+    v = (last or glob or "4k").split(",")[0].split(":")[0]
+    try:
+        return parse_size(v)
+    except ValueError:
+        return 4096
+
+# The first line of a latency test's one-job twin (-a cal/brutal): the tuner
+# stages it at numjobs=iodepth=nrfiles=1 on every client whatever the search
+# found, so the run shows one single-threaded stream's latency next to the
+# latency of every client at its calibrated load.
+FLOOR_MARKER = "# wekatester-floor:"
+
+def is_floor_twin(lines):
+    return any(l.startswith(FLOOR_MARKER) for l in lines[:3])
+
+def lat_kind(lines):
+    """A latency file's geometry kind: 'lat1m' when its measured section
+    moves 1MiB blocks (the -b test, whose job count and floor are its own
+    slot), 'lat' otherwise."""
+    return "lat1m" if job_bs(lines) >= (1 << 20) else "lat"
+
+# The host-file schema: the host, four identity columns, then eight nj/fs/nr/qd
+# geometry slots, one per (type, direction). The 1MiB latency slots (-b) come
+# LAST, so a host file written before they existed still lines up column for
+# column -- its rows simply end early.
+GEOM_SLOTS = ("bw_r", "bw_w", "lat_r", "lat_w", "iops_r", "iops_w",
+              "lat1m_r", "lat1m_w")
 GEOM_NAMES = ("bandwidthR", "bandwidthW", "latencyR", "latencyW",
-              "iopsR", "iopsW")
+              "iopsR", "iopsW", "latency1mR", "latency1mW")
+HOSTFILE_COLS = 5 + len(GEOM_SLOTS)   # host, login, engine, cpus, dir, slots
 FIELDS = ("login", "engine", "cpus", "dir") + tuple(
     f"{s}_{k}" for s in GEOM_SLOTS for k in ("nj", "fs", "nr", "qd"))
 
@@ -666,22 +715,112 @@ def probe_unbindable(path, universe):
     bindp, _ = probe_cpu_fact(path, "bindable_priv")
     return set(universe) - bind - bindp
 
-def probe_usable(path, base_list=""):
-    """The cpus fio may run on for one host, sorted: <base_list> (the
-    operator's cpu list; every cpu when empty) minus weka's pinned cores and
-    minus the cpus the host refuses to bind. ONE rule for usable_cores and
-    the calibration shapes -- the tuner's usable_for says the same thing
-    over its own facts, and a divergence would make a measured job count
+def probe_topology(path):
+    """cpu -> (socket, core) from the probe's topo_* lines (the sysfs
+    topology files), where core is the set of that core's hardware threads.
+    {} when the probe carried none: an old probe, or a /sys without
+    topology -- and then every cpu counts as a core of its own."""
+    pkg, cid, sib = {}, {}, {}
+    try:
+        fh = open(path)
+    except OSError:
+        return {}
+    with fh:
+        for line in fh:
+            f = line.split()
+            if len(f) < 3 or not f[0].startswith("topo_") or not f[1].isdigit():
+                continue
+            c = int(f[1])
+            try:
+                if f[0] == "topo_physical_package_id":
+                    pkg[c] = int(f[2])
+                elif f[0] == "topo_core_id":
+                    cid[c] = int(f[2])
+                elif f[0] == "topo_thread_siblings_list":
+                    sib[c] = frozenset(parse_cpulist(f[2]))
+            except ValueError:
+                continue
+    cpus = set(pkg) | set(cid) | set(sib)
+    # threads without a siblings list share a core with every thread of the
+    # same (socket, core_id)
+    byid = {}
+    for c in cpus:
+        if c not in sib and c in cid:
+            byid.setdefault((pkg.get(c, 0), cid[c]), set()).add(c)
+    out = {}
+    for c in cpus:
+        if c in sib and c in sib[c]:
+            core = sib[c]
+        elif c in cid:
+            core = frozenset(byid[(pkg.get(c, 0), cid[c])])
+        else:
+            core = frozenset([c])
+        out[c] = (pkg.get(c, 0), core)
+    return out
+
+def reserve_count(ncores, ndpdk):
+    """Cores left to the OS and weka's own non-DPDK work (Frank, 2026-09-25):
+    2 on a host of up to 24 physical cores, 4 above, plus one for every 4
+    DPDK cores past 4 (5-8 -> +1, 9-12 -> +2), at most 12 and never more than
+    half the cores. Core 0 is always one of them."""
+    extra = (ndpdk - 4 + 3) // 4 if ndpdk > 4 else 0
+    return max(1, min((2 if ncores <= 24 else 4) + extra, 12, ncores // 2))
+
+def place_reserve(order, socket, dpdk, core0, want):
+    """Which cores the reserve takes: core 0 of socket 0 first, then one core
+    at a time round-robin over the sockets from the one after core 0's, each
+    socket giving its lowest free core. That is Frank's placement: two
+    sockets reserve core 0 and the next core of socket 0 plus the first two
+    of socket 1; one socket reserves its next cores; more sockets share the
+    rest one at a time. A DPDK core is never a reserve core -- not even core
+    0 when weka has pinned it (a misconfiguration the tuner warns about): the
+    OS then gets its full count from the free cores."""
+    picked = [core0] if core0 is not None and core0 not in dpdk else []
+    socks = sorted(set(socket[k] for k in order))
+    if not socks:
+        return picked
+    s0 = socket.get(core0, socks[0])
+    i = socks.index(s0) if s0 in socks else 0
+    rr = socks[i + 1:] + socks[:i + 1]
+    free = dict((s, [k for k in order if socket[k] == s and k not in dpdk
+                     and k not in picked]) for s in socks)
+    while len(picked) < want and any(free.values()):
+        for s in rr:
+            if len(picked) >= want:
+                break
+            if free[s]:
+                picked.append(free[s].pop(0))
+    return picked
+
+def probe_cores(path, base_list=""):
+    """The cpus fio may run on for one host, counted in PHYSICAL cores
+    (Frank's rule, 2026-09-25). ONE rule for the tuner, the calibration
+    shapes and usable_cores: a divergence would make a measured job count
     describe a cpu set the staged jobs do not run on.
-      - weka pins each dedicated io thread to exactly ONE cpu (a single-cpu
-        task mask), while utility threads carry wide masks and float. Only
-        single-cpu masks are dedicated cores.
+      - weka's DPDK cores are whole cores. Weka pins each dedicated io thread
+        to exactly ONE cpu (a single-cpu task mask; utility threads carry
+        wide masks and float), and hives that core's SMT sibling off on
+        purpose (WEKAPP-550768), so the sibling is weka's too.
+      - core 0 of socket 0 and its sibling always stay with the OS, and the
+        reserve (reserve_count, place_reserve) takes more cores beside it.
+      - N = physical cores - DPDK cores - reserved cores. N/2 and N jobs run
+        one per physical core with the siblings idle ("phys"); 2N and 4N run
+        on every thread of those cores ("all"), which is how a calibration
+        finds out whether the siblings help or hurt.
+      - an operator cpu list (<base_list>) is the operator's own reserve:
+        only weka's cores and core 0's pair come out of it.
       - isolcpus does NOT narrow the set: measured on saving-calf
-        (2026-08-20), isolating cpus cost 4-7% write iops at every
-        housekeeping-core count tried, and the widest mask won. Split
-        affinity keeps a mask spanning both partitions safe."""
+        (2026-08-20), confining the OS cost 4-7% write iops at every
+        housekeeping-core count tried. Split affinity keeps a mask spanning
+        both partitions safe.
+    Returns a dict: n, phys, all, and the counts the logs quote (ncores,
+    dpdk, reserved: the reserved cores' threads, sockets, smt, topo)."""
     ncpus, weka = 0, set()
-    for line in open(path):
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
         f = line.split()
         if len(f) < 2:
             continue          # a bare 'isolated' line means no isolated cpus
@@ -691,13 +830,53 @@ def probe_usable(path, base_list=""):
             cpuset = parse_cpulist(f[1])
             if len(cpuset) == 1:
                 weka |= cpuset
-    universe = probe_universe(path, ncpus)
-    unbind = probe_unbindable(path, universe or set(range(ncpus)))
-    base = parse_cpulist(base_list) if base_list else set(universe)
-    if universe:
-        base &= universe   # never a cpu the host does not have
-    return (sorted(base - weka - unbind) or sorted(base - weka)
-            or sorted(base) or list(range(ncpus)))
+    universe = set(probe_universe(path, ncpus))
+    unbind = probe_unbindable(path, universe)
+    topo = probe_topology(path)
+    core = {}      # cpu -> its core's key: the core's lowest online thread
+    for c in sorted(universe):
+        t = topo.get(c)
+        core[c] = min(((set(t[1]) & universe) if t else set()) | {c})
+    threads = {}
+    for c in sorted(core):
+        threads.setdefault(core[c], []).append(c)
+    socket = dict((k, topo[k][0] if k in topo else 0) for k in threads)
+    order = sorted(threads)
+    dpdk = set(core[c] for c in weka if c in core)
+    core0 = core.get(0, order[0] if order else None)
+    if base_list:
+        base = parse_cpulist(base_list)
+        if universe:
+            base &= universe
+        reserved = [core0] if core0 is not None else []
+    else:
+        base = set(universe)
+        reserved = place_reserve(order, socket, dpdk, core0,
+                                 reserve_count(len(order), len(dpdk)))
+    skip = dpdk | set(reserved)
+    use = []
+    for k in order:
+        if k in skip:
+            continue
+        t = [c for c in threads[k] if c in base and c not in unbind]
+        if t:
+            use.append(t)
+    return {"n": len(use), "phys": sorted(t[0] for t in use),
+            "all": sorted(c for t in use for c in t),
+            "ncores": len(order), "dpdk": len(dpdk),
+            "reserved": [threads[k] for k in reserved if k in threads],
+            "sockets": len(set(socket.values())) or 1,
+            "smt": any(len(v) > 1 for v in threads.values()),
+            "topo": bool(topo), "weka_core0": core0 in dpdk}
+
+def cores_summary(c):
+    """The one-line account of probe_cores' answer the logs print."""
+    res = " ".join(fmt_cpulist(t) for t in c["reserved"]) or "none"
+    return ("%d physical core(s)%s - %d weka DPDK - %d reserved for the OS "
+            "(%s) = N=%d: N/2 and N jobs on %s, 2N and 4N on %s"
+            % (c["ncores"], "" if c["topo"] else " (no topology: one per cpu)",
+               c["dpdk"], len(c["reserved"]), res, c["n"],
+               fmt_cpulist(c["phys"]) or "none", fmt_cpulist(c["all"]) or "none"))
 
 def pick_engine(tally):
     # Most-used engine wins; a tie goes to ENGINE_ORDER -- io_uring over
@@ -921,6 +1100,7 @@ parse_args() {
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
             -u|--unlink) UNLINK=1; shift ;;
+            -b|--bulk) BULK=1; shift ;;
             -a|--auto)
                 AUTO_LEVEL="max"
                 # The level is a keyword, not a value, so it is matched
@@ -1020,7 +1200,9 @@ brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 
 # Set inspection: which searches does a jobfile set actually need?
 # Prints unique sorted lines from exactly {bw read, bw write, iops read,
-# iops write, lat read, lat write} -- nothing else ever -- and prints NOTHING
+# iops write, lat read, lat write, lat1m read, lat1m write} -- nothing else
+# ever; lat1m only for a 1MiB latency file or, under -b, beside every 4k
+# one -- and prints NOTHING
 # when the set needs no calibration. That grammar is a contract: the calibration engine and the
 # dry-run report both consume these lines verbatim, so an extra ladder is
 # wasted measurement time on every client and a missing one silently falls
@@ -1055,11 +1237,11 @@ brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 # value, else [global]'s): read/randread -> read, write/randwrite -> write,
 # the mixed forms -> both. A file that names no rw= anywhere contributes no
 # direction, hence no ladder.
-cal_required() {   # cal_required <setdir>
-    pyrun "$1" <<'PYEOF' || return 1
+cal_required() {   # cal_required <setdir> [bulk 0|1]
+    pyrun "$1" "${2:-0}" <<'PYEOF' || return 1
 import os, re, sys
 
-src = sys.argv[1]
+src, bulk = sys.argv[1], sys.argv[2] == "1"
 if not os.path.isdir(src):
     sys.exit(f"ERROR: cal_required: not a jobfile set directory: {src}")
 
@@ -1089,9 +1271,14 @@ for f in sorted(os.listdir(src)):
     items = report_items(lines)
     if "latency" in items:
         # latency runs at qd1 by definition; what is searched is how many
-        # jobs keep it at the floor, per direction the file uses
+        # jobs keep it at the floor, per direction the file uses. A 1MiB
+        # latency file is its own search (lat1m), and under -b every 4k
+        # latency file gains a 1MiB twin at staging, so it needs one too.
+        kind = lat_kind(lines)
         for d in file_directions(lines):
-            needed.add(f"lat {d}")
+            needed.add(f"{kind} {d}")
+            if bulk and kind == "lat":
+                needed.add(f"lat1m {d}")
         continue
     types = []
     if "bandwidth" in items or not items: types.append("bw")
@@ -1105,30 +1292,21 @@ for line in sorted(needed):
 PYEOF
 }
 
-# Usable cores for ONE host, by the tuner's own rule (probe_usable in the
+# Usable cores for ONE host, by the tuner's own rule (probe_cores in the
 # shared layer) -- the same arithmetic auto_tune's facts block does for its
 # cpus_allowed/numjobs stamping, and the one the calibration shapes use to
 # size their cells (a divergence would make a measured job count describe a
-# cpu set the staged jobs do not run on). ONE rule: everything except the
-# cpus weka has pinned.
-#   - weka pins each dedicated io thread to exactly ONE cpu (a single-cpu task
-#     mask), while utility threads carry wide masks and float. Only single-cpu
-#     masks are dedicated cores; counting the wide ones collapses the union
-#     onto "all cpus" and leaves nothing usable.
-#   - isolcpus does NOT narrow the set. It used to: fio was pinned to the
-#     isolated cpus minus weka's, on the theory that the isolated partition
-#     was set aside for exactly this work. Measured on saving-calf
-#     (2026-08-20), that theory cost throughput -- isolating cpus was 4-7%
-#     WORSE on write iops at every housekeeping-core count tried, and the
-#     widest mask won, because what fio wants is the largest number of
-#     distinct physical cores. A mask spanning both partitions is safe:
-#     cpus_allowed_policy=split gives every job its own cpu.
-# Prints the COUNT, and fails loudly rather than printing 0: numjobs=0 is no
-# valid fio job, so a ladder sized from an unreadable probe must not run.
-usable_cores() {   # usable_cores <host> [count|list] [cpulist]
-                   # count (or list) of usable cpus: the given cpu list minus
-                   # weka's pinned cores when one is provided (the host-file
-                   # nj contract), every cpu minus weka's otherwise
+# cpu set the staged jobs do not run on). ONE rule, in physical cores: every
+# core except weka's DPDK cores (with their siblings) and the OS reserve
+# (core 0 and its sibling first); see probe_cores.
+# count = N, the usable PHYSICAL cores; phys = one thread per usable core,
+# where N/2 and N jobs run; list = every thread of them, where 2N and 4N run.
+# Fails loudly rather than printing 0: numjobs=0 is no valid fio job, so a
+# ladder sized from an unreadable probe must not run.
+usable_cores() {   # usable_cores <host> [count|phys|list] [cpulist]
+                   # an operator cpu list (the host-file nj contract) is the
+                   # base: weka's cores and core 0's pair come out of it,
+                   # nothing else
     [ -f "$WORK_DIR/probe/$1" ] || {
         log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
         return 1
@@ -1137,13 +1315,15 @@ usable_cores() {   # usable_cores <host> [count|list] [cpulist]
 import sys
 
 path = sys.argv[1]
-usable = probe_usable(path, sys.argv[3])
-if not usable:
-    sys.exit(f"ERROR: usable_cores: {path} reports no usable cpus")
+c = probe_cores(path, sys.argv[3])
+if c["n"] < 1:
+    sys.exit(f"ERROR: usable_cores: {path} leaves fio no cpus: {cores_summary(c)}")
 if sys.argv[2] == "list":
-    print(",".join(str(c) for c in usable))
+    print(",".join(str(x) for x in c["all"]))
+elif sys.argv[2] == "phys":
+    print(",".join(str(x) for x in c["phys"]))
 else:
-    print(len(usable))
+    print(c["n"])
 PYEOF
 }
 
@@ -1314,7 +1494,8 @@ CAL_SCRATCH=".wekatester-cal"
 #              accounting off -- the iops test records no latency
 #   latency    the floor (one job at queue depth 1), then as many jobs as keep
 #              the latency within CAL_FLOOR_PCT (5) percent of it: the most
-#              IOPS the client does AT the floor. Not a knee.
+#              IOPS the client does AT the floor. Not a knee. Under -b the
+#              same again at 1MiB blocks (lat1m), its own test and slot.
 #
 # WHERE IT IS MEASURED. Clients are grouped into SHAPES by their hardware --
 # cpu model and count, memory, weka's pinned cores, and the NICs weka uses
@@ -1336,11 +1517,16 @@ CAL_SCRATCH=".wekatester-cal"
 # until the planner says done. The recorded tuple is (qd nr fs nj), with nj
 # always written down: bandwidth's answer IS a job count, and so is latency's.
 #
-# `-a brutal` is the same search with every early stop disabled -- every rung
-# of every ladder is measured, the re-splits run to their caps, and more
-# cells are re-measured before a peak is picked. The retired brutal grid (an
-# nrfiles = iodepth diagonal under fleet contention) is gone; nrfiles and
-# numjobs are separate axes of the one search now.
+# THE JOB COUNTS (Frank, 2026-09-25) come from N, the client's usable
+# PHYSICAL cores (probe_cores: every core minus weka's DPDK cores and the OS
+# reserve). N/2 and N jobs run one per physical core with the siblings idle;
+# 2N and 4N run on the siblings too, which is how a search learns whether
+# they help or hurt. nrfiles walks CAL_NR_LADDER, iodepth
+# CAL_BW_QD_LADDER or CAL_IOPS_QD_LADDER.
+#
+# `-a brutal` is the same search with every early stop disabled: every
+# combination of numjobs, iodepth and nrfiles the ladders define is measured,
+# and more cells are re-measured before a peak is picked.
 CAL_RUNTIME=${CAL_RUNTIME:-30}   # seconds per search cell (plus a 2s ramp);
                          # "-a cal:15" sets it per run. It does not change how
                          # long the measured jobs run -- that is -x.
@@ -1353,20 +1539,28 @@ CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after every write cell and after a
                          # surface smooth while the write surfaces carried the
                          # previous cell's debt; at 5s cells a whole write grid
                          # came back a checkerboard)
-# ONE file size everywhere. Every calibration cell, every seeded file and --
-# through the measured tuples the writeback records -- every staged test runs
-# on 5G files, so a number from any level is comparable with any other and
-# the sweep's size floor is satisfied by construction. Measured on isca224
-# (2026-08-24): the same staged iops-write geometry delivered 7.5% differently
-# at fs=256M vs fs=1024M, purely from the working set -- sizes are part of the
-# measurement, so they are held equal. A host file that pins its own fs still
+# ONE amount of data per job everywhere. Every seeded file is 5G, and every
+# calibration cell -- and through the measured tuples the writeback records,
+# every staged test -- gives each job 5G of data, split over its files
+# (nrfiles=2 runs 2 x 2560M, nrfiles=4 4 x 1280M, each the leading part of a
+# 5G file), so a number from any level is comparable with any other and the
+# sweep's size floor is satisfied by construction. The working set is part of
+# the measurement: on isca224 (2026-08-24) the same staged iops-write geometry
+# delivered 7.5% differently at fs=256M vs fs=1024M, and WEKAPP-289548 saw 4k
+# random reads lose 30% from 1M files to 3G files -- so the file ladder moves
+# the file count and nothing else. A host file that pins its own fs still
 # wins, as host files always do.
 FILESIZE_MIB=${FILESIZE_MIB:-5120}
-CAL_NR=${CAL_NR:-2}      # files per job in every search cell
-CAL_NR_CANDIDATES=${CAL_NR_CANDIDATES:-"1 4"}   # iops: file counts re-tested
-                         # at the winning (numjobs, iodepth); nrfiles was the
-                         # flattest axis in every field grid, so two
-                         # neighbours, not a sweep
+CAL_NR=${CAL_NR:-1}      # files per job in the first cell of every search,
+                         # and in every latency cell: at iodepth 1 one IO is in
+                         # flight per job, so more files add no concurrency
+CAL_NR_LADDER=${CAL_NR_LADDER:-"1 2 4"}   # nrfiles tried per job count: at
+                         # 2N and 4N for bandwidth, at every count for iops
+CAL_BW_QD_LADDER=${CAL_BW_QD_LADDER:-"1 2 4 8 16"}   # bandwidth iodepths at
+                         # 2N and 4N; at or below N bandwidth runs nrfiles=1
+                         # iodepth=1 only (1 is kept at 2N so N x qd1 against
+                         # 2N x qd1 isolates what the siblings add)
+CAL_IOPS_QD_LADDER=${CAL_IOPS_QD_LADDER:-"1 2 4 8 16 32 64 128 256 512"}
 CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
 CAL_FLOOR_PCT=${CAL_FLOOR_PCT:-5}  # latency: a rung is "at the floor" within this
 CAL_FLOOR_REPS=${CAL_FLOOR_REPS:-3}   # readings of the one-job floor cell; the
@@ -1387,35 +1581,29 @@ CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs without progress that
 CAL_CONFIRM=${CAL_CONFIRM:-3}   # before a peak is picked, the top cells get a
                          # second reading: contention only subtracts, so a
                          # second chance can raise a cell and never lower it
-CAL_BW_QD_MAX=${CAL_BW_QD_MAX:-128}   # bandwidth: deepest queue tried once the
-                         # job ladder has not reached line rate
-CAL_IOPS_QD_MAX=${CAL_IOPS_QD_MAX:-256}   # iops: deepest queue tried
-CAL_NJ_MAX_PCT=${CAL_NJ_MAX_PCT:-200}   # most jobs a cell may run, percent of
-                         # the usable cpus: the iops re-split may try two jobs
-                         # per cpu (on isca224 the peak moved to 2x jobs at
-                         # qd8). Each step up widens the seeded dataset
-                         # (at 200, 52 cores x 2 files x 5G is ~1TiB of read
-                         # set); the seed prices it before writing a byte.
-                         # 300 is a defensible opt-in, and brutal's default.
 CAL_MEM_PCT=${CAL_MEM_PCT:-25}   # percent of a client's MemTotal that one cell's
                          # in-flight buffers (numjobs x iodepth x bs) may take:
-                         # a backstop for small clients at the deep end of the
-                         # bandwidth queue ladder, named in the log when it bites
+                         # a backstop for small clients at the deep end of a
+                         # queue ladder, named in the log when it bites. Every
+                         # step up in jobs or files also widens the seeded
+                         # dataset (4N jobs x 4 files x 5G); the seed prices it
+                         # before writing a byte and stops if it will not fit.
 BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-5}
-BRUTAL_NR_CANDIDATES=${BRUTAL_NR_CANDIDATES:-"1 4 8"}
-BRUTAL_NJ_MAX_PCT=${BRUTAL_NJ_MAX_PCT:-300}
 
-# The knobs as the planner takes them, one k=v word each.
+# The knobs as the planner takes them, one k=v word each; a ladder is one
+# comma-joined word.
 cal_knobs() {
-    local exh=0 conf=$CAL_CONFIRM nrc=$CAL_NR_CANDIDATES njmax=$CAL_NJ_MAX_PCT
+    local exh=0 conf=$CAL_CONFIRM
     if brutal_mode; then
-        exh=1; conf=$BRUTAL_CONFIRM; nrc=$BRUTAL_NR_CANDIDATES; njmax=$BRUTAL_NJ_MAX_PCT
+        exh=1; conf=$BRUTAL_CONFIRM
     fi
     printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" "floor=$CAL_FLOOR_PCT" \
         "band=$CAL_KNEE_PCT" "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
-        "nrc=$(printf '%s' "$nrc" | tr -s ' ' ',')" "bwqd=$CAL_BW_QD_MAX" \
-        "iopsqd=$CAL_IOPS_QD_MAX" "njmaxpct=$njmax" "floorreps=$CAL_FLOOR_REPS"
+        "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
+        "bwqd=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')" \
+        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')" \
+        "floorreps=$CAL_FLOOR_REPS"
 }
 
 # One calibration cell, staged as a jobfile for ONE host. Pure: every input
@@ -1434,12 +1622,13 @@ cal_knobs() {
 # same flags the staged iops jobs carry (and wekawithin has run with for
 # years): the iops test records no latency, and the cell measures exactly
 # what the test will run.
-stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat> <read|write> <engine> <nj> <qd> <nr> <runtime>
+stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime>
     local f=$1 hd=$2 name=$3 cpus=$4 type=$5 dirn=$6 eng=$7 nj=$8 qd=$9 nr=${10} rt=${11} bs rw v
     case "$type" in
         (bw)       bs=1Mi; rw=$dirn ;;
         (iops|lat) bs=4k;  rw=rand$dirn ;;
-        (*) die "stage_cal_cell: unknown cell type: $type (bw|iops|lat)" ;;
+        (lat1m)    bs=1Mi; rw=rand$dirn ;;   # -b: the latency test at 1MiB
+        (*) die "stage_cal_cell: unknown cell type: $type (bw|iops|lat|lat1m)" ;;
     esac
     case "$dirn" in
         (read|write) ;;
@@ -1468,7 +1657,9 @@ stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat> <
         printf 'ioengine=%s\n' "$eng"
         printf 'direct=1\n'
         printf 'bs=%s\n' "$bs"
-        printf 'filesize=%sM\n' "$FILESIZE_MIB"
+        # a job's data stays FILESIZE_MIB however many files it is split over:
+        # the file ladder measures the file count, not a bigger working set
+        printf 'filesize=%sM\n' "$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))"
         printf 'nrfiles=%s\n' "$nr"
         printf 'numjobs=%s\n' "$nj"
         printf 'iodepth=%s\n' "$qd"
@@ -1831,7 +2022,7 @@ for j, names in sorted(groups.items()):
                 "nrfiles=%d" % len(chunk)]
 if sections > 4000:
     sys.exit("ERROR: the seed needs %d fio sections and fio caps a run at "
-             "4096 jobs; lower CAL_NJ_MAX_PCT or the nrfiles candidates" % sections)
+             "4096 jobs; shorten CAL_NR_LADDER or mount weka with more cores (a smaller N)" % sections)
 with open(outpath, "w") as fh:
     fh.write("\n".join(out) + "\n")
 print(len(todo), len(todo) * fsmib, len(trunc))
@@ -1851,7 +2042,7 @@ PYEOF
         if [ -z "$availmib" ]; then
             log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2
         elif [ "$nmib" -gt "$availmib" ]; then
-            die "$host: the calibration dataset needs ${nmib}MiB and $hd has ${availmib}MiB free; free space under the destination, shrink FILESIZE_MIB, lower CAL_NJ_MAX_PCT, or drop -a $AUTO_LEVEL"
+            die "$host: the calibration dataset needs ${nmib}MiB and $hd has ${availmib}MiB free; free space under the destination, shrink FILESIZE_MIB, shorten CAL_NR_LADDER, or drop -a $AUTO_LEVEL"
         fi
     fi
     if [ "${ntrunc:-0}" -gt 0 ]; then
@@ -1897,9 +2088,9 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
         done < "$cov"
     fi
     if [ "$dirn" = read ]; then
-        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_CPUS"
+        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_ALL"
     else
-        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_CPUS"
+        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_ALL"
     fi
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
@@ -2051,7 +2242,10 @@ for h in hosts:
         base = open(os.path.join(auth, h + ".cpus")).read().strip()
     else:
         base = field(h, "cpus")
-    usable = probe_usable(f["path"], base) if os.path.exists(f["path"]) else []
+    cores = probe_cores(f["path"], base)
+    if cores["n"] < 1:
+        sys.exit("ERROR: %s: no cpus left for fio -- %s; mount weka with fewer "
+                 "cores or use a larger client" % (h, cores_summary(cores)))
     ports, why = weka_ports(f)
     linerate, nicsig = 0, "nics:unknown"
     if ports is not None:
@@ -2069,10 +2263,10 @@ for h in hosts:
     pinned = cli_engine if cli_engine != "-" else ("" if regen else field(h, "engine"))
     mem_gib = int(round(f["mem_kb"] / 1048576.0)) if f["mem_kb"] else 0
     key = (f["model"], f["ncpus"], mem_gib, len(f["weka"]), nicsig,
-           len(usable), tuple(cands), pinned)
+           cores["n"], len(cores["all"]), tuple(cands), pinned)
     if key not in index:
         index[key] = len(shapes)
-        shapes.append({"rep": h, "members": [], "f": f, "usable": usable,
+        shapes.append({"rep": h, "members": [], "f": f, "cores": cores,
                        "ports": ports, "why": why, "linerate": linerate,
                        "cands": cands, "pinned": pinned, "mem_gib": mem_gib})
     shapes[index[key]]["members"].append(h)
@@ -2090,8 +2284,9 @@ with open(out_path, "w") as fh:
                 if all(vals):
                     cached.append("%s=%s" % (slot, "/".join(vals)))
         memcap = int(f["mem_kb"] * 1024 * mem_pct / 100) if f["mem_kb"] else 0
-        fh.write("\t".join([str(i), rep, str(len(s["usable"]) or 1),
-                            fmt_cpulist(s["usable"]) or "-", str(int(s["linerate"])),
+        c = s["cores"]
+        fh.write("\t".join([str(i), rep, str(c["n"]), fmt_cpulist(c["phys"]),
+                            fmt_cpulist(c["all"]), str(int(s["linerate"])),
                             ",".join(s["cands"]), s["pinned"] or "-", str(memcap),
                             " ".join(cached) or "-", " ".join(s["members"])]) + "\n")
         if s["ports"]:
@@ -2107,11 +2302,11 @@ with open(out_path, "w") as fh:
                 nics += " -> line rate %s" % gib(s["linerate"])
         else:
             nics = "weka NICs: %s" % s["why"]
-        print("shape %d of %d: %d host(s), calibrated on %s -- %s, %d cpus "
-              "(%d pinned by weka, %d for fio), %s, %s"
+        print("shape %d of %d: %d host(s), calibrated on %s -- %s, %d cpus, %s, %s"
               % (i, len(shapes), len(s["members"]), rep, f["model"] or "cpu model unknown",
-                 f["ncpus"], len(f["weka"]), len(s["usable"]),
-                 ("%d GiB" % s["mem_gib"]) if s["mem_gib"] else "memory unknown", nics))
+                 f["ncpus"], ("%d GiB" % s["mem_gib"]) if s["mem_gib"] else "memory unknown",
+                 nics))
+        print("  cores: %s" % cores_summary(c))
         more = s["members"][:24]
         print("  hosts: %s%s" % (" ".join(more), "" if len(s["members"]) <= 24
                                  else " (+%d more)" % (len(s["members"]) - 24)))
@@ -2128,35 +2323,47 @@ PYEOF
 # or the verdict,
 #   done <numjobs> <iodepth> <nrfiles> <message>
 # History lines are "<phase> <engine> <nj> <qd> <nr> <runtime> <value> [aux]"
-# -- bytes/s for bw, IOPS for iops, mean latency in us (aux: IOPS) for lat.
-# "budget" instead of "next" prints the most cells the search can take.
-#
-#   bandwidth  numjobs 1, 2, 4 ... usable at qd1, stopping at the first rung
-#              >= CAL_LINE_PCT of line rate. Short of it, the queue ladder at
-#              the best job count (a sync engine widens numjobs instead),
-#              again stopping at the target. Never reached, or line rate
-#              unknown: the peak -- the top CAL_CONFIRM cells re-measured, the
-#              best reading wins, and inside CAL_KNEE_PCT the least
-#              outstanding IO. A reading 5% above line rate means the line
-#              rate is not the ceiling, and the search falls back to the peak.
-#   iops       the queue ladder 1..CAL_IOPS_QD_MAX at one job per usable cpu,
-#              until it flattens; then the SAME outstanding IO re-split over
-#              fewer jobs with deeper queues and over more jobs with shallower
-#              ones, each direction continuing while it wins; then nrfiles
-#              re-tested at the winner; then the peak rule above.
+# -- bytes/s for bw, IOPS for iops, mean latency in us (aux: IOPS) for lat
+# and lat1m. "budget" instead of "next" prints the most cells the search can
+# take. N is the shape's usable PHYSICAL cores (probe_cores); the job counts
+# are Frank's (2026-09-25): N/2 and N run one job per physical core with the
+# siblings idle, 2N and 4N put the siblings to work too.
+#   bandwidth  numjobs 1, 2, 4 ... N/2, N at nrfiles=1 iodepth=1, stopping at
+#              the first rung >= CAL_LINE_PCT of line rate -- no queue or file
+#              ladder at or below N. Short of it: 2N and 4N, each walking
+#              iodepth (CAL_BW_QD_LADDER) for every nrfiles (CAL_NR_LADDER),
+#              again stopping at the target; 4N only when 2N beat N (cal).
+#              Never reached, or line rate unknown: the peak -- the top
+#              CAL_CONFIRM cells re-measured, the best reading wins, and
+#              inside CAL_KNEE_PCT the least outstanding IO. A reading 5%
+#              above line rate means the line rate is not the ceiling, and
+#              the search falls back to the peak.
+#   iops       N/2 and N at iodepth=1 nrfiles=1 -- no ladder at or below N
+#              (Frank, 2026-09-25). Then 2N and 4N: the queue ladder
+#              CAL_IOPS_QD_LADDER at nrfiles=1 until it flattens, then nrfiles
+#              2 and 4 at that count's winning iodepth and one step deeper; 4N
+#              only when 2N beat N. Then the peak rule above. Brutal walks the
+#              whole queue ladder at every file count at 2N and 4N.
 #   latency    the floor: CAL_FLOOR_REPS readings of one job at qd1, lowest
-#              wins. Then numjobs 2, 4 ... usable at qd1 while the latency
-#              stays within CAL_FLOOR_PCT of the floor; a rung that leaves the
-#              band gets one re-measure before it is believed. The answer is
-#              the last rung inside the band.
-# Readings from a confirm pass never steer a step that came before it, so
-# re-measuring the top cells cannot reopen a decision already taken.
-cal_plan() {   # cal_plan <next|budget> <bw|iops|lat> <read|write> <engine> <usable> <linerate> <memcap> <history> <k=v>...
+#   lat1m      wins. Then numjobs 2, 4 ... N/2, N at qd1 nrfiles=1, and 2N and
+#              4N at qd1 with each nrfiles of CAL_NR_LADDER (the lowest counts),
+#              while the latency stays within CAL_FLOOR_PCT of the floor; a
+#              rung that leaves the band gets one re-measure before it is
+#              believed. The answer is the last rung inside the band. lat1m is
+#              the same search at 1MiB blocks (-b).
+# Every cell keeps a job's data at FILESIZE_MIB, split over its files
+# (nrfiles=4 reads 4 x 1280M of 5G files): a file ladder that also grew the
+# data would measure the working set, not the file count (WEKAPP-289548: the
+# same 4k test lost 30% IOPS from 1M files to 3G files).
+# A sync engine keeps one IO in flight per job, so its iodepth ladders are
+# just qd1. Readings from a confirm pass never steer a step that came before
+# it, so re-measuring the top cells cannot reopen a decision already taken.
+cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...
     python3 - "$@" <<'PYEOF'
 import sys
 
 act, ctype, dirn, eng = sys.argv[1:5]
-usable = max(1, int(sys.argv[5]))
+N = max(1, int(sys.argv[5]))
 linerate = float(sys.argv[6])
 memcap = float(sys.argv[7])
 hist = sys.argv[8]
@@ -2165,15 +2372,18 @@ EXH = K.get("exh") == "1"
 LINE, FLOORPCT, BAND = float(K["line"]), float(K["floor"]), float(K["band"])
 THR, STOP, CONFIRM = float(K["thr"]), int(K["stop"]), int(K["confirm"])
 RT, NR = K["rt"], int(K["nr"])
-NRC = [int(x) for x in K["nrc"].split(",") if x.strip()]
-BWQD, IOPSQD = int(K["bwqd"]), int(K["iopsqd"])
-NJMAX = max(usable, usable * int(K["njmaxpct"]) // 100)
+def lad(key):
+    return sorted(set(int(x) for x in K[key].split(",") if x.strip()))
+NRL, BWQD, IOPSQD = lad("nrc"), lad("bwqd"), lad("iopsqd")
 FLOORREPS = max(1, int(K["floorreps"]))
 SYNC = ("psync", "sync", "pvsync", "pvsync2", "vsync")
 sync = eng in SYNC
-BS = (1 << 20) if ctype == "bw" else 4096
+if sync:
+    BWQD, IOPSQD = [1], [1]   # one IO in flight per job, whatever iodepth says
+BS = (1 << 20) if ctype in ("bw", "lat1m") else 4096
+N2 = max(1, N // 2)
 
-def ladder(lo, hi):
+def doubling(lo, hi):
     """lo, 2lo, 4lo ... and hi itself: the widest point is always measured,
     even when it is not a power of two."""
     out, v = [], lo
@@ -2184,14 +2394,22 @@ def ladder(lo, hi):
         out.append(hi)
     return out
 
+BW_LOW = sorted(set(doubling(1, N) + [N2]))      # at or below N: nrfiles=1 iodepth=1
+HIGH = [2 * N, 4 * N]                              # the siblings in: the ladders
+IOPS_LOW = sorted(set([N2, N]))
+LAT_LOW = sorted(set(doubling(2, N) + [N2, N]) - {1}) if N >= 2 else []
+NRX = [x for x in NRL if x != NR]
+
 if act == "budget":
     if ctype == "bw":
-        n = len(ladder(1, usable)) + len(ladder(2, BWQD)) + CONFIRM
+        n = len(BW_LOW) + len(HIGH) * len(NRL) * len(BWQD) + CONFIRM
     elif ctype == "iops":
-        n = len(ladder(1, IOPSQD)) + len(ladder(1, usable)) + len(ladder(usable, NJMAX)) \
-            + len([x for x in NRC if x != NR]) + CONFIRM
+        if EXH:
+            n = len(IOPS_LOW) + len(HIGH) * len(NRL) * len(IOPSQD) + CONFIRM
+        else:
+            n = len(IOPS_LOW) + len(HIGH) * (len(IOPSQD) + 2 * len(NRX)) + CONFIRM
     else:
-        n = FLOORREPS + 2 * len(ladder(2, usable) if usable >= 2 else [])
+        n = FLOORREPS + 2 * (len(LAT_LOW) + len(HIGH) * len(NRL))
     print(n)
     sys.exit(0)
 
@@ -2259,8 +2477,19 @@ def human(v):
 def geo(k):
     return "numjobs=%d iodepth=%d nrfiles=%d" % k
 
+def where(nj):
+    return "one job per physical core" if nj <= N else "siblings in"
+
 def fits(k):
     return memcap <= 0 or k[0] * k[1] * BS <= memcap
+
+notes = []
+def guard(k):
+    # in-flight buffers do not depend on nrfiles: one note per job count and depth
+    n = ("the queue ladder stopped short of numjobs=%d iodepth=%d: its in-flight "
+         "buffers exceed the memory guard (CAL_MEM_PCT)" % (k[0], k[1]))
+    if n not in notes:
+        notes.append(n)
 
 def reading(k):
     n = len(reads(k))
@@ -2268,7 +2497,6 @@ def reading(k):
 
 if ctype == "bw":
     target = linerate * LINE / 100 if linerate > 0 else 0.0
-    notes = []
     if target and rows and max(v for p, k, v, a in rows) > linerate * 1.05:
         target = 0.0
         notes.append("a reading beat the NIC line rate by more than 5%, so line "
@@ -2278,39 +2506,47 @@ if ctype == "bw":
                 linerate / float(1 << 30))) if linerate > 0 else ""
     def note():
         return ("; " + "; ".join(notes)) if notes else ""
+    # at or below N: one job per physical core, nrfiles=1 iodepth=1, nothing else
     done1, vals = [], []
-    for k in [(nj, 1, NR) for nj in ladder(1, usable)]:
+    for nj in BW_LOW:
+        k = (nj, 1, NR)
         if best(k, True) is None:
             cell("numjobs", k)
         done1.append(k)
         vals.append(best(k, True))
         if target and not EXH and best(k, True) >= target:
-            finish(k, "%s -> %s%s (first numjobs at >= %g%% of line rate)%s"
+            finish(k, "%s -> %s%s (the first numjobs at >= %g%% of line rate, "
+                   "one job per physical core)%s"
                    % (geo(k), human(best(k)), of_line(k), LINE, note()))
         if not target and not EXH and plateau(vals):
             break
-    base = tiepick(done1, True)
-    if sync:
-        stage2 = [(nj, 1, NR) for nj in ladder(usable * 2, NJMAX)] if NJMAX > usable else []
-        phase, vals2 = "numjobs", list(vals)
-    else:
-        stage2 = [(base[0], qd, NR) for qd in ladder(2, BWQD)]
-        phase, vals2 = "iodepth", [best(base, True)]
+    top1 = max(best(k, True) for k in done1)
+    # past N the siblings join, and iodepth x nrfiles are searched
     done2 = []
-    for k in stage2:
-        if not fits(k):
-            notes.append("the queue ladder stopped short of %s: its in-flight "
-                         "buffers exceed the memory guard (CAL_MEM_PCT)" % geo(k))
-            break
-        if best(k, True) is None:
-            cell(phase, k)
-        done2.append(k)
-        vals2.append(best(k, True))
-        if target and not EXH and best(k, True) >= target:
-            finish(k, "%s -> %s%s (numjobs alone did not reach %g%% of line "
-                   "rate; this is the first iodepth that did)%s"
-                   % (geo(k), human(best(k)), of_line(k), LINE, note()))
-        if not EXH and plateau(vals2):
+    for nj in HIGH:
+        top2 = 0.0
+        for nr in NRL:
+            vals2 = []
+            for qd in BWQD:
+                k = (nj, qd, nr)
+                if not fits(k):
+                    guard(k)
+                    break
+                if best(k, True) is None:
+                    cell("wide", k)
+                done2.append(k)
+                v = best(k, True)
+                vals2.append(v)
+                top2 = max(top2, v)
+                if target and not EXH and v >= target:
+                    finish(k, "%s -> %s%s (numjobs up to N=%d on the physical cores did "
+                           "not reach %g%% of line rate; this is the first cell with the "
+                           "siblings in that did)%s"
+                           % (geo(k), human(v), of_line(k), N, LINE, note()))
+                if not EXH and plateau(vals2):
+                    break
+        if not EXH and nj == 2 * N and top2 <= top1 * (1 + THR / 100):
+            notes.append("2N (%d jobs, siblings in) did not beat N; 4N was not tried" % nj)
             break
     k = confirm_then_pick(done1 + done2)
     if EXH:
@@ -2319,96 +2555,99 @@ if ctype == "bw":
         why = "never reached %g%% of line rate; the peak" % LINE
     else:
         why = "the peak"
-    finish(k, "%s -> %s%s (%s)%s" % (geo(k), reading(k), of_line(k), why, note()))
+    finish(k, "%s -> %s%s (%s, %s)%s" % (geo(k), reading(k), of_line(k), why,
+                                        where(k[0]), note()))
 
 if ctype == "iops":
-    if sync:
-        lad, phase = [(nj, 1, NR) for nj in ladder(usable, NJMAX)], "numjobs"
-    else:
-        lad, phase = [(usable, qd, NR) for qd in ladder(1, IOPSQD)], "iodepth"
-    done1, vals = [], []
-    for k in lad:
+    pool, trail = [], []
+    # at or below N: one job per physical core at iodepth=1 nrfiles=1, nothing else
+    for nj in IOPS_LOW:
+        k = (nj, 1, NR)
         if best(k, True) is None:
-            cell(phase, k)
-        done1.append(k)
-        vals.append(best(k, True))
-        if not EXH and plateau(vals):
-            break
-    inc = tiepick(done1, True)
-    splits, trail = [], []
-    if not sync:
-        for way in ("fewer", "more"):
-            nj, qd = inc[0], inc[1]
-            prev = best(inc, True)
-            while True:
-                if way == "fewer":
-                    if nj < 2 or qd * 2 > IOPSQD:
-                        break
-                    nj, qd = nj // 2, qd * 2
-                else:
-                    if qd < 2 or nj * 2 > NJMAX:
-                        break
-                    nj, qd = nj * 2, qd // 2
-                k = (nj, qd, NR)
-                if best(k, True) is None:
-                    cell("resplit", k)
-                splits.append(k)
-                v = best(k, True)
-                trail.append("%dx%d %+.1f%%" % (nj, qd, (v - best(inc, True)) * 100 / best(inc, True)))
-                if not EXH and v <= prev * (1 + THR / 100):
+            cell("numjobs", k)
+        pool.append(k)
+        trail.append("%d jobs %s at iodepth 1" % (nj, human(best(k, True))))
+    top_low = max(best(k, True) for k in pool)
+    # past N the siblings join, and iodepth x nrfiles are searched
+    for nj in HIGH:
+        mine = []
+        for nr in (NRL if EXH else [NR]):
+            vals = []
+            for qd in IOPSQD:
+                k = (nj, qd, nr)
+                if not fits(k):
+                    guard(k)
                     break
-                prev = max(prev, v)
-    pool = done1 + splits
-    win = tiepick(pool, True)
-    nrs = []
-    for nr in NRC:
-        if nr == NR:
-            continue
-        k = (win[0], win[1], nr)
-        if best(k, True) is None:
-            cell("nrfiles", k)
-        nrs.append(k)
-    k = confirm_then_pick(pool + nrs)
-    parts = ["%s ladder peaked at %s" % ("numjobs" if sync else "iodepth", geo(inc))]
-    if trail:
-        parts.append("re-split at the same outstanding IO: " + ", ".join(trail))
-    if nrs:
-        parts.append("nrfiles: " + ", ".join(
-            "%d %+.1f%%" % (n[2], (best(n) - best(win)) * 100 / best(win)) for n in nrs))
-    finish(k, "%s -> %s (%s)" % (geo(k), reading(k), "; ".join(parts)))
+                if best(k, True) is None:
+                    cell("iodepth" if nr == NR else "nrfiles", k)
+                pool.append(k)
+                mine.append(k)
+                vals.append(best(k, True))
+                if not EXH and plateau(vals):
+                    break
+        if not mine:
+            break    # the memory guard stopped this job count before its first cell
+        top = tiepick(mine, True)
+        if not EXH:
+            for nr in NRX:
+                for qd in sorted(set([top[1], min(top[1] * 2, max(IOPSQD))])):
+                    k = (nj, qd, nr)
+                    if not fits(k):
+                        continue
+                    if best(k, True) is None:
+                        cell("nrfiles", k)
+                    pool.append(k)
+                    mine.append(k)
+        top = tiepick(mine, True)
+        trail.append("%d jobs %s at iodepth %d nrfiles %d"
+                     % (nj, human(best(top, True)), top[1], top[2]))
+        if not EXH and nj == 2 * N and best(top, True) <= top_low * (1 + THR / 100):
+            notes.append("2N (%d jobs, siblings in) did not beat N; 4N was not tried" % nj)
+            break
+    k = confirm_then_pick(pool)
+    finish(k, "%s -> %s (%s; %s)%s" % (geo(k), reading(k), ", ".join(trail), where(k[0]),
+                                      ("; " + "; ".join(notes)) if notes else ""))
 
-if ctype == "lat":
+if ctype in ("lat", "lat1m"):
     fk = (1, 1, NR)
     fl = reads(fk)
     if len(fl) < FLOORREPS:
         cell("floor", fk)
     floor = min(fl)
     limit = floor * (1 + FLOORPCT / 100)
-    last_in, first_out = fk, None
-    for nj in (ladder(2, usable) if usable >= 2 else []):
-        k = (nj, 1, NR)
-        r = reads(k)
-        if not r:
-            cell("widen", k)
+    last_in, first_out, detail = fk, None, []
+    for nj in LAT_LOW + HIGH:
+        # at or below N nrfiles=1 only; past it every file count, the lowest counts
+        keys = [(nj, 1, NR)] if nj <= N else [(nj, 1, nr) for nr in NRL]
+        for k in keys:
+            if not reads(k):
+                cell("widen" if k[2] == NR else "nrfiles", k)
         if first_out is not None:
+            continue    # brutal measures on; the answer is already decided
+        bk = min(keys, key=lambda k: (min(reads(k)), k[2]))
+        if len(keys) > 1:
+            detail.append("numjobs=%d: %s" % (nj, ", ".join(
+                "nrfiles %d %.1f us" % (k[2], min(reads(k))) for k in keys)))
+        if min(reads(bk)) <= limit:
+            last_in = bk
             continue
-        if min(r) <= limit:
-            last_in = k
-            continue
-        if len(r) < 2:
-            cell("recheck", k)
-        first_out = k
+        if len(reads(bk)) < 2:
+            cell("recheck", bk)
+        first_out = bk
         if not EXH:
             break
     at = min(reads(last_in))
-    msg = ("floor %.1f us (lowest of %d at numjobs=1), band <= %.1f us; "
-           "numjobs=%d stays at the floor: %.1f us, %s IOPS"
-           % (floor, len(fl), limit, last_in[0], at, format(int(aux(last_in) or 0), ",")))
+    msg = ("%sfloor %.1f us (lowest of %d at numjobs=1), band <= %.1f us; "
+           "numjobs=%d nrfiles=%d stays at the floor (%s): %.1f us, %s IOPS"
+           % ("1MiB " if ctype == "lat1m" else "", floor, len(fl), limit, last_in[0],
+              last_in[2], where(last_in[0]), at, format(int(aux(last_in) or 0), ",")))
     if first_out is not None:
         msg += "; numjobs=%d left the band at %.1f us (re-measured)" % (
             first_out[0], min(reads(first_out)))
-    elif usable >= 2:
-        msg += "; every rung to numjobs=%d stayed inside the band" % usable
+    else:
+        msg += "; every rung to numjobs=%d (4N) stayed inside the band" % (4 * N)
+    if detail:
+        msg += "; " + "; ".join(detail)
     finish(last_in, msg)
 
 sys.exit("ERROR: cal_plan: unknown cell type: %s" % ctype)
@@ -2454,17 +2693,21 @@ PYEOF
 }
 
 # Run one cell solo on <rep> and leave its reading in $WORK_DIR/cal/reading:
-# bytes/s (bw), IOPS (iops), or "<mean-us> <iops>" (lat). Called directly,
-# never inside $(...): a die in a command substitution would only end the
-# substitution. Globals from cal_shape_run: CAL_SID, CAL_REP_DIR,
-# CAL_REP_NAME, CAL_REP_CPUS.
+# bytes/s (bw), IOPS (iops), or "<mean-us> <iops>" (lat, lat1m). Called
+# directly, never inside $(...): a die in a command substitution would only
+# end the substitution. Globals from cal_shape_run: CAL_SID, CAL_REP_DIR,
+# CAL_REP_NAME, CAL_REP_N, CAL_REP_PHYS, CAL_REP_ALL. A cell of at most N
+# jobs runs one job per physical core with the siblings idle; a wider one
+# spreads over the siblings too -- the same split the staged jobs get.
 CAL_CELLS=0
-cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat> <read|write> <engine> <nj> <qd> <nr> <runtime>
-    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 base json vals h v a what
+cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime>
+    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 base json vals h v a what cpus
     base="cal-$type-$dirn-$eng-nj$nj-qd$qd-nr$nr-${rt}s"
     what="cell $type-$dirn $eng numjobs=$nj iodepth=$qd nrfiles=$nr"
+    cpus=$CAL_REP_ALL
+    [ "$nj" -gt "$CAL_REP_N" ] || cpus=$CAL_REP_PHYS
     stage_cal_cell "$WORK_DIR/cal/$rep/$base.job" "$CAL_REP_DIR" "$CAL_REP_NAME" \
-        "$CAL_REP_CPUS" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
+        "$cpus" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
     cal_push "$base.job" "$rep" || die "cannot copy a calibration cell to $MASTER"
     CAL_CELLS=$((CAL_CELLS + 1))
     json="$WORK_DIR/cal/res-s$CAL_SID-$CAL_CELLS-$base.json"
@@ -2476,7 +2719,7 @@ cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat> <read|write> <engine> <nj>
         cal_evidence "$what" "$json" "$base.job" quiet "$rep"
         die "calibration $what errored on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
-    if [ "$type" = lat ]; then
+    if [ "$type" = lat ] || [ "$type" = lat1m ]; then
         vals=$(cal_lat_values "$json" "$dirn") || die "cannot read the latency of ${json##*/}"
         read -r h v a <<<"$vals"
         printf '%s %s\n' "$v" "$a" > "$WORK_DIR/cal/reading"
@@ -2492,7 +2735,7 @@ cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat> <read|write> <engine> <nj>
 # Search one (type, direction) on the shape's representative: the planner
 # names each cell, bash runs it, until the planner is done. The verdict's
 # tuple lands in cal/s<id>/tuple-<type>-<dirn> as "qd nr fs nj".
-cal_search() {   # cal_search <rep> <bw|iops|lat> <read|write> <engine> <usable> <linerate> <memcap>
+cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap>
     local rep=$1 type=$2 dirn=$3 eng=$4 usable=$5 linerate=$6 memcap=$7
     local sdir="$WORK_DIR/cal/s$CAL_SID" hist act phase nj qd nr rt msg n=0 knobs
     hist="$sdir/hist-$type-$dirn"
@@ -2513,7 +2756,7 @@ cal_search() {   # cal_search <rep> <bw|iops|lat> <read|write> <engine> <usable>
                 n=$((n + 1)) ;;
             ("done "*)
                 read -r _ nj qd nr msg <<<"$act"
-                printf '%s %s %sM %s\n' "$qd" "$nr" "$FILESIZE_MIB" "$nj" > "$sdir/tuple-$type-$dirn"
+                printf '%s %s %sM %s\n' "$qd" "$nr" "$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))" "$nj" > "$sdir/tuple-$type-$dirn"
                 log "cal: shape $CAL_SID $type-$dirn: $msg [$n cell(s), $eng]"
                 return 0 ;;
             (*) die "the calibration planner said something unexpected for $type $dirn: $act" ;;
@@ -2525,15 +2768,16 @@ cal_search() {   # cal_search <rep> <bw|iops|lat> <read|write> <engine> <usable>
 # rep's host-file row already carries, seed what the rest needs, choose the
 # engine, run one search per remaining (type, direction). Leaves the engine
 # in cal/s<id>/engine and one tuple file per slot it settled.
-cal_shape_run() {   # cal_shape_run <id> <rep> <usable> <cpus> <linerate> <engines> <pinned> <memcap> <cached> <ladders>
-    local sid=$1 rep=$2 usable=$3 cpus=$4 linerate=$5 engines=$6 pinned=$7 memcap=$8 cached=$9 ladders=${10}
+cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <cached> <ladders>
+    local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 cached=${10} ladders=${11}
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
-    local eng pick rest etype edirn enj eqd e ncand budget wcells mins
+    local eng pick rest etype edirn enj eqd e ncand budget wcells mins qmax
     CAL_SID=$sid
     CAL_REP_DIR=$(host_dir "$rep")
     CAL_REP_NAME=$(host_name "$rep")
-    CAL_REP_CPUS=$cpus
-    [ "$cpus" != "-" ] || CAL_REP_CPUS=""
+    CAL_REP_N=$usable
+    CAL_REP_PHYS=$phys
+    CAL_REP_ALL=$allc
     CAL_DENSE_WRITE=0
     mkdir -p "$sdir" "$WORK_DIR/cal/$rep" || die "cannot create $sdir"
     rm -f "$WORK_DIR/cal/$rep/seeded.read" "$WORK_DIR/cal/$rep/seeded.write"
@@ -2551,7 +2795,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <usable> <cpus> <linerate> <engin
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
-        case "$type $dirn" in ("iops write"|"lat write") CAL_DENSE_WRITE=1 ;; esac
+        case "$type $dirn" in ("iops write"|"lat write"|"lat1m write") CAL_DENSE_WRITE=1 ;; esac
     done <<SLOTEOF
 $ladders
 SLOTEOF
@@ -2592,7 +2836,9 @@ BUDEOF
             [ -n "$edirn" ] || continue
             case "$etype" in
                 (bw)   enj=$usable; eqd=1 ;;
-                (iops) enj=$usable; eqd=16; [ "$eqd" -le "$CAL_IOPS_QD_MAX" ] || eqd=$CAL_IOPS_QD_MAX ;;
+                (iops) qmax=1
+                       for e in $CAL_IOPS_QD_LADDER; do [ "$e" -le "$qmax" ] || qmax=$e; done
+                       enj=$usable; eqd=16; [ "$eqd" -le "$qmax" ] || eqd=$qmax ;;
                 (lat)  enj=1; eqd=1 ;;
             esac
             for e in ${engines//,/ }; do
@@ -2605,7 +2851,7 @@ BUDEOF
         log "cal: shape $sid: ioengine $eng -- $rest"
     fi
     printf '%s\n' "$eng" > "$sdir/engine"
-    for type in bw iops lat; do
+    for type in bw iops lat lat1m; do
         for dirn in write read; do
             printf '%s' "$todo" | grep -qx "$type $dirn" || continue
             cal_search "$rep" "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap"
@@ -2616,7 +2862,7 @@ BUDEOF
 calibrate() {
     cal_mode || return 0
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
-    ladders=$(cal_required "$capdir") || die "cannot inspect $capdir for calibration"
+    ladders=$(cal_required "$capdir" "$BULK") || die "cannot inspect $capdir for calibration"
     if [ -z "$ladders" ]; then
         log "cal: nothing to calibrate in this set (no measurable jobs)"
         return 0
@@ -2652,7 +2898,7 @@ calibrate() {
     while IFS= read -r line; do log "cal: $line"; done < "$WORK_DIR/cal/shapes.txt"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
-    local sid rep usable cpus linerate engines pinned memcap cached members
+    local sid rep usable phys allc linerate engines pinned memcap cached members
     pids=(); hs=()
     while IFS=$'\t' read -r sid rep rest; do
         run_host "$rep" "mkdir -p '$(host_dir "$rep")${CAL_NS_DIR-/$CAL_SCRATCH}'" &
@@ -2662,8 +2908,8 @@ calibrate() {
         wait "${pids[$i]}" || die "cannot create the calibration namespace dir on ${hs[$i]}"
     done
     # one shape at a time, each alone
-    while IFS=$'\t' read -r sid rep usable cpus linerate engines pinned memcap cached members <&3; do
-        cal_shape_run "$sid" "$rep" "$usable" "$cpus" "$linerate" "$engines" "$pinned" "$memcap" "$cached" "$ladders"
+    while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap cached members <&3; do
+        cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$cached" "$ladders"
     done 3< "$shapes"
 
     # One cal.results line per MEMBER: the shape's engine, then (qd nr fs nj)
@@ -2676,7 +2922,7 @@ calibrate() {
 print(" ".join(CAL_SLOTS))
 PYEOF
     ) || die "cannot derive the cal.results slot order"
-    while IFS=$'\t' read -r sid rep usable cpus linerate engines pinned memcap cached members <&3; do
+    while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap cached members <&3; do
         eng="-"
         [ ! -s "$WORK_DIR/cal/s$sid/engine" ] || read -r eng < "$WORK_DIR/cal/s$sid/engine"
         line=$eng; any=0
@@ -3386,7 +3632,10 @@ probe_remote_cmd() {
     # machine-id, else empty), carried here so the host-file writeback never
     # opens a session of its own per host to fetch it.
     #
-    # The shape facts come last (see cal_shapes): cpu_model, memtotal_kb, one
+    # The shape facts come last (see cal_shapes): cpu_model, memtotal_kb, the
+    # cpu topology as "topo_<file> <cpu> <value>" lines -- one grep over every
+    # cpu's physical_package_id, core_id and thread_siblings_list, which is
+    # how probe_cores counts PHYSICAL cores and finds each one's sibling --, one
     # "nic <dev> <speed> <pci> <driver> <vendor:device>" line per bus-backed
     # netdev with the speed ethtool reports (sysfs where ethtool is missing),
     # and one "weka_net <container> <json>" line per weka container -- the
@@ -3433,6 +3682,10 @@ probe_remote_cmd() {
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \
         echo \"cpu_model \${_m:--}\"; \
         echo \"memtotal_kb \$([ -r \"\$_sr/proc/meminfo\" ] && awk '/^MemTotal:/ {print \$2; exit}' \"\$_sr/proc/meminfo\")\"; \
+        if [ -r \"\$_sr/sys/devices/system/cpu/cpu0/topology/core_id\" ]; then \
+            grep -H . \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/core_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list \
+            | awk -F: '{n = split(\$1, p, \"/\"); c = p[n - 2]; sub(/^cpu/, \"\", c); print \"topo_\" p[n], c, \$2}'; \
+        fi; \
         for _d in \"\$_sr\"/sys/class/net/*; do \
             [ -e \"\$_d/device\" ] || continue; _n=\${_d##*/}; \
             _s=; if command -v ethtool >/dev/null; then _s=\$(ethtool \"\$_n\" 2>&1 | awk '\$1 == \"Speed:\" {print \$2; exit}'); fi; \
@@ -3896,19 +4149,22 @@ for h in hosts:
             if len(cpuset) == 1:
                 weka |= cpuset
         elif f[0] == "engines": engines = f[1:]
-    # Everything except the cpus weka pinned. isolcpus deliberately does NOT
-    # narrow this: on saving-calf (2026-08-20) isolating cpus measured 4-7%
-    # worse on write iops than the stock kernel at every housekeeping-core
-    # count, and the widest mask won -- fio wants distinct physical cores,
-    # and cpus_allowed_policy=split keeps each job on its own cpu even when
-    # the mask spans both partitions.
-    # ... and minus whatever the probe measured as unbindable: a cpu that
-    # refuses the bind is not usable however online it looks.
+    # probe_cores' rule, in physical cores: every core except weka's DPDK
+    # cores (siblings included) and the OS reserve, minus whatever the probe
+    # measured as unbindable. isolcpus deliberately does NOT narrow it (see
+    # probe_cores). "usable" is every thread of those cores; "phys" one per
+    # core, where a job count at or below N runs.
     universe = probe_universe(os.path.join(work, "probe", h), ncpus)
     unbind = probe_unbindable(os.path.join(work, "probe", h),
                               universe or set(range(ncpus)))
-    usable = (sorted(universe - weka - unbind) or sorted(universe - weka)
-              or sorted(universe) or list(range(ncpus)))
+    cores = probe_cores(os.path.join(work, "probe", h))
+    if cores["n"] < 1:
+        sys.exit(f"ERROR: {h}: no cpus left for fio -- {cores_summary(cores)}; "
+                 f"mount weka with fewer cores or use a larger client")
+    if cores["weka_core0"]:
+        warn(f"{h}: weka has pinned a dedicated core on core 0 -- that core "
+             f"and its sibling belong to the OS; fio stays off it regardless")
+    usable = cores["all"]
     if nodes and not weka:
         # the pin detection is the only thing keeping fio off weka's cores;
         # if weka is running and none were found, say so rather than
@@ -3918,7 +4174,7 @@ for h in hosts:
              f"weka's; check that this weka pins its io threads")
     facts[h] = {"ncpus": ncpus, "weka": weka, "usable": usable,
                 "engines": engines, "isolated": sorted(iso),
-                "universe": universe, "unbindable": unbind}
+                "universe": universe, "unbindable": unbind, "cores": cores}
 
 if len({f["ncpus"] for f in facts.values()}) > 1:
     warn("system core counts differ between hosts: "
@@ -3929,21 +4185,35 @@ if len({len(f["weka"]) for f in facts.values()}) > 1:
 
 common_engines = [e for e in ENGINE_ORDER
                   if all(e in f["engines"] for f in facts.values())]
-def usable_for(h):
-    # the nj contract: the operator's cpu list, minus cpus the host does not
-    # have (check_cpu_pinning noted them; a staged cpus_allowed naming one
-    # is rejected by the fio SERVER, whose error text is lost), minus weka's
-    # pinned cores; every cpu minus weka's when the file gives none
-    c = target(h, "cpus")
-    if not c:
-        return facts[h]["usable"]
-    cs = parse_cpulist(c)
-    if facts[h]["universe"]:
-        cs &= facts[h]["universe"]
-    real = sorted(cs)
-    cs -= set(facts[h]["weka"])
-    cs -= set(facts[h]["unbindable"])
-    return sorted(cs) or real or sorted(parse_cpulist(c))
+_cores_for = {}
+def cores_for(h):
+    # the nj contract: the operator's cpu list is the base when the file
+    # gives one -- minus cpus the host does not have (check_cpu_pinning noted
+    # them; a staged cpus_allowed naming one is rejected by the fio SERVER,
+    # whose error text is lost), weka's cores and core 0's pair --, and
+    # probe_cores' own rule over every cpu otherwise
+    if h not in _cores_for:
+        c = target(h, "cpus")
+        if not c:
+            _cores_for[h] = facts[h]["cores"]
+        else:
+            cc = probe_cores(os.path.join(work, "probe", h), c)
+            if cc["n"] < 1:
+                sys.exit(f"ERROR: {h}: the host file's cpu list ({c}) leaves "
+                         f"fio no cpus -- every one is weka's, core 0's pair, "
+                         f"or not on this host")
+            _cores_for[h] = cc
+    return _cores_for[h]
+
+def usable_for(h):    # every thread fio may use: where 2N and 4N jobs run
+    return cores_for(h)["all"]
+
+def cpus_for(h, nj):
+    # N/2 and N jobs run one per physical core with the siblings idle; more
+    # than N spread over the siblings too -- the cpu set a calibration cell
+    # with that job count was measured on
+    c = cores_for(h)
+    return c["phys"] if nj <= c["n"] else c["all"]
 
 min_usable = min(len(usable_for(h)) for h in hosts)
 
@@ -4182,7 +4452,8 @@ for job in jobs:
         # direction. A single-direction file takes its own slot; a mixed file
         # takes the deeper-queued direction's WHOLE tuple -- a coherent
         # measured pair, never a blend of the two directions.
-        kind_key = "lat" if is_latency else ("bw" if is_bw else "iops" if is_iops else "")
+        kind_key = (lat_kind(lines) if is_latency else
+                    ("bw" if is_bw else "iops" if is_iops else ""))
         if kind_key:
             slot = pick_slot(kind_key, file_directions(lines),
                              lambda k: target(h, k))
@@ -4193,21 +4464,38 @@ for job in jobs:
                     continue
                 if tkey == "nj" and v.isdigit():
                     # The host file is the operator's, so this is honoured.
-                    # An exact multiple of the usable cpus is a measured
-                    # calibration winner (the iops re-split found more jobs
-                    # than cpus faster) and gets a note; anything else is
-                    # probably stale and gets the warning (seen live on
-                    # iscg001: 52 jobs in a 46-cpu mask).
-                    cap = len(usable_for(h))
-                    if int(v) > cap and int(v) % cap == 0:
-                        print(f"note: {h}: {slot}_nj={v} runs "
-                              f"{int(v) // cap} jobs per cpu ({cap} usable)",
-                              file=sys.stderr)
+                    # Past every thread of the usable cores is the 4N rung
+                    # of a calibration (two jobs per thread on an SMT host)
+                    # and gets a note; past 4N it matches no rung and is
+                    # probably stale (seen live on iscg001: 52 jobs in a
+                    # 46-cpu mask), so it gets the warning.
+                    cap, n = len(usable_for(h)), cores_for(h)["n"]
+                    if int(v) > 4 * n:
+                        warn_once(f"{h}: host-file {slot}_nj={v} exceeds 4N "
+                                  f"({4 * n}; N={n} usable physical cores) -- "
+                                  f"split affinity will run "
+                                  f"{-(-int(v) // cap)} jobs on some cpus")
                     elif int(v) > cap:
-                        warn_once(f"{h}: host-file {slot}_nj={v} exceeds its "
-                                  f"{cap} usable cpu(s) -- split affinity will "
-                                  f"double-book {int(v) - cap} of them")
+                        print(f"note: {h}: {slot}_nj={v} runs up to "
+                              f"{-(-int(v) // cap)} jobs per cpu ({cap} usable "
+                              f"threads)", file=sys.stderr)
                 out = override(out, jkey, v)
+        if is_floor_twin(lines):
+            # the one-job twin of a latency test: one stream per client at
+            # numjobs=iodepth=nrfiles=1, with the same data per job as its
+            # calibrated original (the calibration floor's own geometry)
+            _slot = pick_slot(kind_key, file_directions(lines),
+                              lambda k: target(h, k)) if kind_key else ""
+            _fs = target(h, f"{_slot}_fs") if _slot else ""
+            _nr = target(h, f"{_slot}_nr") if _slot else ""
+            for key in ("numjobs", "iodepth", "nrfiles"):
+                out = override(out, key, "1")
+            if _fs and _nr.isdigit():
+                try:
+                    out = override(out, "filesize", "%dM" % max(
+                        1, parse_size(_fs) * int(_nr) // (1 << 20)))
+                except ValueError:
+                    pass
         if target(h, "engine"):
             out = override(out, "ioengine", target(h, "engine"))
         if is_iops and iops_nolat:
@@ -4217,9 +4505,15 @@ for job in jobs:
             for key in ("disable_lat", "disable_clat", "disable_slat", "norandommap"):
                 out = override(out, key, "1")
 
+        # the job count is final now: N/2 and N jobs run one per physical
+        # core, more spread over the siblings too -- what the calibration
+        # cell with this count ran on
+        _nj = first_value(out, "numjobs")
+        out = override(out, "cpus_allowed", fmt_cpulist(
+            cpus_for(h, int(_nj) if _nj.isdigit() else 1)))
         header = [f"# generated by wekatester auto[{label}] for {h}",
-                  f"# usable cores: {fmt_cpulist(facts[h]['usable'])} "
-                  f"(of {facts[h]['ncpus']}, weka: {fmt_cpulist(facts[h]['weka']) or 'none'})"]
+                  f"# usable cores: {cores_summary(cores_for(h))} "
+                  f"(of {facts[h]['ncpus']} cpus, weka: {fmt_cpulist(facts[h]['weka']) or 'none'})"]
         with open(os.path.join(work, "jobs", h, job), "w") as fp:
             fp.write("\n".join(header + out) + "\n")
     kind = "latency" if is_latency else ("bandwidth" if is_bw else "iops" if is_iops else "all")
@@ -4553,7 +4847,8 @@ PYEOF
 # the python heredoc owns stdin) = everything.
 # Output, one host per line, tab-separated, "-" = unset:
 #   host login engine cpus dir, then nj/fs/nr/qd per slot in
-#   bw_r, bw_w, lat_r, lat_w, iops_r, iops_w order (29 columns)
+#   bw_r, bw_w, lat_r, lat_w, iops_r, iops_w, lat1m_r, lat1m_w order
+#   (37 columns)
 # CLI values arrive as arguments and take precedence over the file.
 # A fresh host file: header plus a commented format reference, so an editor
 # session or a later -a writeback starts from something self-describing.
@@ -4847,11 +5142,14 @@ for host in hosts:
         lines = open(p).read().splitlines()
         if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
             continue
+        if is_floor_twin(lines):
+            continue   # its one-job geometry is forced, not something to record
         kinds = [KIND[w] for l in lines if l.startswith("# report")
                  for w in l.split()[2:] if w in KIND]
-        # precedence latency > bandwidth > iops, same as the tuner
-        kind = "lat" if "lat" in kinds else ("bw" if "bw" in kinds else
-                                             ("iops" if "iops" in kinds else ""))
+        # precedence latency > bandwidth > iops, same as the tuner; a 1MiB
+        # latency file (a -b twin) records into the lat1m slot
+        kind = lat_kind(lines) if "lat" in kinds else ("bw" if "bw" in kinds else
+                                                       ("iops" if "iops" in kinds else ""))
         d.setdefault("engine", first_value(lines, "ioengine"))
         d.setdefault("cpus", first_value(lines, "cpus_allowed"))
         d.setdefault("dir", first_value(lines, "directory"))
@@ -4922,11 +5220,11 @@ for host in hosts:
         continue
     want = updates[host]
     cell = seen_cell.get(host) or IDENT.get(host, host)
+    slots = [geom(want, s) for s in GEOM_SLOTS]
+    while slots and not slots[-1] and len(slots) > 6:
+        slots.pop()   # no 1MiB latency geometry: the row stays in the old width
     w.writerow([cell, want.get("login", ""), want.get("engine", ""),
-                want.get("cpus", ""), want.get("dir", ""),
-                geom(want, "bw_r"), geom(want, "bw_w"),
-                geom(want, "lat_r"), geom(want, "lat_w"),
-                geom(want, "iops_r"), geom(want, "iops_w")])
+                want.get("cpus", ""), want.get("dir", "")] + slots)
 with open(wb, "w") as fp:
     fp.write("\n".join(out) + "\n" + buf.getvalue())
 print(f"host file: recorded {len(updates)} host line(s) in {wb} ({mode})")
@@ -5005,7 +5303,7 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         continue
     if lineno == 1 and row[0].strip().lower() == "host":
         continue   # header
-    row = [c.strip() for c in (row + [""] * 11)[:11]]
+    row = [c.strip() for c in (row + [""] * HOSTFILE_COLS)[:HOSTFILE_COLS]]
     host_cell = row[0]
     host, login, engine, cpus, ddir = host_addr(host_cell), row[1], row[2], row[3], row[4]
     fields = {}
@@ -5015,7 +5313,7 @@ for lineno, row in enumerate(csv.reader(fp), start=1):
         fields["cpus"] = cpus
     if ddir:
         fields["dir"] = ddir
-    for kind, raw in zip(GEOM_NAMES, row[5:11]):
+    for kind, raw in zip(GEOM_NAMES, row[5:HOSTFILE_COLS]):
         fields.update(parse_geom(kind, raw, lineno))
     if host:
         if login:
@@ -5298,7 +5596,7 @@ dry_run_report() {
     log "dry run: nothing was executed; details of what would have run:"
     if cal_mode; then
         local caldir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} call
-        call=$(cal_required "$caldir") || call=""
+        call=$(cal_required "$caldir" "$BULK") || call=""
         if [ -n "$call" ]; then
             log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
             mkdir -p "$WORK_DIR/cal"
@@ -5342,7 +5640,10 @@ SET_DIR=""       # merged view actually staged: source files + generated layout
 # Single source of truth for what runs and in what order -- the editor loop
 # and the runner must never disagree on either.
 discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
-    local job
+    # byte order, whatever the operator's locale: 021-latencyR.job before its
+    # -b twin 021b-latencyR-1M.job (en_US collation ignores the dash and
+    # would flip them), the same order every python sort here uses
+    local job LC_ALL=C
     JOBFILES=()
     for job in "$1"/[0-9]*; do
         [ -f "$job" ] || die "no jobfiles found in $1"
@@ -5437,8 +5738,9 @@ for host in hosts:
         lines = override_lines(lines, "directory", hd)
         if has_final and host in rows and not is_layout(base, lines):
             words = report_words(lines)
-            # precedence latency > bandwidth > iops, same as the tuner
-            kind = ("lat" if "latency" in words else "bw" if "bandwidth" in words
+            # precedence latency > bandwidth > iops, same as the tuner; a
+            # 1MiB latency file (a -b twin) takes the lat1m slot
+            kind = (lat_kind(lines) if "latency" in words else "bw" if "bandwidth" in words
                     else "iops" if "iops" in words else "")
             if kind:
                 def get(key):
@@ -5654,6 +5956,83 @@ for i in range(0, len(argv), 3):
 PYEOF
 }
 
+# -b: beside every latency jobfile of the staged set, its 1MiB twin -- the
+# same file with every bs=/blocksize= line set to 1Mi (bs=1Mi added to
+# [global] when the file has none), named after it so it runs right after it
+# and is summarized as a test of its own: 021-latencyR.job gains
+# 021b-latencyR-1M.job. The twin keeps the file names and section names, so
+# it reads and writes the same dataset the 4k test does and the layout
+# covers it unchanged. A latency file already at 1MiB gets no twin. Under -a
+# the tuner files the twin under its own geometry slot (lat1m, by its block
+# size), which is what -a cal/brutal calibrate for it.
+stage_bulk_twins() {   # stage_bulk_twins <set-dir>
+    pyrun "$1" "$LAYOUT_JOB" "$LAYOUT_MARKER" <<'PYEOF' || return 1
+import os, re, sys
+
+d, layout_job, marker = sys.argv[1:4]
+made = []
+for name in sorted(os.listdir(d)):
+    path = os.path.join(d, name)
+    if not name[:1].isdigit() or not os.path.isfile(path) or name == layout_job:
+        continue
+    lines = open(path).read().splitlines()
+    if any(l.startswith(marker) for l in lines[:3]):
+        continue
+    words = [w for l in lines for m in [re.match(r"^#\s*report\s+(.*)$", l)] if m
+             for w in m.group(1).split()]
+    if "latency" not in words or job_bs(lines) >= (1 << 20):
+        continue
+    twin = re.sub(r"^(\d+)", r"\1b", name)
+    twin = twin[:-4] + "-1M.job" if twin.endswith(".job") else twin + "-1M"
+    if os.path.exists(os.path.join(d, twin)):
+        sys.exit(f"ERROR: -b: the set already has a file named {twin}")
+    has_bs = any(re.match(r"^(bs|blocksize)=", l) for l in lines)
+    out = [re.sub(r"^(bs|blocksize)=.*$", r"\1=1Mi", l) for l in lines]
+    if not has_bs:
+        out = override_lines(out, "bs", "1Mi")
+    out = [f"# -b: the 1MiB twin of {name}, staged by wekatester"] + out
+    with open(os.path.join(d, twin), "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    made.append(twin)
+print(" ".join(made))
+PYEOF
+}
+
+# -a cal/brutal: beside every latency jobfile (the -b twins included), a
+# one-job twin, 021-latencyR.job gaining 021-latencyR-1job.job, which sorts
+# and so runs right before it. The tuner stages the twin at numjobs=iodepth=
+# nrfiles=1 on every client with the same data per job as its original, and
+# the original at what the search found: one single-threaded stream's
+# latency across the fleet, next to every client's latency at its calibrated
+# load. Same files and sections as the original, so the layout covers it.
+stage_floor_twins() {   # stage_floor_twins <set-dir>
+    pyrun "$1" "$LAYOUT_JOB" "$LAYOUT_MARKER" <<'PYEOF' || return 1
+import os, re, sys
+
+d, layout_job, marker = sys.argv[1:4]
+made = []
+for name in sorted(os.listdir(d)):
+    path = os.path.join(d, name)
+    if not name[:1].isdigit() or not os.path.isfile(path) or name == layout_job:
+        continue
+    lines = open(path).read().splitlines()
+    if any(l.startswith(marker) for l in lines[:3]) or is_floor_twin(lines):
+        continue
+    words = [w for l in lines for m in [re.match(r"^#\s*report\s+(.*)$", l)] if m
+             for w in m.group(1).split()]
+    if "latency" not in words:
+        continue
+    twin = name[:-4] + "-1job.job" if name.endswith(".job") else name + "-1job"
+    if os.path.exists(os.path.join(d, twin)):
+        sys.exit(f"ERROR: the set already has a file named {twin}")
+    out = [f"{FLOOR_MARKER} {name} at numjobs=iodepth=nrfiles=1 on every client, staged by wekatester"] + lines
+    with open(os.path.join(d, twin), "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    made.append(twin)
+print(" ".join(made))
+PYEOF
+}
+
 stage_jobfiles() {
     echo
     # -C already resolved a set to run; otherwise -w names one.
@@ -5677,10 +6056,25 @@ stage_jobfiles() {
         cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
         is_layout_file "$JOBFILE_SRC/$job" && has_layout=1
     done
+    if [ "$BULK" -eq 1 ]; then
+        local twins
+        twins=$(stage_bulk_twins "$SET_DIR") || die "cannot stage the -b 1MiB latency tests"
+        if [ -n "$twins" ]; then
+            log "-b: staged the 1MiB latency test(s) $twins beside their 4k originals"
+        else
+            log "WARNING: -b: this set has no 4k latency test to run at 1MiB" >&2
+        fi
+    fi
+    if cal_mode; then
+        local floors
+        floors=$(stage_floor_twins "$SET_DIR") || die "cannot stage the one-job latency tests"
+        [ -z "$floors" ] || log "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
+    fi
     if [ "$has_layout" -eq 0 ]; then
         generate_layout "$JOBFILE_SRC" "$SET_DIR" || die "layout generation failed"
-        discover_jobfiles "$SET_DIR"
     fi
+    # the staged view is the list that runs: source files, twins, the layout
+    discover_jobfiles "$SET_DIR"
     # The layout job must run FIRST or it is not a barrier: a custom set may
     # carry a marker-detected layout file whose numeric prefix sorts it later,
     # so enforce the order rather than trust the name.
