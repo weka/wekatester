@@ -2032,7 +2032,12 @@ def weka_ports(f):
         if hit:
             ports[hit] = f["nics"][hit]
         else:
-            lost.append("/".join(cand) or "?")
+            # name, device and identifier often repeat each other: say each once
+            uniq = []
+            for v in cand:
+                if v not in uniq:
+                    uniq.append(v)
+            lost.append(" ".join(uniq) or "?")
     if lost:
         return None, ("weka's NIC %s has no kernel netdev to ask ethtool about "
                       "(bound to vfio?)" % lost[0])
