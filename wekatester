@@ -49,6 +49,9 @@ REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LOAD_CHECK=0        # -l: check each calibrated bandwidth/iops setting under load
+LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
+                    # in place of what ethtool reports (a cloud VF says 100 Gb/s
+                    # on a 16 Gb/s instance) or when nothing can report it
 
 # -C/--customize: copy a workload set, edit it, run it.
 CUSTOMIZE=0
@@ -414,6 +417,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
+                  [--line-rate Gb/s]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-b] [-l] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -450,6 +454,10 @@ attaching is the way to pass a value that starts with a dash.
                           30); it does not change
                           how long the measured jobs run -- that is
                           -x/--duration
+  --line-rate Gb/s        every client's dataplane line rate, for the -a cal
+                          bandwidth target, in place of what ethtool reports:
+                          a cloud VF can report 100 Gb/s on a 16 Gb/s
+                          instance, and without the weka CLI nothing reports it
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -814,7 +822,8 @@ def probe_cores(path, base_list=""):
         on every thread of those cores ("all"), which is how a calibration
         finds out whether the siblings help or hurt.
       - an operator cpu list (<base_list>) is the operator's own reserve:
-        only weka's cores and core 0's pair come out of it.
+        only weka's cores and core 0's pair come out of it -- unless it names
+        every cpu the host has, which restricts nothing.
       - isolcpus does NOT narrow the set: measured on saving-calf
         (2026-08-20), confining the OS cost 4-7% write iops at every
         housekeeping-core count tried. Split affinity keeps a mask spanning
@@ -854,6 +863,11 @@ def probe_cores(path, base_list=""):
         base = parse_cpulist(base_list)
         if universe:
             base &= universe
+        if universe and base == universe:
+            # a list naming every cpu (0-255 on a 64-cpu box) is no choice:
+            # the reserve applies whole, as if the file gave none
+            base_list = ""
+    if base_list:
         reserved = [core0] if core0 is not None else []
     else:
         base = set(universe)
@@ -874,6 +888,28 @@ def probe_cores(path, base_list=""):
             "sockets": len(set(socket.values())) or 1,
             "smt": any(len(v) > 1 for v in threads.values()),
             "topo": bool(topo), "weka_core0": core0 in dpdk}
+
+def probe_aio_room(path):
+    """How many more aio events the kernel lets this host's processes set
+    up (fs.aio-max-nr less fs.aio-nr, as the probe read them), or None when
+    the probe could not tell. Every libaio job reserves its iodepth against
+    it at setup, so numjobs x iodepth past it dies with EAGAIN in
+    io_queue_init -- seen on iscg001 2026-09-25: 128 jobs x 512 took the
+    whole default 65,536 and the other 60 of 188 failed."""
+    mx = nr = None
+    try:
+        for line in open(path):
+            f = line.split()
+            if len(f) == 2 and f[1].isdigit():
+                if f[0] == "aio_max_nr":
+                    mx = int(f[1])
+                elif f[0] == "aio_nr":
+                    nr = int(f[1])
+    except OSError:
+        return None
+    if mx is None:
+        return None
+    return max(0, mx - (nr or 0))
 
 def cores_summary(c):
     """The one-line account of probe_cores' answer the logs print."""
@@ -1031,6 +1067,10 @@ parse_args() {
                            [ -n "$OUTPUT_DIR" ] || { usage >&2; die "option --output requires a value"; }
                            shift ;;
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
+            --line-rate)   need_arg "$1" $# "${2:-}"; LINE_RATE_GBPS=$2; shift 2 ;;
+            --line-rate=*) LINE_RATE_GBPS=${opt#--line-rate=}
+                           [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
+                           shift ;;
             -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
             --engine=*)    ENGINE=${opt#--engine=}
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
@@ -1195,6 +1235,14 @@ parse_args() {
     fi
     if [ "$LOAD_CHECK" -eq 1 ] && ! cal_mode; then
         usage >&2; die "-l checks the calibrated settings under load: it needs -a cal or -a brutal"
+    fi
+    if [ -n "$LINE_RATE_GBPS" ]; then
+        case "$LINE_RATE_GBPS" in
+            (*[!0-9.]*|*.*.*|.)
+                usage >&2; die "--line-rate takes the line rate in Gb/s, a positive number such as 16 or 12.5: '$LINE_RATE_GBPS'" ;;
+        esac
+        awk -v v="$LINE_RATE_GBPS" 'BEGIN {exit !(v > 0)}' \
+            || { usage >&2; die "--line-rate must be above 0 Gb/s: '$LINE_RATE_GBPS'"; }
     fi
 }
 
@@ -2122,12 +2170,14 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
 # rep's complete tuples as slot=qd/nr/fs/nj words, "-" for none) and prints
 # the human form on stdout. Warnings go to stderr.
 cal_shapes() {   # cal_shapes <out> <ladders>
+    WEKATESTER_LINE_GBPS=$LINE_RATE_GBPS \
     pyrun "$1" "$2" "$WORK_DIR" "${ENGINE:--}" "$REGEN_LAYOUT" "$CAL_MEM_PCT" \
           "${AUTH_DIR:--}" "${HOSTS[@]}" <<'PYEOF'
 import json, os, re, sys
 
 out_path, ladders, work, cli_engine, regen, mem_pct, auth = sys.argv[1:8]
 hosts = sys.argv[8:]
+line_gbps = os.environ.get("WEKATESTER_LINE_GBPS", "")
 regen = regen == "1"
 mem_pct = float(mem_pct)
 needed = []
@@ -2247,11 +2297,10 @@ def weka_ports(f):
 shapes, index = [], {}
 for h in hosts:
     f = facts(h)
-    base = ""
-    if auth != "-" and os.path.exists(os.path.join(auth, h + ".cpus")):
-        base = open(os.path.join(auth, h + ".cpus")).read().strip()
-    else:
-        base = field(h, "cpus")
+    # the host file's own list, as the tuner reads it (cores_for): probe_cores
+    # trims it the way check_cpu_pinning does, and has to see it as written to
+    # tell a catch-all like 0-255 from an operator's choice
+    base = field(h, "cpus")
     cores = probe_cores(f["path"], base)
     if cores["n"] < 1:
         sys.exit("ERROR: %s: no cpus left for fio -- %s; mount weka with fewer "
@@ -2269,6 +2318,9 @@ for h in hosts:
         else:
             why = "ethtool reports no link speed for %s" % " ".join(
                 n for n in sorted(ports) if not ports[n]["speed"])
+    ethtool = linerate
+    if line_gbps:
+        linerate = float(line_gbps) * 125000000   # Gb/s -> bytes/s
     cands = [e for e in ENGINE_ORDER if e in f["engines"]] or f["engines"][:1] or ["psync"]
     pinned = cli_engine if cli_engine != "-" else ("" if regen else field(h, "engine"))
     mem_gib = int(round(f["mem_kb"] / 1048576.0)) if f["mem_kb"] else 0
@@ -2277,7 +2329,7 @@ for h in hosts:
     if key not in index:
         index[key] = len(shapes)
         shapes.append({"rep": h, "members": [], "f": f, "cores": cores,
-                       "ports": ports, "why": why, "linerate": linerate,
+                       "ports": ports, "why": why, "linerate": linerate, "ethtool": ethtool,
                        "cands": cands, "pinned": pinned, "mem_gib": mem_gib})
     shapes[index[key]]["members"].append(h)
 
@@ -2308,10 +2360,13 @@ with open(out_path, "w") as fh:
                 speeds[k] = speeds.get(k, 0) + 1
             nics = "weka NICs %s: %s" % (" ".join(sorted(s["ports"])), ", ".join(
                 "%d x %s" % (c, k) for k, c in sorted(speeds.items())))
-            if s["linerate"]:
-                nics += " -> line rate %s" % gib(s["linerate"])
+            if s["ethtool"]:
+                nics += " -> line rate %s" % gib(s["ethtool"])
         else:
             nics = "weka NICs: %s" % s["why"]
+        if line_gbps:
+            nics += "; line rate %s from --line-rate %s Gb/s%s" % (
+                gib(s["linerate"]), line_gbps, " in place of ethtool's" if s["ethtool"] else "")
         print("shape %d of %d: %d host(s), calibrated on %s -- %s, %d cpus, %s, %s"
               % (i, len(shapes), len(s["members"]), rep, f["model"] or "cpu model unknown",
                  f["ncpus"], ("%d GiB" % s["mem_gib"]) if s["mem_gib"] else "memory unknown",
@@ -2390,6 +2445,10 @@ SYNC = ("psync", "sync", "pvsync", "pvsync2", "vsync")
 sync = eng in SYNC
 if sync:
     BWQD, IOPSQD = [1], [1]   # one IO in flight per job, whatever iodepth says
+# libaio reserves numjobs x iodepth aio events at setup; past the kernel's
+# room (fs.aio-max-nr less what is in use) the cell dies with EAGAIN
+AIO = K.get("aio", "-")
+AIOCAP = int(AIO) if eng == "libaio" and AIO.isdigit() else None
 BS = (1 << 20) if ctype in ("bw", "lat1m") else 4096
 N2 = max(1, N // 2)
 
@@ -2491,13 +2550,19 @@ def where(nj):
     return "one job per physical core" if nj <= N else "siblings in"
 
 def fits(k):
-    return memcap <= 0 or k[0] * k[1] * BS <= memcap
+    return ((memcap <= 0 or k[0] * k[1] * BS <= memcap)
+            and (AIOCAP is None or k[0] * k[1] <= AIOCAP))
 
 notes = []
 def guard(k):
-    # in-flight buffers do not depend on nrfiles: one note per job count and depth
-    n = ("the queue ladder stopped short of numjobs=%d iodepth=%d: its in-flight "
-         "buffers exceed the memory guard (CAL_MEM_PCT)" % (k[0], k[1]))
+    # neither limit depends on nrfiles: one note per job count and depth
+    if AIOCAP is not None and k[0] * k[1] > AIOCAP:
+        n = ("the queue ladder stopped short of numjobs=%d iodepth=%d: libaio would "
+             "set up %d aio events and the kernel has room for %d (raise "
+             "fs.aio-max-nr to search deeper)" % (k[0], k[1], k[0] * k[1], AIOCAP))
+    else:
+        n = ("the queue ladder stopped short of numjobs=%d iodepth=%d: its in-flight "
+             "buffers exceed the memory guard (CAL_MEM_PCT)" % (k[0], k[1]))
     if n not in notes:
         notes.append(n)
 
@@ -2750,7 +2815,7 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
     local sdir="$WORK_DIR/cal/s$CAL_SID" hist act phase nj qd nr rt msg n=0 knobs
     hist="$sdir/hist-$type-$dirn"
     : > "$hist"
-    knobs=$(cal_knobs)
+    knobs="$(cal_knobs)aio=${CAL_REP_AIO:--}"
     while :; do
         # shellcheck disable=SC2086 -- the knobs are one k=v word each
         act=$(cal_plan next "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap" "$hist" $knobs) \
@@ -2788,6 +2853,12 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     CAL_REP_N=$usable
     CAL_REP_PHYS=$phys
     CAL_REP_ALL=$allc
+    CAL_REP_AIO=$(pyrun "$WORK_DIR/probe/$rep" <<'PYEOF'
+import sys
+r = probe_aio_room(sys.argv[1])
+print("-" if r is None else r)
+PYEOF
+    ) || CAL_REP_AIO=-
     CAL_DENSE_WRITE=0
     mkdir -p "$sdir" "$WORK_DIR/cal/$rep" || die "cannot create $sdir"
     rm -f "$WORK_DIR/cal/$rep/seeded.read" "$WORK_DIR/cal/$rep/seeded.write"
@@ -3087,6 +3158,10 @@ for h in hosts:
             nj2 = nj // 2
     elif notch == "heavy" and first_value(lines, "ioengine") not in SYNC:
         qd2 = qd * 2    # a sync engine keeps one IO in flight: no heavier notch
+        room = probe_aio_room(os.path.join(work, "probe", h))
+        if (first_value(lines, "ioengine") == "libaio" and room is not None
+                and nj * qd2 > room):
+            qd2 = qd    # libaio could not set that many aio events up here
     if (nj2, qd2) != (nj, qd):
         print(h, nj2, qd2)
         lines = override_lines(lines, "numjobs", str(nj2))
@@ -3859,6 +3934,8 @@ probe_remote_cmd() {
     # opens a session of its own per host to fetch it.
     #
     # The shape facts come last (see cal_shapes): cpu_model, memtotal_kb, the
+    # kernel's aio room (aio_max_nr and aio_nr, for the libaio queue ladders),
+    # the
     # cpu topology as "topo_<file> <cpu> <value>" lines -- one grep over every
     # cpu's physical_package_id, core_id and thread_siblings_list, which is
     # how probe_cores counts PHYSICAL cores and finds each one's sibling --, one
@@ -3908,6 +3985,8 @@ probe_remote_cmd() {
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \
         echo \"cpu_model \${_m:--}\"; \
         echo \"memtotal_kb \$([ -r \"\$_sr/proc/meminfo\" ] && awk '/^MemTotal:/ {print \$2; exit}' \"\$_sr/proc/meminfo\")\"; \
+        echo \"aio_max_nr \$([ -r \"\$_sr/proc/sys/fs/aio-max-nr\" ] && cat \"\$_sr/proc/sys/fs/aio-max-nr\")\"; \
+        echo \"aio_nr \$([ -r \"\$_sr/proc/sys/fs/aio-nr\" ] && cat \"\$_sr/proc/sys/fs/aio-nr\")\"; \
         if [ -r \"\$_sr/sys/devices/system/cpu/cpu0/topology/core_id\" ]; then \
             grep -H . \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/core_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list \
             | awk -F: '{n = split(\$1, p, \"/\"); c = p[n - 2]; sub(/^cpu/, \"\", c); print \"topo_\" p[n], c, \$2}'; \
@@ -4704,7 +4783,7 @@ for job in jobs:
                 v = target(h, f"{slot}_{tkey}") if slot else ""
                 if not v:
                     continue
-                if tkey == "nj" and v.isdigit():
+                if tkey == "nj" and v.isdigit() and not is_floor_twin(lines):
                     # The host file is the operator's, so this is honoured.
                     # Past every thread of the usable cores is the 4N rung
                     # of a calibration (two jobs per thread on an SMT host)

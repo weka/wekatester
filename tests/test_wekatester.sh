@@ -1640,8 +1640,10 @@ t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
 t_assert "usable_cores: a list naming cpus the host does not have is trimmed" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\n" > "$d/probe/h1"
+    # 0-11 on an 8-cpu box names every cpu it has: no choice at all, so the
+    # full reserve (0 and 1) applies, not the operator-list exemption
     out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "0-11") )
-    [ "$out" = "1,2,3,4,5,6,7" ]'
+    [ "$out" = "2,3,4,5,6,7" ]'
 
 # --- cal_values: per-client rung values from fio client JSON ---
 # Grammar consumed verbatim by the orchestrator: "<host> <value>", one line
@@ -3862,6 +3864,46 @@ t_assert "load check: latency tests are left alone" bash -c '
     lchk_fixture latency; export LCHK_SOLO=1 LCHK_BASE=1
     out=$(lchk_go)
     [ -z "$out" ] && [ ! -e "$LD/fiolog" ] || { echo "$out" >&2; false; }'
+
+# --- --line-rate, the libaio aio room, and catch-all cpu lists ---
+t_assert "--line-rate takes a positive Gb/s figure, attached or separate" bash -c '
+    (source ./wekatester; parse_args --line-rate 16 h1; [ "$LINE_RATE_GBPS" = 16 ]) &&
+    (source ./wekatester; parse_args --LINE-RATE=12.5 h1; [ "$LINE_RATE_GBPS" = 12.5 ]) &&
+    for v in 0 abc 1.2.3 -5; do
+        if err=$( (source ./wekatester; parse_args "--line-rate=$v" h1) 2>&1 ); then echo "accepted $v" >&2; exit 1; fi
+        case "$err" in *"--line-rate"*) ;; *) echo "$v: $err" >&2; exit 1;; esac
+    done'
+t_assert "cal_shapes: --line-rate replaces ethtool's figure, and gives a host with no weka CLI a target" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8 h3:8
+    sed -i.b "/^weka_net /d" "$d/probe/h3"; echo "weka_cli absent" >> "$d/probe/h3"
+    out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h3); REGEN_LAYOUT=0; AUTH_DIR=""; LINE_RATE_GBPS=16
+            cal_shapes "$d/shapes" "bw read") 2>&1 )
+    [ "$(cut -f6 "$d/shapes" | tr "\n" " ")" = "2000000000 2000000000 " ] || { cat "$d/shapes" >&2; exit 1; }
+    case "$out" in *"100 Gb/s -> line rate 11.64 GiB/s; line rate 1.86 GiB/s from --line-rate 16 Gb/s in place of ethtool'"'"'s"*"no weka CLI on the host; line rate 1.86 GiB/s from --line-rate 16 Gb/s"*) true;;
+        *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *"no line-rate target"*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "probe: the kernel's aio limit and use come along as aio_max_nr and aio_nr" bash -c '
+    d=$(mktemp -d); r=$d/root; mkdir -p "$r/proc/sys/fs"
+    echo 65536 > "$r/proc/sys/fs/aio-max-nr"; echo 1024 > "$r/proc/sys/fs/aio-nr"
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
+    out=$(WEKATESTER_SYSROOT=$r bash -c "$cmd" 2>&1)
+    printf "%s\n" "$out" | grep -qx "aio_max_nr 65536" && printf "%s\n" "$out" | grep -qx "aio_nr 1024" &&
+    printf "aio_max_nr 65536\naio_nr 1024\n" > "$d/p" &&
+    [ "$(source ./wekatester; pyrun "$d/p" <<< "import sys; print(probe_aio_room(sys.argv[1]))")" = 64512 ] &&
+    printf "ncpus 4\n" > "$d/q" &&
+    [ "$(source ./wekatester; pyrun "$d/q" <<< "import sys; print(probe_aio_room(sys.argv[1]))")" = None ]'
+t_assert "cal_plan: libaio stops a queue ladder at the kernel's aio room, and says how to go deeper" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    # iscg001, 2026-09-25: 188 jobs x 512 set up more aio events than 65,536
+    out=$(plan_sim "$d" iops write libaio 47 0 0 exh=1 aio=65536)
+    ! awk "\$2 * \$3 > 65536" "$d/asked" | grep -q . || { awk "\$2 * \$3 > 65536" "$d/asked" >&2; exit 1; }
+    grep -q "^iodepth 188 256 1$" "$d/asked" &&
+    case "$out" in *"the queue ladder stopped short of numjobs=188 iodepth=512: libaio would set up 96256 aio events and the kernel has room for 65536 (raise fs.aio-max-nr to search deeper)"*) true;;
+        *) echo "$out" >&2; exit 1;; esac
+    # io_uring owes the aio limit nothing
+    plan_sim "$d" iops write io_uring 47 0 0 exh=1 aio=65536 >/dev/null &&
+    grep -q "^iodepth 188 512 1$" "$d/asked"'
 
 # --- engine choice: one per shape, from the type winners ---
 t_assert "cal_engine_pick: per-type winners, ties to io_uring, the tally picks the shape engine" bash -c '

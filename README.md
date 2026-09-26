@@ -21,6 +21,7 @@ wekatester uses fio's native client/server mode:
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
+                  [--line-rate Gb/s]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-b] [-l] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -57,6 +58,10 @@ attaching is the way to pass a value that starts with a dash.
                           30); it does not change
                           how long the measured jobs run -- that is
                           -x/--duration
+  --line-rate Gb/s        every client's dataplane line rate, for the -a cal
+                          bandwidth target, in place of what ethtool reports:
+                          a cloud VF can report 100 Gb/s on a 16 Gb/s
+                          instance, and without the weka CLI nothing reports it
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   -i, --identity [login:]keyfile[,...]
@@ -131,6 +136,8 @@ With no server given, the test runs on the local host -- no ssh required.
 `-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a cal` and `-a brutal` the 1 MiB test gets its own calibrated job count, recorded in its own host-file columns (`latency1mR`, `latency1mW`).
 
 `-l/--load` — with `-a cal` or `-a brutal`, check each calibrated bandwidth and IOPS setting under load before its test runs. See *Checking the settings under load* below.
+
+`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI.
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -275,7 +282,9 @@ socket, core and SMT siblings from sysfs, and N is what is left for fio:
   first two of socket 1; one socket reserves its next cores.
 - **N = physical cores − DPDK cores − reserved cores.** An operator cpu list
   in the host file is the operator's own reserve: only weka's cores and core
-  0's pair come out of it. A client with N < 1 stops the run with the numbers.
+  0's pair come out of it — unless it names every cpu the host has (a `0-255`
+  catch-all), which restricts nothing, so the whole rule applies. A client
+  with N < 1 stops the run with the numbers.
 
 The searches use four job counts: **N/2 and N run one job per physical core
 with the siblings idle; 2N and 4N put the siblings to work too**, which is how
@@ -315,7 +324,11 @@ fail to beat the best by 2%, and 4N runs only when 2N beat N.
   and the search falls back to the peak.
 - **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
   nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at that count's
-  winning iodepth and one step deeper. The peak rule decides.
+  winning iodepth and one step deeper. The peak rule decides. With libaio,
+  every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
+  by default), so the probe reads the room left, and a cell past it is not
+  run: the log says where the ladder stopped and to raise `fs.aio-max-nr` to
+  search deeper.
 - **Latency** takes three readings of one job at queue depth 1, and the floor
   is the *lowest*, because contention only ever adds latency. Numjobs then
   widens 2, 4 … N/2, N, and on to 2N and 4N with each nrfiles, at queue depth
