@@ -984,6 +984,45 @@ t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
     v="$FIX/jobs/h1/000-wekatester-layout.job"
     grep -q "# operator note" "$v" && ! grep -q "re-derived" "$v" &&
     case "$err" in *"user-edited layout staged as-is"*) true;; *) echo "$err" >&2; false;; esac'
+# The layout lays out where the measured jobs will run: a host-file dir is
+# that host's destination for the layout too, never the global -d.
+t_assert "tuner: the re-derived layout is marked and lays out at each host's own destination" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    { printf "h1\t-\t-\t-\t/mnt/pin"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    l1="$FIX/jobs/h1/000-wekatester-layout.job"; l2="$FIX/jobs/h2/000-wekatester-layout.job"
+    head -1 "$l1" | grep -q "^# wekatester-layout: generated (re-derived by wekatester auto\[max\]" &&
+    (source ./wekatester; is_layout_file "$l1") &&
+    grep -q "^directory=/mnt/pin$" "$l1" && grep -q "^directory=/mnt/weka$" "$l2" &&
+    grep -q "^directory=/mnt/pin$" "$FIX/jobs/h1/011-bw.job" &&
+    [ "$(cat "$FIX/usable/h1")" = "2-4" ] || { cat "$l1" >&2; false; }'
+t_assert "tuner: an edited layout is staged at each host's own destination too" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
+    { printf "h1\t-\t-\t-\t/mnt/pin"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    grep -q "^directory=/mnt/pin$" "$FIX/jobs/h1/000-wekatester-layout.job" &&
+    grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/000-wekatester-layout.job"'
+# The fleet-shared read set is calibration's: safe and max stage reads on
+# the client's own grid, exactly as a plain run does.
+t_assert "staging: only cal and brutal put reads on the fleet-shared set; safe and max keep the client's own grid" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set"
+    printf "ncpus 8\nengines libaio psync\n" > "$d/probe.h1"
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=2\nioengine=libaio\n[j]\nrw=read\n" > "$d/set/011-r.job"
+    for lvl in safe max cal brutal; do
+        w=$(mktemp -d); mkdir -p "$w/jobs" "$w/probe"; cp "$d/probe.h1" "$w/probe/h1"
+        (source ./wekatester
+         WORK_DIR=$w; DIRECTORY=/mnt/w; HOSTS=(h1); AUTO_LEVEL=$lvl
+         stage_variants "$d/set") >/dev/null 2>&1 || { echo "stage_variants failed at -a $lvl" >&2; exit 1; }
+        grep "^filename_format=" "$w/jobs/h1/011-r.job" > "$d/fmt.$lvl"
+    done
+    grep -qx "filename_format=\$filenum/\$jobnum" "$d/fmt.safe" &&
+    grep -qx "filename_format=\$filenum/\$jobnum" "$d/fmt.max" &&
+    grep -qx "filename_format=shared.\$filenum/\$jobnum" "$d/fmt.cal" &&
+    grep -qx "filename_format=shared.\$filenum/\$jobnum" "$d/fmt.brutal" ||
+        { head "$d"/fmt.* >&2; false; }'
 t_assert "tuner capacity: layout job does not double the required total" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
@@ -1256,6 +1295,23 @@ t_assert "-s summarizes every job in a bundle, in order, skipping layout results
     esac
     case "$out" in
         *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*"==== 021-mix ===="*"total bandwidth: 7.00 GiB/s"*"==== 030-broken ===="*"no JSON in fio output"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "-s: a result in another JSON layout is named; the rest of the bundle still summarizes" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); b="$d/20260101-000000"; mkdir -p "$b"
+    printf "{ \"client_stats\": [ { \"jobname\": \"All clients\", \"read\": {} } ] }\n" > "$b/results_011-odd.json"
+    fio_json_single_fixture "$b/results_012-bw.json"
+    tar -czf "$d/bundle.tgz" -C "$d" 20260101-000000
+    out=$(./wekatester -s "$d/bundle.tgz") || { echo "$out" >&2; exit 1; }
+    case "$out" in
+        *"==== 011-odd ===="*"results_011-odd.json: not the fio JSON layout this summary reads"*"==== 012-bw ===="*"read bandwidth: 2.00 GiB/s"*) true;;
+        *) echo "$out" >&2; exit 1;;
+    esac
+    cp "$b/results_011-odd.json" "$d/odd.json"
+    ! out=$(./wekatester -s "$d/odd.json" 2>&1) &&
+    case "$out" in
+        *"odd.json: not the fio JSON layout this summary reads"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 t_assert "-s on a bundle with no results files errors" bash -c '
@@ -1912,6 +1968,24 @@ numjobs=16"
      ! grep -q "wekatester-layout: generated" "$u1" &&
      ! is_layout_file "$u1" &&
      awk "/^\[global\]/{g=1} /^unlink=1$/{if(g)ok=1} END{exit !ok}" "$u1")'
+t_assert "-u: a hand-written layout with no [global] still unlinks every section" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); mkdir -p "$d/jobs/h1" "$d/set"; SET_DIR=$d/set
+     lay="# wekatester-layout: generated sha256=0000
+[lay]
+directory=/mnt/x
+create_only=1
+filesize=5G
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     stage_unlink_variants
+     u=$d/jobs/h1/999-wekatester-unlink.job
+     [ "$(head -2 "$u" | tr "\n" " ")" = "[global] unlink=1 " ] &&
+     grep -q "^\[lay\]$" "$u" && grep -q "^filesize=4k$" "$u" ||
+         { cat "$u" >&2; false; })'
 t_assert "run_jobs: the unlink job is timed, never summarized" bash -c '
     d=$(mktemp -d); mkdir "$d/set" "$d/out"
     cat > "$d/r.json" <<"JSON"
@@ -2682,6 +2756,20 @@ t_assert "engines: a pinned -e engine failing its job is fatal, naming the evide
         *"ioengine '\''io_uring'\'' failed its test job on h2"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+t_assert "engines: under -a a host where no engine passes stops the run, quoting each engine's evidence" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1 h2); AUTO_LEVEL=max; DIRECTORY=/mnt/x; FIO_BIN=fio
+        printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+        printf "engines io_uring libaio psync\n" > "$d/probe/h2"
+        run_host() { case "$1" in (h2) echo "fio: io_u error: Invalid argument"; return 1;; (*) return 0;; esac; }
+        test_engines) 2>&1 >/dev/null ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected a nonzero exit" >&2; exit 1; }
+    case "$err" in
+        *"h2: ioengine libaio: fio: io_u error: Invalid argument"*"no ioengine passed its test job on h2 (tried: io_uring libaio psync)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac &&
+    grep -q "^engines io_uring libaio psync$" "$d/probe/h1"'
 t_assert "finalize: a host-line engine that failed its test dies naming host+evidence" bash -c '
     d=$(mktemp -d); f=$(mktemp)
     printf "h1,,weird_eng,,,,,\n" > "$f"
@@ -3002,6 +3090,20 @@ t_assert "writeback: -g overwrites without a prompt, but never login or allowed_
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
      writeback_targets) >/dev/null
     tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$"'
+# The layout job sorts first, so before it carried the marker its engine,
+# cpu list and directory won the record. It records nothing now; the cpu
+# list is the tuner's usable list, which no single job names whole.
+t_assert "writeback: the layout records nothing; the cpu list is the tuner's usable list, not one job's subset" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"; mkdir -p "$d/usable"
+    printf "# wekatester-layout: generated (re-derived)\n[global]\ndirectory=/mnt/elsewhere\ncpus_allowed=0-7\nioengine=psync\n[layout-1]\ncreate_only=1\n" \
+        > "$d/jobs/h1/000-wekatester-layout.job"
+    printf "0-5\n" > "$d/usable/h1"
+    printf "host,user_login,ioengine\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
+     writeback_targets) >/dev/null
+    tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-5,/mnt/w," || { tail -1 "$f" >&2; false; }'
 
 # A generic (host-less) row is a default, never the host's own setting. The
 # writeback leaves it byte-for-byte alone and gives the host its own line

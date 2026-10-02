@@ -4314,13 +4314,27 @@ test_engines() {
     # rewrite each probe's engines line to the proven subset (untested
     # engines are dropped only in auto mode, where the list WAS the tests)
     if [ -n "$AUTO_LEVEL" ]; then
+        local ok none=() c
         for host in "${HOSTS[@]}"; do
-            local ok
             ok=$(awk -v h="$host" '$1 == h && $3 == "ok" {printf " %s", $2}' "$results")
+            [ -n "$ok" ] || none+=("$host")
             awk -v ok="$ok" '$1 == "engines" {print "engines" ok; next} {print}' \
                 "$WORK_DIR/probe/$host" > "$WORK_DIR/probe/$host.new"
             mv "$WORK_DIR/probe/$host.new" "$WORK_DIR/probe/$host"
         done
+        # -a stages every job on a proven engine; a host with none would
+        # only fail later, in a calibration cell or a measured job, under an
+        # error that no longer names the cause. The workdir dies with the
+        # process, so quote each engine's evidence now.
+        if [ ${#none[@]} -gt 0 ]; then
+            for host in "${none[@]}"; do
+                for c in $cand; do
+                    [ -s "$WORK_DIR/et/$host.$c.out" ] || continue
+                    log "$host: ioengine $c: $(tail -1 "$WORK_DIR/et/$host.$c.out")" >&2
+                done
+            done
+            die "no ioengine passed its test job on ${none[*]} (tried:$(printf ' %s' $cand)); -a $AUTO_LEVEL needs one that works there -- check direct IO on the destination and the fio build"
+        fi
     fi
     # a PINNED engine failing anywhere is fatal, naming host and evidence
     if [ -n "$ENGINE" ]; then
@@ -4896,8 +4910,13 @@ def layout_pristine(lines):
 
 jobs = sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f))
 layout_set = {j for j in jobs if is_layout(os.path.join(src, j))}
+os.makedirs(os.path.join(work, "usable"), exist_ok=True)
 for h in hosts:
     os.makedirs(os.path.join(work, "jobs", h), exist_ok=True)
+    # what fio may run on here, for the host-file writeback: each staged job
+    # names only the subset its job count runs on, never this whole list
+    with open(os.path.join(work, "usable", h), "w") as fp:
+        fp.write(fmt_cpulist(usable_for(h)) + "\n")
 
 def derive_layout_variant(h):
     """Re-derive layout sections from this host's already-tuned variants, so
@@ -4952,8 +4971,11 @@ def derive_layout_variant(h):
         return kept
 
     best = pick_engine(engines)
-    out = [f"# re-derived by wekatester auto[{label}] from this host's tuned variants",
-           "[global]", f"directory={directory}",
+    # the marker keeps every reader of the staged dir (capacity, writeback,
+    # bundle summary) treating this as the layout job under any file name;
+    # no sha: it is re-derived every run, so nothing compares it
+    out = [f"{LAYOUT_MARKER} (re-derived by wekatester auto[{label}] from this host's tuned variants)",
+           "[global]", f"directory={target(h, 'dir') or directory}",
            f"cpus_allowed={fmt_cpulist(usable_for(h))}",
            "create_serialize=0", "fallocate=none", f"ioengine={best}"]
     n = 0
@@ -5153,7 +5175,7 @@ for job in sorted(layout_set):
         if pristine:
             out = derive_layout_variant(h)
         else:
-            out = override(lines, "directory", directory)
+            out = override(lines, "directory", target(h, "dir") or directory)
             out = override(out, "cpus_allowed", fmt_cpulist(usable_for(h)))
         with open(os.path.join(work, "jobs", h, job), "w") as fp:
             fp.write("\n".join(out) + "\n")
@@ -5781,11 +5803,18 @@ for host in hosts:
     userf = os.path.join(work, "auth", f"{host}.user")
     if os.path.exists(userf):
         d["login"] = open(userf).read().strip()
+    # the cpu list fio may run on here, as the tuner resolved it: a staged
+    # job names only the subset its own job count runs on (physical cores
+    # alone at N or fewer jobs), so no single job is the list to record
+    usable = os.path.join(work, "usable", host)
+    if os.path.exists(usable):
+        d.setdefault("cpus", open(usable).read().strip())
     for job in sorted(os.listdir(jdir)) if os.path.isdir(jdir) else []:
         p = os.path.join(jdir, job)
         lines = open(p).read().splitlines()
-        if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
-            continue
+        if job == "000-wekatester-layout.job" or any(
+                l.startswith("# wekatester-layout: generated") for l in lines[:3]):
+            continue   # the layout is a barrier, not a test: it records nothing
         if is_floor_twin(lines):
             continue   # its one-job geometry is forced, not something to record
         kinds = [KIND[w] for l in lines if l.startswith("# report")
@@ -6340,8 +6369,17 @@ stage_variants() {
         # missing both its own handling and max's.
         tuner_tier=$AUTO_LEVEL
         cal_mode && tuner_tier=max
+        # The fleet-shared read set exists because calibration's read cells
+        # measured it, so only cal and brutal stage reads onto it. safe and
+        # max stage every file on the client's own grid, the one plain runs
+        # use, so alternating the two never lays out a second read grid.
+        local ns=""
+        if cal_mode; then
+            ns=$(cal_namespace "$srcdir") \
+                || die "cannot derive the calibration namespace from $srcdir"
+        fi
         WEKATESTER_TIER_LABEL=$AUTO_LEVEL \
-        WEKATESTER_NS="$(cal_namespace "$srcdir")" \
+        WEKATESTER_NS="$ns" \
         WEKATESTER_IOPS_NOLAT=$(cal_mode && echo 1 || echo 0) \
         auto_tune "$srcdir" "$WORK_DIR" "$tuner_tier" "$DIRECTORY" \
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
@@ -6524,8 +6562,11 @@ stage_unlink_variants() {
             /^size=/     { print "filesize=4k"; next }
             /^(blocksize|bs)=/ { print "blocksize=4k"; next }
             { print }
-            /^\[global\]/ && !ins { print "unlink=1"; ins = 1 }
-        ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB"
+        ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB" \
+            || die "cannot derive the -u unlink job for $host from $src"
+        # every section must unlink: a hand-written layout may have no
+        # [global] at all, and override_variant_key creates one then
+        override_variant_key "$WORK_DIR/jobs/$host/$UNLINK_JOB" unlink 1
     done
     JOBFILES+=("$UNLINK_JOB")
 }
@@ -7449,10 +7490,10 @@ def parse_stats(raw, label):
     per_host = {}
     alls = None
     for s in data.get("client_stats", []):
-        if s["jobname"] == "All clients":
+        if s.get("jobname") == "All clients":
             alls = s
         else:
-            per_host[s.get("hostname", s["jobname"])] = s
+            per_host[s.get("hostname", s.get("jobname", "?"))] = s
     if alls is None:
         if len(per_host) == 1:
             alls = next(iter(per_host.values()))  # fio emits no aggregate for one client
@@ -7549,13 +7590,19 @@ def summarize_bundle(path):
             raw = tf.extractfile(m).read().decode(errors="replace")
             try:
                 per_host, alls = parse_stats(raw, os.path.basename(m.name))
+                render(per_host, alls)
             except Unsummarizable as exc:
                 # a failed run's bundle can hold half-written results; show
                 # the rest rather than dying on the first casualty
                 print(f"    ({exc})")
                 print()
-                continue
-            render(per_host, alls)
+            except (KeyError, TypeError, ValueError) as exc:
+                # well-formed JSON in another layout (an older fio, a file
+                # that is not fio's): the same -- say so, show the rest.
+                # render prints nothing until every line is built
+                print(f"    ({os.path.basename(m.name)}: not the fio JSON layout "
+                      f"this summary reads: {exc!r})")
+                print()
 
 
 if tarfile.is_tarfile(path):
@@ -7576,7 +7623,10 @@ if expected:
             f"{path}: no results from {len(missing)} of {len(expected)} host(s): "
             + ", ".join(missing)
         )
-render(per_host, alls)
+try:
+    render(per_host, alls)
+except (KeyError, TypeError, ValueError) as exc:
+    sys.exit(f"{path}: not the fio JSON layout this summary reads: {exc!r}")
 PYEOF
 }
 
