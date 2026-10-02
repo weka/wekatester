@@ -405,11 +405,10 @@ jobs will not reproduce is not the test's ceiling. So:
   A job count at or below N runs one job per physical core; a wider one
   spreads over the siblings too.
 - **the engine** a shape was measured on is the engine its staged jobs run.
-- **one amount of data per job.** Every seeded file is `FILESIZE_MIB` (5G),
-  and every calibration cell and, through the recorded tuples, every staged
-  test gives each job 5G of data split over its files: nrfiles 2 runs two
-  2560M regions, nrfiles 4 four 1280M ones, each the leading part of a 5G
-  file. The working set is part of the measurement — the same staged
+- **one amount of data per job.** Every calibration cell and, through the
+  recorded tuples, every staged test gives each job `FILESIZE_MIB` (5G) of
+  data split over its files: nrfiles 2 runs two 2560M regions, nrfiles 4
+  four 1280M ones, each the leading part of its file. The working set is part of the measurement — the same staged
   iops-write geometry delivered 7.5% differently at 256M vs 1024M files, and
   WEKAPP-289548 saw 4k random reads lose 30% from 1M files to 3G files — so
   the file ladder changes the file count and nothing else. A host file that
@@ -419,11 +418,22 @@ jobs will not reproduce is not the test's ceiling. So:
 `filename_format` can address the grid, meaning it has both `$filenum` and
 `$jobnum` and no `$jobname`. The dataset splits along the read/write line:
 
-- **Reads use one fleet-shared dataset** (`shared.<fmt>`). Every client's read
-  cells and staged read jobs open the *same* files. That is the realistic fleet
-  workload, and it lets one dense set serve any number of clients. The layout
-  job lays it out once, from the first host, for the widest job count any host
+- **Reads use one fleet-shared dataset per filesystem group** (`shared.<fmt>`).
+  Every client's read cells and staged read jobs open the *same* files as the
+  rest of its group. That is the realistic fleet workload, and it lets one
+  dense set serve any number of clients. The layout job lays it out once per
+  group, from the group's first host, for the widest job count any member
   reads it with. The host name `shared` is reserved.
+- **A filesystem group** is every client whose destination is the same
+  directory, whatever path it is mounted at: one weka filesystem can sit at
+  `/mnt/foo` on one client and `/mnt/bar` on another. The mount check's write
+  probe has each client append its name to the run's group file
+  (`.wekatester-group.<run>.lst`) in its own destination; once every client
+  has passed every other check, each returns that file's sha256, and equal
+  hashes are one group. A separate subdirectory, even of the same filesystem,
+  is a group of its own. The file is removed once hashed. Each group has its
+  own representative for every shape, so a group's read cells read that
+  group's own set.
 - **Writes use per-client sets** (`<host>.<fmt>`), because concurrent
   cross-client writes to shared files measure lease arbitration, not the
   client. A set whose calibration writes are all sequential gets
@@ -434,16 +444,30 @@ jobs will not reproduce is not the test's ceiling. So:
 Sets whose format cannot express the grid fall back to the private
 `.wekatester-cal` scratch.
 
-**Only the representatives seed, and incrementally.** Before its first cell, a
-shape's representative gets the files N jobs need. A wider cell, such as 4N
-jobs or a higher nrfiles, seeds its own extra files first; 4N jobs at nrfiles
-4 is 16N files of 5G, which the seed estimate prices before writing. A file already at or above `FILESIZE_MIB` is left alone. Size is
+**Seeding is incremental, and each file only as big as its largest use.** A
+job at nrfiles 4 reads 1.25G of each of its first four files, so file 0 is
+seeded at 5G (nrfiles 1 reads all of it), file 1 at 2.5G, files 2 and 3 at
+1.25G: 10G per job at nrfiles 4, not four 5G files. Every size is fixed
+before the first seed from every nrfiles step, so a file is created once at
+its final size and never grows. Before its first cell, a shape's
+representative gets the files N jobs need; a wider cell, such as 4N jobs or
+a higher nrfiles, seeds its own extra files first. The shared read set is
+seeded by its whole filesystem group: every member's fio server is idle while
+shapes calibrate one at a time, so each writes a round-robin share of the
+missing files into its own view of the directory. Write sets stay on their
+own client. A file already at or above its size is left alone. Size is
 a sufficient test **because the seed job sets `fallocate=none`**: a partial
 create leaves a short file that fails the test, never a full-size hollow one
 that passes it. Before a byte is written the seed prints its estimate: the
 dense files and GiB to write, the sparse truncates, and the free space at the
 destination with the share the seed will take. A seed that would not fit
-stops there. The dataset is kept after the run, so the next calibration seeds
+stops there. Before the first cell, calibration also prices everything it
+will write per filesystem — each group's shared read set for its widest
+reader and each representative's own write set for its shape's widest cell,
+less what is already laid out — adding up the groups and hosts on one weka
+filesystem, and stops (or, with `--ignore-capacity`, asks) when it cannot
+fit. The other members' own write sets are priced by the run's capacity
+check, at the measured answers. The dataset is kept after the run, so the next calibration seeds
 nothing; `-u` removes it once the last measured job has finished, exactly as
 it removes the workload's own files (a failed run keeps it for the rerun).
 

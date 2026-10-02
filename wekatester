@@ -48,6 +48,7 @@ DRY_RUN=0           # -n: create/generate and print what would run; execute noth
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
+GROUP_FILE=""       # this run's filesystem-group file in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LOAD_CHECK=0        # -l: check each calibrated bandwidth/iops setting under load
 LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
@@ -1087,6 +1088,50 @@ def host_addr(cell):
     localhost). Strip the id, then map the name onto the address."""
     name = cell.split("/", 1)[0].strip()
     return ALIAS.get(name, name)
+
+def load_fs_groups(work, hosts):
+    """host -> the members of its filesystem group, in host order, from
+    collect_fs_groups' $WORK_DIR/groups ("<host> <group>"). The first member
+    lays out and prices the group's fleet-shared read set. Without the file
+    every host is one group: one shared directory, as before groups."""
+    gid = {}
+    path = os.path.join(work, "groups")
+    if os.path.exists(path):
+        for line in open(path):
+            f = line.split()
+            if len(f) == 2:
+                gid[f[0]] = f[1]
+    members = {}
+    for h in hosts:
+        members.setdefault(gid.get(h, "1"), []).append(h)
+    return {h: members[gid.get(h, "1")] for h in hosts}
+
+# Seeded file sizes. A job at nrfiles=nr takes FILESIZE_MIB/nr from each of
+# its first nr files, so file f only ever needs the largest share any test
+# takes from it: with nrfiles 1, 2 and 4 that is 5G, 2.5G, 1.25G and 1.25G
+# per job -- 10G, not the 20G of four 5G files. A need is (nj, nr, mib):
+# jobs below nj at nrfiles nr read or write mib of each of their first nr
+# files. Every size is fixed before the first seed, from every need there
+# is, so a file is created once at its final size and never has to grow.
+SEED_ANY_JOB = 1 << 30
+
+def ladder_needs(nrs, fsmib, nj=SEED_ANY_JOB):
+    return [(nj, nr, max(1, fsmib // nr)) for nr in sorted(set(nrs)) if nr > 0]
+
+def read_needs(path):
+    """Listed needs beyond the ladder: "<nj> <nr> <mib>" lines."""
+    out = []
+    if os.path.exists(path):
+        for line in open(path):
+            p = line.split()
+            if len(p) == 3 and all(x.isdigit() for x in p):
+                out.append((int(p[0]), int(p[1]), int(p[2])))
+    return out
+
+def seed_size_mib(j, f, needs):
+    """MiB file f of job j is seeded at: the largest share any need takes
+    from it, or 0 when nothing needs the file."""
+    return max([mib for nj, nr, mib in needs if j < nj and f < nr] or [0])
 PYLIBEOF
 )
 
@@ -2115,90 +2160,150 @@ SUBDIREOF
             || die "$host: cannot create the calibration namespace subdirectories"
     fi
     tlist="$WORK_DIR/cal/$host/truncate.list"
-    want=$(python3 - "$(host_name "$host")" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
-               "$root" "$eng" "$cpus" "$WORK_DIR/cal/$host/$job" \
-               "$WORK_DIR/cal/$host/scratch.list" "${CAL_FMT:-\$jobnum.\$filenum}" \
-               "${CAL_SEP:-.cal.}" "$unified" "$dense" "$tlist" <<'PYEOF'
+    # Who writes: the rep alone, except for the unified READ side, which its
+    # whole filesystem group shares -- every member's fio server is up and
+    # idle while shapes calibrate one at a time, so each takes a slice of
+    # the missing files (round robin, by file) into its own view of the one
+    # directory, on its own cpus and engine. A member's line is
+    # "<host> <dir> <cpus> <engine>"; the rep comes first.
+    local members="$WORK_DIR/cal/$host/seed.members" m mdir mcpus meng active
+    printf '%s\t%s\t%s\t%s\n' "$host" "$root" "$cpus" "$eng" > "$members"
+    if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ]; then
+        for m in $(group_members "$host"); do
+            [ "$m" != "$host" ] || continue
+            mcpus=$(awk -F'\t' -v h="$m" '$1 == h {print $2; exit}' "$WORK_DIR/cal/hostinfo")
+            meng=$(awk -F'\t' -v h="$m" '$1 == h {print $3; exit}' "$WORK_DIR/cal/hostinfo")
+            mdir=$(host_dir "$m")
+            printf '%s\t%s\t%s\t%s\n' "$m" "$mdir" "$mcpus" "${meng:-$eng}" >> "$members"
+        done
+    fi
+    want=$(pyrun "$(host_name "$host")" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
+               "$job" "$WORK_DIR/cal" "$WORK_DIR/cal/$host/scratch.list" \
+               "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" "$dense" \
+               "$tlist" "$CAL_NR $CAL_NR_LADDER" "$members" \
+               "$WORK_DIR/cal/needs.read.$(group_first "$host")" "$WORK_DIR/cal/needs.write.$host" <<'PYEOF'
+import os
 import sys
 
-(host, rnj, rnr, wnj, wnr, fsmib, directory, eng, cpus, outpath, listpath,
- fmt, sep, unified, dense, tlistpath) = sys.argv[1:17]
+(host, rnj, rnr, wnj, wnr, fsmib, jobname, outdir, listpath, fmt, sep, unified,
+ dense, tlistpath, nrs, membersf, rneedsf, wneedsf) = sys.argv[1:19]
 rnj, rnr, wnj, wnr, fsmib = int(rnj), int(rnr), int(wnj), int(wnr), int(fsmib)
-need = fsmib * 1024 * 1024
+nrs = [int(x) for x in nrs.split() if x.isdigit()]
 have = {}
 for line in open(listpath):
     p = line.split()
     if len(p) == 2 and p[1].isdigit():
         have[p[0]] = int(p[1])
 
+def needs_from(path):
+    # the nrfiles ladder's shares, plus any listed need beyond it
+    # ("<nj> <nr> <mib>" lines: what a host-file value pins past the grid)
+    out = ladder_needs(nrs, fsmib)
+    if os.path.exists(path):
+        for line in open(path):
+            p = line.split()
+            if len(p) == 3 and all(x.isdigit() for x in p):
+                out.append((int(p[0]), int(p[1]), int(p[2])))
+    return out
+
+rneeds, wneeds = needs_from(rneedsf), needs_from(wneedsf)
+if unified != "1":
+    # the scratch keeps reads and writes on the same files: one size serves both
+    rneeds = wneeds = rneeds + wneeds
+
+def size_of(needs, j, f, nr):
+    return seed_size_mib(j, f, needs) or max(1, fsmib // nr)
+
 def name_for(prefix, j, f):
     return (prefix + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
 
-todo, trunc, seen = [], [], set()
+rtodo, wtodo, trunc, seen = [], [], [], set()
 rprefix = "shared." if unified == "1" else host + sep
 for j in range(rnj):
     for f in range(rnr):
-        name = name_for(rprefix, j, f)
-        if name in seen or have.get(name, 0) >= need:
+        name, mib = name_for(rprefix, j, f), size_of(rneeds, j, f, rnr)
+        if name in seen or have.get(name, 0) >= mib << 20:
             continue
         seen.add(name)
-        todo.append((j, name))
+        rtodo.append((j, name, mib))
 for j in range(wnj):
     for f in range(wnr):
-        name = name_for(host + sep, j, f)
-        if name in seen or have.get(name, 0) >= need:
+        name, mib = name_for(host + sep, j, f), size_of(wneeds, j, f, wnr)
+        if name in seen or have.get(name, 0) >= mib << 20:
             continue
         seen.add(name)
         if unified == "1" and dense == "0":
-            trunc.append(name)
+            trunc.append((name, mib))
         else:
-            todo.append((j, name))
+            wtodo.append((j, name, mib))
 with open(tlistpath, "w") as fh:
-    fh.write("".join(f"{n} {fsmib}\n" for n in trunc))
-# fallocate=none: see generate_layout -- the incremental skip trusts size,
-# which is only sound if a partial write leaves a short file.
-out = ["[global]", "directory=%s" % directory, "unique_filename=0",
-       "ioengine=%s" % eng, "direct=1", "bs=1Mi", "rw=write",
-       "fallocate=none", "create_on_open=1", "nrfiles=1",
-       "filesize=%dM" % fsmib]
-if cpus:
-    out += ["cpus_allowed=%s" % cpus, "cpus_allowed_policy=split"]
+    fh.write("".join(f"{n} {mib}\n" for n, mib in trunc))
+
+members = [l.rstrip("\n").split("\t") for l in open(membersf) if l.strip()]
+share = {m[0]: [] for m in members}
+if unified == "1":
+    for k, item in enumerate(rtodo):
+        share[members[k % len(members)][0]].append(item)
+else:
+    share[members[0][0]] += rtodo
+share[members[0][0]] += wtodo
+
 # One section per file blew straight through fio's REAL_MAX_JOBS (4096) the
 # first time a wide dataset was seeded: 52 jobs x 128 files = 6656 sections,
 # dead at parse two seconds in (field client B, 2026-08-24). A section seeds up to
-# SEED_CHUNK files through a colon-joined filename list -- the incremental
-# skip stays exact (only files that failed the size test are listed), and the
-# chunk keeps the option line far below fio's 4096-byte parser buffer.
+# SEED_CHUNK files of one size through a colon-joined filename list -- the
+# incremental skip stays exact (only files that failed the size test are
+# listed), and the chunk keeps the option line far below fio's 4096-byte
+# parser buffer.
 SEED_CHUNK = 16
-groups = {}
-for j, name in todo:
-    groups.setdefault(j, []).append(name)
-sections = 0
-for j, names in sorted(groups.items()):
-    for c in range(0, len(names), SEED_CHUNK):
-        chunk = names[c:c + SEED_CHUNK]
-        sections += 1
-        out += ["[seed-%d-%d]" % (j, c // SEED_CHUNK),
-                "filename=%s" % ":".join(chunk),
-                "nrfiles=%d" % len(chunk)]
-if sections > 4000:
-    sys.exit("ERROR: the seed needs %d fio sections and fio caps a run at "
-             "4096 jobs; shorten CAL_NR_LADDER or mount weka with more cores (a smaller N)" % sections)
-with open(outpath, "w") as fh:
-    fh.write("\n".join(out) + "\n")
-print(len(todo), len(todo) * fsmib, len(trunc))
+active = []
+for m, directory, cpus, eng in members:
+    files = share[m]
+    if not files:
+        continue
+    # fallocate=none: see generate_layout -- the incremental skip trusts
+    # size, which is only sound if a partial write leaves a short file.
+    out = ["[global]", "directory=%s" % directory, "unique_filename=0",
+           "ioengine=%s" % eng, "direct=1", "bs=1Mi", "rw=write",
+           "fallocate=none", "create_on_open=1"]
+    if cpus:
+        out += ["cpus_allowed=%s" % cpus, "cpus_allowed_policy=split"]
+    groups = {}
+    for j, name, mib in files:
+        groups.setdefault((j, mib), []).append(name)
+    sections = 0
+    for (j, mib), names in sorted(groups.items()):
+        for c in range(0, len(names), SEED_CHUNK):
+            chunk = names[c:c + SEED_CHUNK]
+            sections += 1
+            out += ["[seed-%d-%dM-%d]" % (j, mib, c // SEED_CHUNK),
+                    "filename=%s" % ":".join(chunk),
+                    "nrfiles=%d" % len(chunk), "filesize=%dM" % mib]
+    if sections > 4000:
+        sys.exit("ERROR: %s: the seed needs %d fio sections and fio caps a run at "
+                 "4096 jobs; shorten CAL_NR_LADDER or mount weka with more cores "
+                 "(a smaller N)" % (m, sections))
+    os.makedirs(os.path.join(outdir, m), exist_ok=True)
+    with open(os.path.join(outdir, m, jobname), "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    active.append(m)
+print(len(rtodo) + len(wtodo), sum(mib for _, _, mib in rtodo + wtodo), len(trunc))
+print(" ".join(active))
 PYEOF
           ) || die "$host: cannot build the calibration seed"
-    read -r nfiles nmib ntrunc <<<"$want"
+    read -r nfiles nmib ntrunc <<<"${want%%$'\n'*}"
+    active=""; [ "$want" = "${want#*$'\n'}" ] || active=${want#*$'\n'}
     read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
     case "$availmib" in (""|*[!0-9]*) availmib="" ;; esac
-    local side="dataset"
+    local side="dataset" by=""
     if [ "$wnj" -eq 0 ]; then
         side="read set"; [ "$unified" -eq 0 ] || side="shared read set"
     elif [ "$rnj" -eq 0 ]; then
         side="write set"
     fi
-    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "${ntrunc:-0}" "$availmib" "$hd")"
+    set -- $active
+    [ "$#" -le 1 ] || by=" across $# client(s) of its filesystem group"
+    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "${ntrunc:-0}" "$availmib" "$hd")"
     if [ "${nmib:-0}" -gt 0 ]; then
         if [ -z "$availmib" ]; then
             log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2
@@ -2208,30 +2313,34 @@ PYEOF
     fi
     if [ "${ntrunc:-0}" -gt 0 ]; then
         # sparse write canvases: st_size set by truncate, bytes land as the
-        # write cells put them there. Chunked so the command string stays small.
-        tmib=$(awk 'NR==1 {print $2}' "$tlist")
-        awk '{print $1}' "$tlist" | while IFS= read -r tn || [ -n "$tn" ]; do
-            printf "'%s' " "$tn"
-        done | xargs -n 64 | while IFS= read -r tchunk; do
-            run_host "$host" "cd '$root' && truncate -s ${tmib}M $tchunk" \
-                || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
+        # write cells put them there. One pass per file size, chunked so the
+        # command string stays small.
+        for tmib in $(awk '{print $2}' "$tlist" | sort -un); do
+            awk -v s="$tmib" '$2 == s {print $1}' "$tlist" | while IFS= read -r tn || [ -n "$tn" ]; do
+                printf "'%s' " "$tn"
+            done | xargs -n 64 | while IFS= read -r tchunk; do
+                run_host "$host" "cd '$root' && truncate -s ${tmib}M $tchunk" \
+                    || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
+            done
         done
         [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
             || die "$host: cannot truncate-seed the write set"
         log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
     fi
-    [ "${nfiles:-0}" -gt 0 ] || return 0
-    cal_push "$job" "$host" || die "cannot copy the calibration seed to $MASTER"
-    log "cal: seeding $host's calibration $side..."
+    [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
+    cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
+    log "cal: seeding $host's calibration $side${by}..."
+    cmd="'$FIO_BIN' --output-format=json --eta=never"
+    for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed must leave its evidence somewhere that survives the
     # workdir cleanup: /dev/shm/wt.* is wiped on exit
-    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta=never --client=$host '$TARGET_DIR.cal/$host/$job'" \
-            > "$res"; then
-        cal_evidence seed "$res" "$job" say "$host"
+    # shellcheck disable=SC2086 -- active is a list of host names
+    if ! run_host "$MASTER" "$cmd" > "$res"; then
+        cal_evidence seed "$res" "$job" say $active
         die "calibration seed failed (${res##*/} and $job are in the run bundle under cal/)"
     fi
     if ! check_fio_errors "$res" layout; then
-        cal_evidence seed "$res" "$job" quiet "$host"
+        cal_evidence seed "$res" "$job" quiet $active
         die "calibration seed errored on $host (${res##*/} and $job are in the run bundle under cal/)"
     fi
     sleep "$CAL_SETTLE"   # let the seed's write backlog destage
@@ -2400,7 +2509,9 @@ def weka_ports(f):
                       "(bound to vfio?)" % lost[0])
     return ports, ""
 
-shapes, index = [], {}
+shapes, index, hostinfo = [], {}, []
+fs_group = load_fs_groups(work, hosts)
+ngroups = len(set(g[0] for g in fs_group.values()))
 for h in hosts:
     f = facts(h)
     # the host file's own list, as the tuner reads it (cores_for): probe_cores
@@ -2440,8 +2551,12 @@ for h in hosts:
     cands = [e for e in ENGINE_ORDER if e in f["engines"]] or f["engines"][:1] or ["psync"]
     pinned = cli_engine if cli_engine != "-" else ("" if regen else field(h, "engine"))
     mem_gib = int(round(f["mem_kb"] / 1048576.0)) if f["mem_kb"] else 0
+    # one representative per shape per filesystem group (Frank, 2026-10-02):
+    # a group's read cells must read that group's own shared set
     key = (f["model"], f["ncpus"], mem_gib, len(f["weka"]), nicsig,
-           cores["n"], len(cores["all"]), tuple(cands), pinned)
+           cores["n"], len(cores["all"]), tuple(cands), pinned, fs_group[h][0])
+    # every host may help seed its group's shared set: what it runs on
+    hostinfo.append("%s\t%s\t%s" % (h, fmt_cpulist(cores["all"]), pinned or cands[0]))
     if key not in index:
         index[key] = len(shapes)
         shapes.append({"rep": h, "members": [], "f": f, "cores": cores,
@@ -2499,6 +2614,8 @@ with open(out_path, "w") as fh:
                  f["ncpus"], ("%d GiB" % s["mem_gib"]) if s["mem_gib"] else "memory unknown",
                  nics))
         print("  cores: %s" % cores_summary(c))
+        if ngroups > 1:
+            print("  filesystem group of %s: reads that group's shared set" % fs_group[rep][0])
         more = s["members"][:24]
         print("  hosts: %s%s" % (" ".join(more), "" if len(s["members"]) <= 24
                                  else " (+%d more)" % (len(s["members"]) - 24)))
@@ -2513,6 +2630,9 @@ with open(out_path, "w") as fh:
             print("WARNING: shape %d (%s): %s -- the bandwidth search has no line-rate "
                   "target and runs to its peak instead" % (i, rep, s["why"] or "no line rate"),
                   file=sys.stderr)
+# per host: the cpus and engine it seeds its group's shared set with
+with open(os.path.join(os.path.dirname(out_path), "hostinfo"), "w") as fh:
+    fh.write("".join(l + "\n" for l in hostinfo))
 PYEOF
 }
 
@@ -3111,10 +3231,10 @@ cal_remove_dataset() {
     local host i ucmd pids=() hs=()
     for host in "${HOSTS[@]}"; do
         if [ -z "$CAL_NS_DIR" ]; then
-            # unified: this host's write set, and -- from the first host
-            # only -- the fleet-shared read set, deleted by the same glob
-            # derivation the sweep uses
-            if [ "$host" = "${HOSTS[0]}" ]; then
+            # unified: this host's write set, and -- from the first host of
+            # each filesystem group only -- the group's fleet-shared read
+            # set, deleted by the same glob derivation the sweep uses
+            if [ "$host" = "$(group_first "$host")" ]; then
                 ucmd=$(pyrun shared "." "$CAL_FMT" "$(host_dir "$host")" <<'UNLSEOF'
 import re
 import sys
@@ -3158,6 +3278,149 @@ UNLEOF
         wait "${pids[$i]}" \
             || log "WARNING: could not remove the calibration dataset on ${hs[$i]}" >&2
     done
+}
+
+# What calibration itself will write, priced per filesystem before the first
+# cell, so a dataset that cannot fit stops before the first shape instead of
+# in the middle of the third: each filesystem group's shared read set for its
+# widest reader (4N of its widest shape, every nrfiles step, plus anything a
+# listed need adds), each representative's own write set for its shape's
+# widest cell, every file at its seeded size, less what is already there.
+# Groups and hosts on one weka filesystem add up against it together (Frank,
+# 2026-10-02), the pooling check_capacity uses. The other members' own write
+# sets are not calibration's to write: the run's capacity check prices them
+# at the measured answers before the first measured job. Over: die, or with
+# --ignore-capacity ask, as check_capacity does.
+cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
+    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line
+    depth=$(( $(printf '%s' "${CAL_FMT:-\$jobnum.\$filenum}" | tr -cd / | wc -c) + 1 ))
+    mkdir -p "$WORK_DIR/cal/cap" || die "cannot create $WORK_DIR/cal/cap"
+    : > "$WORK_DIR/cal/cap/names"
+    while IFS=$'\t' read -r _ rep _; do
+        hd=$(host_dir "$rep")
+        root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
+        printf '%s\t%s\n' "$rep" "$(host_name "$rep")" >> "$WORK_DIR/cal/cap/names"
+        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
+        pids+=($!); hs+=("$rep")
+    done < "$shapes"
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || die "${hs[$i]}: cannot list the calibration dataset or its free space"
+    done
+    pyrun "$WORK_DIR" "$shapes" "$ladders" "${CAL_NS_DIR-unset}" "${CAL_FMT:-\$jobnum.\$filenum}" \
+          "${CAL_SEP:-.cal.}" "$FILESIZE_MIB" "$CAL_NR $CAL_NR_LADDER" "${HOSTS[@]}" \
+          > "$WORK_DIR/cal/cap/report" <<'PYEOF'
+import os, sys
+
+work, shapes_path, ladders, nsdir, fmt, sep, fsmib, nrs = sys.argv[1:9]
+hosts = sys.argv[9:]
+unified = nsdir == ""
+fsmib = int(fsmib)
+nrs = [int(x) for x in nrs.split() if x.isdigit()]
+dirs = set(l.split()[1] for l in ladders.splitlines() if len(l.split()) == 2)
+fs_group = load_fs_groups(work, hosts)
+cap = os.path.join(work, "cal", "cap")
+names = dict(l.rstrip("\n").split("\t") for l in open(os.path.join(cap, "names")) if "\t" in l)
+
+shapes = []
+for line in open(shapes_path):
+    p = line.rstrip("\n").split("\t")
+    if len(p) >= 3:
+        shapes.append((p[1], int(p[2])))     # rep, N
+
+have, dfs = {}, {}
+for rep, _ in shapes:
+    raw = open(os.path.join(cap, rep)).read().split("WEKATESTER_DF\n", 1)
+    have[rep] = {}
+    for l in raw[0].splitlines():
+        q = l.split()
+        if len(q) == 2 and q[1].isdigit():
+            have[rep][q[0]] = int(q[1])
+    # the seed's df line: source, size in KiB, free MiB; then the fs type
+    tail = raw[1].splitlines() if len(raw) > 1 else []
+    f = tail[0].split() if tail else []
+    if len(f) >= 3 and f[2].isdigit():
+        key = ("host", rep)
+        if len(tail) >= 2 and tail[1].strip() == "wekafs":
+            key = (f[0].rsplit("/", 1)[-1], f[1])
+        dfs[rep] = (key, int(f[2]) << 20)
+
+def name_for(prefix, j, f):
+    return (prefix + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
+
+def deficit(prefix, needs, listing):
+    """Bytes still to write for every file the needs ask for, and the most
+    jobs x files they reach."""
+    if not needs:
+        return 0, 0, 0
+    nj, nr = max(n[0] for n in needs), max(n[1] for n in needs)
+    total = 0
+    for j in range(nj):
+        for f in range(nr):
+            mib = seed_size_mib(j, f, needs)
+            if mib:
+                total += max(0, (mib << 20) - listing.get(name_for(prefix, j, f), 0))
+    return total, nj, nr
+
+gib = lambda n: "%.1f" % (n / float(1 << 30))
+pools, lines = {}, []
+def charge(rep, need, what):
+    lines.append("cal: capacity: %s: ~%sGiB to write" % (what, gib(need)))
+    if rep not in dfs or need == 0:
+        return
+    key, avail = dfs[rep]
+    p = pools.setdefault(key, {"need": 0, "avail": avail, "hosts": []})
+    p["need"] += need
+    p["avail"] = min(p["avail"], avail)
+    if rep not in p["hosts"]:
+        p["hosts"].append(rep)
+
+if unified and "read" in dirs:
+    # one shared read set per filesystem group, for every shape that reads it
+    for first in sorted(set(fs_group[r][0] for r, _ in shapes), key=hosts.index):
+        needs = []
+        for rep, n in shapes:
+            if fs_group[rep][0] == first:
+                needs += ladder_needs(nrs, fsmib, 4 * n)
+        needs += read_needs(os.path.join(work, "cal", "needs.read." + first))
+        lister = first if first in have else next(r for r, _ in shapes if fs_group[r][0] == first)
+        need, nj, nr = deficit("shared.", needs, have[lister])
+        charge(lister, need, "the shared read set of %s's filesystem group (up to %d jobs x %d files)" % (first, nj, nr))
+for rep, n in shapes:
+    if unified and "write" not in dirs:
+        continue
+    needs = ladder_needs(nrs, fsmib, 4 * n) + read_needs(os.path.join(work, "cal", "needs.write." + rep))
+    if not unified:
+        needs += read_needs(os.path.join(work, "cal", "needs.read." + fs_group[rep][0]))
+    need, nj, nr = deficit(names.get(rep, rep) + sep, needs, have[rep])
+    charge(rep, need, "%s's own %s (up to %d jobs x %d files)" % (
+        rep, "write set" if unified else "calibration scratch", nj, nr))
+
+for l in lines:
+    print(l)
+over = False
+for key, p in sorted(pools.items(), key=lambda kv: str(kv[0])):
+    where = ("weka filesystem %s" % key[0]) if key[0] != "host" else ("%s's destination" % key[1])
+    if p["need"] > p["avail"]:
+        over = True
+        print("ERROR: calibration needs ~%sGiB on %s (%s) but only %sGiB is available"
+              % (gib(p["need"]), where, " ".join(p["hosts"]), gib(p["avail"])), file=sys.stderr)
+sys.exit(2 if over else 0)
+PYEOF
+    rc=$?
+    while IFS= read -r line; do log "$line"; done < "$WORK_DIR/cal/cap/report"
+    case $rc in
+        0) return 0 ;;
+        2) ;;
+        *) die "calibration capacity check failed" ;;
+    esac
+    [ "$IGNORE_CAPACITY" -eq 1 ] \
+        || die "not enough capacity for the calibration dataset (use --ignore-capacity to be asked anyway)"
+    if try_interactive; then
+        confirm_explicit "not enough capacity for the calibration dataset: continue anyway and risk ENOSPC mid-calibration?" \
+            || die "not enough capacity"
+    else
+        log "WARNING: --ignore-capacity: not enough capacity for the calibration dataset, calibrating anyway (unattended)" >&2
+    fi
 }
 
 calibrate() {
@@ -3211,6 +3474,7 @@ calibrate() {
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "cannot create the calibration namespace dir on ${hs[$i]}"
     done
+    cal_capacity_check "$shapes" "$ladders"
     # one shape at a time, each alone
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
         cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders"
@@ -3608,7 +3872,85 @@ missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
 # a shared filesystem the directory's owner/mode is a property of the
 # filesystem itself, so one failing host usually means all do.
 probe_writable() {   # probe_writable <host> <dir>
-    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\""
+    # the same session drops the host's name into the run's group file
+    # there: collect_fs_groups hashes it once every host is through
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$(host_name "$1")' >> '$2/$GROUP_FILE'}"
+}
+
+# --- filesystem groups (Frank, 2026-10-02) --------------------------------------
+# Clients whose destinations are one directory share one fleet-shared read
+# set, laid out once for all of them and priced once against their
+# filesystem. A mount path says nothing about that: one weka filesystem can
+# sit at /mnt/foo on one client and /mnt/bar on another. So the mount check's
+# write probe has every client append its name to the run's group file in its
+# own destination, and once every client has passed every other check, each
+# returns the file's hash. Equal hashes are one file, so one directory, so one
+# group. A separate subdirectory, even of the same filesystem, is a group of
+# its own -- the operator gave it its own directory on purpose. Two different
+# files can never hash alike: each ends with a name only its own clients
+# appended, and every reader of one file reads the same bytes even if an
+# append was lost. The file is removed once hashed. Writes $WORK_DIR/groups,
+# "<host> <group>" in host order, a group numbered by its first host.
+collect_fs_groups() {
+    [ -n "$GROUP_FILE" ] || return 0
+    local i h hd pids=() sum n=0 line
+    mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
+    for i in "${!HOSTS[@]}"; do
+        h=${HOSTS[$i]}
+        ( run_host "$h" "sha256sum '$(host_dir "$h")/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        pids[$i]=$!
+    done
+    : > "$WORK_DIR/fsgroup/sums"
+    for i in "${!HOSTS[@]}"; do
+        h=${HOSTS[$i]}
+        sum=""
+        if wait "${pids[$i]}"; then read -r sum _ < "$WORK_DIR/fsgroup/$i.sum" || sum=""; fi
+        case "$sum" in
+            (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file $(host_dir "$h")/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
+        esac
+        printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
+    done
+    pids=()
+    for h in "${HOSTS[@]}"; do
+        run_host "$h" "rm -f '$(host_dir "$h")/$GROUP_FILE'" &
+        pids+=($!)
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove $(host_dir "${HOSTS[$i]}")/$GROUP_FILE" >&2
+    done
+    awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
+    n=$(awk '{print $2}' "$WORK_DIR/groups" | sort -u | wc -l | tr -d ' ')
+    if [ "$n" -le 1 ]; then
+        debug "filesystem groups: all ${#HOSTS[@]} host(s) share $(host_dir "${HOSTS[0]}")"
+        return 0
+    fi
+    log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
+    for i in $(seq 1 "$n"); do
+        line=$(awk -v g="$i" '$2 == g {printf "%s%s", (c++ ? " " : ""), $1}' "$WORK_DIR/groups")
+        hd=$(host_dir "${line%% *}")
+        log "  group $i: $line (at $hd on ${line%% *})"
+    done
+}
+
+# The first host of <host>'s filesystem group: it lays out, prices and
+# removes the group's fleet-shared read set. Every host is one group when
+# collect_fs_groups did not run.
+group_first() {   # group_first <host>
+    if [ -s "$WORK_DIR/groups" ]; then
+        awk -v h="$1" '$1 == h {g = $2} {if (!($2 in f)) f[$2] = $1} END {print (g != "" ? f[g] : h)}' "$WORK_DIR/groups"
+    else
+        printf '%s\n' "${HOSTS[0]}"
+    fi
+}
+
+# Every host of <host>'s filesystem group, in host order, one per line.
+group_members() {   # group_members <host>
+    if [ -s "$WORK_DIR/groups" ]; then
+        awk -v h="$1" 'NR == FNR {if ($1 == h) g = $2; next} $2 == g {print $1}' \
+            "$WORK_DIR/groups" "$WORK_DIR/groups"
+    else
+        printf '%s\n' "${HOSTS[@]}"
+    fi
 }
 
 write_fix_hint() {   # write_fix_hint <dir> -> how to fix a directory the login user cannot write
@@ -3651,6 +3993,9 @@ confirm_create_dirs() {   # confirm_create_dirs <count>
 # it, and the warning is replayed into the run log so the bundle says so.
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
+    # one name per run, so two runs sharing a destination never read each
+    # other's group lines (collect_fs_groups)
+    [ -n "$GROUP_FILE" ] || GROUP_FILE=".wekatester-group.$(date +%s).$$.lst"
     local host line verdict failed=() mode_fail=0 write_fail=0 hd anc i
     local missing=() missing_dirs=() missing_parents=()
     local cached_hosts=() cached_modes=() mode who n
@@ -4724,6 +5069,7 @@ ignore_capacity = sys.argv[5] == "1"
 iops_nolat = os.environ.get("WEKATESTER_IOPS_NOLAT") == "1"
 targets_path = sys.argv[6]
 hosts = sys.argv[7:]
+FS_GROUP = load_fs_groups(work, hosts)
 
 # Host-file resolution (targets.final): per-host overrides that beat the
 # tuner -- CLI beats the file upstream, the file beats what is derived here.
@@ -4930,18 +5276,19 @@ def derive_layout_variant(h):
         if j in layout_set: continue
         vlines = open(os.path.join(work, "jobs", h, j)).read().splitlines()
         fmt = first_value(vlines, "filename_format")
-        # the shared dataset is laid out ONCE: only the first host's layout
-        # job carries its sections, or N clients would race to create (and
-        # the sweep to credit) the same files N times over -- and it carries
-        # them for EVERY reader, since hosts of different shapes read the set
-        # with different job counts and the widest one decides what must exist
+        # the shared dataset is laid out ONCE per filesystem group: only the
+        # group's first host's layout job carries its sections, or N clients
+        # would race to create (and the sweep to credit) the same files N
+        # times over -- and it carries them for EVERY reader in the group,
+        # since hosts of different shapes read the set with different job
+        # counts and the widest one decides what must exist
         readers = [h]
         if fmt and fmt.startswith("shared."):
-            if h != hosts[0]:
+            if h != FS_GROUP[h][0]:
                 eng = first_value(vlines, "ioengine")
                 if eng: engines[eng] = engines.get(eng, 0) + 1
                 continue
-            readers = hosts
+            readers = FS_GROUP[h]
         if fmt:
             key, section, out_fmt = fmt, None, fmt
         else:
@@ -5212,6 +5559,7 @@ import os, re, sys
 
 work = sys.argv[1]
 hosts = sys.argv[2:]
+fs_group = load_fs_groups(work, hosts)
 SKIP = {"000-wekatester-relayout.job", "999-wekatester-unlink.job"}
 MARKER = "# wekatester-layout: generated"
 
@@ -5279,8 +5627,8 @@ for h in hosts:
             layout_total += layout_footprint(p)
             continue
         ns = job_value(p, "filename_format", "") or f"__default__:{job}"
-        if ns.startswith("shared.") and h != hosts[0]:
-            continue   # the fleet-shared dataset is priced once, on host one
+        if ns.startswith("shared.") and h != fs_group[h][0]:
+            continue   # a group's shared dataset is priced once, on its first host
         namespaces[ns] = max(namespaces.get(ns, 0), footprint(p))
     required = max(sum(namespaces.values()), layout_total)
     # bytes the sweep verified as already laid out serve both the layout and
@@ -7746,6 +8094,7 @@ main() {
         # what the real run would pin (or die on) -- local set arithmetic
         # on the probe, no remote command
         check_cpu_pinning
+        collect_fs_groups
         stage_jobfiles
         sweep_layout_grid   # self-gated: a dry run never mutates
         check_capacity
@@ -7772,6 +8121,8 @@ main() {
         finalize_targets
     fi
     check_cpu_pinning
+    # every check but capacity has passed: who shares a destination
+    collect_fs_groups
     start_fio_servers
     verify_fio_ports
     calibrate

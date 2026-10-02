@@ -4547,10 +4547,13 @@ t_assert "calibrate: each shape is measured solo on its first host, the answer l
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
-    # every cell ran with exactly one client: a representative
-    ! grep -q -- "--client=h2" "$d/simlog" &&
-    [ "$(grep -o -- "--client=[a-z0-9]*" "$d/simlog" | sort -u | tr "\n" " ")" = "--client=h1 --client=h3 " ] &&
-    ! grep -- "--client=" "$d/simlog" | grep -q -- "--client=.*--client=" &&
+    # every cell ran with exactly one client: a representative (the seeds
+    # are not cells: the shared read set is seeded by the whole group)
+    grep -v cal-seed- "$d/simlog" > "$d/cells" &&
+    ! grep -q -- "--client=h2" "$d/cells" &&
+    [ "$(grep -o -- "--client=[a-z0-9]*" "$d/cells" | sort -u | tr "\n" " ")" = "--client=h1 --client=h3 " ] &&
+    ! grep -- "--client=" "$d/cells" | grep -q -- "--client=.*--client=" &&
+    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h2 " &&
     # h1 and h2 share the shape, and so its answer
     [ "$(grep "^h1 " "$d/cal.results" | cut -d" " -f2-)" = "$(grep "^h2 " "$d/cal.results" | cut -d" " -f2-)" ] &&
     # h1 (8 cpus, weka on 7, the OS on 0-1): N=5, so bandwidth reaches line
@@ -4605,7 +4608,7 @@ t_assert "calibrate: a rep that already carries a direction reuses it for the wh
     grep -qx "h2 - 4 2 5120M 3 - - - - - - - - - - - - - - - - - - - - - - - - - - - -" "$d/cal.results" &&
     case "$out" in *"shape 1: h1 already carries bw read geometry (qd/nr/fs/nj 4/2/5120M/3) -- the whole shape reuses it"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
-t_assert "calibrate: only representatives seed; unified reads seed the shared set, bw-only writes truncate" bash -c '
+t_assert "calibrate: the shared read seed is split across the filesystem group; writes stay on the representative, bw-only writes truncate" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
@@ -4619,12 +4622,15 @@ t_assert "calibrate: only representatives seed; unified reads seed the shared se
      run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
     # 4 cpus, weka on 3, the OS on 0-1: N=1, one file per job, and the 2N
-    # cells widen the shared read set to two jobs
+    # cells widen the shared read set to two jobs -- one each for h1 and h2,
+    # both driven from the master, while the write set stays on h1
     ! grep -q "^h2|" "$d/simlog" &&
     grep -qx "filename=shared.0/0" "$d/cal/h1/cal-seed-read.job" &&
-    grep -qx "filename=shared.0/1" "$d/cal/h1/cal-seed-read.job" &&
+    grep -qx "filename=shared.0/1" "$d/cal/h2/cal-seed-read.job" &&
+    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h1 .*--client=h2 " &&
+    ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h2" &&
     grep -q "truncate -s 5120M" "$d/simlog" &&
-    case "$out" in *"cal: seed estimate: h1 (shared read set, 1x1 read + 0x0 write jobs x files): 1 dense file(s) = 5.0 GiB to write"*"truncate-seeded 1 write file(s)"*) true;;
+    case "$out" in *"cal: seed estimate: h1 (shared read set, 1x1 read + 0x0 write jobs x files): 1 dense file(s) = 5.0 GiB to write"*"truncate-seeded 1 write file(s)"*"2x1 read + 0x0 write jobs x files across 2 client(s) of its filesystem group"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "calibrate: a 4k-random write search forces the dense write seed" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -4637,7 +4643,12 @@ t_assert "calibrate: a 4k-random write search forces the dense write seed" bash 
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
      calibrate) >/dev/null 2>&1
-    grep -q "^filename=h1.0/0:h1.1/0" "$d/cal/h1/cal-seed-write.job" && [ ! -s "$d/cal/h1/truncate.list" ]'
+    # a section per job and size: 5G for file 0, 2.5G for file 1, 1.25G for files 2-3
+    f=$d/cal/h1/cal-seed-write.job
+    grep -A2 -x "filename=h1.0/0" "$f" | grep -qx "filesize=5120M" &&
+    grep -A2 -x "filename=h1.1/0" "$f" | grep -qx "filesize=2560M" &&
+    grep -A2 -x "filename=h1.2/0:h1.3/0" "$f" | grep -qx "filesize=1280M" &&
+    [ ! -s "$d/cal/h1/truncate.list" ] || { cat "$f" >&2; false; }'
 t_assert "calibrate: every write cell settles, read cells never do" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
@@ -4766,7 +4777,9 @@ t_assert "cal_seed_rep: a wide seed stays far below the fio 4096-job cap, and th
             cal_seed_rep h1 104 64 0 0 1 libaio "0-51") 2>&1 )
     f=$d/cal/h1/cal-seed-read.job
     n=$(grep -c "^\[seed-" "$f")
-    [ "$n" = 416 ] || { echo "sections=$n" >&2; exit 1; }
+    # per job: one section each for its 5G, 2.5G and 1.25G files, four for the
+    # 60 past the nrfiles ladder (at the 80M share the cell itself reads)
+    [ "$n" = 728 ] || { echo "sections=$n" >&2; exit 1; }
     [ "$(awk "/^filename=/ { if (length(\$0) > m) m = length(\$0) } END { print m }" "$f")" -lt 1024 ] &&
     grep -qx "fallocate=none" "$f" && grep -qx "filesize=5120M" "$f" &&
     est=$(printf "%s\n" "$out" | grep -n "seed estimate: h1" | cut -d: -f1 | head -1) &&
@@ -4781,7 +4794,7 @@ t_assert "cal_seed_rep: a seed that does not fit stops before writing a byte" ba
             run_host() { cal_sim_host "$@"; }
             cal_seed_rep h1 8 2 0 0 1 libaio "") 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && ! grep -q "cal-seed-" "$d/simlog" &&
-    case "$err" in *"h1: the calibration dataset needs 81920MiB and /mnt/weka has 10000MiB free"*) true;; *) echo "$err" >&2; false;; esac'
+    case "$err" in *"h1: the calibration dataset needs 61440MiB and /mnt/weka has 10000MiB free"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "cal_seed_rep: sufficiency is the only test -- a complete file is never rewritten" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
     (source ./tests/helpers.sh; source ./wekatester
@@ -4794,7 +4807,142 @@ t_assert "cal_seed_rep: sufficiency is the only test -- a complete file is never
      cal_seed_rep h1 2 2 0 0 1 libaio "") >/dev/null 2>&1
     f=$d/cal/h1/cal-seed-read.job
     [ "$(grep "^filename=" "$f" | tr "\n" " ")" = "filename=h1.cal.0.1 filename=h1.cal.1.1 " ] &&
-    grep -q "^\[seed-1-0\]$" "$f" || { cat "$f" >&2; false; }'
+    grep -q "^\[seed-1-2560M-0\]$" "$f" || { cat "$f" >&2; false; }'
+
+# --- filesystem groups (Frank, 2026-10-02) ---
+# Clients that see one destination directory share one fleet-shared read set,
+# whatever path they mount it at; a separate directory, even on the same
+# filesystem, is a group of its own.
+t_assert "fs groups: equal group-file hashes are one group, numbered by first host; the file is removed" bash -c '
+    w=$(mktemp -d)
+    out=$( (source ./wekatester
+        WORK_DIR=$w; HOSTS=(h1 h2 h3 h4); GROUP_FILE=.g.lst; DIRECTORY=/mnt/x
+        run_host() { case "$2" in (sha256sum*) case "$1" in (h3) echo "bbbb  f";; (*) echo "aaaa  f";; esac;; (rm*) echo "$1" >> "$w/rm";; esac; }
+        collect_fs_groups) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    [ "$(tr "\n" " " < "$w/groups")" = "h1 1 h2 1 h3 2 h4 1 " ] &&
+    [ "$(sort "$w/rm" | tr "\n" " ")" = "h1 h2 h3 h4 " ] &&
+    case "$out" in *"filesystem groups: 2"*"group 1: h1 h2 h4 (at /mnt/x on h1)"*"group 2: h3 (at /mnt/x on h3)"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "fs groups: a host whose group file cannot be hashed stops the run, naming it" bash -c '
+    err=$( (source ./wekatester
+        WORK_DIR=$(mktemp -d); HOSTS=(h1 h2); GROUP_FILE=.g.lst; DIRECTORY=/mnt/x
+        run_host() { case "$1:$2" in (h2:sha256sum*) return 1;; (*:sha256sum*) echo "aaaa  f";; esac; }
+        collect_fs_groups) 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in *"h2: cannot hash the filesystem-group file /mnt/x/.g.lst"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "fs groups: one directory under two mount paths is one group; a sibling directory on the same filesystem is another" bash -c '
+    d=$(mktemp -d); w=$(mktemp -d)
+    mkdir -p "$d/fs1/test" "$d/fs1/other" "$d/fs2/test" "$d/mnt"
+    ln -s "$d/fs1" "$d/mnt/foo"; ln -s "$d/fs1" "$d/mnt/bar"
+    row() { printf "%s\t-\t-\t-\t%s" "$1" "$2"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; }
+    { row h1 "$d/mnt/foo/test"; row h2 "$d/mnt/bar/test"; row h3 "$d/fs2/test"; row h4 "$d/mnt/foo/other"; } > "$w/targets.final"
+    (source ./wekatester
+     WORK_DIR=$w; HOSTS=(h1 h2 h3 h4); GROUP_FILE=.g.lst
+     run_host() { bash -c "$2"; }
+     for h in "${HOSTS[@]}"; do probe_writable "$h" "$(host_dir "$h")" || exit 1; done
+     [ "$(cat "$d/fs1/test/.g.lst" | tr "\n" " ")" = "h1 h2 " ] || exit 1
+     collect_fs_groups >/dev/null 2>&1) || exit 1
+    [ "$(tr "\n" " " < "$w/groups")" = "h1 1 h2 1 h3 2 h4 3 " ] &&
+    [ ! -e "$d/fs1/test/.g.lst" ] && [ ! -e "$d/fs2/test/.g.lst" ] && [ ! -e "$d/fs1/other/.g.lst" ] ||
+        { cat "$w/groups" >&2; false; }'
+t_assert "fs groups: the hashes come back after every other check and before the fio servers, dry runs included" bash -c '
+    m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
+    dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")
+    printf "%s\n" "$dry" | grep -q "collect_fs_groups" &&
+    printf "%s\n" "$m" | awk "/check_cpu_pinning/ {p = NR} /collect_fs_groups/ {c = NR} /start_fio_servers/ {s = NR} END {exit !(p && c > p && s > c)}"'
+t_assert "tuner: each filesystem group lays out its own shared set, on its first host" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    cp "$FIX/probe/h1" "$FIX/probe/h3"
+    printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=\$filenum/\$jobnum\n[bw]\nrw=read\niodepth=1\n" > "$FIX/src/011-bw.job"
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    printf "h1 1\nh2 2\nh3 1\n" > "$FIX/groups"
+    (source ./wekatester; WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3) >/dev/null 2>&1
+    grep -q "^filename_format=shared\." "$FIX/jobs/h1/000-wekatester-layout.job" &&
+    grep -q "^filename_format=shared\." "$FIX/jobs/h2/000-wekatester-layout.job" &&
+    ! grep -q "^filename_format=shared\." "$FIX/jobs/h3/000-wekatester-layout.job"'
+t_assert "capacity: each filesystem group's shared set is priced once, and groups on one filesystem add up" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    cp "$FIX/probe/h1" "$FIX/probe/h3"; cp "$FIX/probe/h1" "$FIX/probe/h4"
+    printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=\$filenum/\$jobnum\n[bw]\nrw=read\niodepth=1\n" > "$FIX/src/011-bw.job"
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    # 50 GiB free on one weka filesystem; one shared set is 3 jobs x 10G
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n10.0.1.1/default 104857600 0 52428800 1%% /mnt/weka\nwekafs\n" > "$FIX/probe/_df"
+    chk() { (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
+        IGNORE_CAPACITY=0; WORK_DIR=$FIX; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka
+        run_host() { cat "$FIX/probe/_df"; }
+        WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3 h4 >/dev/null 2>&1 || exit 9
+        check_capacity); }
+    printf "h1 1\nh2 1\nh3 1\nh4 1\n" > "$FIX/groups"
+    out=$(chk 2>&1) || { echo "one group should fit: $out" >&2; exit 1; }
+    printf "h1 1\nh2 1\nh3 2\nh4 2\n" > "$FIX/groups"
+    err=$(chk 2>&1 >/dev/null) && { echo "two groups passed: $err" >&2; exit 1; }
+    case "$err" in *"weka filesystem default: its 4 hosts (h1 h2 h3 h4) need ~60.0GiB together but only 50.0GiB is available"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "cal_shapes: one representative per shape per filesystem group" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2 h3 h4
+    printf "h1 1\nh2 1\nh3 2\nh4 2\n" > "$d/groups"; mkdir -p "$d/cal"
+    out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3 h4); REGEN_LAYOUT=0; ENGINE=""
+            cal_shapes "$d/cal/shapes" "bw read") 2>&1 ) || { echo "$out" >&2; exit 1; }
+    [ "$(cut -f2 "$d/cal/shapes" | tr "\n" " ")" = "h1 h3 " ] &&
+    [ "$(cut -f12 "$d/cal/shapes" | tr "\n" "|")" = "h1 h2|h3 h4|" ] &&
+    [ "$(cut -f1,3 "$d/cal/hostinfo" | tr "\t\n" ": ")" = "h1:io_uring h2:io_uring h3:io_uring h4:io_uring " ] &&
+    case "$out" in *"filesystem group of h3: reads that group"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cal_seed_rep: each file is seeded at the largest share a test takes: 2 jobs to nrfiles 4 are 2x5G + 2x2.5G + 4x1.25G" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
+    out=$( (source ./tests/helpers.sh; source ./wekatester
+            WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; DIRECTORY=/mnt/weka
+            TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
+            copy_to_master() { :; }
+            run_host() { cal_sim_host "$@"; }
+            cal_seed_rep h1 2 4 0 0 1 libaio "") 2>&1 ) || { echo "$out" >&2; exit 1; }
+    f=$d/cal/h1/cal-seed-read.job
+    [ "$(grep -c "^filesize=5120M$" "$f") $(grep -c "^filesize=2560M$" "$f") $(grep -c "^filesize=1280M$" "$f")" = "2 2 2" ] &&
+    grep -A2 -x "filename=h1.cal.0.2:h1.cal.0.3" "$f" | grep -qx "filesize=1280M" &&
+    case "$out" in *"8 dense file(s) = 20.0 GiB to write"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cal_seed_rep: a listed need past the ladder makes its files at least that big" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
+    # nrfiles 3 pinned: file 2 needs 5120/3 = 1706M, more than the ladder 1280M
+    printf "4 3 1706\n" > "$d/cal/needs.read.h1"
+    (source ./tests/helpers.sh; source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; DIRECTORY=/mnt/weka
+     TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     cal_seed_rep h1 1 4 0 0 1 libaio "") >/dev/null 2>&1 || exit 1
+    f=$d/cal/h1/cal-seed-read.job
+    grep -A2 -x "filename=h1.cal.0.2" "$f" | grep -qx "filesize=1706M" &&
+    grep -A2 -x "filename=h1.cal.0.3" "$f" | grep -qx "filesize=1280M" || { cat "$f" >&2; false; }'
+t_assert "calibration capacity: groups and representatives on one weka filesystem add up before the first cell; files already there count" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    printf "h1 1\nh2 1\nh3 2\nh4 2\nh5 3\n" > "$d/groups"
+    # N=1 everywhere: 4 jobs x 4 files at 1024M + 512M + 256M + 256M = 8 GiB a set;
+    # fs1 holds two groups shared sets and two reps write sets (32 GiB), fs2 one of each
+    { printf "1\th1\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th1 h2\n"
+      printf "2\th3\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th3 h4\n"
+      printf "3\th5\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th5\n"; } > "$d/cal/shapes"
+    chk() {   # chk <fs1 free MiB> [listing on h1]
+        (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1 h2 h3 h4 h5); DIRECTORY=/mnt/w; IGNORE_CAPACITY=0
+         CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.; FILESIZE_MIB=1024; CAL_NR=1; CAL_NR_LADDER="1 2 4"
+         run_host() { case "$1" in
+             (h1) printf "%b" "$LIST1"; printf "WEKATESTER_DF\nfs1 99999999 %s\nwekafs\n" "$FREE1" ;;
+             (h3) printf "WEKATESTER_DF\nfs1 99999999 %s\nwekafs\n" "$FREE1" ;;
+             (h5) printf "WEKATESTER_DF\nfs2 88888888 20480\nwekafs\n" ;;
+         esac; }
+         FREE1=$1; LIST1=${2:-}
+         cal_capacity_check "$d/cal/shapes" "bw read
+bw write"); }
+    err=$(chk 30720 2>&1 >/dev/null) && { echo "passed at 30 GiB: $err" >&2; exit 1; }
+    case "$err" in *"calibration needs ~32.0GiB on weka filesystem fs1 (h1 h3) but only 30.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
+    case "$err" in *fs2*) echo "fs2 fits: $err" >&2; exit 1;; esac
+    # 1 GiB of the first group shared set already laid out: 31 GiB still to write
+    out=$(chk 31744 "shared.0.0 1073741824\n" 2>&1) || { echo "the credit did not count: $out" >&2; false; }'
+t_assert "-u: each filesystem group's shared set is removed from that group's first host" bash -c '
+    d=$(mktemp -d); printf "h1 1\nh2 2\nh3 1\n" > "$d/groups"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/w; CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.
+     run_host() { printf "%s|%s\n" "$1" "$2" >> "$d/cmds"; }
+     cal_remove_dataset) >/dev/null 2>&1
+    [ "$(grep "/mnt/w/shared\." "$d/cmds" | cut -d"|" -f1 | sort | tr "\n" " ")" = "h1 h2 " ] || { cat "$d/cmds" >&2; false; }'
 
 # --- what the tuner stages from it ---
 t_assert "tuner: under -a cal the iops jobs run with latency accounting off, other jobs do not" bash -c '
