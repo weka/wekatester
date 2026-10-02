@@ -208,7 +208,8 @@ of trusting the jobfiles' static values. Four levels:
 - `-a cal` — calibrates before staging, **per client shape**: the clients are
   grouped by hardware, one client of each shape is measured alone, and the
   search finds the parameters that give that shape its best result per test
-  type. What it finds is cached in `hostlist.csv`. The answer to "why these
+  type. What it finds is recorded in `hostlist.csv`, where it pins the next
+  calibration (see What lands in the host file). The answer to "why these
   numbers" becomes "measured on your clients against this cluster."
 - `-a brutal` — the same search with every early stop disabled (see below).
 
@@ -483,6 +484,14 @@ bandwidth's answer *is* a job count, and so is latency's. The rules are the
 usual ones: calibration fills empty fields only, and overwrites them under
 `-g`, so a geometry you authored yourself still wins over calibration.
 
+**The host file is only ever added to.** Nothing in it is replaced, deleted
+or rewritten in place. A host's own line that the run would change is
+commented out (`# superseded by -a: ...`) and its new version written directly
+below it; a host with no line of its own gets one appended at the end; a
+line whose values all hold is left exactly as it is. Values compare by what
+they mean, not how they are spelled: `5G` is `5120M`, a cpu list `2-4` is
+`2,3,4` (but `2,4` is not `2-4`).
+
 Under `-g` everything derived overwrites the host file except the three columns
 the operator owns outright: host, login, and allowed_cpus, as written on the
 host's **own** line. A generic (host-less) line is a default, not the host's
@@ -499,20 +508,31 @@ over the other's.
 
 Results flow into the run's geometry one precedence slot below the operator:
 CLI > host file > calibration > tuner. They persist to `hostlist.csv` through
-the `-a` writeback, which is also the cache. When a shape's representative
-already carries a complete tuple for a direction, meaning all four fields
-including numjobs, the whole shape reuses it and skips that search. A partial
-tuple never counts, and neither does one an `-a max` run wrote down: the
-writeback never records a *staged* numjobs, so a tuned guess cannot pass for a
-measurement. `-g` re-measures. `-n` names the shapes and the searches a run
-would perform without executing them.
+the `-a` writeback. **A host-file value pins its knob** (Frank, 2026-10-02):
+whatever the value — written by you or recorded by an earlier calibration —
+it is the only value that knob takes in that host's searches, used as
+written on every rung (a pinned iodepth holds on the qd1 rungs too) and
+never capped by a guard; the knobs the row leaves open are searched around
+it, and a row with all four fields is measured again at exactly that cell.
+Nothing is skipped. Hosts whose rows pin different values calibrate as
+shapes of their own. A pin past the grid (a nrfiles off the ladder, a
+filesize, a job count past 4N) sizes the seed so its files exist. `-g`
+ignores the host file's values and searches everything; `--line-rate`
+searches bandwidth again, because a recorded bandwidth answer does not say
+which line rate it stopped at, while the other values still pin. The
+writeback never records a *staged* numjobs, so a tuned guess never becomes a
+pin. `-n` names the shapes and the searches a run would perform without
+executing them.
 
-A host file written before this calibration existed carries iodepth, nrfiles
-and filesize without numjobs, and so does every `-a max` writeback. Those
-slots are measured again, and fill mode then keeps the old fields and adds only
-numjobs, a mix nobody measured. Calibration warns for each such slot. If the
-fields came from an earlier `-a` run rather than from you, re-run once with
-`-g` so the measured tuple replaces them.
+**A kernel aio room that would be exceeded stops the run before it starts.**
+libaio sets up numjobs x iodepth aio events at once, and past
+`fs.aio-max-nr` (less what is in use) the job fails with EAGAIN. A
+calibration pin whose smallest cell would exceed a shape's room, with libaio
+pinned or among the engines calibration tries, and a staged libaio job past
+its host's room, both stop with an alert naming the slot or job, the events
+and the room; nothing has run and the host file is unchanged. A searched
+cell past the room is skipped by the planner's guard instead, and the
+verdict says so.
 
 Every staged jobfile records what auto derived for that host in header
 comments. Auto also warns when workers differ (core counts, weka cores).

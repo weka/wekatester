@@ -2372,7 +2372,7 @@ numjobs=44"
 # An old-format tuple (fs/nr/qd, no nj) is re-measured, and fill mode keeps
 # its fields: a mix nobody measured, which the writeback would make permanent.
 # The file cannot say whether the operator wrote it, so the run warns.
-t_assert "apply_cal_results: an old tuple without numjobs is re-measured, kept, and warned about" bash -c '
+t_assert "apply_cal_results: fill keeps the host file's pinned fields and adds what was searched; -g replaces" bash -c '
     d=$(mktemp -d)
     printf "h1 - 4 2 5120M 6 - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n" > "$d/cal.results"
     { printf "h1"; for i in $(seq 2 37); do
@@ -2381,11 +2381,8 @@ t_assert "apply_cal_results: an old tuple without numjobs is re-measured, kept, 
     cp "$d/targets.final" "$d/orig"
     err=$( (source ./wekatester; WORK_DIR=$d; REGEN_LAYOUT=0; apply_cal_results) 2>&1 )
     a=$(awk -F"\t" "\$1==\"h1\" {print \$6, \$7, \$8, \$9}" "$d/targets.final")
-    [ "$a" = "6 1G 2 8" ] || { echo "fill: $a" >&2; exit 1; }
-    case "$err" in
-        *"WARNING: h1: the host file'"'"'s bandwidthR geometry (fs/nr/qd 1G/2/8) has no numjobs, so it was measured again"*"re-run with -g so the measured tuple (6/5120M/2/4) replaces them"*) true;;
-        *) echo "$err" >&2; exit 1;;
-    esac
+    # the fields pinned the search, so the tuple was measured with them: no warning
+    [ "$a" = "6 1G 2 8" ] && [ -z "$err" ] || { echo "fill: $a $err" >&2; exit 1; }
     cp "$d/orig" "$d/targets.final"
     err=$( (source ./wekatester; WORK_DIR=$d; REGEN_LAYOUT=1; apply_cal_results) 2>&1 )
     b=$(awk -F"\t" "\$1==\"h1\" {print \$6, \$7, \$8, \$9}" "$d/targets.final")
@@ -4256,7 +4253,7 @@ t_assert "cal_shapes: --line-rate replaces ethtool's figure, and gives a host wi
     # with no weka CLI there is no ethtool figure to stand in for
     case "$out" in *"no weka CLI on the host; line rate 1.86 GiB/s from --line-rate 16 Gb/s in place of"*) echo "$out" >&2; exit 1;; esac
     case "$out" in *"no line-rate target"*) echo "$out" >&2; false;; *) true;; esac'
-t_assert "cal_shapes: --line-rate measures a bandwidth answer the host file carries again; the others stay cached" bash -c '
+t_assert "cal_shapes: --line-rate measures a bandwidth answer the host file carries again; the others still pin" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8
     # bw_r nj/fs/nr/qd are cols 6-9, iops_r cols 22-25
@@ -4266,7 +4263,7 @@ t_assert "cal_shapes: --line-rate measures a bandwidth answer the host file carr
     out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; LINE_RATE_GBPS=16
             cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") 2>&1 ) || { echo "$out" >&2; exit 1; }
     [ "$(cut -f11 "$d/shapes")" = "iops_r=16/1/5120M/10" ] || { cut -f11 "$d/shapes" >&2; exit 1; }
-    case "$out" in *"--line-rate: the host file'"'"'s bandwidth answer (bw_r) is measured again against it and replaced; its other answers are reused"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *"--line-rate: the host file'"'"'s bandwidth answer (bw_r) is measured again against it and replaced; its other values still pin their knobs"*) ;; *) echo "$out" >&2; exit 1;; esac
     # without the flag the recorded answer stands, and nothing says otherwise
     out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0
             cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") 2>&1 ) || { echo "$out" >&2; exit 1; }
@@ -4335,7 +4332,7 @@ t_assert "libaio_events: numjobs x iodepth per section, summed while sections ru
     printf "[global]\nioengine=io_uring\nnumjobs=64\niodepth=512\n[x]\n" > "$d/c"
     out=$(source ./wekatester; pyrun "$d/a" "$d/b" "$d/c" <<< "import sys; print(\" \".join(str(libaio_events(open(p).read().splitlines())) for p in sys.argv[1:]))")
     [ "$out" = "128 56 0" ] || { echo "$out" >&2; false; }'
-t_assert "check_aio_room: a staged libaio job past its host's aio room gets a warning naming fs.aio-max-nr" bash -c '
+t_assert "check_aio_room: a staged libaio job past its host's aio room stops the run before it starts, naming fs.aio-max-nr" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/jobs/h1" "$d/jobs/h2"
     printf "aio_max_nr 65536\naio_nr 0\n" > "$d/probe/h1"
     printf "aio_max_nr 1048576\naio_nr 0\n" > "$d/probe/h2"
@@ -4343,8 +4340,8 @@ t_assert "check_aio_room: a staged libaio job past its host's aio room gets a wa
         printf "[global]\nioengine=libaio\nnumjobs=188\n[create]\ncreate_only=1\n[io]\nstonewall\niodepth=512\n" > "$d/jobs/$h/032-iopsW.job"
         printf "[global]\nioengine=libaio\nnumjobs=4\n[r]\niodepth=16\n" > "$d/jobs/$h/011-bw.job"
     done
-    err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); check_aio_room) 2>&1 )
-    case "$err" in *"WARNING: 032-iopsW.job: libaio sets up 96256 aio events at once (numjobs x iodepth) on h1, and the kernel has room for 65536"*"raise fs.aio-max-nr"*) ;; *) echo "$err" >&2; exit 1;; esac
+    err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); check_aio_room) 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"ERROR: 032-iopsW.job: libaio sets up 96256 aio events at once (numjobs x iodepth) on h1, and the kernel has room for 65536"*"raise fs.aio-max-nr"*"nothing was run and the host file is unchanged"*) ;; *) echo "$err" >&2; exit 1;; esac
     case "$err" in *"011-bw.job"*|*" on h2"*|*"h1 h2"*) echo "$err" >&2; false;; *) true;; esac'
 t_assert "tuner: a catch-all cpu list the OS reserve empties says so, and how to keep an own reserve" bash -c '
     source ./tests/helpers.sh; tuner_fixture
@@ -4441,7 +4438,7 @@ t_assert "cal_shapes: identical hardware is one shape on its first host, differe
         *"shape 1 of 2: 2 host(s), calibrated on h1 -- Test CPU 8-core, 8 cpus, 252 GiB, weka NICs ens1: 1 x mlx5_core [0x15b3:0x101d] 100 Gb/s -> line rate 11.64 GiB/s"*"cores: 8 physical core(s) (no topology: one per cpu) - 1 weka DPDK - 2 reserved for the OS (0 1) = N=5: N/2 and N jobs on 2-6, 2N and 4N on 2-6"*"hosts: h1 h2"*"shape 2 of 2"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "cal_shapes: a rep's complete tuple is cached for its shape; partial ones and -g are not" bash -c '
+t_assert "cal_shapes: a rep's host-file values pin its shape's searches, a partial row too; -g pins nothing" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
     # bw_r nj/fs/nr/qd are cols 6-9; iops_r only has its qd (col 25)
@@ -4450,7 +4447,7 @@ t_assert "cal_shapes: a rep's complete tuple is cached for its shape; partial on
       done; printf "\n"; } > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; AUTH_DIR=""
      cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") >/dev/null 2>&1
-    [ "$(cut -f11 "$d/shapes")" = "bw_r=1/2/5120M/4" ] || { cut -f11 "$d/shapes" >&2; exit 1; }
+    [ "$(cut -f11 "$d/shapes")" = "bw_r=1/2/5120M/4 iops_r=32/-/-/-" ] || { cut -f11 "$d/shapes" >&2; exit 1; }
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=1; AUTH_DIR=""
      cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
     [ "$(cut -f11 "$d/shapes")" = "-" ]'
@@ -4568,7 +4565,7 @@ t_assert "calibrate: each shape is measured solo on its first host, the answer l
         *"shape 1 of 2: 2 host(s), calibrated on h1"*"N=5"*"shape 1: ioengine io_uring"*"shape 1 bw-write: numjobs=10 iodepth=2"*"siblings in that did"*"shape 1 lat-read: floor 100.0 us"*"shape 2: measuring"*"solo on h3"*) true;;
         *) printf "%s\n" "$out" >&2; false;;
     esac'
-t_assert "calibrate: with --line-rate the bandwidth answer the host file carries is measured again and replaces it; iops is reused" bash -c '
+t_assert "calibrate: with --line-rate the bandwidth answer the host file carries is measured again and replaces it; iops is measured at its pins" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8
     printf "# report bandwidth\n[global]\n[a]\nrw=read\n" > "$d/set/011-r.job"
@@ -4585,12 +4582,15 @@ t_assert "calibrate: with --line-rate the bandwidth answer the host file carries
      run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
     grep -q "cal-bw-read-" "$d/simlog" || { printf "%s\n" "$out" >&2; exit 1; }
-    ! grep -q "cal-iops-read-" "$d/simlog" || { echo "an iops cell ran" >&2; exit 1; }
+    # iops is pinned (3/5120M/1/64): measured again, at exactly those values
+    grep -q "cal-iops-read-" "$d/simlog" || { echo "no iops cell ran" >&2; exit 1; }
+    ! grep -o "cal-iops-read-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" "$d/simlog" | grep -qv -- "-nj3-qd64-nr1$" ||
+        { echo "an iops cell left its pins" >&2; exit 1; }
     bw=$(awk -F"\t" "\$1==\"h1\" {print \$6\"/\"\$7\"/\"\$8\"/\"\$9}" "$d/targets.final")
     io=$(awk -F"\t" "\$1==\"h1\" {print \$22\"/\"\$23\"/\"\$24\"/\"\$25}" "$d/targets.final")
     [ "$io" = "3/5120M/1/64" ] || { echo "iops_r: $io" >&2; exit 1; }
     case "$bw" in ("9/5120M/1/1"|*-*) echo "bw_r: $bw" >&2; false;; (*) true;; esac'
-t_assert "calibrate: a rep that already carries a direction reuses it for the whole shape" bash -c '
+t_assert "calibrate: host-file values are the only ones a search tries, measured again; a host without them is a shape of its own" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
@@ -4603,10 +4603,15 @@ t_assert "calibrate: a rep that already carries a direction reuses it for the wh
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
-     calibrate) 2>&1 )
-    ! grep -q -- "--client=" "$d/simlog" &&
-    grep -qx "h2 - 4 2 5120M 3 - - - - - - - - - - - - - - - - - - - - - - - - - - - -" "$d/cal.results" &&
-    case "$out" in *"shape 1: h1 already carries bw read geometry (qd/nr/fs/nj 4/2/5120M/3) -- the whole shape reuses it"*) true;;
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    # h1 is pinned to 3 jobs x iodepth 4 x 2 files: every bw cell on it runs
+    # exactly that, the engine cells too; h2 has no row, so it is a shape of
+    # its own with the full search
+    c1=$(grep -- "--client=h1 " "$d/simlog" | grep -o "cal-bw-read-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" | sort -u)
+    [ -n "$c1" ] && ! printf "%s\n" "$c1" | grep -qv -- "-nj3-qd4-nr2$" || { echo "h1 cells: $c1" >&2; exit 1; }
+    [ "$(grep -- "--client=h2 " "$d/simlog" | grep -o "cal-bw-read-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" | sort -u | wc -l)" -gt 3 ] || { echo "h2 not searched" >&2; exit 1; }
+    grep "^h1 " "$d/cal.results" | grep -q "^h1 [a-z_]* 4 2 5120M 3 " &&
+    case "$out" in *"bw read is pinned by h1"*"host-file row (qd/nr/fs/nj 4/2/5120M/3): only those values are tested"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "calibrate: the shared read seed is split across the filesystem group; writes stay on the representative, bw-only writes truncate" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -4943,6 +4948,101 @@ t_assert "-u: each filesystem group's shared set is removed from that group's fi
      run_host() { printf "%s|%s\n" "$1" "$2" >> "$d/cmds"; }
      cal_remove_dataset) >/dev/null 2>&1
     [ "$(grep "/mnt/w/shared\." "$d/cmds" | cut -d"|" -f1 | sort | tr "\n" " ")" = "h1 h2 " ] || { cat "$d/cmds" >&2; false; }'
+
+# --- host-file values pin their knobs (Frank, 2026-10-02) ---
+# A host-file value is the only value its knob takes in calibration, used as
+# written and never capped; open knobs are searched around it.
+t_assert "cal_plan: a pinned job count is the only one tried; the open knobs are still searched" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(plan_sim "$d" bw read io_uring 16 0 0 pin_nj=40) || { echo "$out" >&2; exit 1; }
+    [ "$(cut -d" " -f2 "$d/asked" | sort -u)" = 40 ] &&
+    [ "$(cut -d" " -f3 "$d/asked" | sort -u | wc -l)" -gt 1 ] &&
+    case "$out" in "done 40 "*"pinned by the host file: numjobs=40 -- the only value(s) tried"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cal_plan: a pinned iodepth holds on the qd1 rungs too" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    plan_sim "$d" bw read io_uring 8 0 0 pin_qd=4 >/dev/null || exit 1
+    [ "$(cut -d" " -f3 "$d/asked" | sort -u)" = 4 ] && grep -q "^numjobs 1 4 1$" "$d/asked" || { cat "$d/asked" >&2; false; }'
+t_assert "cal_plan: a fully pinned libaio cell runs as written, past the aio room, never refused by a guard" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(plan_sim "$d" iops read libaio 16 0 0 pin_nj=188 pin_qd=512 pin_nr=1 aio=65536) || { echo "$out" >&2; exit 1; }
+    [ "$(cut -d" " -f2- "$d/asked" | sort -u)" = "188 512 1" ] &&
+    case "$out" in "done 188 512 1 "*) true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in *"stopped short"*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "cal_plan: a pinned latency job count is its own answer, the lowest of its readings" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(plan_sim "$d" lat read io_uring 16 0 0 pin_nj=8) || { echo "$out" >&2; exit 1; }
+    [ "$(sort -u "$d/asked")" = "pinned 8 1 1" ] && [ "$(wc -l < "$d/asked" | tr -d " ")" = 3 ] &&
+    case "$out" in "done 8 1 1 "*"pinned by the host file: numjobs=8"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ "$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K pin_nj=8)" = 3 ] &&
+    [ "$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K pin_nj=40)" = 9 ]'
+t_assert "stage_cal_cell: a pinned filesize is the cell's, as written" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester; CAL_PIN_FS=10G
+     stage_cal_cell "$d/c.job" /mnt/w h1 "" bw read libaio 4 1 2 30) || exit 1
+    grep -qx "filesize=10G" "$d/c.job" &&
+    (source ./wekatester; stage_cal_cell "$d/d.job" /mnt/w h1 "" bw read libaio 4 1 2 30) &&
+    grep -qx "filesize=2560M" "$d/d.job"'
+t_assert "cal_shapes: pins past the grid become seed needs -- an off-ladder nrfiles, a pinned filesize and its latency twin" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8; mkdir -p "$d/cal"
+    # bw_r (cols 6-9) pins nrfiles 3; lat_w (cols 18-21) pins fs 8G at nrfiles 2
+    { printf "h1"; for i in $(seq 2 37); do
+          case $i in (8) printf "\t3";; (19) printf "\t8G";; (20) printf "\t2";; (*) printf "\t-";; esac
+      done; printf "\n"; } > "$d/targets.final"
+    (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; ENGINE=""
+     cal_shapes "$d/cal/shapes" "$(printf "bw read\nlat write\n")") >/dev/null 2>&1 || exit 1
+    [ "$(cat "$d/cal/needs.read.h1")" = "20 3 1706" ] &&
+    [ "$(cat "$d/cal/needs.write.h1" | tr "\n" " ")" = "20 2 8192 1 1 16384 " ] ||
+        { head "$d"/cal/needs.* >&2; false; }'
+t_assert "cal_shapes: hosts whose host-file values differ calibrate as shapes of their own" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2 h3; mkdir -p "$d/cal"
+    { for h in h1 h3; do printf "%s" "$h"; for i in $(seq 2 37); do case $i in (6) printf "\t2";; (*) printf "\t-";; esac; done; printf "\n"; done
+      printf "h2"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"; } > "$d/targets.final"
+    (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3); REGEN_LAYOUT=0; ENGINE=""
+     cal_shapes "$d/cal/shapes" "bw read") >/dev/null 2>&1 || exit 1
+    [ "$(cut -f2,12 "$d/cal/shapes" | tr "\t\n" ":|")" = "h1:h1 h3|h2:h2|" ] || { cat "$d/cal/shapes" >&2; false; }'
+t_assert "cal_aio_preflight: a pin past the aio room stops calibration before anything runs; a room it fits, or no libaio, passes" bash -c '
+    d=$(mktemp -d)
+    row() { printf "1\th1\t5\t2-6\t2-6\t0\t%s\t%s\t0\t%s\t%s\th1\n" "$1" "$2" "$3" "$4"; }
+    row "io_uring,libaio" - 65536 "iops_r=512/-/-/188" > "$d/over"
+    row "io_uring,libaio" - 1048576 "iops_r=512/-/-/188" > "$d/fits"
+    row "io_uring,psync" - 65536 "iops_r=512/-/-/188" > "$d/noaio"
+    row "libaio" libaio 100 "bw_r=-/-/-/200" > "$d/nj"
+    err=$( (source ./wekatester; cal_aio_preflight "$d/over") 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"shape 1 (h1): iops_r pinned at numjobs=188 iodepth=512 needs 96256 aio events at once with libaio (one of the engines calibration tries), and the kernel has room for 65536"*"nothing was run and the host file is unchanged"*) ;; *) echo "$err" >&2; exit 1;; esac
+    (source ./wekatester; cal_aio_preflight "$d/fits") && (source ./wekatester; cal_aio_preflight "$d/noaio") || exit 1
+    err=$( (source ./wekatester; cal_aio_preflight "$d/nj") 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"bw_r pinned at numjobs=200 iodepth=1 (open) needs 200 aio events at once with libaio (pinned)"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "writeback: a host line is commented out and its new version written directly below it; others stay put" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "host,user_login,ioengine\nh2,,,,\nh1,,psync,,,,,\nh9,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }
+     writeback_targets) >/dev/null
+    [ "$(sed -n 3p "$f")" = "# superseded by -a: h1,,psync,,,,," ] &&
+    sed -n 4p "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w," &&
+    [ "$(sed -n 2p "$f")" = "h2,,,," ] && [ "$(sed -n 5p "$f")" = "h9,,,," ] && [ "$(wc -l < "$f" | tr -d " ")" = 5 ] ||
+        { cat "$f" >&2; false; }'
+t_assert "writeback: values are compared by meaning -- 1024M is 1G, so the line stays as written, even under -g" bash -c '
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1024M/8/32,\n" > "$f"
+    before=$(cat "$f")
+    for g in 0 1; do
+        (source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1; REGEN_LAYOUT=$g
+         host_machine_id() { :; }
+         writeback_targets) >/dev/null
+        [ "$(cat "$f")" = "$before" ] || { echo "-g=$g:"; cat "$f"; exit 1; } >&2
+    done'
+t_assert "writeback: cpu lists compare as sets -- 2-4 is 2,3,4 but 2,4 is not 2-4" bash -c '
+    d=$(mktemp -d)
+    r=$( (source ./wekatester; pyrun <<"PYN"
+print(parse_cpulist("2-4") == parse_cpulist("2,3,4"), parse_cpulist("2,4") == parse_cpulist("2-4"))
+PYN
+    ) )
+    [ "$r" = "True False" ] || { echo "$r" >&2; false; }'
 
 # --- what the tuner stages from it ---
 t_assert "tuner: under -a cal the iops jobs run with latency accounting off, other jobs do not" bash -c '

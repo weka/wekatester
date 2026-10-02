@@ -1861,7 +1861,11 @@ stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|la
         printf 'bs=%s\n' "$bs"
         # a job's data stays FILESIZE_MIB however many files it is split over:
         # the file ladder measures the file count, not a bigger working set
-        printf 'filesize=%sM\n' "$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))"
+        if [ -n "${CAL_PIN_FS:-}" ]; then
+            printf 'filesize=%s\n' "$CAL_PIN_FS"   # pinned by the host file, as written
+        else
+            printf 'filesize=%sM\n' "$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))"
+        fi
         printf 'nrfiles=%s\n' "$nr"
         printf 'numjobs=%s\n' "$nj"
         printf 'iodepth=%s\n' "$qd"
@@ -1999,7 +2003,6 @@ forced = set(LINE_RATE_SLOTS) if sys.argv[4] != "-" else set()
 
 NCOLS = 1 + len(FIELDS)
 ENGINE = 1 + FIELDS.index("engine")
-NAMES = dict(zip(GEOM_SLOTS, GEOM_NAMES))
 
 knees = {}
 for line in open(res):
@@ -2036,22 +2039,9 @@ for host in sorted(knees):
         qd, nr, fs, nj = tuples[CAL_TUPLE * i:CAL_TUPLE * i + CAL_TUPLE]
         base = slot_base(slot)
         win = force or slot in forced
-        # A slot with some fields but no numjobs was re-measured (a measured
-        # tuple always carries its nj), and fill mode now keeps those fields
-        # and adds only what is missing -- a mix nobody measured. From the
-        # operator ("12/10G//8") that is the contract; from an earlier -a
-        # run (the old calibration and every -a max writeback recorded
-        # fs/nr/qd without nj) it is a trap the writeback would then make
-        # permanent. The file cannot say which, so say it here.
-        kept = [row[base + off] for off in (1, 2, 3) if row[base + off] != "-"]
-        if not win and kept and row[base] == "-" and nj != "-":
-            print(f"WARNING: {host}: the host file's {NAMES[slot]} geometry "
-                  f"(fs/nr/qd {row[base + 1]}/{row[base + 2]}/{row[base + 3]}) has no "
-                  f"numjobs, so it was measured again; fill mode keeps the fields "
-                  f"it has and adds only numjobs={nj}. If those fields came from an "
-                  f"earlier -a run rather than from you, re-run with -g so the "
-                  f"measured tuple ({nj}/{fs}/{nr}/{qd}) replaces them",
-                  file=sys.stderr)
+        # The host file's values pinned the search (cal_shapes), so the
+        # measured tuple already carries them: fill mode adds only what was
+        # searched, and every field of the row was measured together.
         for off, v in ((3, qd), (2, nr), (1, fs), (0, nj)):   # qd, nr, fs, nj
             if v != "-" and (win or row[base + off] == "-"):
                 row[base + off] = v
@@ -2376,22 +2366,28 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
 # the other. The first host of a shape is its representative.
 #
 # Writes the machine form to <out>, one TSV line per shape:
-#   id rep usable phys all linerate engines pinned memcap aio cached members
+#   id rep usable phys all linerate engines pinned memcap aio pins members
 # (usable = N; phys and all the cpu lists N/2..N and 2N/4N jobs run on;
 # linerate in bytes/s, --line-rate's figure when given, 0 = unknown; engines
 # comma-joined in ENGINE_ORDER; pinned "-" when nothing pins it; memcap in
 # bytes, 0 = no guard; aio the kernel aio room the shape's libaio cells must
 # fit, the SMALLEST of its members' -- every member runs the shape's answer
-# --, "-" when no probe could tell; cached the rep's complete tuples as
-# slot=qd/nr/fs/nj words, "-" for none; members last, as load_check reads
-# them) and prints the human form on stdout. Warnings go to stderr.
+# --, "-" when no probe could tell; pins the rep's host-file values as
+# slot=qd/nr/fs/nj words, "-" for an open knob and for no pins at all;
+# members last, as load_check reads them) and prints the human form on
+# stdout. Warnings go to stderr. Also writes cal/hostinfo (each host's cpus
+# and engine, for the shared seed) and cal/needs.* (what the pins need from
+# the seed beyond the nrfiles ladder).
 cal_shapes() {   # cal_shapes <out> <ladders>
+    WEKATESTER_CAL_NRS="$CAL_NR $CAL_NR_LADDER" WEKATESTER_FSMIB=$FILESIZE_MIB \
     pyrun "$1" "$2" "$WORK_DIR" "${ENGINE:--}" "$REGEN_LAYOUT" "$CAL_MEM_PCT" \
           "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" <<'PYEOF'
 import json, os, re, sys
 
 out_path, ladders, work, cli_engine, regen, mem_pct, line_gbps = sys.argv[1:8]
 hosts = sys.argv[8:]
+NRS = sorted(set(int(x) for x in os.environ.get("WEKATESTER_CAL_NRS", "1 1 2 4").split() if x.isdigit()))
+FSMIB = int(os.environ.get("WEKATESTER_FSMIB", "5120"))
 line_gbps = "" if line_gbps == "-" else line_gbps
 regen = regen == "1"
 mem_pct = float(mem_pct)
@@ -2509,6 +2505,22 @@ def weka_ports(f):
                       "(bound to vfio?)" % lost[0])
     return ports, ""
 
+# A host's pins: the host-file values of each searched slot (qd, nr, fs,
+# nj; "" for a knob it leaves open). -g searches everything, and
+# --line-rate searches bandwidth again: a recorded answer does not say
+# which line rate it stopped at (Frank, 2026-09-27).
+def host_pins(h):
+    out = []
+    if regen:
+        return out
+    for slot in needed:
+        if line_gbps and slot in LINE_RATE_SLOTS:
+            continue
+        vals = tuple(field(h, "%s_%s" % (slot, k)) for k in ("qd", "nr", "fs", "nj"))
+        if any(vals):
+            out.append((slot, vals))
+    return out
+
 shapes, index, hostinfo = [], {}, []
 fs_group = load_fs_groups(work, hosts)
 ngroups = len(set(g[0] for g in fs_group.values()))
@@ -2552,9 +2564,12 @@ for h in hosts:
     pinned = cli_engine if cli_engine != "-" else ("" if regen else field(h, "engine"))
     mem_gib = int(round(f["mem_kb"] / 1048576.0)) if f["mem_kb"] else 0
     # one representative per shape per filesystem group (Frank, 2026-10-02):
-    # a group's read cells must read that group's own shared set
+    # a group's read cells must read that group's own shared set; and hosts
+    # whose host-file values pin different knobs calibrate apart, since a
+    # pin is the only value its search tries
     key = (f["model"], f["ncpus"], mem_gib, len(f["weka"]), nicsig,
-           cores["n"], len(cores["all"]), tuple(cands), pinned, fs_group[h][0])
+           cores["n"], len(cores["all"]), tuple(cands), pinned, fs_group[h][0],
+           tuple(host_pins(h)))
     # every host may help seed its group's shared set: what it runs on
     hostinfo.append("%s\t%s\t%s" % (h, fmt_cpulist(cores["all"]), pinned or cands[0]))
     if key not in index:
@@ -2577,15 +2592,10 @@ def gib(b):
 with open(out_path, "w") as fh:
     for i, s in enumerate(shapes, 1):
         rep, f = s["rep"], s["f"]
-        cached, again = [], []
-        if not regen:
-            for slot in needed:
-                vals = [field(rep, "%s_%s" % (slot, k)) for k in ("qd", "nr", "fs", "nj")]
-                if all(vals):
-                    if line_gbps and slot in LINE_RATE_SLOTS:
-                        again.append(slot)   # measured again, against the figure
-                    else:
-                        cached.append("%s=%s" % (slot, "/".join(vals)))
+        pins = host_pins(rep)
+        again = [slot for slot in needed if not regen and line_gbps and slot in LINE_RATE_SLOTS
+                 and any(field(rep, "%s_%s" % (slot, k)) for k in ("qd", "nr", "fs", "nj"))]
+        cached = ["%s=%s" % (slot, "/".join(v or "-" for v in vals)) for slot, vals in pins]
         memcap = int(f["mem_kb"] * 1024 * mem_pct / 100) if f["mem_kb"] else 0
         c = s["cores"]
         fh.write("\t".join([str(i), rep, str(c["n"]), fmt_cpulist(c["phys"]),
@@ -2625,14 +2635,48 @@ with open(out_path, "w") as fh:
             # answer replaces the recorded one (apply_cal_results, writeback)
             print("  --line-rate: the host file's bandwidth answer (%s) is measured "
                   "again against it and replaced%s"
-                  % (", ".join(again), "; its other answers are reused" if cached else ""))
+                  % (", ".join(again), "; its other values still pin their knobs" if cached else ""))
+        if pins:
+            print("  pinned by the host file (the only values tried; -g searches everything): %s"
+                  % "; ".join("%s %s" % (slot, ", ".join(
+                      "%s=%s" % (n, v) for n, v in zip(("iodepth", "nrfiles", "filesize", "numjobs"), vals) if v))
+                      for slot, vals in pins))
         if not s["linerate"] and any(n.startswith("bw_") for n in needed):
             print("WARNING: shape %d (%s): %s -- the bandwidth search has no line-rate "
                   "target and runs to its peak instead" % (i, rep, s["why"] or "no line rate"),
                   file=sys.stderr)
 # per host: the cpus and engine it seeds its group's shared set with
-with open(os.path.join(os.path.dirname(out_path), "hostinfo"), "w") as fh:
+caldir = os.path.dirname(out_path)
+with open(os.path.join(caldir, "hostinfo"), "w") as fh:
     fh.write("".join(l + "\n" for l in hostinfo))
+# What the pins need from the seed beyond the nrfiles ladder, as "<nj> <nr>
+# <mib>" needs (seed_size_mib): a pinned nrfiles off the ladder, a pinned
+# filesize, a pinned job count past 4N -- and a pinned latency filesize's
+# one-job twin, which reads one file of fs x nr. Read needs belong to the
+# filesystem group's shared set, write needs to the representative's own.
+for name in os.listdir(caldir):
+    if name.startswith("needs."):
+        os.remove(os.path.join(caldir, name))
+needs = {}
+for s in shapes:
+    rep = s["rep"]
+    for slot, (q, n, fs, j) in host_pins(rep):
+        typ, d = slot.rsplit("_", 1)
+        nrs = [int(n)] if n.isdigit() else NRS
+        nj = int(j) if j.isdigit() else 4 * s["cores"]["n"]
+        try:
+            fmib = parse_size(fs) >> 20 if fs else 0
+        except ValueError:
+            fmib = 0
+        dest = ("needs.read." + fs_group[rep][0]) if d == "r" else ("needs.write." + rep)
+        lines = needs.setdefault(dest, [])
+        for nr in nrs:
+            lines.append("%d %d %d" % (nj, nr, fmib or max(1, FSMIB // nr)))
+        if typ in ("lat", "lat1m") and fmib:
+            lines.append("1 1 %d" % (fmib * max(nrs)))
+for dest, lines in needs.items():
+    with open(os.path.join(caldir, dest), "w") as fh:
+        fh.write("".join(l + "\n" for l in lines))
 PYEOF
 }
 
@@ -2728,7 +2772,26 @@ BW_LOW = sorted(set(doubling(1, N) + [N2]))      # at or below N: nrfiles=1 iode
 HIGH = [2 * N, 4 * N]                              # the siblings in: the ladders
 IOPS_LOW = sorted(set([N2, N]))
 LAT_LOW = sorted(set(doubling(2, N) + [N2, N]) - {1}) if N >= 2 else []
+
+# Host-file values pin their knob (Frank, 2026-10-02): a pinned value is the
+# ONLY value that knob takes, on every rung, whatever the rung's own rule
+# says, and it is used as written -- never capped by a guard. The knobs left
+# unpinned are searched as usual around it.
+def pin(key):
+    v = K.get(key, "-")
+    return int(v) if v.isdigit() and int(v) > 0 else None
+PNJ, PQD, PNR = pin("pin_nj"), pin("pin_qd"), pin("pin_nr")
+if PNJ:
+    BW_LOW = IOPS_LOW = LAT_LOW = [PNJ] if PNJ <= N else []
+    HIGH = [PNJ] if PNJ > N else []
+if PQD:
+    BWQD, IOPSQD = [PQD], [PQD]
+if PNR:
+    NRL, NR = [PNR], PNR
+QD1 = PQD or 1                                     # the qd of the qd1 rungs
 NRX = [x for x in NRL if x != NR]
+pinned = ", ".join("%s=%d" % (n, v) for n, v in (("numjobs", PNJ), ("iodepth", PQD),
+                                                  ("nrfiles", PNR)) if v)
 
 if act == "budget":
     if ctype == "bw":
@@ -2738,6 +2801,8 @@ if act == "budget":
             n = len(IOPS_LOW) + len(HIGH) * len(NRL) * len(IOPSQD) + CONFIRM
         else:
             n = len(IOPS_LOW) + len(HIGH) * (len(IOPSQD) + 2 * len(NRX)) + CONFIRM
+    elif PNJ:
+        n = FLOORREPS * (len(NRL) if PNJ > N else 1)
     else:
         n = FLOORREPS + 2 * (len(LAT_LOW) + len(HIGH) * len(NRL))
     print(n)
@@ -2821,9 +2886,12 @@ def over(k):
     return why
 
 def fits(k):
-    return not over(k)
+    # a pinned depth at a pinned job count is used as written: no guard
+    return bool(PNJ and PQD) or not over(k)
 
 notes = []
+if pinned:
+    notes.append("pinned by the host file: %s -- the only value(s) tried" % pinned)
 def guard(k):
     # one note per job count and depth, naming every limit that refused it;
     # raising fs.aio-max-nr only helps when the room is the sole reason, and
@@ -2855,7 +2923,7 @@ if ctype == "bw":
     # at or below N: one job per physical core, nrfiles=1 iodepth=1, nothing else
     done1, vals = [], []
     for nj in BW_LOW:
-        k = (nj, 1, NR)
+        k = (nj, QD1, NR)
         if best(k, True) is None:
             cell("numjobs", k)
         done1.append(k)
@@ -2866,7 +2934,7 @@ if ctype == "bw":
                    % (geo(k), human(best(k)), of_line(k), LINE, note()))
         if not target and not EXH and plateau(vals):
             break
-    top1 = max(best(k, True) for k in done1)
+    top1 = max([best(k, True) for k in done1] or [0.0])
     # past N the siblings join, and iodepth x nrfiles are searched
     done2 = []
     for nj in HIGH:
@@ -2913,12 +2981,12 @@ if ctype == "iops":
     pool, trail = [], []
     # at or below N: one job per physical core at iodepth=1 nrfiles=1, nothing else
     for nj in IOPS_LOW:
-        k = (nj, 1, NR)
+        k = (nj, QD1, NR)
         if best(k, True) is None:
             cell("numjobs", k)
         pool.append(k)
-        trail.append("%d jobs %s at iodepth 1" % (nj, human(best(k, True))))
-    top_low = max(best(k, True) for k in pool)
+        trail.append("%d jobs %s at iodepth %d" % (nj, human(best(k, True)), QD1))
+    top_low = max([best(k, True) for k in pool] or [0.0])
     # past N the siblings join, and iodepth x nrfiles are searched
     for nj in HIGH:
         mine = []
@@ -2960,7 +3028,19 @@ if ctype == "iops":
                                       ("; " + "; ".join(notes)) if notes else ""))
 
 if ctype in ("lat", "lat1m"):
-    fk = (1, 1, NR)
+    if PNJ:
+        # the job count is pinned: no floor to widen from, no band -- the
+        # pinned cell's lowest reading is the answer (each nrfiles past N,
+        # unless that is pinned too)
+        keys = [(PNJ, QD1, nr) for nr in (NRL if PNJ > N else [NR])]
+        for k in keys:
+            if len(reads(k)) < FLOORREPS:
+                cell("pinned", k)
+        bk = min(keys, key=lambda k: (min(reads(k)), k[2]))
+        finish(bk, "%s%s -> %.1f us (lowest of %d), %s IOPS; %s"
+               % ("1MiB " if ctype == "lat1m" else "", geo(bk), min(reads(bk)),
+                  len(reads(bk)), format(int(aux(bk) or 0), ","), "; ".join(notes)))
+    fk = (1, QD1, NR)
     fl = reads(fk)
     if len(fl) < FLOORREPS:
         cell("floor", fk)
@@ -2969,7 +3049,7 @@ if ctype in ("lat", "lat1m"):
     last_in, first_out, detail = fk, None, []
     for nj in LAT_LOW + HIGH:
         # at or below N nrfiles=1 only; past it every file count, the lowest counts
-        keys = [(nj, 1, NR)] if nj <= N else [(nj, 1, nr) for nr in NRL]
+        keys = [(nj, QD1, NR)] if nj <= N else [(nj, QD1, nr) for nr in NRL]
         for k in keys:
             if not reads(k):
                 cell("widen" if k[2] == NR else "nrfiles", k)
@@ -2999,6 +3079,8 @@ if ctype in ("lat", "lat1m"):
         msg += "; every rung to numjobs=%d (4N) stayed inside the band" % (4 * N)
     if detail:
         msg += "; " + "; ".join(detail)
+    if notes:
+        msg += "; " + "; ".join(notes)
     finish(last_in, msg)
 
 sys.exit("ERROR: cal_plan: unknown cell type: %s" % ctype)
@@ -3051,6 +3133,21 @@ PYEOF
 # jobs runs one job per physical core with the siblings idle; a wider one
 # spreads over the siblings too -- the same split the staged jobs get.
 CAL_CELLS=0
+CAL_PIN_FS=""   # a pinned filesize for the cells being run (cal_search, the engine cells)
+
+# A slot's host-file pins, from cal_shape_run's pins-<type>-<dirn> file ("qd nr
+# fs nj", "-" for an unpinned knob): as planner knobs, and the pinned fs.
+cal_pin_knobs() {   # cal_pin_knobs <shape-dir> <type> <dirn>
+    local q=- n=- f=- j=-
+    [ ! -s "$1/pins-$2-$3" ] || read -r q n f j < "$1/pins-$2-$3"
+    printf 'pin_qd=%s pin_nr=%s pin_fs=%s pin_nj=%s' "$q" "$n" "$f" "$j"
+}
+cal_pin_fs() {   # cal_pin_fs <shape-dir> <type> <dirn> -> the pinned fs, or nothing
+    local q=- n=- f=- j=-
+    [ ! -s "$1/pins-$2-$3" ] || read -r q n f j < "$1/pins-$2-$3"
+    [ "$f" = - ] || printf '%s' "$f"
+}
+
 cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime>
     local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 base json vals h v a what cpus
     base="cal-$type-$dirn-$eng-nj$nj-qd$qd-nr$nr-${rt}s"
@@ -3091,7 +3188,8 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
     local sdir="$WORK_DIR/cal/s$CAL_SID" hist act phase nj qd nr rt msg n=0 knobs
     hist="$sdir/hist-$type-$dirn"
     : > "$hist"
-    knobs="$(cal_knobs)aio=${CAL_REP_AIO:--}"
+    knobs="$(cal_knobs)aio=${CAL_REP_AIO:--} $(cal_pin_knobs "$sdir" "$type" "$dirn")"
+    CAL_PIN_FS=$(cal_pin_fs "$sdir" "$type" "$dirn")
     while :; do
         # shellcheck disable=SC2086 -- the knobs are one k=v word each
         act=$(cal_plan next "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap" "$hist" $knobs) \
@@ -3107,8 +3205,9 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
                 n=$((n + 1)) ;;
             ("done "*)
                 read -r _ nj qd nr msg <<<"$act"
-                printf '%s %s %sM %s\n' "$qd" "$nr" "$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))" "$nj" > "$sdir/tuple-$type-$dirn"
+                printf '%s %s %s %s\n' "$qd" "$nr" "${CAL_PIN_FS:-$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))M}" "$nj" > "$sdir/tuple-$type-$dirn"
                 log "cal: shape $CAL_SID $type-$dirn: $msg [$n cell(s), $eng]"
+                CAL_PIN_FS=""
                 return 0 ;;
             (*) die "the calibration planner said something unexpected for $type $dirn: $act" ;;
         esac
@@ -3119,10 +3218,10 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
 # rep's host-file row already carries, seed what the rest needs, choose the
 # engine, run one search per remaining (type, direction). Leaves the engine
 # in cal/s<id>/engine and one tuple file per slot it settled.
-cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <cached> <ladders>
-    local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 aio=${10} cached=${11} ladders=${12}
+cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
+    local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 aio=${10} pins=${11} ladders=${12}
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
-    local eng pick rest etype ctype edirn enj eqd e ncand budget wcells mins qmax
+    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax
     CAL_SID=$sid
     CAL_REP_DIR=$(host_dir "$rep")
     CAL_REP_NAME=$(host_name "$rep")
@@ -3138,13 +3237,15 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
         [ -n "$type" ] || continue
         slot="${type}_${dirn:0:1}"
         c=""
-        for kv in $cached; do
+        for kv in $pins; do
             [ "${kv%%=*}" != "$slot" ] || c=${kv#*=}
         done
+        rm -f "$sdir/pins-$type-$dirn"
         if [ -n "$c" ]; then
-            printf '%s\n' "$c" | tr '/' ' ' > "$sdir/tuple-$type-$dirn"
-            log "cal: shape $sid: $rep already carries $type $dirn geometry (qd/nr/fs/nj $c) -- the whole shape reuses it (re-measure with -g)"
-            continue
+            # the host file pins these knobs: they are the only values this
+            # search tries, and every other knob is searched around them
+            printf '%s\n' "$c" | tr '/' ' ' > "$sdir/pins-$type-$dirn"
+            log "cal: shape $sid: $type $dirn is pinned by $rep's host-file row (qd/nr/fs/nj $c): only those values are tested (-g searches everything)"
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
@@ -3159,7 +3260,7 @@ SLOTEOF
     budget=0; wcells=0
     while read -r type dirn; do
         [ -n "$type" ] || continue
-        c=$(cal_plan budget "$type" "$dirn" x "$usable" 0 0 /dev/null $(cal_knobs)) \
+        c=$(cal_plan budget "$type" "$dirn" x "$usable" 0 0 /dev/null $(cal_knobs) $(cal_pin_knobs "$sdir" "$type" "$dirn")) \
             || die "cannot size the $type $dirn search"
         budget=$((budget + c))
         [ "$dirn" != write ] || wcells=$((wcells + c))
@@ -3204,10 +3305,19 @@ BUDEOF
                        enj=$usable; eqd=16; [ "$eqd" -le "$qmax" ] || eqd=$qmax ;;
                 (lat)  enj=1; eqd=1 ;;
             esac
+            # the slot's pins hold here too: an engine is ranked on what the
+            # search will run
+            enr=$CAL_NR
+            read -r pq pn _ pj <<<"$(cal_pin_knobs "$sdir" "$ctype" "$edirn" | sed 's/pin_[a-z]*=//g')"
+            [ "$pj" = - ] || enj=$pj
+            [ "$pq" = - ] || eqd=$pq
+            [ "$pn" = - ] || enr=$pn
+            CAL_PIN_FS=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
             for e in ${engines//,/ }; do
-                cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$CAL_NR" "$CAL_ENGINE_RUNTIME"
+                cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
                 printf '%s %s %s\n' "$etype" "$e" "$(cat "$WORK_DIR/cal/reading")" >> "$sdir/engines"
             done
+            CAL_PIN_FS=""
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
         read -r eng rest <<<"$pick"
@@ -3423,6 +3533,53 @@ PYEOF
     fi
 }
 
+# The pins a calibration must run as written (cal_shapes), checked against
+# each shape's kernel aio room before anything starts (Frank, 2026-10-02):
+# the smallest cell a pin forces -- pinned numjobs x pinned iodepth, 1 for a
+# knob left open -- with libaio pinned or among the engines calibration may
+# try (the engine cells run the pins too). Over: an alert naming the shape,
+# the slot and the room, and a stop; the host file is not touched.
+cal_aio_preflight() {   # cal_aio_preflight <shapes>
+    pyrun "$1" <<'PYEOF'
+import sys
+
+bad = []
+for line in open(sys.argv[1]):
+    p = line.rstrip("\n").split("\t")
+    if len(p) < 12:
+        continue
+    sid, rep, engines, pinned, aio, pins = p[0], p[1], p[6].split(","), p[7], p[9], p[10]
+    cands = [pinned] if pinned != "-" else engines
+    if "libaio" not in cands or not aio.isdigit():
+        continue
+    for kv in pins.split():
+        if "=" not in kv:
+            continue
+        slot, vals = kv.split("=", 1)
+        q, n, f, j = (vals.split("/") + ["-"] * 4)[:4]
+        if not (q.isdigit() or j.isdigit()):
+            continue
+        events = (int(j) if j.isdigit() else 1) * (int(q) if q.isdigit() else 1)
+        if events > int(aio):
+            bad.append("shape %s (%s): %s pinned at numjobs=%s iodepth=%s needs %d aio events at "
+                       "once with libaio (%s), and the kernel has room for %s there "
+                       "(fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr, pin "
+                       "another ioengine (-e or the host file), or change the pin"
+                       % (sid, rep, slot, j if j.isdigit() else "1 (open)",
+                          q if q.isdigit() else "1 (open)", events,
+                          "pinned" if pinned == "libaio" else "one of the engines calibration tries",
+                          aio))
+for b in bad:
+    print("ERROR: " + b, file=sys.stderr)
+sys.exit(2 if bad else 0)
+PYEOF
+    case $? in
+        0) return 0 ;;
+        2) die "calibration would exceed the kernel's aio room (above); nothing was run and the host file is unchanged" ;;
+        *) die "cannot check the calibration pins against the kernel's aio room" ;;
+    esac
+}
+
 calibrate() {
     cal_mode || return 0
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
@@ -3463,6 +3620,7 @@ calibrate() {
     cal_shapes "$shapes" "$ladders" > "$WORK_DIR/cal/shapes.txt" \
         || die "cannot group the hosts into client shapes"
     while IFS= read -r line; do log "cal: $line"; done < "$WORK_DIR/cal/shapes.txt"
+    cal_aio_preflight "$shapes"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     local sid rep usable phys allc linerate engines pinned memcap aio cached members
@@ -6180,7 +6338,8 @@ for host in hosts:
             # fills only unmeasured slots. A staged numjobs is never recorded:
             # the tuner re-derives it from the usable cores every run, and a
             # recorded count would only go stale (weka re-pins, cpu list
-            # edits) -- and it would pass for a measured tuple in the cache.
+            # edits) -- and the next calibration would test only that guess,
+            # since a recorded value pins its knob.
             for sfx in sorted({"read": "r", "write": "w"}[dd]
                               for dd in file_directions(lines)):
                 for tkey, jkey in (("fs", "filesize"),
@@ -6194,6 +6353,24 @@ for host in hosts:
 # for whatever that row left unset (or everything, under -g). Values a
 # generic row supplied are not in `have`, so a host that ran on a generic
 # cpu list gets its own line carrying the list that actually executed.
+# Values compare by what they mean, not how they are spelled: 5G is 5120M,
+# 2-4 is 2,3,4 (but 2,4 is not 2-4) -- a line whose values all hold is left
+# exactly as it is (Frank, 2026-10-02).
+def norm(k, v):
+    try:
+        if k == "cpus":
+            return frozenset(parse_cpulist(v))
+        if k.endswith("_fs"):
+            return parse_size(v)
+        if k.endswith(("_nj", "_nr", "_qd")):
+            return int(v)
+    except ValueError:
+        pass
+    return v
+
+def same(a, b):
+    return set(a) == set(b) and all(norm(k, a[k]) == norm(k, b[k]) for k in a)
+
 updates = {}
 for host in hosts:
     have = hostrows.get(host, {})
@@ -6206,52 +6383,72 @@ for host in hosts:
         if k in ("login", "cpus") and k in have:
             continue   # identity, credentials and the operator's OWN cpu
                        # list are never overwritten, -g included
+        if k in have and norm(k, have[k]) == norm(k, v):
+            continue   # the same value: the row keeps its own spelling
         if mode == "overwrite" or k not in have or k in fresh:
             want[k] = v
-    if want and want != have:
+    if want and not same(want, have):
         updates[host] = want
 
 if not updates:
     print("host file: nothing to record")
     sys.exit(0)
 
-# comment out superseded host lines, then append the new ones
+# The host file is only ever added to (Frank, 2026-10-02): a host's own line
+# is commented out and its new version written directly below it; a host
+# with no line of its own gets one appended at the end. Nothing is deleted
+# or rewritten in place, and a generic (host-less) row is never touched.
 lines = open(wb).read().splitlines()
-out, seen_cell = [], {}
-for line in lines:
+
+def own_line(line):
+    """The address of the host whose own line this is, or ""."""
     try:
         row = next(csv.reader([line]))
     except StopIteration:
         row = []
     h = row[0].strip() if row else ""
-    addr = host_addr(h) if h else ""
-    if h and not h.startswith("#") and h.lower() != "host" and addr in updates:
-        # a row the operator already wrote keeps its own spelling of the host,
-        # machine-id or not -- automation only names a machine it is adding
+    if h and not h.startswith("#") and h.lower() != "host" and host_addr(h) in updates:
+        return host_addr(h), h
+    return "", ""
+
+# a row the operator already wrote keeps its own spelling of the host,
+# machine-id or not -- automation only names a machine it is adding
+seen_cell = {}
+for line in lines:
+    addr, h = own_line(line)
+    if addr:
         seen_cell.setdefault(addr, h)
-        out.append("# superseded by -a: " + line)
-    else:
-        out.append(line)
 
 def geom(want, slot):
     parts = [want.get(f"{slot}_{k}", "") for k in ("nj", "fs", "nr", "qd")]
     return "/".join(parts).rstrip("/") if any(parts) else ""
 
 import io
-buf = io.StringIO()
-w = csv.writer(buf, lineterminator="\n")
-for host in hosts:
-    if host not in updates:
-        continue
+def render(host):
     want = updates[host]
     cell = seen_cell.get(host) or IDENT.get(host, host)
     slots = [geom(want, s) for s in GEOM_SLOTS]
     while slots and not slots[-1] and len(slots) > 6:
         slots.pop()   # no 1MiB latency geometry: the row stays in the old width
-    w.writerow([cell, want.get("login", ""), want.get("engine", ""),
-                want.get("cpus", ""), want.get("dir", "")] + slots)
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="").writerow(
+        [cell, want.get("login", ""), want.get("engine", ""),
+         want.get("cpus", ""), want.get("dir", "")] + slots)
+    return buf.getvalue()
+
+out, placed = [], set()
+for line in lines:
+    addr, _ = own_line(line)
+    if addr:
+        out.append("# superseded by -a: " + line)
+        if addr not in placed:
+            out.append(render(addr))
+            placed.add(addr)
+    else:
+        out.append(line)
+out += [render(h) for h in hosts if h in updates and h not in placed]
 with open(wb, "w") as fp:
-    fp.write("\n".join(out) + "\n" + buf.getvalue())
+    fp.write("\n".join(out) + "\n")
 print(f"host file: recorded {len(updates)} host line(s) in {wb} ({mode})")
 PYEOF
 }
@@ -7107,7 +7304,7 @@ PYEOF
 # without -t/-e/-a never probe, so they go unchecked.
 check_aio_room() {
     [ -d "$WORK_DIR/probe" ] || return 0
-    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || log "WARNING: could not check the staged libaio jobs against the kernel's aio room" >&2
+    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
 import os, sys
 
 work, hosts = sys.argv[1], sys.argv[2:]
@@ -7125,12 +7322,19 @@ for h in hosts:
                 over.setdefault((job, n, room), []).append(h)
 for (job, n, room), hs in sorted(over.items()):
     names = " ".join(hs[:8]) + (" (+%d more)" % (len(hs) - 8) if len(hs) > 8 else "")
-    print("WARNING: %s: libaio sets up %d aio events at once (numjobs x iodepth) on %s, "
+    print("ERROR: %s: libaio sets up %d aio events at once (numjobs x iodepth) on %s, "
           "and the kernel has room for %d (fs.aio-max-nr less fs.aio-nr, as probed): the "
-          "jobs past the room will fail io_queue_init with EAGAIN (fio error 11) -- raise "
-          "fs.aio-max-nr, or re-measure with -g if the setting came from the host file"
-          % (job, n, names, room), file=sys.stderr)
+          "jobs past the room would fail io_queue_init with EAGAIN (fio error 11) -- raise "
+          "fs.aio-max-nr, run another ioengine (-e or the host file), or lower the job's "
+          "numjobs x iodepth" % (job, n, names, room), file=sys.stderr)
+sys.exit(2 if over else 0)
 PYEOF
+    case $? in
+        0) ;;
+        # stop before anything runs (Frank, 2026-10-02); nothing was written
+        2) die "the kernel's aio room would be exceeded (above); nothing was run and the host file is unchanged" ;;
+        *) log "WARNING: could not check the staged libaio jobs against the kernel's aio room" >&2 ;;
+    esac
 }
 
 stage_jobfiles() {
