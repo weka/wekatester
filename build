@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# build -- assemble ./wekatester from src/: src/wekatester.sh is the bash,
+# and every "#@include py/<name>.py" line inside a python heredoc is replaced
+# by that file. Both the sources and the assembled script are committed; the
+# suite checks they agree (tests/test_wekatester.sh, "build:").
+#   ./build            rewrites ./wekatester
+#   ./build <path>     writes the assembly there instead
+set -euo pipefail
+cd "$(dirname "$0")"
+out=${1:-wekatester}
+tmp=$(mktemp "${TMPDIR:-/tmp}/wekatester.build.XXXXXX")
+LC_ALL=C awk -v dir=src '
+    /^#@include / {
+        f = dir "/" $2; n = 0
+        while ((getline line < f) > 0) { print line; n++ }
+        close(f)
+        if (n == 0) { print "build: cannot read " f > "/dev/stderr"; bad = 1; exit 1 }
+        next
+    }
+    { print }
+    END { if (bad) exit 1 }
+' src/wekatester.sh > "$tmp"
+chmod +x "$tmp"
+mv "$tmp" "$out"

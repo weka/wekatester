@@ -522,6 +522,16 @@ warn and continue (useful when `df` under-reports, e.g. a filesystem that
 is thin-provisioned or still rebalancing). If `df` returns nothing usable
 for a host, that host goes unchecked, with a warning.
 
+# Source layout and build
+
+`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash and ssh there, fio on the workers, and python3 on the controller. It is assembled, not hand-edited:
+
+- `src/wekatester.sh` — the bash. Each Python heredoc holds one `#@include py/<name>.py` line in place of its body.
+- `src/py/*.py` — the Python, one file per heredoc; `lib.py` is the shared library `pyrun` prepends to each of the others at run time.
+- `./build` — bash and awk; splices the pieces into `./wekatester` (`./build <path>` writes elsewhere).
+
+Both the sources and the assembled `wekatester` are committed. Edit under `src/`, run `./build`, run the suite. The suite fails when the committed script and the assembly differ, when an include names a missing file, or when a Python body is left in the bash source.
+
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
 

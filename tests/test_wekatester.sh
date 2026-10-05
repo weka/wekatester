@@ -5354,5 +5354,32 @@ t_assert "staging: a --client list that overflows one shell argument dies before
     c=$( (source ./wekatester; FIO_BIN=/usr/bin/fio; TARGET_DIR=/dev/shm/x; HOSTS=(h1 h2); fio_client_cmd 011-bw.job) ) &&
     [ "$c" = "'"'"'/usr/bin/fio'"'"' --output-format=json --eta=never --client=h1 '"'"'/dev/shm/x/h1/011-bw.job'"'"' --client=h2 '"'"'/dev/shm/x/h2/011-bw.job'"'"'" ] || { echo "$c" >&2; false; }'
 
+# --- build: the committed script is the assembly of src/ (plan B, 2026-10-05) ---
+# Both src/ and the assembled wekatester are committed; these keep them equal
+# and keep every Python body out of the bash source.
+t_assert "build: ./build reproduces the committed wekatester byte for byte, executable" bash -c '
+    t=$(mktemp)
+    ./build "$t" && cmp -s "$t" wekatester && [ -x "$t" ]'
+t_assert "build: every include names a src/py file, each file is included exactly once, and the bash source parses" bash -c '
+    bash -n src/wekatester.sh &&
+    inc=$(awk "/^#@include /{print \$2}" src/wekatester.sh | sort) &&
+    files=$(cd src && ls py/*.py | sort) &&
+    [ -n "$inc" ] && [ "$inc" = "$files" ] &&
+    [ "$(printf "%s\n" "$inc" | uniq -d | wc -l)" -eq 0 ]'
+t_assert "build: a python heredoc body in the bash source is exactly its include line -- no Python left behind" bash -c '
+    awk "
+        !inpy && match(\$0, /<<.(PY|PYLIB|NS|DIR|UNL|UNLS)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
+        inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
+        inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
+        END { exit !(seen == 35 && bad == 0) }
+    " src/wekatester.sh'
+t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/py"
+    printf "#!/usr/bin/env bash\npyrun <<\"PYEOF\"\n#@include py/nope.py\nPYEOF\n" > "$d/src/wekatester.sh"
+    cp build "$d/build"; printf "keep\n" > "$d/wekatester"
+    err=$(cd "$d" && ./build 2>&1) && { echo "built: $err" >&2; exit 1; }
+    case "$err" in *"cannot read src/py/nope.py"*) ;; *) echo "$err" >&2; exit 1;; esac
+    [ "$(cat "$d/wekatester")" = keep ]'
+
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
