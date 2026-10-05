@@ -3299,6 +3299,15 @@ t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash
     head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd$" &&
     b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
     [ "$b" = "read write" ]'
+# The schema and the floor marker are spelled in bash (GEOM_SLOTS,
+# GEOM_NAMES, FLOOR_MARKER, which the awk layer reads) and in lib.py.
+t_assert "awk and python agree: the host-file schema and the floor marker" bash -c '
+    source ./wekatester
+    py=$(pyrun <<< "print(\" \".join(GEOM_SLOTS)); print(\" \".join(GEOM_NAMES)); print(FLOOR_MARKER)") &&
+    aw=$(awkrun "BEGIN { print geom_slots(); print geom_names(); print floor_marker() }") &&
+    [ "$py" = "$GEOM_SLOTS
+$GEOM_NAMES
+$FLOOR_MARKER" ] && [ "$aw" = "$py" ] || { printf "%s\n--\n%s\n" "$py" "$aw" >&2; false; }'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
@@ -3997,6 +4006,44 @@ assert [t[0] for t in c["reserved"]] == [0, 16, 1, 17, 2], c["reserved"]
 assert c["n"] == 32 - 8 - 5, c
 EOF
     )'
+# usable_cores and the pinning check run the core rule in awk, the tuner and
+# the calibration shapes in python (lib.py): two spellings of ONE rule, held
+# to the same answer on every probe shape the suite knows -- topology or
+# none, SMT adjacent or split, two sockets, offline and unbindable cpus,
+# weka on core 0 -- for no list, operator lists, and catch-alls.
+t_assert "awk and python agree: probe_cores, cores_summary, reserve_count and probe_aio_room, probe for probe and list for list" bash -c '
+    d=$(mktemp -d)
+    topo_fixture "$d/p1" 32 adjacent 2 4 6 8 10 12
+    topo_fixture "$d/p2" 16 split 6 7
+    { printf "ncpus 64\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/p3"
+    { printf "ncpus 64\nonline 0-63\n"
+      for c in $(seq 24 31); do printf "weka_allowed %s\n" "$c"; done
+      for c in $(seq 0 63); do k=$(( c % 32 ))
+          printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s,%s\n" $c $(( k / 16 )) $c $k $c $k $(( k + 32 )); done; } > "$d/p4"
+    printf "ncpus 6\nonline 0-3,6-7\nbindable 0,1,2,3,6\nbindable_priv 7\naio_max_nr 65536\naio_nr 1024\n" > "$d/p5"
+    printf "ncpus 8\nweka_allowed 0\nweka_allowed 7\nweka_allowed 0-7\nisolated 4-7\naio_max_nr 100\naio_nr 200\n" > "$d/p6"
+    printf "engines psync \n" > "$d/p7"
+    { printf "ncpus 6\nonline 2-7\n"
+      for c in 2 3 4 5 6 7; do printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\n" $c $(( c / 4 )) $c $(( c / 2 )); done; } > "$d/p8"
+    py=$(source ./wekatester; pyrun "$d"/p* <<< "import sys
+for p in sys.argv[1:]:
+    for l in (\"\", \"0-3\", \"2-6\", \"4-11\", \"18-31\", \"16-31\", \"0-63\", \"1-255\"):
+        c = probe_cores(p, l)
+        print(c[\"n\"], \",\".join(map(str, c[\"phys\"])), \",\".join(map(str, c[\"all\"])), int(c[\"catchall\"]), probe_aio_room(p), cores_summary(c))
+print(\" \".join(str(reserve_count(n, k)) for n in range(1, 70) for k in range(0, 20)))")
+    aw=$(source ./wekatester; awkrun "BEGIN {
+        nl = split(\"-|0-3|2-6|4-11|18-31|16-31|0-63|1-255\", LS, \"|\")
+        for (i = 1; i < ARGC; i++) {
+            np = readlines(ARGV[i], P)
+            for (j = 1; j <= nl; j++) {
+                probe_cores(P, np, LS[j] == \"-\" ? \"\" : LS[j], R, PH, AL); room = probe_aio_room(P, np)
+                print R[\"n\"], join_sorted(PH, \",\"), join_sorted(AL, \",\"), R[\"catchall\"], (room == \"\" ? \"None\" : room), cores_summary(R, PH, AL)
+            }
+        }
+        for (n = 1; n < 70; n++) for (k = 0; k < 20; k++) out = out (out == \"\" ? \"\" : \" \") reserve_count(n, k)
+        print out
+    }" "$d"/p*)
+    [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
 t_assert "reserve rules: 2 up to 24 cores, 4 above, +1 per 4 DPDK past 4, at most 12 and half; round-robin placement" bash -c '
     (source ./wekatester; pyrun <<"EOF"
 assert reserve_count(8, 2) == 2 and reserve_count(24, 4) == 2 and reserve_count(25, 4) == 4
@@ -4263,7 +4310,7 @@ t_assert "libaio_events: numjobs x iodepth per section, summed while sections ru
     printf "[global]\nioengine=libaio\nnumjobs=4\n[create]\ncreate_only=1\n[io]\nstonewall\niodepth=32\n" > "$d/a"
     printf "[global]\nioengine=libaio\n[r]\nnumjobs=3\niodepth=8\n[w]\nnumjobs=2\niodepth=16\n" > "$d/b"
     printf "[global]\nioengine=io_uring\nnumjobs=64\niodepth=512\n[x]\n" > "$d/c"
-    out=$(source ./wekatester; pyrun "$d/a" "$d/b" "$d/c" <<< "import sys; print(\" \".join(str(libaio_events(open(p).read().splitlines())) for p in sys.argv[1:]))")
+    out=$(source ./wekatester; awkrun "BEGIN { for (i = 1; i < ARGC; i++) { n = readlines(ARGV[i], L); printf \"%s%s\", (i > 1 ? \" \" : \"\"), libaio_events(L, n) } print \"\" }" "$d/a" "$d/b" "$d/c")
     [ "$out" = "128 56 0" ] || { echo "$out" >&2; false; }'
 t_assert "check_aio_room: a staged libaio job past its host's aio room stops the run before it starts, naming fs.aio-max-nr" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/jobs/h1" "$d/jobs/h2"
@@ -5368,10 +5415,10 @@ t_assert "build: every include names a src/py file, each file is included exactl
     [ "$(printf "%s\n" "$inc" | uniq -d | wc -l)" -eq 0 ]'
 t_assert "build: a python heredoc body in the bash source is exactly its include line -- no Python left behind" bash -c '
     awk "
-        !inpy && match(\$0, /<<.(PY|PYLIB|NS|DIR|UNL|UNLS)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
+        !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
         inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
         inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 35 && bad == 0) }
+        END { exit !(seen == 24 && bad == 0) }
     " src/wekatester.sh'
 t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/py"

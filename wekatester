@@ -954,39 +954,6 @@ def probe_aio_room(path):
         return None
     return max(0, mx - (nr or 0))
 
-def libaio_events(lines):
-    """The most kernel aio events one jobfile sets up at once through
-    libaio: every clone of a job reserves its iodepth (io_queue_init), so
-    numjobs x iodepth per section, summed over the sections that run
-    together -- a stonewall starts a new group -- and the largest group
-    taken. A section inherits every [global] above it. 0 when nothing in
-    the file runs libaio."""
-    glob, cur, groups = {}, None, [[]]
-    def close(sec):
-        if sec is None:
-            return
-        if sec.get("stonewall", "0") != "0" and groups[-1]:
-            groups.append([])
-        if sec.get("ioengine") == "libaio":
-            try:
-                n = int(sec.get("numjobs") or 1) * int(sec.get("iodepth") or 1)
-            except ValueError:
-                n = 0
-            groups[-1].append(n)
-    for l in lines:
-        s = l.strip()
-        if not s or s[0] in "#;":
-            continue
-        m = re.match(r"^\[(.+)\]$", s)
-        if m:
-            close(cur)
-            cur = None if m.group(1).strip() == "global" else dict(glob)
-            continue
-        k, _, v = s.partition("=")
-        (glob if cur is None else cur)[k.strip()] = v.strip()
-    close(cur)
-    return max(sum(g) for g in groups)
-
 def cores_summary(c):
     """The one-line account of probe_cores' answer the logs print."""
     res = " ".join(fmt_cpulist(t) for t in c["reserved"]) or "none"
@@ -1131,6 +1098,491 @@ PYLIBEOF
 
 pyrun() {   # pyrun <args...> -- python script on stdin, WEKA_PYLIB prepended
     { printf '%s\n' "$WEKA_PYLIB"; cat; } | python3 - "$@"
+}
+
+# --- the shared awk layer ----------------------------------------------------
+# What WEKA_PYLIB is to the embedded python, WEKA_AWK is to every awk that
+# took a python's place: each rule both need, spelled once per language.
+# Where lib.py keeps its own copy because the remaining python still uses
+# it, the suite holds the two to the same answers ("awk and python agree").
+# awkrun prepends it, and the schema and marker constants below, to one
+# program. Conventions every program keeps:
+#   - BEGIN only, its data on ARGV: -v would put a path or a value through
+#     awk's escape processing, and a BEGIN-only program never reads ARGV as
+#     files. awk_fail exits 1 from anywhere, which only BEGIN makes safe.
+#   - LC_ALL=C: byte order is the code-point order python sorted by.
+#   - files are read whole by readlines, python's universal newlines (\n,
+#     \r\n, a lone \r), and written back as python did: lines joined by \n,
+#     one at the end.
+#   - a byte count is printed with %.0f: print and %d round or clip past
+#     2^31 on some awks.
+#   - portable to macOS awk, gawk and mawk alike: a comparison inside a
+#     print list is parenthesized, a function has at most 50 parameters and
+#     locals, and A[k] = (k in A) ? ... is never written (mawk creates A[k]
+#     before it tests).
+#
+# The host-file schema: the host, four identity columns, then eight
+# nj/fs/nr/qd geometry slots, one per (type, direction). The 1MiB latency
+# slots come LAST, so a host file written before they existed still lines up
+# column for column. lib.py spells the same lists; the suite keeps them equal.
+GEOM_SLOTS="bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w"
+GEOM_NAMES="bandwidthR bandwidthW latencyR latencyW iopsR iopsW latency1mR latency1mW"
+# The first line of a latency test's one-job twin (-a cal/brutal), lib.py's
+# FLOOR_MARKER: stage_floor_twins writes it, the tuner and the writeback
+# read it.
+FLOOR_MARKER="# wekatester-floor:"
+
+IFS= read -r -d '' WEKA_AWK <<'AWKLIB' || :
+function awk_fail(msg) { print "ERROR: " msg > "/dev/stderr"; exit 1 }
+
+# python's str.strip() and str.split() whitespace, its ASCII part
+function strip(s) {
+    sub(/^[ \t\n\013\014\r\034\035\036\037]+/, "", s)
+    sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
+    return s
+}
+function rstrip(s) {
+    sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
+    return s
+}
+function pysplit(s, F) {   # str.split(): F[1..n]
+    split("", F)
+    s = strip(s)
+    return s == "" ? 0 : split(s, F, /[ \t\n\013\014\r\034\035\036\037]+/)
+}
+# int(): the number, or "" where python raises ValueError
+function py_int(s) {
+    s = strip(s)
+    if (s !~ /^[+-]?[0-9]+(_[0-9]+)*$/) return ""
+    gsub(/_/, "", s)
+    return s + 0 + 0
+}
+function replace_all(s, from, to,    i, out) {   # str.replace
+    out = ""
+    while ((i = index(s, from)) > 0) {
+        out = out substr(s, 1, i - 1) to
+        s = substr(s, i + length(from))
+    }
+    return out s
+}
+function vars_to_glob(s) {   # re.sub(r"\$\w+", "*", s)
+    gsub(/\$[A-Za-z0-9_]+/, "*", s)
+    return s
+}
+function count_char(s, c) { return gsub(c, "", s) }
+function dirname(p,    head) {   # os.path.dirname
+    if (!match(p, /\/[^\/]*$/)) return ""
+    head = substr(p, 1, RSTART)
+    if (head !~ /^\/+$/) sub(/\/+$/, "", head)
+    return head
+}
+function path_join(a, b) {   # os.path.join(a, b)
+    if (substr(b, 1, 1) == "/" || a == "") return b
+    return a (substr(a, length(a)) == "/" ? "" : "/") b
+}
+function squote(s) { return "\047" s "\047" }
+
+# open(path).read().splitlines() into L[1..n]; -1 when it cannot be read
+function readlines(path, L,    n, r, line, m, k, parts) {
+    split("", L); n = 0
+    while ((r = (getline line < path)) > 0) {
+        if (index(line, "\r")) {
+            sub(/\r$/, "", line)
+            m = split(line, parts, "\r")
+            if (m == 0) L[++n] = ""
+            for (k = 1; k <= m; k++) L[++n] = parts[k]
+        } else
+            L[++n] = line
+    }
+    close(path)
+    return r < 0 ? -1 : n
+}
+function writelines(path, L, n,    i) {   # "\n".join(L) + "\n"
+    if (n == 0) printf "\n" > path
+    for (i = 1; i <= n; i++) print L[i] > path
+    close(path)
+}
+
+# A[1..n] sorted in place, numerically or bytewise
+function sort_arr(A, n, num,    gap, i, j, t) {
+    for (gap = int(n / 2); gap > 0; gap = int(gap / 2))
+        for (i = gap + 1; i <= n; i++) {
+            t = A[i]
+            for (j = i; j > gap && (num ? (A[j - gap] + 0 > t + 0) : (A[j - gap] "" > t "")); j -= gap)
+                A[j] = A[j - gap]
+            A[j] = t
+        }
+}
+
+# cpu sets: arrays keyed by cpu number
+function set_size(S,    k, n) { n = 0; for (k in S) n++; return n }
+function set_any(S,    k) { for (k in S) return 1; return 0 }
+function set_sorted(S, A,    k, n) {
+    split("", A); n = 0
+    for (k in S) A[++n] = k + 0
+    sort_arr(A, n, 1)
+    return n
+}
+function join_sorted(S, sep,    A, n, i, out) {   # sep.join(sorted(S))
+    n = set_sorted(S, A); out = ""
+    for (i = 1; i <= n; i++) out = out (i > 1 ? sep : "") A[i]
+    return out
+}
+function fmt_cpulist(S,    A, n, i, j, out) {   # 0-3,8: runs collapsed
+    n = set_sorted(S, A); out = ""
+    for (i = 1; i <= n; i = j + 1) {
+        for (j = i; j < n && A[j + 1] == A[j] + 1; j++)
+            ;
+        out = out (out == "" ? "" : ",") (i == j ? A[i] : A[i] "-" A[j])
+    }
+    return out
+}
+# lib.py's parse_cpulist: 1, or 0 where it raises ValueError
+function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
+    split("", S)
+    n = split(s, P, ",")
+    for (i = 1; i <= n; i++) {
+        if (index(P[i], "-")) {
+            if (split(P[i], ab, "-") != 2) return 0
+            if ((a = py_int(ab[1])) == "" || (b = py_int(ab[2])) == "") return 0
+            for (c = a; c <= b; c++) S[c] = 1
+        } else if (P[i] != "") {
+            if ((a = py_int(P[i])) == "") return 0
+            S[a] = 1
+        }
+    }
+    return 1
+}
+
+# --- jobfiles ---
+# lib.py's first_value: the first "key=<value>" line's value, up to the
+# first blank; "" when none
+function first_value(L, n, key,    i, v) {
+    for (i = 1; i <= n; i++) {
+        if (index(L[i], key "=") != 1) continue
+        v = substr(L[i], length(key) + 2)
+        if (match(v, /^[^ \t\n\013\014\r\034\035\036\037]+/)) return substr(v, 1, RLENGTH)
+    }
+    return ""
+}
+function is_layout_marked(L, n,    i) {   # the layout marker in the first three lines
+    for (i = 1; i <= 3 && i <= n; i++)
+        if (index(L[i], layout_marker()) == 1) return 1
+    return 0
+}
+# lib.py's override_lines (override_variant_key's three cases): replace
+# every key= line; else insert key=value after the first [global]; else
+# create [global] at the top. Into O[1..m].
+function override_lines(L, n, key, value, O,    i, m, hit, g) {
+    split("", O); m = 0; hit = 0; g = 0
+    for (i = 1; i <= n; i++)
+        if (index(L[i], key "=") == 1) hit = 1
+        else if (!g && index(L[i], "[global]") == 1) g = i
+    if (!hit && !g) { O[++m] = "[global]"; O[++m] = key "=" value }
+    for (i = 1; i <= n; i++) {
+        O[++m] = (hit && index(L[i], key "=") == 1) ? key "=" value : L[i]
+        if (!hit && i == g) O[++m] = key "=" value
+    }
+    return m
+}
+# The sha256 a generated layout job's marker carries, "" for another line.
+# The body it covers is layout_body's.
+function marker_sha(line,    p, h) {
+    p = layout_marker() " sha256="
+    if (index(line, p) != 1) return ""
+    h = rstrip(substr(line, length(p) + 1))
+    return (length(h) == 64 && h ~ /^[0-9a-f]+$/) ? h : ""
+}
+function layout_body(L, n,    i, k, out) {   # every non-marker line, trailing blanks off, \n-joined
+    out = ""; k = 0
+    for (i = 1; i <= n; i++)
+        if (index(L[i], layout_marker()) != 1) out = out (k++ ? "\n" : "") rstrip(L[i])
+    return out
+}
+# The most kernel aio events one jobfile sets up at once through libaio:
+# every clone of a job reserves its iodepth (io_queue_init), so numjobs x
+# iodepth per section (each inherits every [global] above it; a value that
+# is not a number counts 0), summed over the sections that run together --
+# a stonewall starts a new group -- and the largest group taken. 0 when
+# nothing in the file runs libaio.
+function libaio_events(L, n,    i, s, p, k, v, G, sec, insec, ng, GS, GN, best) {
+    split("", G); split("", sec); insec = 0; ng = 1; GS[1] = 0; GN[1] = 0
+    for (i = 1; i <= n + 1; i++) {
+        if (i <= n) {
+            s = strip(L[i])
+            if (s == "" || substr(s, 1, 1) == "#" || substr(s, 1, 1) == ";") continue
+            if (s !~ /^\[.+\]$/) {
+                if ((p = index(s, "="))) { k = strip(substr(s, 1, p - 1)); v = strip(substr(s, p + 1)) }
+                else { k = strip(s); v = "" }
+                if (insec) sec[k] = v; else G[k] = v
+                continue
+            }
+        }
+        if (insec) {   # a section ends: at the next header, or at the end
+            if ((("stonewall" in sec) ? sec["stonewall"] : "0") != "0" && GN[ng] > 0) {
+                ng++; GS[ng] = 0; GN[ng] = 0
+            }
+            if (("ioengine" in sec) && sec["ioengine"] == "libaio") {
+                k = ("numjobs" in sec) && sec["numjobs"] != "" ? py_int(sec["numjobs"]) : 1
+                v = ("iodepth" in sec) && sec["iodepth"] != "" ? py_int(sec["iodepth"]) : 1
+                GS[ng] += (k == "" || v == "") ? 0 : k * v
+                GN[ng]++
+            }
+        }
+        if (i > n) break
+        insec = strip(substr(s, 2, length(s) - 2)) != "global"
+        if (insec) { split("", sec); for (k in G) sec[k] = G[k] }
+    }
+    best = GS[1]
+    for (i = 2; i <= ng; i++) if (GS[i] > best) best = GS[i]
+    return best
+}
+
+# --- probe facts (the probe snippet's lines, P[1..np]) ---
+# lib.py's probe_cpu_fact: the cpus on the first "key <list>" line (none
+# for "-", tested and empty); 1 when the line is there, 0 when the probe
+# could not test -- never an answer
+function probe_cpu_fact(P, np, key, S,    i, F) {
+    split("", S)
+    for (i = 1; i <= np; i++)
+        if (pysplit(P[i], F) > 1 && F[1] == key) {
+            if (F[2] != "-" && !parse_cpulist(F[2], S)) awk_fail("probe: bad cpu list on its " key " line: " F[2])
+            return 1
+        }
+    return 0
+}
+function probe_universe(P, np, ncpus, U,    c) {   # the online list, else 0..ncpus-1
+    if (probe_cpu_fact(P, np, "online", U) && set_any(U)) return
+    split("", U)
+    for (c = 0; c < ncpus; c++) U[c] = 1
+}
+function probe_unbindable(P, np, U, UB,    B, BP, c) {   # measured, never a guess
+    split("", UB)
+    if (!probe_cpu_fact(P, np, "bindable", B)) return
+    probe_cpu_fact(P, np, "bindable_priv", BP)
+    for (c in U) if (!(c in B) && !(c in BP)) UB[c] = 1
+}
+# lib.py's probe_topology: TK[c] for every cpu it names, TS[c] its socket,
+# TL[c] its core's threads (a list); 1 when the probe carried topology
+function probe_topology(P, np, TK, TS, TL,    i, F, c, v, pkg, cid, sib, S, key, BY) {
+    split("", TK); split("", TS); split("", TL)
+    split("", pkg); split("", cid); split("", sib); split("", BY)
+    for (i = 1; i <= np; i++) {
+        if (pysplit(P[i], F) < 3 || substr(F[1], 1, 5) != "topo_" || F[2] !~ /^[0-9]+$/) continue
+        c = F[2] + 0
+        if (F[1] == "topo_physical_package_id") { if ((v = py_int(F[3])) != "") pkg[c] = v }
+        else if (F[1] == "topo_core_id") { if ((v = py_int(F[3])) != "") cid[c] = v }
+        else if (F[1] == "topo_thread_siblings_list") { if (parse_cpulist(F[3], S)) sib[c] = F[3] }
+    }
+    for (c in pkg) TK[c] = 1
+    for (c in cid) TK[c] = 1
+    for (c in sib) TK[c] = 1
+    # threads without a siblings list share a core with every thread of the
+    # same (socket, core_id)
+    for (c in TK) {
+        TS[c] = (c in pkg) ? pkg[c] : 0
+        if (!(c in sib) && (c in cid)) {
+            key = TS[c] SUBSEP cid[c]
+            if (key in BY) BY[key] = BY[key] "," c; else BY[key] = c
+        }
+    }
+    for (c in TK) {
+        if ((c in sib) && parse_cpulist(sib[c], S) && (c in S)) TL[c] = join_sorted(S, ",")
+        else if (c in cid) {
+            key = TS[c] SUBSEP cid[c]
+            if (!(key in BY)) awk_fail("probe: cpu " c " is missing from its own thread_siblings_list")
+            TL[c] = BY[key]
+        } else
+            TL[c] = c
+    }
+    return set_any(TK)
+}
+# lib.py's reserve_count and place_reserve: how many cores the OS keeps,
+# and which -- core 0 first, then round-robin over the sockets from the one
+# after core 0's, each giving its lowest free core; never a DPDK core
+function reserve_count(ncores, ndpdk,    v) {
+    v = (ncores <= 24 ? 2 : 4) + (ndpdk > 4 ? int((ndpdk - 1) / 4) : 0)
+    if (v > 12) v = 12
+    if (v > int(ncores / 2)) v = int(ncores / 2)
+    return v < 1 ? 1 : v
+}
+function place_reserve(ORD, nk, SOCK, DPDK, core0, want, RES,    n, i, s, ns, SO, seen, p, r, RR, FREE, FH, FN, left) {
+    split("", RES); n = 0
+    if (core0 != "" && !(core0 in DPDK)) RES[++n] = core0
+    ns = 0
+    for (i = 1; i <= nk; i++)
+        if (!((s = SOCK[ORD[i]]) in seen)) { seen[s] = 1; SO[++ns] = s }
+    if (ns == 0) return n
+    sort_arr(SO, ns, 1)
+    p = 1
+    for (i = 1; i <= ns; i++) if (SO[i] == SOCK[core0]) { p = i; break }
+    r = 0
+    for (i = p + 1; i <= ns; i++) RR[++r] = SO[i]
+    for (i = 1; i <= p; i++) RR[++r] = SO[i]
+    for (i = 1; i <= ns; i++) { FH[SO[i]] = 1; FN[SO[i]] = 0 }
+    for (i = 1; i <= nk; i++)
+        if (!(ORD[i] in DPDK) && !(n && ORD[i] == RES[1])) {
+            s = SOCK[ORD[i]]; FREE[s, ++FN[s]] = ORD[i]
+        }
+    while (n < want) {
+        left = 0
+        for (i = 1; i <= ns; i++) if (FH[SO[i]] <= FN[SO[i]]) left = 1
+        if (!left) break
+        for (i = 1; i <= r; i++) {
+            if (n >= want) break
+            s = RR[i]
+            if (FH[s] <= FN[s]) RES[++n] = FREE[s, FH[s]++]
+        }
+    }
+    return n
+}
+# lib.py's probe_cores: the cpus fio may run on for one host, in PHYSICAL
+# cores -- ONE rule for the tuner, the calibration shapes, usable_cores and
+# the pinning check; the python says why for every step. R gets n, ncores,
+# dpdk, nres and res (the reserved cores' threads, for the summary),
+# unlisted, unbound, topo and catchall; PHYS one thread per usable core,
+# ALL every thread of them. In three parts: awk caps a function at 50
+# parameters and locals together.
+function probe_cores(P, np, base_list, R, PHYS, ALL,    U, UB, CORE, THR, ORD, nk, SOCK, DPDK, core0, B, RES, nres, SKIP, S, i, j, k, T, nt, t, inb, use, unlisted, unbound, res) {
+    split("", R); split("", PHYS); split("", ALL)
+    nk = probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R)
+    core0 = (0 in CORE) ? CORE[0] : (nk ? ORD[1] : "")
+    split("", RES); nres = 0
+    if (probe_base(base_list, U, UB, THR, DPDK, core0, B, R)) {
+        # core 0's pair -- unless weka owns core 0: then it already left as
+        # a DPDK core, and counting it twice broke the logged sum
+        if (core0 != "" && !(core0 in DPDK)) RES[++nres] = core0
+    } else {
+        split("", B)
+        for (k in U) B[k] = 1
+        nres = place_reserve(ORD, nk, SOCK, DPDK, core0, reserve_count(nk, set_size(DPDK)), RES)
+    }
+    res = ""
+    for (i = 1; i <= nres; i++) {
+        split("", S); nt = split(THR[RES[i]], T, ",")
+        for (j = 1; j <= nt; j++) S[T[j]] = 1
+        res = res (i > 1 ? " " : "") fmt_cpulist(S)
+        SKIP[RES[i]] = 1
+    }
+    use = 0; unlisted = 0; unbound = 0
+    for (i = 1; i <= nk; i++) {
+        k = ORD[i]
+        if ((k in DPDK) || (k in SKIP)) continue
+        nt = split(THR[k], T, ","); t = 0; inb = 0
+        for (j = 1; j <= nt; j++) {
+            if (!(T[j] in B)) continue
+            inb = 1
+            if (T[j] in UB) continue
+            if (!t++) PHYS[T[j]] = 1
+            ALL[T[j]] = 1
+        }
+        if (t) use++
+        else if (inb) unbound++   # listed, but the host binds none of its threads
+        else unlisted++           # the operator's list leaves the whole core out
+    }
+    R["n"] = use; R["ncores"] = nk; R["dpdk"] = set_size(DPDK)
+    R["nres"] = nres; R["res"] = res == "" ? "none" : res
+    R["unlisted"] = unlisted; R["unbound"] = unbound
+}
+# The host's cpus and cores: U the cpus it has, UB those it refuses to
+# bind, CORE[cpu] its core's key (the core's lowest online thread), THR[key]
+# the core's threads (a list), ORD[1..n] the keys in order (n returned),
+# SOCK[key] its socket, DPDK the keys of weka's dedicated cores -- weka pins
+# each dedicated io thread to exactly ONE cpu, so only single-cpu masks
+# count -- and R["topo"].
+function probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R,    i, F, S, ncpus, weka, TK, TS, TL, A, n, c, m, T, nt, j, k, nk) {
+    ncpus = 0; split("", weka)
+    for (i = 1; i <= np; i++) {
+        if (pysplit(P[i], F) < 2) continue   # a bare isolated line: no isolated cpus
+        if (F[1] == "ncpus" && F[2] ~ /^[0-9]+$/) ncpus = F[2] + 0
+        else if (F[1] == "weka_allowed") {
+            if (!parse_cpulist(F[2], S)) awk_fail("probe: bad cpu list on a weka_allowed line: " F[2])
+            if (set_size(S) == 1) for (c in S) weka[c] = 1
+        }
+    }
+    probe_universe(P, np, ncpus, U)
+    probe_unbindable(P, np, U, UB)
+    R["topo"] = probe_topology(P, np, TK, TS, TL)
+    split("", CORE); split("", THR)
+    n = set_sorted(U, A)
+    for (i = 1; i <= n; i++) {
+        c = A[i]; m = c
+        if (c in TK) {
+            nt = split(TL[c], T, ",")
+            for (j = 1; j <= nt; j++) if ((T[j] in U) && T[j] + 0 < m) m = T[j] + 0
+        }
+        CORE[c] = m
+        if (m in THR) THR[m] = THR[m] "," c; else THR[m] = c
+    }
+    split("", ORD); nk = 0
+    for (k in THR) ORD[++nk] = k + 0
+    sort_arr(ORD, nk, 1)
+    split("", SOCK); split("", DPDK)
+    for (i = 1; i <= nk; i++) SOCK[ORD[i]] = (ORD[i] in TK) ? TS[ORD[i]] : 0
+    for (c in weka) if (c in CORE) DPDK[CORE[c]] = 1
+    return nk
+}
+# Does an operator cpu list (the host file's) stand? B gets it, trimmed to
+# the cpus the host has. A list covering every cpu fio could use -- all but
+# weka's cores (both threads), core 0's pair and the cpus the host refuses
+# to bind -- restricts nothing and counts as none (R["catchall"]).
+function probe_base(base_list, U, UB, THR, DPDK, core0, B, R,    BU, NEVER, c, k, T, nt, j) {
+    R["catchall"] = 0
+    if (base_list == "") return 0
+    if (!parse_cpulist(base_list, B)) awk_fail("bad cpu list: " base_list)
+    if (!set_any(U)) return 1
+    for (c in B) if (c in U) BU[c] = 1
+    split("", B)
+    for (c in BU) B[c] = 1
+    for (c in UB) NEVER[c] = 1
+    for (k in DPDK) { nt = split(THR[k], T, ","); for (j = 1; j <= nt; j++) NEVER[T[j]] = 1 }
+    if (core0 != "") { nt = split(THR[core0], T, ","); for (j = 1; j <= nt; j++) NEVER[T[j]] = 1 }
+    for (c in U) if (!(c in NEVER) && !(c in B)) return 1
+    R["catchall"] = 1
+    return 0
+}
+function cores_summary(R, PHYS, ALL,    more, p, a) {   # lib.py's: the one line the logs print
+    more = ""
+    if (R["unlisted"]) more = more sprintf(" - %d outside the host-file cpu list", R["unlisted"])
+    if (R["unbound"]) more = more sprintf(" - %d unbindable", R["unbound"])
+    p = fmt_cpulist(PHYS); a = fmt_cpulist(ALL)
+    return sprintf("%d physical core(s)%s - %d weka DPDK - %d reserved for the OS (%s)%s = N=%d: N/2 and N jobs on %s, 2N and 4N on %s", R["ncores"], R["topo"] ? "" : " (no topology: one per cpu)", R["dpdk"], R["nres"], R["res"], more, R["n"], p == "" ? "none" : p, a == "" ? "none" : a)
+}
+# lib.py's probe_aio_room: fs.aio-max-nr less fs.aio-nr as the probe read
+# them, "" when it could not tell
+function probe_aio_room(P, np,    i, F, mx, nr) {
+    mx = ""; nr = ""
+    for (i = 1; i <= np; i++)
+        if (pysplit(P[i], F) == 2 && F[2] ~ /^[0-9]+$/) {
+            if (F[1] == "aio_max_nr") mx = F[2] + 0
+            else if (F[1] == "aio_nr") nr = F[2] + 0
+        }
+    if (mx == "") return ""
+    mx -= (nr == "" ? 0 : nr)
+    return mx < 0 ? 0 : mx
+}
+AWKLIB
+
+awkrun() {   # awkrun <program> <arg>... -- WEKA_AWK prepended, LC_ALL=C
+    LC_ALL=C awk "$WEKA_AWK
+function geom_slots() { return \"$GEOM_SLOTS\" }
+function geom_names() { return \"$GEOM_NAMES\" }
+function layout_job() { return \"$LAYOUT_JOB\" }
+function layout_marker() { return \"$LAYOUT_MARKER\" }
+function floor_marker() { return \"$FLOOR_MARKER\" }
+$1" "${@:2}"
+}
+
+# stdin's sha256, lowercase hex: sha256sum, or shasum where there is none
+# (a macOS controller)
+sha256_hex() {
+    local out
+    if command -v sha256sum >/dev/null; then
+        out=$(sha256sum) || return 1
+    else
+        out=$(shasum -a 256) || return 1
+    fi
+    printf '%s' "${out%% *}"
 }
 
 # -a takes a level and, for the measuring levels, an optional per-rung
@@ -1506,20 +1958,15 @@ usable_cores() {   # usable_cores <host> [count|phys|list] [cpulist]
         log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
         return 1
     }
-    pyrun "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" <<'PYEOF' || return 1
-import sys
-
-path = sys.argv[1]
-c = probe_cores(path, sys.argv[3])
-if c["n"] < 1:
-    sys.exit(f"ERROR: usable_cores: {path} leaves fio no cpus: {cores_summary(c)}")
-if sys.argv[2] == "list":
-    print(",".join(str(x) for x in c["all"]))
-elif sys.argv[2] == "phys":
-    print(",".join(str(x) for x in c["phys"]))
-else:
-    print(c["n"])
-PYEOF
+    awkrun 'BEGIN {
+        path = ARGV[1]
+        if ((np = readlines(path, P)) < 0) np = 0
+        probe_cores(P, np, ARGV[3], R, PHYS, ALL)
+        if (R["n"] < 1) awk_fail("usable_cores: " path " leaves fio no cpus: " cores_summary(R, PHYS, ALL))
+        if (ARGV[2] == "list") print join_sorted(ALL, ",")
+        else if (ARGV[2] == "phys") print join_sorted(PHYS, ",")
+        else print R["n"]
+    }' "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" || return 1
 }
 
 # WHERE calibration measures: on the workload's own files whenever the set's
@@ -1541,46 +1988,43 @@ PYEOF
 #
 # Prints "unified <fmt>" or "scratch $jobnum.$filenum".
 cal_namespace() {   # cal_namespace <set-dir>
-    pyrun "$1" <<'NSEOF'
-import os
-import re
-import sys
-
-src = sys.argv[1]
-for job in sorted(f for f in os.listdir(src) if re.match(r"^[0-9]", f)):
-    path = os.path.join(src, job)
-    try:
-        lines = open(path).read().splitlines()
-    except OSError:
-        continue
-    if any(l.startswith("# wekatester-layout: generated") for l in lines[:3]):
-        continue          # the layout job mirrors the measured ones
-    fmt = first_value(lines, "filename_format")
-    if fmt and "$filenum" in fmt and "$jobnum" in fmt and "$jobname" not in fmt:
-        print("unified", fmt)
-        raise SystemExit(0)
-print("scratch", "$jobnum.$filenum")
-NSEOF
+    local f files=() LC_ALL=C
+    [ -d "$1" ] || { log "ERROR: cal_namespace: no set directory $1" >&2; return 1; }
+    for f in "$1"/[0-9]*; do
+        [ -f "$f" ] && files+=("$f")
+    done
+    # the first jobfile (byte order) with a grid-addressable format decides;
+    # the layout job mirrors the measured ones, so it never does
+    awkrun 'BEGIN {
+        for (i = 1; i < ARGC; i++) {
+            if ((n = readlines(ARGV[i], L)) < 0 || is_layout_marked(L, n)) continue
+            fmt = first_value(L, n, "filename_format")
+            if (index(fmt, "$filenum") && index(fmt, "$jobnum") && !index(fmt, "$jobname")) {
+                print "unified", fmt
+                exit 0
+            }
+        }
+        print "scratch", "$jobnum.$filenum"
+    }' ${files[@]+"${files[@]}"}
 }
 
 # Every directory the scratch's names imply, relative to the scratch root.
 # fio never mkdirs, so the caller creates these before the seed writes.
 cal_scratch_dirs() {   # cal_scratch_dirs <host> <sep> <fmt> <nj> <maxfilenum>
-    pyrun "$1" "$2" "$3" "$4" "$5" <<'DIREOF'
-import os
-import sys
-
-host, sep, fmt, nj, maxf = (sys.argv[1], sys.argv[2], sys.argv[3],
-                            int(sys.argv[4]), int(sys.argv[5]))
-dirs = set()
-for j in range(nj):
-    for f in range(maxf + 1):
-        name = (host + sep + fmt).replace("$jobnum", str(j)).replace("$filenum", str(f))
-        d = os.path.dirname(name)
-        if d:
-            dirs.add(d)
-print("\n".join(sorted(dirs)))
-DIREOF
+    awkrun 'BEGIN {
+        pat = ARGV[1] ARGV[2] ARGV[3]
+        if ((nj = py_int(ARGV[4])) == "" || (maxf = py_int(ARGV[5])) == "")
+            awk_fail("cal_scratch_dirs: not a number: " ARGV[4] " " ARGV[5])
+        n = 0
+        for (j = 0; j < nj; j++)
+            for (f = 0; f <= maxf; f++) {
+                d = dirname(replace_all(replace_all(pat, "$jobnum", j), "$filenum", f))
+                if (d != "" && !(d in seen)) { seen[d] = 1; D[++n] = d }
+            }
+        sort_arr(D, n, 0)
+        for (i = 1; i <= n; i++) out = out (i > 1 ? "\n" : "") D[i]
+        print out
+    }' "$1" "$2" "$3" "$4" "$5"
 }
 
 # Copy a failed seed's evidence into the run dir so it lands in the bundle:
@@ -3325,6 +3769,20 @@ BUDEOF
     done
 }
 
+# The removal command for the dataset files <name><sep><fmt> names under <hd>
+# (the sweep's glob derivation: every $var a wildcard, find bounded at the
+# format's own depth), then whatever directories that leaves empty.
+cal_remove_cmd() {   # cal_remove_cmd <name> <sep> <fmt> <hd>
+    awkrun 'BEGIN {
+        glob = vars_to_glob(ARGV[1] ARGV[2] ARGV[3]); hd = ARGV[4]
+        depth = 1 + count_char(glob, "/")
+        cmd = sprintf("find %s -maxdepth %d -type f -path %s -delete", squote(hd), depth, squote(hd "/" glob))
+        if (index(glob, "/"))
+            cmd = cmd sprintf(" && find %s -maxdepth %d -type d -path %s -empty -delete", squote(hd), depth - 1, squote(hd "/" substr(glob, 1, match(glob, /\/[^\/]*$/) - 1)))
+        print cmd
+    }' "$@"
+}
+
 # -u, after the last measured job (main): the calibration dataset -- in the
 # unified namespace each host's write set and, from the first host only, the
 # fleet-shared read set, by the same glob derivation the sweep uses; in the
@@ -3338,39 +3796,13 @@ cal_remove_dataset() {
             # each filesystem group only -- the group's fleet-shared read
             # set, deleted by the same glob derivation the sweep uses
             if [ "$host" = "$(group_first "$host")" ]; then
-                ucmd=$(pyrun shared "." "$CAL_FMT" "$(host_dir "$host")" <<'UNLSEOF'
-import re
-import sys
-
-host, sep, fmt, hd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-pat = host + sep + fmt
-glob = re.sub(r"\$\w+", "*", pat)
-depth = 1 + glob.count("/")
-cmd = f"find '{hd}' -maxdepth {depth} -type f -path '{hd}/{glob}' -delete"
-if "/" in glob:
-    dglob = glob.rsplit("/", 1)[0]
-    cmd += f" && find '{hd}' -maxdepth {depth - 1} -type d -path '{hd}/{dglob}' -empty -delete"
-print(cmd)
-UNLSEOF
-                ) || die "cannot derive the shared dataset removal command"
+                ucmd=$(cal_remove_cmd shared "." "$CAL_FMT" "$(host_dir "$host")") \
+                    || die "cannot derive the shared dataset removal command"
                 run_host "$host" "$ucmd" \
                     || log "WARNING: could not remove the shared dataset" >&2
             fi
-            ucmd=$(pyrun "$(host_name "$host")" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")" <<'UNLEOF'
-import re
-import sys
-
-host, sep, fmt, hd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-pat = host + sep + fmt
-glob = re.sub(r"\$\w+", "*", pat)
-depth = 1 + glob.count("/")
-cmd = f"find '{hd}' -maxdepth {depth} -type f -path '{hd}/{glob}' -delete"
-if "/" in glob:
-    dglob = glob.rsplit("/", 1)[0]
-    cmd += f" && find '{hd}' -maxdepth {depth - 1} -type d -path '{hd}/{dglob}' -empty -delete"
-print(cmd)
-UNLEOF
-            ) || die "$host: cannot derive the dataset removal command"
+            ucmd=$(cal_remove_cmd "$(host_name "$host")" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")") \
+                || die "$host: cannot derive the dataset removal command"
             run_host "$host" "$ucmd" &
         else
             run_host "$host" "rm -rf '$(host_dir "$host")$CAL_NS_DIR'" &
@@ -3648,19 +4080,15 @@ calibrate() {
 
     # One cal.results line per MEMBER: the shape's engine, then (qd nr fs nj)
     # per slot in CAL_SLOTS order, "- - - -" for a slot this set does not
-    # run. The slot order IS the schema: taken from the shared layer instead
-    # of spelled a second time here.
+    # run. The slot order IS the schema: GEOM_SLOTS, lib.py's CAL_SLOTS,
+    # instead of spelled a second time here.
     : > "$WORK_DIR/cal.results"
-    local slots slot type dirn t eng any m
-    slots=$(pyrun <<'PYEOF'
-print(" ".join(CAL_SLOTS))
-PYEOF
-    ) || die "cannot derive the cal.results slot order"
+    local slot type dirn t eng any m
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
         eng="-"
         [ ! -s "$WORK_DIR/cal/s$sid/engine" ] || read -r eng < "$WORK_DIR/cal/s$sid/engine"
         line=$eng; any=0
-        for slot in $slots; do
+        for slot in $GEOM_SLOTS; do
             type=${slot%_*}
             dirn=read; [ "${slot##*_}" = r ] || dirn=write
             t="$WORK_DIR/cal/s$sid/tuple-$type-$dirn"
@@ -5806,13 +6234,9 @@ PYEOF
 # A fresh host file: header plus a commented format reference, so an editor
 # session or a later -a writeback starts from something self-describing.
 write_targets_template() {   # write_targets_template <path>
-    local header
+    local header="host,user_login,ioengine,allowed_cpus,destination_folder" n
     # the column list comes from the shared schema, not a second spelling
-    header=$(pyrun <<'PYEOF'
-print("host,user_login,ioengine,allowed_cpus,destination_folder,"
-      + ",".join(f"{n}:nj/fs/nr/qd" for n in GEOM_NAMES))
-PYEOF
-    ) || die "cannot derive the host file header"
+    for n in $GEOM_NAMES; do header="$header,$n:nj/fs/nr/qd"; done
     { printf '%s\n' "$header"
       cat <<'CSVEOF'
 # One host per line assigns to that host; lines without a host apply to the
@@ -6817,50 +7241,67 @@ PYEOF
     done
     # host-file engine (final resolution) applies per host, to every staged
     # file including a re-derived layout; the global -e post-pass in
-    # stage_jobfiles still runs after this and wins. One python for the fleet.
+    # stage_jobfiles still runs after this and wins
     [ -f "$WORK_DIR/targets.final" ] || return 0
-    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF' || die "per-host engine override failed"
-import os, sys
+    stage_host_engines
+}
 
-work, hosts = sys.argv[1], sys.argv[2:]
-rows = {}
-for line in open(os.path.join(work, "targets.final")):
-    p = line.rstrip("\n").split("\t")
-    rows.setdefault(p[0], p)
-for host in hosts:
-    row = rows.get(host, [])
-    eng = row[2] if len(row) > 2 else ""
-    if eng in ("", "-"):
-        continue
-    d = os.path.join(work, "jobs", host)
-    for name in sorted(os.listdir(d)):
-        path = os.path.join(d, name)
-        if not os.path.isfile(path):
-            continue
-        lines = override_lines(open(path).read().splitlines(), "ioengine", eng)
-        with open(path, "w") as fh:
-            fh.write("\n".join(lines) + "\n")
-PYEOF
+# Each host's host-file engine (targets.final) onto every one of its staged
+# files, as an ioengine= line (override_lines). One awk for the fleet.
+stage_host_engines() {
+    list_staged "$WORK_DIR/staged.list" || die "per-host engine override failed"
+    awkrun 'BEGIN {
+        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+        for (i = 1; i <= n; i++) {   # the first row per host, as targets_field reads it
+            split(L[i], F, "\t")
+            if (!(F[1] in eng)) eng[F[1]] = F[3]
+        }
+        if ((m = readlines(ARGV[2], M)) < 0) awk_fail("cannot read " ARGV[2])
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            e = (F[1] in eng) ? eng[F[1]] : ""
+            if (e == "" || e == "-") continue
+            if (F[2] == "") awk_fail(F[1] ": no staged jobfiles")
+            if ((n = readlines(F[2], L)) < 0) awk_fail("cannot read " F[2])
+            n = override_lines(L, n, "ioengine", e, O)
+            writelines(F[2], O, n)
+        }
+    }' "$WORK_DIR/targets.final" "$WORK_DIR/staged.list" || die "per-host engine override failed"
+}
+
+# Every host's staged files, one "<host><tab><path>" line each, hosts in
+# order and each host's files in byte order; "<host><tab>" alone for a host
+# with no staged directory. The fleet-wide awks read this rather than list
+# directories of their own: one process for every host, never one per host.
+list_staged() {   # list_staged <outfile>
+    local host f LC_ALL=C
+    for host in "${HOSTS[@]}"; do
+        if [ -d "$WORK_DIR/jobs/$host" ]; then
+            for f in "$WORK_DIR/jobs/$host"/*; do
+                [ -f "$f" ] || continue
+                printf '%s\t%s\n' "$host" "$f"
+            done
+        else
+            printf '%s\t\n' "$host"
+        fi
+    done > "$1"
 }
 
 # Is the layout file in this staged dir still the generated original?
 layout_variant_pristine() {   # layout_variant_pristine <dir>
-    local f
+    local f want
     for f in "$1"/[0-9]*; do
         is_layout_file "$f" || continue
-        python3 - "$f" <<'PYEOF'
-import hashlib, re, sys
-lines = open(sys.argv[1]).read().splitlines()
-MARKER = "# wekatester-layout: generated"
-for l in lines[:3]:
-    m = re.match(re.escape(MARKER) + r" sha256=([0-9a-f]{64})\s*$", l)
-    if m:
-        body = [x for x in lines if not x.startswith(MARKER)]
-        digest = hashlib.sha256("\n".join(x.rstrip() for x in body).encode()).hexdigest()
-        sys.exit(0 if digest == m.group(1) else 1)
-sys.exit(1)
-PYEOF
-        return $?
+        # the digest its marker carries (on one of the first three lines),
+        # then the body generate_layout took it over
+        awkrun 'BEGIN {
+            n = readlines(ARGV[1], L)
+            for (i = 1; i <= 3 && i <= n; i++) if ((want = marker_sha(L[i])) != "") break
+            if (want == "") exit 1
+            print want
+            printf "%s", layout_body(L, n)
+        }' "$f" | { IFS= read -r want && [ "$(sha256_hex)" = "$want" ]; }
+        return
     done
     return 0   # no layout staged yet: nothing to preserve
 }
@@ -7086,31 +7527,35 @@ PYEOF
 # without -t/-e/-a never probe, so they go unchecked.
 check_aio_room() {
     [ -d "$WORK_DIR/probe" ] || return 0
-    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
-import os, sys
-
-work, hosts = sys.argv[1], sys.argv[2:]
-over = {}
-for h in hosts:
-    room = probe_aio_room(os.path.join(work, "probe", h))
-    d = os.path.join(work, "jobs", h)
-    if room is None or not os.path.isdir(d):
-        continue
-    for job in sorted(os.listdir(d)):
-        p = os.path.join(d, job)
-        if os.path.isfile(p):
-            n = libaio_events(open(p).read().splitlines())
-            if n > room:
-                over.setdefault((job, n, room), []).append(h)
-for (job, n, room), hs in sorted(over.items()):
-    names = " ".join(hs[:8]) + (" (+%d more)" % (len(hs) - 8) if len(hs) > 8 else "")
-    print("ERROR: %s: libaio sets up %d aio events at once (numjobs x iodepth) on %s, "
-          "and the kernel has room for %d (fs.aio-max-nr less fs.aio-nr, as probed): the "
-          "jobs past the room would fail io_queue_init with EAGAIN (fio error 11) -- raise "
-          "fs.aio-max-nr, run another ioengine (-e or the host file), or lower the job's "
-          "numjobs x iodepth" % (job, n, names, room), file=sys.stderr)
-sys.exit(2 if over else 0)
-PYEOF
+    # one awk for the fleet: per host its probed room, then its staged files
+    list_staged "$WORK_DIR/staged.list" && awkrun 'BEGIN {
+        if ((m = readlines(ARGV[2], M)) < 0) awk_fail("cannot read " ARGV[2])
+        nk = 0; last = ""
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            if (F[1] != last) {
+                last = F[1]
+                if ((np = readlines(ARGV[1] "/probe/" last, P)) < 0) np = 0
+                room = probe_aio_room(P, np)
+            }
+            if (room == "" || F[2] == "") continue
+            if ((n = readlines(F[2], L)) < 0) awk_fail("cannot read " F[2])
+            if ((ev = libaio_events(L, n)) <= room) continue
+            job = F[2]; sub(/.*\//, "", job)
+            key = job SUBSEP sprintf("%.0f", ev) SUBSEP sprintf("%.0f", room)
+            if (!(key in nh)) {   # ordered as python sorts (job, events, room)
+                K[++nk] = sprintf("%s\001%020.0f\001%020.0f", job, ev, room)
+                KEY[K[nk]] = key; JOB[key] = job; EV[key] = ev; ROOM[key] = room
+            }
+            if (++nh[key] <= 8) names[key] = names[key] (nh[key] > 1 ? " " : "") last
+        }
+        sort_arr(K, nk, 0)
+        for (i = 1; i <= nk; i++) {
+            key = KEY[K[i]]
+            printf "ERROR: %s: libaio sets up %.0f aio events at once (numjobs x iodepth) on %s, and the kernel has room for %.0f (fs.aio-max-nr less fs.aio-nr, as probed): the jobs past the room would fail io_queue_init with EAGAIN (fio error 11) -- raise fs.aio-max-nr, run another ioengine (-e or the host file), or lower the job\047s numjobs x iodepth\n", JOB[key], EV[key], names[key] (nh[key] > 8 ? sprintf(" (+%d more)", nh[key] - 8) : ""), ROOM[key] > "/dev/stderr"
+        }
+        exit (nk ? 2 : 0)
+    }' "$WORK_DIR" "$WORK_DIR/staged.list"
     case $? in
         0) ;;
         # stop before anything runs (Frank, 2026-10-02); nothing was written
@@ -7453,52 +7898,56 @@ PYEOF
 ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
     local host cmd i pids=() hs=()
     for host in "${HOSTS[@]}"; do
-        cmd=$(python3 - "$WORK_DIR/jobs/$host/$1" <<'PYEOF'
-import os, sys
-
-glb, sections, cur = {}, [], None
-for raw in open(sys.argv[1]):
-    line = raw.strip()
-    if not line or line[0] in "#;":
-        continue
-    if line.startswith("["):
-        name = line[1:-1]
-        cur = glb if name == "global" else {}
-        if name != "global":
-            sections.append((name, cur))
-        continue
-    if "=" in line and cur is not None:
-        k, v = line.split("=", 1)
-        cur[k.strip()] = v.strip()
-
-dirs = set()
-for name, sec in sections:
-    fmt = sec.get("filename_format", glb.get("filename_format"))
-    if not fmt or "/" not in fmt:
-        continue
-    sub = fmt.rsplit("/", 1)[0].replace("$jobname", name)
-    combos = [sub]
-    for var, key in (("$filenum", "nrfiles"), ("$jobnum", "numjobs")):
-        if var in sub:
-            count = int(sec.get(key, glb.get(key, 1)))
-            combos = [c.replace(var, str(n)) for c in combos for n in range(count)]
-    if any("$" in c for c in combos):
-        print(f"WARNING: cannot pre-create directories for [{name}]: "
-              f"unsupported variable in '{sub}'", file=sys.stderr)
-        continue
-    base = sec.get("directory", glb.get("directory", ""))
-    for c in combos:
-        dirs.add(os.path.join(base, c))
-
-# chunked so the remote command stays far below ssh's packet limit
-dirs = sorted(dirs)
-cmds = []
-while dirs:
-    chunk, dirs = dirs[:400], dirs[400:]
-    cmds.append("mkdir -p " + " ".join("'%s'" % d for d in chunk))
-print(" && ".join(cmds))
-PYEOF
-        ) || die "cannot derive the layout directory set for $host"
+        # every directory each section's filename_format implies under its
+        # directory=, a section's own keys over [global]'s; mkdir -p lines
+        # of 400, so the remote command stays far below ssh's packet limit
+        cmd=$(awkrun 'BEGIN {
+            if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+            ns = 0; cur = ""   # "": before any section, where keys count for nothing
+            for (i = 1; i <= n; i++) {
+                line = strip(L[i]); c = substr(line, 1, 1)
+                if (line == "" || c == "#" || c == ";") continue
+                if (c == "[") {
+                    name = substr(line, 2, length(line) - 2)
+                    if (name == "global") cur = "g"
+                    else { SN[++ns] = name; cur = ns }
+                    continue
+                }
+                if ((p = index(line, "=")) && cur != "")
+                    KV[cur, strip(substr(line, 1, p - 1))] = strip(substr(line, p + 1))
+            }
+            nd = 0
+            for (s = 1; s <= ns; s++) {
+                name = SN[s]
+                fmt = ((s, "filename_format") in KV) ? KV[s, "filename_format"] : KV["g", "filename_format"]
+                if (!index(fmt, "/")) continue
+                pre = replace_all(substr(fmt, 1, match(fmt, /\/[^\/]*$/) - 1), "$jobname", name)
+                nc = 1; C[1] = pre
+                for (v = 1; v <= 2; v++) {
+                    var = v == 1 ? "$filenum" : "$jobnum"; key = v == 1 ? "nrfiles" : "numjobs"
+                    if (!index(pre, var)) continue
+                    cnt = ((s, key) in KV) ? KV[s, key] : (("g", key) in KV) ? KV["g", key] : 1
+                    if ((cnt = py_int(cnt)) == "") awk_fail("[" name "]: " key " is not a number")
+                    m = 0
+                    for (j = 1; j <= nc; j++) for (k = 0; k < cnt; k++) C2[++m] = replace_all(C[j], var, k)
+                    nc = m
+                    for (j = 1; j <= nc; j++) C[j] = C2[j]
+                }
+                for (j = 1; j <= nc; j++) if (index(C[j], "$")) break
+                if (j <= nc) {
+                    print "WARNING: cannot pre-create directories for [" name "]: unsupported variable in " squote(pre) > "/dev/stderr"
+                    continue
+                }
+                base = ((s, "directory") in KV) ? KV[s, "directory"] : KV["g", "directory"]
+                for (j = 1; j <= nc; j++)
+                    if (!((d = path_join(base, C[j])) in seen)) { seen[d] = 1; D[++nd] = d }
+            }
+            sort_arr(D, nd, 0)
+            out = ""
+            for (i = 1; i <= nd; i++)
+                out = out ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p") " " squote(D[i])
+            print out
+        }' "$WORK_DIR/jobs/$host/$1") || die "cannot derive the layout directory set for $host"
         [ -n "$cmd" ] || continue
         run_host "$host" "$cmd" &
         pids+=($!); hs+=("$host")

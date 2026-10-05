@@ -371,39 +371,6 @@ def probe_aio_room(path):
         return None
     return max(0, mx - (nr or 0))
 
-def libaio_events(lines):
-    """The most kernel aio events one jobfile sets up at once through
-    libaio: every clone of a job reserves its iodepth (io_queue_init), so
-    numjobs x iodepth per section, summed over the sections that run
-    together -- a stonewall starts a new group -- and the largest group
-    taken. A section inherits every [global] above it. 0 when nothing in
-    the file runs libaio."""
-    glob, cur, groups = {}, None, [[]]
-    def close(sec):
-        if sec is None:
-            return
-        if sec.get("stonewall", "0") != "0" and groups[-1]:
-            groups.append([])
-        if sec.get("ioengine") == "libaio":
-            try:
-                n = int(sec.get("numjobs") or 1) * int(sec.get("iodepth") or 1)
-            except ValueError:
-                n = 0
-            groups[-1].append(n)
-    for l in lines:
-        s = l.strip()
-        if not s or s[0] in "#;":
-            continue
-        m = re.match(r"^\[(.+)\]$", s)
-        if m:
-            close(cur)
-            cur = None if m.group(1).strip() == "global" else dict(glob)
-            continue
-        k, _, v = s.partition("=")
-        (glob if cur is None else cur)[k.strip()] = v.strip()
-    close(cur)
-    return max(sum(g) for g in groups)
-
 def cores_summary(c):
     """The one-line account of probe_cores' answer the logs print."""
     res = " ".join(fmt_cpulist(t) for t in c["reserved"]) or "none"
