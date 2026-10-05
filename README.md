@@ -23,7 +23,7 @@ usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [--line-rate Gb/s]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-l] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        wekatester -s results.json
        wekatester --version
@@ -86,11 +86,6 @@ attaching is the way to pass a value that starts with a dash.
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a cal/brutal the 1MiB test
                  gets its own calibrated job count)
-  -l, --load     with -a cal or brutal: before each bandwidth and iops test
-                 runs, run its setting on every client at once; if they
-                 deliver under 90% of their solo results added up, try each
-                 client one notch lighter and heavier and run the test on the
-                 better one -- or report the cluster as the limit
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -136,9 +131,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a cal` and `-a brutal` the 1 MiB test gets its own calibrated job count, recorded in its own host-file columns (`latency1mR`, `latency1mW`).
 
-`-l/--load` — with `-a cal` or `-a brutal`, check each calibrated bandwidth and IOPS setting under load before its test runs. See *Checking the settings under load* below.
-
-`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a cal` or `-a brutal`, and takes 0.1 to 100000 Gb/s. `-a brutal` measures every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency answers are still reused.
+`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a cal` or `-a brutal`, and takes 0.1 to 100000 Gb/s. `-a brutal` measures every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency values still pin their knobs.
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -372,30 +365,6 @@ is about 120 IOPS cells, 35 bandwidth cells and 12 latency cells per direction,
 some 330 per shape, or about three hours at 30s cells. Use `cal` for the answer
 cheaply, and `brutal` when the stopping rules themselves are the suspect.
 
-### Checking the settings under load: `-l`
-
-Calibration finds each client's best settings while that client runs
-**alone**. The real test runs **every client at once**, sharing the cluster.
-With `-l`, before each bandwidth and IOPS test runs for real:
-
-1. Its staged setting runs for `CAL_RUNTIME` seconds on each shape's
-   representative alone, then on every client together.
-2. If the clients together deliver at least 90% (`CAL_FLEET_PCT`) of what they
-   did alone, added up, the setting stands.
-3. Short of that, the clients are getting in each other's way at the cluster.
-   `-l` tries every client one notch lighter (half the iodepth, or half the
-   jobs at iodepth 1) and one notch heavier (twice the iodepth; a libaio
-   client whose aio room cannot take twice as many events stays where it is,
-   and the log says so), re-measures the better one, and runs the test on it
-   if it still wins by more than 2%.
-4. If neither notch moves the total, the cluster itself is the limit, and the
-   log says that total is the cluster's number for the test.
-
-A check costs a few 30s cells per test. Latency tests are left alone: their
-rise under load is the measurement, next to the one-job twins' single-stream
-baseline. The host file keeps the solo calibration; `-l` adjusts only this
-run's staged jobs, and the bundle's copy of them.
-
 ### Calibration measures what the test will run
 
 A value measured under a parallelism, an engine or a file layout the staged
@@ -530,7 +499,9 @@ libaio sets up numjobs x iodepth aio events at once, and past
 calibration pin whose smallest cell would exceed a shape's room, with libaio
 pinned or among the engines calibration tries, and a staged libaio job past
 its host's room, both stop with an alert naming the slot or job, the events
-and the room; nothing has run and the host file is unchanged. A searched
+and the room; nothing has run and the host file is unchanged. The pin
+check runs before the fio servers start, the staged-job check before the
+first test, and a dry run (`-n`) runs both. A searched
 cell past the room is skipped by the planner's guard instead, and the
 verdict says so.
 

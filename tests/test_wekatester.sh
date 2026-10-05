@@ -4158,73 +4158,6 @@ t_assert "calibrate: under -b a latency set also measures the 1MiB test, into it
     # the 4k test holds the floor to N=5 jobs, the 1MiB test to 2N=10
     [ "$(cut -d" " -f11-14,27-30 "$d/cal.results")" = "1 1 5120M 5 1 1 5120M 10" ] || { cat "$d/cal.results" >&2; false; }'
 
-# --- -l: the calibrated settings checked under load ---
-# load_check against a fake fleet: three clients of one shape, a staged iops
-# job at numjobs=8 iodepth=16, and a master whose fio answers per client from
-# LCHK_SOLO (alone) or LCHK_BASE / LCHK_LIGHT / LCHK_HEAVY (all at once)
-lchk_fixture() {
-    LD=$(mktemp -d); mkdir -p "$LD/set" "$LD/run/fio-jobfiles" "$LD/cal" "$LD/target"
-    printf "# report ${1:-iops}\n[global]\nnumjobs=8\niodepth=16\nioengine=io_uring\nruntime=60\ntime_based=1\n[j]\nrw=randread\n" > "$LD/set/031-iopsR.job"
-    for h in h1 h2 h3; do mkdir -p "$LD/jobs/$h" "$LD/run/fio-jobfiles/$h"
-        cp "$LD/set/031-iopsR.job" "$LD/jobs/$h/"; cp "$LD/set/031-iopsR.job" "$LD/run/fio-jobfiles/$h/"; done
-    printf "1\th1\t7\t18,20\t18-31\t0\tio_uring\t-\t0\t-\t-\th1 h2 h3\n" > "$LD/cal/shapes"
-    export LD
-}
-lchk_fake() {   # a fake master fio: one client_stats entry per --client
-    local cmd=$1 n notch v h out=""
-    n=$(printf "%s" "$cmd" | grep -o -- "--client=" | wc -l | tr -d " ")
-    case "$cmd" in (*".lchk/light/"*) notch=light ;; (*".lchk/heavy/"*) notch=heavy ;; (*) notch=base ;; esac
-    if [ "$n" -eq 1 ]; then v=$LCHK_SOLO
-    else case $notch in (light) v=$LCHK_LIGHT ;; (heavy) v=$LCHK_HEAVY ;; (*) v=$LCHK_BASE ;; esac; fi
-    for h in $(printf "%s" "$cmd" | grep -o -- "--client=[a-z0-9]*" | cut -d= -f2); do
-        out="$out${out:+, }{ \"jobname\": \"j\", \"hostname\": \"$h\", \"error\": 0, \"read\": { \"iops\": $v, \"total_ios\": 100 }, \"write\": { \"iops\": 0, \"total_ios\": 0 } }"
-    done
-    printf "{ \"client_stats\": [ %s ] }\n" "$out"
-    printf "%s\n" "$cmd" >> "$LD/fiolog"
-}
-lchk_go() {   # load_check on the fixture; prints its log
-    (source ./wekatester
-     WORK_DIR=$LD; SET_DIR=$LD/set; RUN_DIR=$LD/run; HOSTS=(h1 h2 h3); MASTER=h1
-     LOCAL_MODE=1; TARGET_DIR=$LD/target; FIO_BIN=fio; CAL_RUNTIME=30; CAL_SETTLE=0
-     run_host() { case "$2" in (*--client=*) lchk_fake "$2" ;; (*) bash -c "$2" ;; esac; }
-     load_check 031-iopsR.job) 2>&1
-}
-export -f lchk_fixture lchk_fake lchk_go
-t_assert "-l needs -a cal or -a brutal, and sets the load check with either" bash -c '
-    err=$( (source ./wekatester; parse_args -l h1) 2>&1 ); rc=$?
-    [ "$rc" -ne 0 ] && case "$err" in *"-l checks the calibrated settings under load: it needs -a cal or -a brutal"*) true;; *) echo "$err" >&2; false;; esac &&
-    (source ./wekatester; parse_args -a cal -l h1; [ "$LOAD_CHECK" -eq 1 ]) &&
-    (source ./wekatester; parse_args -a brutal --LOAD h1; [ "$LOAD_CHECK" -eq 1 ])'
-t_assert "load check: a setting that holds under load stands, measured solo then fleet-wide" bash -c '
-    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=95000
-    out=$(lchk_go)
-    case "$out" in *"load check: 031-iopsR.job holds under load: 285,000 IOPS across 3 clients = 95% of their solo sum, 300,000 IOPS"*) true;; *) echo "$out" >&2; exit 1;; esac
-    # one solo cell on the representative, one fleet cell, both CAL_RUNTIME
-    # long; nothing changed, and nothing left behind on the master
-    grep -qx "iodepth=16" "$LD/jobs/h2/031-iopsR.job" &&
-    [ "$(grep -c -- "--client=" "$LD/fiolog")" = 2 ] && head -1 "$LD/fiolog" | grep -q "lchk/base/h1/" &&
-    grep -qx "runtime=30" "$LD/lchk/base/h3/031-iopsR.job" && [ ! -d "$LD/target.lchk" ]'
-t_assert "load check: short of 90%, the better notch is re-measured, and the run uses it" bash -c '
-    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=40000 LCHK_LIGHT=70000 LCHK_HEAVY=45000
-    out=$(lchk_go)
-    case "$out" in *"is 40% of their solo sum (300,000 IOPS), under 90% -- trying one notch lighter and one heavier"*"runs one notch lighter (h1 numjobs=8 iodepth=8, h2 numjobs=8 iodepth=8, h3 numjobs=8 iodepth=8): 210,000 IOPS against 120,000 IOPS at the calibrated setting (lighter 210,000 IOPS, heavier 135,000 IOPS); the host file keeps the solo calibration"*) true;;
-        *) echo "$out" >&2; exit 1;; esac
-    # the staged jobs and the bundle copy carry the notch; the runtime is the run'"'"'s own
-    grep -qx "iodepth=8" "$LD/jobs/h3/031-iopsR.job" && grep -qx "runtime=60" "$LD/jobs/h3/031-iopsR.job" &&
-    grep -qx "iodepth=8" "$LD/run/fio-jobfiles/h1/031-iopsR.job" &&
-    grep -qx "iodepth=8" "$LD/target/h2/031-iopsR.job" &&
-    [ "$(grep -c "lchk/light/" "$LD/fiolog")" = 2 ]'
-t_assert "load check: when no notch moves the total, the cluster is the limit and the setting stays" bash -c '
-    lchk_fixture; export LCHK_SOLO=100000 LCHK_BASE=50000 LCHK_LIGHT=50500 LCHK_HEAVY=49000
-    out=$(lchk_go)
-    case "$out" in *"load check: 031-iopsR.job is cluster-bound: 150,000 IOPS across 3 clients whatever each client runs (lighter 151,500 IOPS, heavier 147,000 IOPS) -- that is the cluster'"'"'s number for this test"*) true;;
-        *) echo "$out" >&2; exit 1;; esac
-    grep -qx "iodepth=16" "$LD/jobs/h1/031-iopsR.job" && ! grep -q "confirm" "$LD/fiolog"'
-t_assert "load check: latency tests are left alone" bash -c '
-    lchk_fixture latency; export LCHK_SOLO=1 LCHK_BASE=1
-    out=$(lchk_go)
-    [ -z "$out" ] && [ ! -e "$LD/fiolog" ] || { echo "$out" >&2; false; }'
-
 # --- --line-rate, the libaio aio room, and catch-all cpu lists ---
 t_assert "--line-rate takes 0.1 to 100000 Gb/s, attached or separate, and only with -a cal or brutal" bash -c '
     (source ./wekatester; parse_args -a cal --line-rate 16 h1; [ "$LINE_RATE_GBPS" = 16 ]) &&
@@ -5043,6 +4976,38 @@ print(parse_cpulist("2-4") == parse_cpulist("2,3,4"), parse_cpulist("2,4") == pa
 PYN
     ) )
     [ "$r" = "True False" ] || { echo "$r" >&2; false; }'
+
+# -l re-tuned calibrated settings for the fleet run, against calibration's
+# intent (Frank, 2026-10-05): it is gone, and naming it says why.
+t_assert "-l and --load are removed, and say why" bash -c '
+    for o in -l --load; do
+        err=$( (source ./wekatester; parse_args -a cal "$o" h1) 2>&1 ) && { echo "$o accepted" >&2; exit 1; }
+        case "$err" in *"-l/--load was removed: the test runs exactly what calibration measured"*) ;; *) echo "$err" >&2; exit 1;; esac
+    done
+    ! grep -q "load_check\|LOAD_CHECK" ./wekatester'
+t_assert "cal_preflight: the aio pin check runs after the filesystem groups and before the fio servers, dry runs included" bash -c '
+    m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
+    dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")
+    printf "%s\n" "$dry" | awk "/collect_fs_groups/ {g = NR} /cal_preflight/ {c = NR} /stage_jobfiles/ {s = NR} END {exit !(g && c > g && s > c)}" &&
+    printf "%s\n" "$m" | awk "/exit 0/ {d = 1} d && /collect_fs_groups/ {g = NR} d && /cal_preflight/ {c = NR} d && /start_fio_servers/ {s = NR} END {exit !(g && c > g && s > c)}" &&
+    ! sed -n "/^calibrate() {/,/^}/p" ./wekatester | grep -q cal_aio_preflight'
+t_assert "cal_preflight: a pin past the aio room stops before anything runs, from the probe and the host file alone" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8
+    printf "aio_max_nr 65536\naio_nr 0\n" >> "$d/probe/h1"
+    printf "# report iops\n[global]\nbs=4k\n[a]\nrw=randread\n" > "$d/set/031-i.job"
+    pre() { (source ./wekatester
+             AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; ENGINE=""; SET_DIR_OVERRIDE=$d/set
+             run_host() { echo "RAN: $2" >> "$d/ran"; }
+             cal_preflight); }
+    # iops_r nj (col 22) 188, qd (col 25) 512: 96256 aio events, room 65536
+    { printf "h1"; for i in $(seq 2 37); do case $i in (22) printf "\t188";; (25) printf "\t512";; (*) printf "\t-";; esac; done; printf "\n"; } > "$d/targets.final"
+    err=$(pre 2>&1) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"iops_r pinned at numjobs=188 iodepth=512 needs 96256 aio events"*"nothing was run and the host file is unchanged"*) ;; *) echo "$err" >&2; exit 1;; esac
+    [ ! -e "$d/ran" ] || { cat "$d/ran" >&2; exit 1; }
+    # no pins: the shapes are worked out and the run goes on
+    { printf "h1"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"; } > "$d/targets.final"
+    pre >/dev/null 2>&1 && [ "$(cut -f2 "$d/cal/shapes")" = h1 ]'
 
 # --- what the tuner stages from it ---
 t_assert "tuner: under -a cal the iops jobs run with latency accounting off, other jobs do not" bash -c '
