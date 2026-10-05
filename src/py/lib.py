@@ -398,23 +398,6 @@ def pick_engine(tally):
     rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
     return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
 
-def override_lines(lines, key, value):
-    """override_variant_key, in python: replace every 'key=' line; else
-    insert 'key=value' right after the first [global]; else create [global]
-    at the top. The staging passes stamp hundreds of files per run and must
-    leave exactly what the bash helper would have."""
-    if any(l.startswith(key + "=") for l in lines):
-        return [key + "=" + value if l.startswith(key + "=") else l for l in lines]
-    if any(l.startswith("[global]") for l in lines):
-        out, done = [], False
-        for l in lines:
-            out.append(l)
-            if not done and l.startswith("[global]"):
-                out.append(key + "=" + value)
-                done = True
-        return out
-    return ["[global]", key + "=" + value] + lines
-
 def first_value(lines, key):
     for l in lines:
         m = re.match(rf"^{key}=(\S+)", l)

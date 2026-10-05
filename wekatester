@@ -981,23 +981,6 @@ def pick_engine(tally):
     rank = {e: i for i, e in enumerate(ENGINE_ORDER)}
     return max(tally, key=lambda e: (tally[e], -rank.get(e, len(ENGINE_ORDER))))
 
-def override_lines(lines, key, value):
-    """override_variant_key, in python: replace every 'key=' line; else
-    insert 'key=value' right after the first [global]; else create [global]
-    at the top. The staging passes stamp hundreds of files per run and must
-    leave exactly what the bash helper would have."""
-    if any(l.startswith(key + "=") for l in lines):
-        return [key + "=" + value if l.startswith(key + "=") else l for l in lines]
-    if any(l.startswith("[global]") for l in lines):
-        out, done = [], False
-        for l in lines:
-            out.append(l)
-            if not done and l.startswith("[global]"):
-                out.append(key + "=" + value)
-                done = True
-        return out
-    return ["[global]", key + "=" + value] + lines
-
 def first_value(lines, key):
     for l in lines:
         m = re.match(rf"^{key}=(\S+)", l)
@@ -1131,6 +1114,9 @@ GEOM_NAMES="bandwidthR bandwidthW latencyR latencyW iopsR iopsW latency1mR laten
 # FLOOR_MARKER: stage_floor_twins writes it, the tuner and the writeback
 # read it.
 FLOOR_MARKER="# wekatester-floor:"
+# lib.py's ENGINE_ORDER: the engine a tie goes to, best first, and the one a
+# set that names none gets.
+ENGINE_ORDER="io_uring libaio psync"
 
 IFS= read -r -d '' WEKA_AWK <<'AWKLIB' || :
 function awk_fail(msg) { print "ERROR: " msg > "/dev/stderr"; exit 1 }
@@ -1270,11 +1256,11 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
         if (index(L[i], layout_marker()) == 1) return 1
     return 0
 }
-# lib.py's override_lines (override_variant_key's three cases): replace
-# every key= line; else insert key=value after the first [global]; else
-# create [global] at the top. Into O[1..m].
-function override_lines(L, n, key, value, O,    i, m, hit, g) {
-    split("", O); m = 0; hit = 0; g = 0
+# override_variant_key's three cases, on lines held in L: replace every
+# key= line; else insert key=value after the first [global]; else create
+# [global] at the top. The new line count.
+function override_lines(L, n, key, value,    O, i, m, hit, g) {
+    m = 0; hit = 0; g = 0
     for (i = 1; i <= n; i++)
         if (index(L[i], key "=") == 1) hit = 1
         else if (!g && index(L[i], "[global]") == 1) g = i
@@ -1283,6 +1269,8 @@ function override_lines(L, n, key, value, O,    i, m, hit, g) {
         O[++m] = (hit && index(L[i], key "=") == 1) ? key "=" value : L[i]
         if (!hit && i == g) O[++m] = key "=" value
     }
+    split("", L)
+    for (i = 1; i <= m; i++) L[i] = O[i]
     return m
 }
 # The sha256 a generated layout job's marker carries, "" for another line.
@@ -1336,6 +1324,163 @@ function libaio_events(L, n,    i, s, p, k, v, G, sec, insec, ng, GS, GN, best) 
     best = GS[1]
     for (i = 2; i <= ng; i++) if (GS[i] > best) best = GS[i]
     return best
+}
+
+# lib.py's parse_size: "5G", "1.5GiB", "4k" as bytes; "" where it raises
+function parse_size(s,    u, m) {
+    s = strip(s)
+    if (s !~ /^[0-9]+(\.[0-9]+)?[kKmMgGtT]?i?[bB]?$/) return ""
+    match(s, /^[0-9]+(\.[0-9]+)?/)
+    u = substr(s, RLENGTH + 1, 1)
+    m = u == "" ? 0 : index("kmgt", tolower(u))
+    return int(substr(s, 1, RLENGTH) * (m ? 2 ^ (10 * m) : 1))
+}
+# A section header ("[name]", blanks may follow): its name, else ""
+function section_name(line,    t) {
+    if (line !~ /^\[.+\][ \t\n\013\014\r\034\035\036\037]*$/) return ""
+    t = rstrip(line)
+    return substr(t, 2, length(t) - 2)
+}
+function last_section(L, n,    i, s, name) {   # lib.py's last_section
+    name = ""
+    for (i = 1; i <= n; i++) if ((s = section_name(L[i])) != "") name = s
+    return name
+}
+# Does a "# report <items>" line (whitespace after "report") name <word>?
+function report_has(L, n, word,    i, F, k, m) {
+    for (i = 1; i <= n; i++) {
+        if (!match(L[i], /^#[ \t\n\013\014\r\034\035\036\037]*report[ \t\n\013\014\r\034\035\036\037]/)) continue
+        m = pysplit(substr(L[i], RLENGTH + 1), F)
+        for (k = 1; k <= m; k++) if (F[k] == word) return 1
+    }
+    return 0
+}
+# The value of a "<key>=<value>" line whose key matches the anchored ERE
+# <keys>, up to the first blank; "" for any other line
+function key_value(line, keys,    v) {
+    if (!match(line, "^(" keys ")=[^ \t\n\013\014\r\034\035\036\037]+")) return ""
+    v = substr(line, 1, RLENGTH)
+    return substr(v, index(v, "=") + 1)
+}
+# lib.py's job_bs: the block size the file's MEASURED section runs, in
+# bytes -- the last job section's bs=/blocksize=, else [global]'s, else 4k;
+# a split value ("4k,8k") by its first entry
+function job_bs(L, n,    i, name, injob, glob, last, v) {
+    glob = ""; last = ""; injob = 0
+    for (i = 1; i <= n; i++) {
+        if ((name = section_name(L[i])) != "") {
+            injob = strip(name) != "global"
+            if (injob) last = ""
+            continue
+        }
+        if ((v = key_value(L[i], "bs|blocksize")) == "") continue
+        if (injob) last = v; else glob = v
+    }
+    v = last != "" ? last : glob != "" ? glob : "4k"
+    sub(/,.*/, "", v); sub(/:.*/, "", v)
+    v = parse_size(v)
+    return v == "" ? 4096 : v
+}
+function lat_kind(L, n) { return job_bs(L, n) >= 1048576 ? "lat1m" : "lat" }
+# lib.py's rw_directions and file_directions: every direction the file's
+# job sections exercise into D (D["read"], D["write"]), [global]'s rw= the
+# fallback for a section without its own; no sections: [global] is the job
+function rw_directions(v, D) {
+    v = tolower(v); sub(/:.*/, "", v)   # fio's ":<modifier>" is no direction
+    if (v == "read" || v == "randread") D["read"] = 1
+    else if (v == "write" || v == "randwrite") D["write"] = 1
+    else if (v == "rw" || v == "randrw" || v == "readwrite" || v == "randreadwrite") {
+        D["read"] = 1; D["write"] = 1
+    }
+}
+function file_directions(L, n, D,    i, name, ns, cur, glob, RW, v) {
+    split("", D); glob = ""; ns = 0; cur = 0
+    for (i = 1; i <= n; i++) {
+        if ((name = section_name(L[i])) != "") {
+            if (strip(name) == "global") cur = 0
+            else { RW[++ns] = ""; cur = ns }
+            continue
+        }
+        if ((v = key_value(L[i], "rw|readwrite")) == "") continue
+        if (cur) RW[cur] = v; else glob = v
+    }
+    if (!ns) rw_directions(glob, D)
+    for (i = 1; i <= ns; i++) rw_directions(RW[i] != "" ? RW[i] : glob, D)
+}
+# A resolved host-file row (resolve_targets' tab-separated output, split
+# into ROW): the 1-based column of a FIELDS key, and its value ("" for "-")
+function field_col(key,    S, n, i) {
+    if (key == "login") return 2
+    if (key == "engine") return 3
+    if (key == "cpus") return 4
+    if (key == "dir") return 5
+    n = split(geom_slots(), S, " ")
+    for (i = 1; i <= n; i++)
+        if (index(key, S[i] "_") == 1)
+            return 6 + 4 * (i - 1) + (index("nj fs nr qd", substr(key, length(S[i]) + 2)) - 1) / 3
+    return 0
+}
+function row_get(ROW, key,    c) {
+    c = field_col(key)
+    return (c in ROW) && ROW[c] != "-" ? ROW[c] : ""
+}
+# lib.py's pick_slot: the geometry slot a file takes -- its own direction,
+# or for a mixed (or unclassifiable) file the direction with the deeper
+# recorded qd, a coherent measured pair, never a blend; "" for none
+function pick_slot(kind, D, ROW,    r, w) {
+    if (("read" in D) && !("write" in D)) return kind "_r"
+    if (("write" in D) && !("read" in D)) return kind "_w"
+    r = row_get(ROW, kind "_r_qd"); r = r ~ /^[0-9]+$/ ? r + 0 : -1
+    w = row_get(ROW, kind "_w_qd"); w = w ~ /^[0-9]+$/ ? w + 0 : -1
+    if (r < 0 && w < 0)
+        return slot_any(ROW, kind "_r") ? kind "_r" : slot_any(ROW, kind "_w") ? kind "_w" : ""
+    return r >= w ? kind "_r" : kind "_w"
+}
+function slot_any(ROW, slot) {
+    return row_get(ROW, slot "_nj") != "" || row_get(ROW, slot "_fs") != "" || row_get(ROW, slot "_nr") != "" || row_get(ROW, slot "_qd") != ""
+}
+# lib.py's pick_engine: the most-used engine; a tie goes to ENGINE_ORDER
+# (an engine it does not list ranks last, and among those the first seen),
+# and no engine at all to its first
+function pick_engine(TALLY, ORD, n,    O, no, i, j, e, r, best, bc, br) {
+    no = split(engine_order(), O, " ")
+    if (!n) return O[1]
+    for (i = 1; i <= n; i++) {
+        e = ORD[i]; r = no
+        for (j = 1; j <= no; j++) if (O[j] == e) { r = j - 1; break }
+        if (i == 1 || TALLY[e] > bc || (TALLY[e] == bc && r < br)) { best = e; bc = TALLY[e]; br = r }
+    }
+    return best
+}
+function is_floor_marked(L, n,    i) {   # lib.py's is_floor_twin
+    for (i = 1; i <= 3 && i <= n; i++)
+        if (index(L[i], floor_marker()) == 1) return 1
+    return 0
+}
+# The INI view the layout readers share: every line stripped, blanks and
+# #/; comments skipped, "[name]" opens a section (substr, no further test)
+# and key=value, both stripped, lands in the section it is in -- before
+# any section, nowhere. SN[1..ns] the sections in order, KV[s, key] their
+# values, KV["g", key] [global]'s; ini_get falls back from a section to
+# [global], then to <dflt>.
+function ini_parse(L, n, SN, KV,    i, line, c, cur, ns, p) {
+    split("", SN); split("", KV); ns = 0; cur = ""
+    for (i = 1; i <= n; i++) {
+        line = strip(L[i]); c = substr(line, 1, 1)
+        if (line == "" || c == "#" || c == ";") continue
+        if (c == "[") {
+            SN[++ns] = substr(line, 2, length(line) - 2)
+            if (SN[ns] == "global") { cur = "g"; ns-- }
+            else cur = ns
+            continue
+        }
+        if ((p = index(line, "=")) && cur != "")
+            KV[cur, strip(substr(line, 1, p - 1))] = strip(substr(line, p + 1))
+    }
+    return ns
+}
+function ini_get(KV, s, key, dflt) {
+    return ((s, key) in KV) ? KV[s, key] : (("g", key) in KV) ? KV["g", key] : dflt
 }
 
 # --- probe facts (the probe snippet's lines, P[1..np]) ---
@@ -1570,6 +1715,7 @@ function geom_names() { return \"$GEOM_NAMES\" }
 function layout_job() { return \"$LAYOUT_JOB\" }
 function layout_marker() { return \"$LAYOUT_MARKER\" }
 function floor_marker() { return \"$FLOOR_MARKER\" }
+function engine_order() { return \"$ENGINE_ORDER\" }
 $1" "${@:2}"
 }
 
@@ -6085,124 +6231,137 @@ is_layout_file() {   # is_layout_file <path>
 # the body identifies a pristine (never hand-edited) file -- the tuner uses
 # that to decide whether it may re-derive the staged variant at -a max.
 generate_layout() {   # generate_layout <setdir> <outdir>
-    pyrun "$1" "$2" <<'PYEOF' || return 1
-import hashlib, os, re, sys
-
-src, outdir = sys.argv[1], sys.argv[2]
-MARKER = "# wekatester-layout: generated"
-NAME = "000-wekatester-layout.job"
-# One namespace collects CONTRIBUTORS -- each source job's own geometry.
-# Emitting one section per (pruned) contributor lays out exactly the union of
-# files the jobs will open. A single independent-max section (max numjobs x
-# max nrfiles x max filesize) would instead create the full cross-product
-# grid, over-provisioning disk by integer factors whenever the geometries
-# diverge -- and the capacity guard would never see it coming.
-namespaces = {}   # key -> dict(section, fmt, contribs=[{numjobs,nrfiles,size_b,fs,sz}])
-engines = {}
-directory = ""
-for f in sorted(os.listdir(src)):
-    if not re.match(r"^[0-9]", f): continue
-    path = os.path.join(src, f)
-    if not os.path.isfile(path): continue
-    lines = open(path).read().splitlines()
-    if f == NAME or any(l.startswith(MARKER) for l in lines[:3]):
-        continue   # never derive layout from layout
-    fmt = first_value(lines, "filename_format")
-    if fmt:
-        key, section, out_fmt = fmt, None, fmt
-    else:
-        # No filename_format: fio's default naming embeds the job section
-        # name, so the layout section must carry the SAME name as the file's
-        # measured (last) section or it would create differently-named files.
-        sec = last_section(lines) or f
-        key, section, out_fmt = f"__jobname__:{sec}", sec, ""
-    eng = first_value(lines, "ioengine")
-    if eng: engines[eng] = engines.get(eng, 0) + 1
-    directory = directory or first_value(lines, "directory")
-    fs, size = first_value(lines, "filesize"), first_value(lines, "size")
-    size_b = -1
-    for v in (fs, size):
-        if v:
-            try: size_b = max(size_b, parse_size(v))
-            except ValueError: pass   # e.g. size=50%: not derivable
-    ns = namespaces.setdefault(key, {"section": section, "fmt": out_fmt, "contribs": []})
-    ns["contribs"].append({"numjobs": int(first_value(lines, "numjobs") or 1),
-                           "nrfiles": int(first_value(lines, "nrfiles") or 1),
-                           "size_b": size_b, "fs": fs, "sz": size})
-
-if not namespaces:
-    sys.exit(f"ERROR: no jobfiles to derive a layout from in {src}")
-
-def prune(contribs):
-    """Keep only contributors no kept contributor's grid fully covers.
-    Descending order makes it one pass: a duplicate or dominated entry always
-    meets its dominator first."""
-    kept = []
-    for a in sorted(contribs, key=lambda c: (-c["numjobs"], -c["nrfiles"], -c["size_b"])):
-        if not any(a["numjobs"] <= b["numjobs"] and a["nrfiles"] <= b["nrfiles"]
-                   and a["size_b"] <= b["size_b"] for b in kept):
-            kept.append(a)
-    return kept
-
-body = []
-body.append("# Auto-generated by wekatester: lays out every file the set's jobs")
-body.append("# will use, as the first job of the run -- a cross-client barrier, so")
-body.append("# all files exist on all machines before any measured test starts.")
-body.append("# Edit freely: an edited layout job is preserved (regenerate with -g).")
-body.append("[global]")
-body.append(f"directory={directory or '/mnt/weka'}")
-# fallocate=none is what makes the layout sweep's size test sound. fio
-# defaults to fallocate=native on Linux, which gives a file its full
-# st_size instantly and only then writes the data -- so a layout killed
-# part way leaves a full-size file full of zeros, which the sweep credits
-# as complete and never rewrites. Without preallocation an interrupted
-# create leaves a SHORT file, which the sweep deletes and recreates.
-body.append("fallocate=none")
-body.append("create_serialize=0")
-best_engine = pick_engine(engines)
-body.append(f"ioengine={best_engine}")
-n = 0
-for key in sorted(namespaces):
-    ns = namespaces[key]
-    kept = prune(ns["contribs"])
-    prev = None
-    for c in kept:
-        n += 1
-        # A jobname namespace (no filename_format) names its files after the
-        # section, so a lone contributor keeps that name; several need
-        # distinct names for wait_for, so fio's default naming
-        # ($jobname.$jobnum.$filenum) is reproduced explicitly instead.
-        if ns["section"] and len(kept) == 1:
-            sec, fmt = ns["section"], ns["fmt"]
-        elif ns["section"]:
-            sec, fmt = "layout-%d" % n, f"{ns['section']}.$jobnum.$filenum"
-        else:
-            sec, fmt = "layout-%d" % n, ns["fmt"]
-        body.append("")
-        body.append(f"[{sec}]")
-        # Contributors of one namespace have overlapping grids and must not
-        # lay out the same file concurrently (fio's extend can unlink a file
-        # another section is mid-write on), so they chain via wait_for.
-        # Distinct namespaces touch disjoint files: those sections run in
-        # parallel -- a global stonewall here would only slow the layout.
-        if prev: body.append(f"wait_for={prev}")
-        prev = sec
-        body.append("create_only=1")
-        body.append("blocksize=1Mi")
-        if fmt: body.append(f"filename_format={fmt}")
-        if c["fs"]: body.append(f"filesize={c['fs']}")
-        elif c["sz"]: body.append(f"size={c['sz']}")
-        else: body.append(f"# WARNING: no derivable file size in this namespace ({key})")
-        if c["nrfiles"] > 1: body.append(f"nrfiles={c['nrfiles']}")
-        body.append(f"numjobs={c['numjobs']}")
-
-normalized = "\n".join(l.rstrip() for l in body)
-digest = hashlib.sha256(normalized.encode()).hexdigest()
-os.makedirs(outdir, exist_ok=True)
-with open(os.path.join(outdir, NAME), "w") as fp:
-    fp.write(f"{MARKER} sha256={digest}\n" + normalized + "\n")
-print(f"layout: generated {os.path.join(outdir, NAME)} ({len(namespaces)} namespace(s))")
-PYEOF
+    local f files=() out n body sha path LC_ALL=C
+    [ -d "$1" ] || { log "ERROR: generate_layout: no set directory $1" >&2; return 1; }
+    for f in "$1"/[0-9]*; do
+        [ -f "$f" ] && files+=("$f")
+    done
+    # prints the namespace count, then the body the marker's digest covers
+    out=$(awkrun '
+    # One namespace collects CONTRIBUTORS -- each source job geometry.
+    # Emitting one section per (pruned) contributor lays out exactly the
+    # union of files the jobs will open. A single independent-max section
+    # (max numjobs x max nrfiles x max filesize) would instead create the
+    # full cross-product grid, over-provisioning disk by integer factors
+    # whenever the geometries diverge -- and the capacity guard would never
+    # see it coming. prune keeps only contributors no kept contributor grid
+    # fully covers: sorted widest first (stably: ties keep file order), a
+    # duplicate or dominated entry always meets its dominator first.
+    function prune(k, KEPT,    n, I, i, j, t, nk, a, b, dom) {
+        n = NC[k]
+        for (i = 1; i <= n; i++) {
+            t = i
+            for (j = i - 1; j >= 1 && wider(k, t, I[j]); j--) I[j + 1] = I[j]
+            I[j + 1] = t
+        }
+        nk = 0
+        for (i = 1; i <= n; i++) {
+            a = I[i]; dom = 0
+            for (j = 1; j <= nk && !dom; j++) {
+                b = KEPT[j]
+                dom = CNJ[k, a] <= CNJ[k, b] && CNR[k, a] <= CNR[k, b] && CSB[k, a] <= CSB[k, b]
+            }
+            if (!dom) KEPT[++nk] = a
+        }
+        return nk
+    }
+    function wider(k, a, b) {   # does contributor a sort before b?
+        if (CNJ[k, a] != CNJ[k, b]) return CNJ[k, a] > CNJ[k, b]
+        if (CNR[k, a] != CNR[k, b]) return CNR[k, a] > CNR[k, b]
+        return CSB[k, a] > CSB[k, b]
+    }
+    BEGIN {
+        nns = 0; ne = 0; directory = ""
+        for (a = 2; a < ARGC; a++) {
+            f = ARGV[a]; sub(/.*\//, "", f)
+            if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
+            if (f == layout_job() || is_layout_marked(L, n)) continue   # never derive layout from layout
+            # No filename_format: fio default naming embeds the job section
+            # name, so the layout section must carry the SAME name as the
+            # measured (last) section of the file, or it would create
+            # differently-named files.
+            if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
+            else {
+                if ((sec = last_section(L, n)) == "") sec = f
+                key = "__jobname__:" sec
+            }
+            if ((eng = first_value(L, n, "ioengine")) != "") {
+                if (!(eng in TALLY)) EORD[++ne] = eng
+                TALLY[eng]++
+            }
+            if (directory == "") directory = first_value(L, n, "directory")
+            fs = first_value(L, n, "filesize"); sz = first_value(L, n, "size"); sb = -1
+            # size=50% and the like are not derivable: no size of their own
+            if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
+            if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
+            nj = first_value(L, n, "numjobs"); nj = nj == "" ? 1 : py_int(nj)
+            nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
+            if (nj == "" || nr == "") awk_fail(ARGV[a] ": numjobs and nrfiles must be numbers")
+            if (!(key in NS)) { NS[key] = ++nns; KEY[nns] = key; SEC[nns] = sec; FMT[nns] = fmt; NC[nns] = 0 }
+            k = NS[key]; c = ++NC[k]
+            CNJ[k, c] = nj; CNR[k, c] = nr; CSB[k, c] = sb; CFS[k, c] = fs; CSZ[k, c] = sz
+        }
+        if (!nns) awk_fail("no jobfiles to derive a layout from in " ARGV[1])
+        nb = 0
+        B[++nb] = "# Auto-generated by wekatester: lays out every file the set\047s jobs"
+        B[++nb] = "# will use, as the first job of the run -- a cross-client barrier, so"
+        B[++nb] = "# all files exist on all machines before any measured test starts."
+        B[++nb] = "# Edit freely: an edited layout job is preserved (regenerate with -g)."
+        B[++nb] = "[global]"
+        B[++nb] = "directory=" (directory != "" ? directory : "/mnt/weka")
+        # fallocate=none is what makes the layout sweep size test sound. fio
+        # defaults to fallocate=native on Linux, which gives a file its full
+        # st_size instantly and only then writes the data -- so a layout
+        # killed part way leaves a full-size file full of zeros, which the
+        # sweep credits as complete and never rewrites. Without
+        # preallocation an interrupted create leaves a SHORT file, which the
+        # sweep deletes and recreates.
+        B[++nb] = "fallocate=none"
+        B[++nb] = "create_serialize=0"
+        B[++nb] = "ioengine=" pick_engine(TALLY, EORD, ne)
+        for (k = 1; k <= nns; k++) KS[k] = KEY[k]
+        sort_arr(KS, nns, 0)
+        cnt = 0
+        for (q = 1; q <= nns; q++) {
+            k = NS[KS[q]]; nk = prune(k, KEPT); prev = ""
+            for (x = 1; x <= nk; x++) {
+                c = KEPT[x]; cnt++
+                # A jobname namespace (no filename_format) names its files
+                # after the section, so a lone contributor keeps that name;
+                # several need distinct names for wait_for, so the default
+                # naming of fio ($jobname.$jobnum.$filenum) is spelled out.
+                if (SEC[k] != "" && nk == 1) { sec = SEC[k]; fmt = FMT[k] }
+                else if (SEC[k] != "") { sec = "layout-" cnt; fmt = SEC[k] ".$jobnum.$filenum" }
+                else { sec = "layout-" cnt; fmt = FMT[k] }
+                B[++nb] = ""
+                B[++nb] = "[" sec "]"
+                # Contributors of one namespace have overlapping grids and
+                # must not lay out the same file concurrently (an extend in
+                # fio can unlink a file another section is mid-write on), so
+                # they chain via wait_for. Distinct namespaces touch disjoint
+                # files: those sections run in parallel -- a global stonewall
+                # here would only slow the layout.
+                if (prev != "") B[++nb] = "wait_for=" prev
+                prev = sec
+                B[++nb] = "create_only=1"
+                B[++nb] = "blocksize=1Mi"
+                if (fmt != "") B[++nb] = "filename_format=" fmt
+                if (CFS[k, c] != "") B[++nb] = "filesize=" CFS[k, c]
+                else if (CSZ[k, c] != "") B[++nb] = "size=" CSZ[k, c]
+                else B[++nb] = "# WARNING: no derivable file size in this namespace (" KEY[k] ")"
+                if (CNR[k, c] > 1) B[++nb] = "nrfiles=" CNR[k, c]
+                B[++nb] = "numjobs=" CNJ[k, c]
+            }
+        }
+        print nns
+        for (i = 1; i <= nb; i++) print rstrip(B[i])
+    }' "$1" ${files[@]+"${files[@]}"}) || return 1
+    n=${out%%$'\n'*}; body=${out#*$'\n'}
+    sha=$(printf '%s' "$body" | sha256_hex) || return 1
+    case "$2" in (*/) path="$2$LAYOUT_JOB" ;; (*) path="$2/$LAYOUT_JOB" ;; esac
+    { [ -d "$2" ] || mkdir -p "$2"; } && printf '%s sha256=%s\n%s\n' "$LAYOUT_MARKER" "$sha" "$body" > "$path" \
+        || return 1
+    printf 'layout: generated %s (%s namespace(s))\n' "$path" "$n"
 }
 
 # --- host files (-t) --------------------------------------------------------------
@@ -7136,94 +7295,77 @@ stage_variants() {
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi
-    # Plain staging: one python for every host and jobfile does the
-    # directory override and the host-file geometry (pick_slot -- the same
-    # resolver the tuner and apply_targets_geometry use), and names the hosts
-    # whose geometry changed. Per host and jobfile this was 2-3 grep/awk for
-    # the directory, a python plus up to 4 awk/mv for the geometry, then per
+    # Plain staging: one awk for every host and jobfile does the directory
+    # override and the host-file geometry (pick_slot -- the same resolver
+    # the tuner and apply_targets_geometry use), and names the hosts whose
+    # geometry changed. Per host and jobfile this was 2-3 grep/awk for the
+    # directory, a python plus up to 4 awk/mv for the geometry, then per
     # host a python for pristineness and a grep/awk/mv per file for the
     # engine: ~50 process starts per host and jobfile, serial, none of them
     # waiting on a worker.
-    local changed pristine=""
-    changed=$(pyrun "$srcdir" "$WORK_DIR" "$DIRECTORY" "$LAYOUT_JOB" "$LAYOUT_MARKER" \
-                    "${HOSTS[@]}" <<'PYEOF'
-import os, re, sys
-
-srcdir, work, directory, layout_job, layout_marker = sys.argv[1:6]
-hosts = sys.argv[6:]
-
-def load_rows(path):   # first row per host, as targets_field's awk saw it
-    rows = {}
-    if os.path.exists(path):
-        for line in open(path):
-            p = line.rstrip("\n").split("\t")
-            rows.setdefault(p[0], p)
-    return rows
-
-# host_dir's rule: the finished resolution when it exists, the pre-auth
-# phase otherwise, the global -d as the fallback; geometry needs the
-# finished one
-final = os.path.join(work, "targets.final")
-has_final = os.path.exists(final)
-rows = load_rows(final if has_final else os.path.join(work, "targets.phase1"))
-
-def field(host, n):   # 1-based column; "" for a dash, a missing row or column
-    row = rows.get(host, [])
-    v = row[n - 1] if n - 1 < len(row) else ""
-    return "" if v == "-" else v
-
-def report_words(lines):   # report_directive: '# report <items>' comment lines
-    out = []
-    for l in lines:
-        m = re.match(r"^#\s*report\s+(.*)$", l)
-        if m:
-            out += m.group(1).split()
-    return out
-
-def is_layout(name, lines):   # is_layout_file, on the staged content
-    return name == layout_job or any(l.startswith(layout_marker) for l in lines[:3])
-
-jobs = sorted(f for f in os.listdir(srcdir)
-              if f[:1].isdigit() and os.path.isfile(os.path.join(srcdir, f)))
-changed = []
-for host in hosts:
-    outdir = os.path.join(work, "jobs", host)
-    os.makedirs(outdir, exist_ok=True)
-    hd = field(host, 5) or directory
-    geo_changed = False
-    for base in jobs:
-        lines = open(os.path.join(srcdir, base)).read().splitlines()
-        # override directory= wherever it appears; jobfiles without one get
-        # it inserted right after [global], and jobfiles with no [global]
-        # at all get the section created at the top -- otherwise the
-        # insert matches nothing and fio silently writes to the server's cwd
-        lines = override_lines(lines, "directory", hd)
-        if has_final and host in rows and not is_layout(base, lines):
-            words = report_words(lines)
-            # precedence latency > bandwidth > iops, same as the tuner; a
-            # 1MiB latency file (a -b twin) takes the lat1m slot
-            kind = (lat_kind(lines) if "latency" in words else "bw" if "bandwidth" in words
-                    else "iops" if "iops" in words else "")
-            if kind:
-                def get(key):
-                    i = 1 + FIELDS.index(key)
-                    v = rows[host][i] if i < len(rows[host]) else ""
-                    return "" if v == "-" else v
-                slot = pick_slot(kind, file_directions(lines), get)
-                if slot:
-                    for tkey, jkey in (("nj", "numjobs"), ("fs", "filesize"),
-                                       ("nr", "nrfiles"), ("qd", "iodepth")):
-                        v = get(f"{slot}_{tkey}")
-                        if v:
-                            lines = override_lines(lines, jkey, v)
-                            geo_changed = True
-        with open(os.path.join(outdir, base), "w") as fh:
-            fh.write("\n".join(lines) + "\n")
-    if geo_changed:
-        changed.append(host)
-print(" ".join(changed))
-PYEOF
-    ) || die "per-host jobfile staging failed"
+    local changed pristine="" f files=() dirs=()
+    [ -d "$srcdir" ] || die "per-host jobfile staging failed (no $srcdir)"
+    for f in "$srcdir"/[0-9]*; do
+        [ -f "$f" ] && files+=("$f")
+    done
+    for host in "${HOSTS[@]}"; do dirs+=("$WORK_DIR/jobs/$host"); done
+    [ ${#dirs[@]} -eq 0 ] || mkdir -p "${dirs[@]}" || die "per-host jobfile staging failed"
+    changed=$(awkrun 'BEGIN {
+        work = ARGV[1]; directory = ARGV[2]; nh = ARGV[3]
+        split("nj fs nr qd", TUPLE, " "); split("numjobs filesize nrfiles iodepth", KNOB, " ")
+        for (i = 1; i <= nh; i++) H[i] = ARGV[3 + i]
+        nf = 0
+        for (a = 4 + nh; a < ARGC; a++) {
+            nf++; SRC[nf] = ARGV[a]; sub(/.*\//, "", SRC[nf])
+            if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
+            NL[nf] = n
+            for (k = 1; k <= n; k++) SL[nf, k] = L[k]
+        }
+        # host_dir rule: the finished resolution when it exists, the
+        # pre-auth phase otherwise, the global -d as the fallback; geometry
+        # needs the finished one. The first row per host counts, as
+        # targets_field reads it.
+        has_final = (n = readlines(work "/targets.final", T)) >= 0
+        if (!has_final) n = readlines(work "/targets.phase1", T)
+        for (i = 1; i <= n; i++) {
+            split(T[i], F, "\t")
+            if (!(F[1] in ROWS)) ROWS[F[1]] = T[i]
+        }
+        out = ""
+        for (i = 1; i <= nh; i++) {
+            h = H[i]; split("", ROW)
+            if ((hr = (h in ROWS))) split(ROWS[h], ROW, "\t")
+            if ((hd = row_get(ROW, "dir")) == "") hd = directory
+            geo = 0
+            for (j = 1; j <= nf; j++) {
+                n = NL[j]
+                for (k = 1; k <= n; k++) L[k] = SL[j, k]
+                # directory= wherever it appears; jobfiles without one get it
+                # right after [global], and jobfiles with no [global] at all
+                # get the section created at the top -- otherwise fio would
+                # silently write to the server cwd
+                n = override_lines(L, n, "directory", hd)
+                if (has_final && hr && SRC[j] != layout_job() && !is_layout_marked(L, n)) {
+                    # precedence latency > bandwidth > iops, same as the
+                    # tuner; a 1MiB latency file (a -b twin) takes lat1m
+                    kind = report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
+                    if (kind != "") {
+                        file_directions(L, n, D)
+                        if ((slot = pick_slot(kind, D, ROW)) != "")
+                            for (q = 1; q <= 4; q++) {
+                                if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
+                                n = override_lines(L, n, KNOB[q], v)
+                                geo = 1
+                            }
+                    }
+                }
+                writelines(work "/jobs/" h "/" SRC[j], L, n)
+            }
+            if (geo) out = out (out == "" ? "" : " ") h
+        }
+        print out
+    }' "$WORK_DIR" "$DIRECTORY" ${#HOSTS[@]} "${HOSTS[@]}" ${files[@]+"${files[@]}"}) \
+        || die "per-host jobfile staging failed"
     for host in $changed; do
         # host-file geometry changed this host's grid: its layout must
         # describe THAT grid, so re-derive it from the staged variants --
@@ -7263,8 +7405,8 @@ stage_host_engines() {
             if (e == "" || e == "-") continue
             if (F[2] == "") awk_fail(F[1] ": no staged jobfiles")
             if ((n = readlines(F[2], L)) < 0) awk_fail("cannot read " F[2])
-            n = override_lines(L, n, "ioengine", e, O)
-            writelines(F[2], O, n)
+            n = override_lines(L, n, "ioengine", e)
+            writelines(F[2], L, n)
         }
     }' "$WORK_DIR/targets.final" "$WORK_DIR/staged.list" || die "per-host engine override failed"
 }
@@ -7382,60 +7524,64 @@ override_variant_key() {   # override_variant_key <file> <key> <value>
 # split.
 stamp_unique_names() {
     local host cpus args=()
-    # one python for the fleet (was one per host, ~30ms each, serial): per
-    # host its staged dir, its name, and the recorded cpu list, "-" for none
+    # one awk for the fleet (was one python per host, ~30ms each, serial):
+    # per host its name and the recorded cpu list, "-" for none
     for host in "${HOSTS[@]}"; do
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
-        args+=("$WORK_DIR/jobs/$host" "$(host_name "$host")" "${cpus:--}")
+        args+=("$host" "$(host_name "$host")" "${cpus:--}")
     done
     [ ${#args[@]} -gt 0 ] || return 0
-    python3 - "${args[@]}" <<'PYEOF' || die "cannot stamp deterministic filenames"
-import os, sys
-
-argv = sys.argv[1:]
-for i in range(0, len(argv), 3):
-    jobsdir, host, cpus = argv[i:i + 3]
-    if cpus == "-":
-        cpus = ""
-    for name in sorted(os.listdir(jobsdir)):
-        path = os.path.join(jobsdir, name)
-        if not os.path.isfile(path):
-            continue
-        lines = open(path).read().splitlines()
-        has_fmt = any(l.strip().startswith("filename_format=") for l in lines)
-        out = []
-        for l in lines:
-            s = l.strip()
-            if s.startswith("filename_format="):
-                val = s.split("=", 1)[1]
-                if "$clientuid" not in val and not val.startswith("shared."):
-                    l = "filename_format=" + host + "." + val
-            elif s.startswith("unique_filename="):
+    list_staged "$WORK_DIR/staged.list" && awkrun '
+    function stamp(path, name, cpus,    L, n, O, m, i, k, s, hasfmt, hascpus, haspol, INS, ni, g) {
+        if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
+        hasfmt = 0
+        for (i = 1; i <= n; i++) if (index(strip(L[i]), "filename_format=") == 1) hasfmt = 1
+        m = 0
+        for (i = 1; i <= n; i++) {
+            s = strip(L[i])
+            if (index(s, "filename_format=") == 1) {
+                if (!index(substr(s, 17), "$clientuid") && index(substr(s, 17), "shared.") != 1)
+                    L[i] = "filename_format=" name "." substr(s, 17)
+            } else if (index(s, "unique_filename=") == 1)
                 continue   # replaced by the forced 0 below
-            out.append(l)
-        has_cpus = any(l.strip().startswith("cpus_allowed=") for l in out)
-        has_policy = any(l.strip().startswith("cpus_allowed_policy=") for l in out)
-        ins = ["unique_filename=0"]
-        if not has_fmt:
-            ins.append("filename_format=%s.$jobname.$jobnum.$filenum" % host)
-        if cpus and not has_cpus:
-            ins.append("cpus_allowed=" + cpus)
-            has_cpus = True
-        if has_cpus and not has_policy:
-            ins.append("cpus_allowed_policy=split")
-        if any(l.strip() == "[global]" for l in out):
-            res, done = [], False
-            for l in out:
-                res.append(l)
-                if not done and l.strip() == "[global]":
-                    res.extend(ins)
-                    done = True
-            out = res
-        else:
-            out = ["[global]"] + ins + out
-        open(path, "w").write("\n".join(out) + "\n")
-PYEOF
+            O[++m] = L[i]
+        }
+        hascpus = 0; haspol = 0
+        for (i = 1; i <= m; i++) {
+            s = strip(O[i])
+            if (index(s, "cpus_allowed=") == 1) hascpus = 1
+            if (index(s, "cpus_allowed_policy=") == 1) haspol = 1
+        }
+        ni = 0; INS[++ni] = "unique_filename=0"
+        if (!hasfmt) INS[++ni] = "filename_format=" name ".$jobname.$jobnum.$filenum"
+        if (cpus != "" && !hascpus) { INS[++ni] = "cpus_allowed=" cpus; hascpus = 1 }
+        if (hascpus && !haspol) INS[++ni] = "cpus_allowed_policy=split"
+        g = 0
+        for (i = 1; i <= m && !g; i++) if (strip(O[i]) == "[global]") g = i
+        split("", L); n = 0
+        if (!g) {
+            L[++n] = "[global]"
+            for (k = 1; k <= ni; k++) L[++n] = INS[k]
+        }
+        for (i = 1; i <= m; i++) {
+            L[++n] = O[i]
+            if (i == g) for (k = 1; k <= ni; k++) L[++n] = INS[k]
+        }
+        writelines(path, L, n)
+    }
+    BEGIN {
+        for (a = 2; a + 2 < ARGC; a += 3) {
+            NAME[ARGV[a]] = ARGV[a + 1]
+            CPUS[ARGV[a]] = ARGV[a + 2] == "-" ? "" : ARGV[a + 2]
+        }
+        if ((m = readlines(ARGV[1], M)) < 0) awk_fail("cannot read " ARGV[1])
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            if (F[2] == "") awk_fail(F[1] ": no staged jobfiles")
+            stamp(F[2], NAME[F[1]], CPUS[F[1]])
+        }
+    }' "$WORK_DIR/staged.list" "${args[@]}" || die "cannot stamp deterministic filenames"
 }
 
 # -b: beside every latency jobfile of the staged set, its 1MiB twin -- the
@@ -7448,36 +7594,35 @@ PYEOF
 # the tuner files the twin under its own geometry slot (lat1m, by its block
 # size), which is what -a cal/brutal calibrate for it.
 stage_bulk_twins() {   # stage_bulk_twins <set-dir>
-    pyrun "$1" "$LAYOUT_JOB" "$LAYOUT_MARKER" <<'PYEOF' || return 1
-import os, re, sys
-
-d, layout_job, marker = sys.argv[1:4]
-made = []
-for name in sorted(os.listdir(d)):
-    path = os.path.join(d, name)
-    if not name[:1].isdigit() or not os.path.isfile(path) or name == layout_job:
-        continue
-    lines = open(path).read().splitlines()
-    if any(l.startswith(marker) for l in lines[:3]):
-        continue
-    words = [w for l in lines for m in [re.match(r"^#\s*report\s+(.*)$", l)] if m
-             for w in m.group(1).split()]
-    if "latency" not in words or job_bs(lines) >= (1 << 20):
-        continue
-    twin = re.sub(r"^(\d+)", r"\1b", name)
-    twin = twin[:-4] + "-1M.job" if twin.endswith(".job") else twin + "-1M"
-    if os.path.exists(os.path.join(d, twin)):
-        sys.exit(f"ERROR: -b: the set already has a file named {twin}")
-    has_bs = any(re.match(r"^(bs|blocksize)=", l) for l in lines)
-    out = [re.sub(r"^(bs|blocksize)=.*$", r"\1=1Mi", l) for l in lines]
-    if not has_bs:
-        out = override_lines(out, "bs", "1Mi")
-    out = [f"# -b: the 1MiB twin of {name}, staged by wekatester"] + out
-    with open(os.path.join(d, twin), "w") as fh:
-        fh.write("\n".join(out) + "\n")
-    made.append(twin)
-print(" ".join(made))
-PYEOF
+    set_entries "$1" || return 1
+    awkrun 'BEGIN {
+        d = ARGV[1]; nf = 0
+        for (a = 2; a < ARGC; a++) {   # "f<name>": a file; "o<name>": taken
+            name = substr(ARGV[a], 2); EXISTS[name] = 1
+            if (substr(ARGV[a], 1, 1) == "f") FILES[++nf] = name
+        }
+        made = ""
+        for (j = 1; j <= nf; j++) {
+            name = FILES[j]
+            if (name !~ /^[0-9]/ || name == layout_job()) continue
+            if ((n = readlines(d "/" name, L)) < 0) awk_fail("cannot read " d "/" name)
+            if (is_layout_marked(L, n) || !report_has(L, n, "latency") || job_bs(L, n) >= 1048576) continue
+            match(name, /^[0-9]+/)
+            twin = substr(name, 1, RLENGTH) "b" substr(name, RLENGTH + 1)
+            twin = twin ~ /\.job$/ ? substr(twin, 1, length(twin) - 4) "-1M.job" : twin "-1M"
+            if (twin in EXISTS) awk_fail("-b: the set already has a file named " twin)
+            hasbs = 0
+            for (i = 1; i <= n; i++)
+                if (match(L[i], /^(bs|blocksize)=/)) { L[i] = substr(L[i], 1, RLENGTH) "1Mi"; hasbs = 1 }
+            if (!hasbs) n = override_lines(L, n, "bs", "1Mi")
+            for (i = n; i >= 1; i--) L[i + 1] = L[i]
+            L[1] = "# -b: the 1MiB twin of " name ", staged by wekatester"
+            writelines(d "/" twin, L, n + 1)
+            EXISTS[twin] = 1
+            made = made (made == "" ? "" : " ") twin
+        }
+        print made
+    }' "$1" ${SET_ENTRIES[@]+"${SET_ENTRIES[@]}"}
 }
 
 # -a cal/brutal: beside every latency jobfile (the -b twins included), a
@@ -7488,31 +7633,46 @@ PYEOF
 # latency across the fleet, next to every client's latency at its calibrated
 # load. Same files and sections as the original, so the layout covers it.
 stage_floor_twins() {   # stage_floor_twins <set-dir>
-    pyrun "$1" "$LAYOUT_JOB" "$LAYOUT_MARKER" <<'PYEOF' || return 1
-import os, re, sys
+    set_entries "$1" || return 1
+    awkrun 'BEGIN {
+        d = ARGV[1]; nf = 0
+        for (a = 2; a < ARGC; a++) {   # "f<name>": a file; "o<name>": taken
+            name = substr(ARGV[a], 2); EXISTS[name] = 1
+            if (substr(ARGV[a], 1, 1) == "f") FILES[++nf] = name
+        }
+        made = ""
+        for (j = 1; j <= nf; j++) {
+            name = FILES[j]
+            if (name !~ /^[0-9]/ || name == layout_job()) continue
+            if ((n = readlines(d "/" name, L)) < 0) awk_fail("cannot read " d "/" name)
+            if (is_layout_marked(L, n) || is_floor_marked(L, n) || !report_has(L, n, "latency")) continue
+            twin = name ~ /\.job$/ ? substr(name, 1, length(name) - 4) "-1job.job" : name "-1job"
+            if (twin in EXISTS) awk_fail("the set already has a file named " twin)
+            for (i = n; i >= 1; i--) L[i + 1] = L[i]
+            L[1] = floor_marker() " " name " at numjobs=iodepth=nrfiles=1 on every client, staged by wekatester"
+            writelines(d "/" twin, L, n + 1)
+            EXISTS[twin] = 1
+            made = made (made == "" ? "" : " ") twin
+        }
+        print made
+    }' "$1" ${SET_ENTRIES[@]+"${SET_ENTRIES[@]}"}
+}
 
-d, layout_job, marker = sys.argv[1:4]
-made = []
-for name in sorted(os.listdir(d)):
-    path = os.path.join(d, name)
-    if not name[:1].isdigit() or not os.path.isfile(path) or name == layout_job:
-        continue
-    lines = open(path).read().splitlines()
-    if any(l.startswith(marker) for l in lines[:3]) or is_floor_twin(lines):
-        continue
-    words = [w for l in lines for m in [re.match(r"^#\s*report\s+(.*)$", l)] if m
-             for w in m.group(1).split()]
-    if "latency" not in words:
-        continue
-    twin = name[:-4] + "-1job.job" if name.endswith(".job") else name + "-1job"
-    if os.path.exists(os.path.join(d, twin)):
-        sys.exit(f"ERROR: the set already has a file named {twin}")
-    out = [f"{FLOOR_MARKER} {name} at numjobs=iodepth=nrfiles=1 on every client, staged by wekatester"] + lines
-    with open(os.path.join(d, twin), "w") as fh:
-        fh.write("\n".join(out) + "\n")
-    made.append(twin)
-print(" ".join(made))
-PYEOF
+# A set directory as the twin stagers see it, in byte order: "f<name>" for
+# each regular file, "o<name>" for anything else there -- a twin may take
+# neither name. Into SET_ENTRIES.
+SET_ENTRIES=()
+set_entries() {   # set_entries <dir>
+    local f LC_ALL=C
+    SET_ENTRIES=()
+    [ -d "$1" ] || { log "ERROR: no set directory $1" >&2; return 1; }
+    for f in "$1"/*; do
+        if [ -f "$f" ]; then
+            SET_ENTRIES+=("f${f##*/}")
+        elif [ -e "$f" ]; then
+            SET_ENTRIES+=("o${f##*/}")
+        fi
+    done
 }
 
 # libaio sets up numjobs x iodepth kernel aio events per job at start
@@ -7965,65 +8125,51 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
 # own depth so nothing outside the grid is ever touched.
 # layout_grid_spec <staged layout jobfile>          -> the spec on stdout
 # layout_grid_spec -o <dir> <host> <jobfile>...      -> <dir>/<host>.gridspec
-#   per host, one python for the fleet; stdout names each host whose
+#   per host, one awk for the fleet; stdout names each host whose
 #   (non-empty) layout job has no fallocate=none line
 layout_grid_spec() {
-    pyrun "$@" <<'PYEOF'
-import os, re, sys
-
-def spec(path):
-    glb, sections, cur = {}, [], None
-    lines = open(path).read().splitlines()
-    for raw in lines:
-        line = raw.strip()
-        if not line or line[0] in "#;":
-            continue
-        if line.startswith("["):
-            name = line[1:-1]
-            cur = glb if name == "global" else {}
-            if name != "global":
-                sections.append((name, cur))
-            continue
-        if "=" in line and cur is not None:
-            k, v = line.split("=", 1)
-            cur[k.strip()] = v.strip()
-    out = []
-    for name, sec in sections:
-        def get(key, dflt=None):
-            return sec.get(key, glb.get(key, dflt))
-        fmt = get("filename_format")
-        fsz = get("filesize")
-        if not fmt or not fsz:
-            continue   # nothing statable without both; the fio run still covers it
-        size = parse_size(fsz)
-        nr = int(get("nrfiles", "1"))
-        nj = int(get("numjobs", "1"))
-        fmt = fmt.replace("$jobname", name)
-        # a singleton counter is an EXACT path component, not a wildcard: with
-        # nrfiles=1 the glob $filenum/* would sweep every sibling directory the
-        # namespace's OTHER sections own (seen live: two same-format sections,
-        # 1G x 502 dirs + 10G in dir 0, each deleting the other's files)
-        if nr == 1:
-            fmt = fmt.replace("$filenum", "0")
-        if nj == 1:
-            fmt = fmt.replace("$jobnum", "0")
-        glob = re.sub(r"\$\w+", "*", fmt)
-        depth = 1 + glob.count("/")
-        out.append(f"{size}\t{glob}\t{depth}\t{size * nr * nj}")
-    return out, "fallocate=none" in lines
-
-if sys.argv[1] == "-o":
-    outdir, rest = sys.argv[2], sys.argv[3:]
-    for host, path in zip(rest[::2], rest[1::2]):
-        out, has_fallocate = spec(path)
-        with open(os.path.join(outdir, host + ".gridspec"), "w") as fh:
-            fh.write("".join(l + "\n" for l in out))
-        if out and not has_fallocate:
-            print(host)
-else:
-    for l in spec(sys.argv[1])[0]:
-        print(l)
-PYEOF
+    awkrun '
+    # one layout jobfile: its spec lines into OUT[1..n] (n returned), and
+    # FA[1], whether a line reads exactly fallocate=none
+    function grid_spec(path, OUT, FA,    L, n, SN, KV, ns, s, fmt, fsz, size, nr, nj, glob, no, i) {
+        if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
+        ns = ini_parse(L, n, SN, KV); no = 0
+        for (s = 1; s <= ns; s++) {
+            fmt = ini_get(KV, s, "filename_format", ""); fsz = ini_get(KV, s, "filesize", "")
+            if (fmt == "" || fsz == "") continue   # nothing statable without both; the fio run still covers it
+            if ((size = parse_size(fsz)) == "") awk_fail(path ": [" SN[s] "]: filesize=" fsz " is not a byte count")
+            nr = py_int(ini_get(KV, s, "nrfiles", "1")); nj = py_int(ini_get(KV, s, "numjobs", "1"))
+            if (nr == "" || nj == "") awk_fail(path ": [" SN[s] "]: nrfiles and numjobs must be numbers")
+            fmt = replace_all(fmt, "$jobname", SN[s])
+            # a singleton counter is an EXACT path component, not a wildcard:
+            # with nrfiles=1 the glob $filenum/* would sweep every sibling
+            # directory the OTHER sections of the namespace own (seen live:
+            # two same-format sections, 1G x 502 dirs + 10G in dir 0, each
+            # deleting the files of the other)
+            if (nr == 1) fmt = replace_all(fmt, "$filenum", "0")
+            if (nj == 1) fmt = replace_all(fmt, "$jobnum", "0")
+            glob = vars_to_glob(fmt)
+            OUT[++no] = sprintf("%.0f\t%s\t%d\t%.0f", size, glob, 1 + count_char(glob, "/"), size * nr * nj)
+        }
+        FA[1] = 0
+        for (i = 1; i <= n; i++) if (L[i] == "fallocate=none") FA[1] = 1
+        return no
+    }
+    BEGIN {
+        if (ARGV[1] != "-o") {
+            no = grid_spec(ARGV[1], OUT, FA)
+            for (k = 1; k <= no; k++) print OUT[k]
+            exit 0
+        }
+        for (a = 3; a + 1 < ARGC; a += 2) {
+            no = grid_spec(ARGV[a + 1], OUT, FA)
+            f = path_join(ARGV[2], ARGV[a] ".gridspec")
+            printf "" > f
+            for (k = 1; k <= no; k++) print OUT[k] > f
+            close(f)
+            if (no && !FA[1]) print ARGV[a]
+        }
+    }' "$@"
 }
 
 # Evidence over attestation: the completion markers this replaced trusted a
@@ -8052,7 +8198,7 @@ sweep_layout_grid() {
     mkdir -p "$WORK_DIR/probe"
     local host hd spec cmd sz glob depth tot pids hs i args=() nofa
     pids=(); hs=()
-    # one python derives every host's grid (was one per host plus a grep,
+    # one awk derives every host's grid (was one per host plus a grep,
     # serial, ahead of a fan-out whose floor is one round trip)
     for host in "${HOSTS[@]}"; do args+=("$host" "$WORK_DIR/jobs/$host/$lay"); done
     nofa=$(layout_grid_spec -o "$WORK_DIR/probe" "${args[@]}") \

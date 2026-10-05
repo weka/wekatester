@@ -3299,6 +3299,57 @@ t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash
     head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd$" &&
     b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
     [ "$b" = "read write" ]'
+# The jobfile rules the staging awks and the tuner (python) both apply:
+# held to one answer, input for input.
+t_assert "awk and python agree: parse_size, first_value, last_section, job_bs, lat_kind, file_directions, pick_slot and pick_engine" bash -c '
+    d=$(mktemp -d)
+    printf "# report latency\n[global]\nbs=4k\nrw=randread\n[lat]\nbs=1M\n" > "$d/a"
+    printf "[global]\nrw=randrw:8\nblocksize=1Mi,4k\n[x]\n[y]\nrw=write\n" > "$d/b"
+    printf "[ global ]\nreadwrite=READ\n[j] \nbs=64k:1M\nfilename_format=\$filenum/\$jobnum\nfilename_format=x\n" > "$d/c"
+    printf "rw=trim\nbs=x\nfilename_format= y\nfilename_format=z w\n" > "$d/e"
+    printf "\n" > "$d/f"
+    printf "[a]]\nrw=rw\n[b]x\nbs=2M\n[global]\n" > "$d/g"
+    sizes="5G 1.5GiB 4k 4096 512m 1Mi 2MiB 1Gb 1GIB 50%% 1G-2G x .5G 5. 10T 7i 0 3.99k"
+    py=$(source ./wekatester; pyrun "$d"/[a-g] <<< "import sys
+for s in \"$sizes\".split():
+    try:
+        print(parse_size(s))
+    except ValueError:
+        print(\"ValueError\")
+for p in sys.argv[1:]:
+    L = open(p).read().splitlines()
+    print(job_bs(L), lat_kind(L), \" \".join(sorted(file_directions(L))) or \"-\", first_value(L, \"filename_format\") or \"-\", last_section(L) or \"-\")
+rows = {\"bw_r_qd\": \"8\", \"bw_w_qd\": \"16\", \"lat_r_nj\": \"4\", \"iops_w_fs\": \"1G\", \"lat1m_w_qd\": \"x\"}
+for kind in (\"bw\", \"lat\", \"iops\", \"lat1m\"):
+    for dirs in ({\"read\"}, {\"write\"}, {\"read\", \"write\"}, set()):
+        print(kind, \" \".join(sorted(dirs)) or \"-\", pick_slot(kind, dirs, lambda k: rows.get(k, \"\")) or \"-\")
+for t in ({}, {\"libaio\": 2, \"io_uring\": 1}, {\"psync\": 1, \"libaio\": 1}, {\"mmap\": 1, \"sync\": 1}, {\"mmap\": 2, \"libaio\": 2}):
+    print(pick_engine(t))
+print(\" \".join(ENGINE_ORDER))")
+    aw=$(source ./wekatester; awkrun "BEGIN {
+        n = split(\"$sizes\", Z, \" \")
+        for (i = 1; i <= n; i++) print ((v = parse_size(Z[i])) == \"\" ? \"ValueError\" : sprintf(\"%.0f\", v))
+        for (a = 1; a < ARGC; a++) {
+            n = readlines(ARGV[a], L); file_directions(L, n, D)
+            dirs = ((\"read\" in D) ? \"read\" : \"\") ((\"read\" in D) && (\"write\" in D) ? \" \" : \"\") ((\"write\" in D) ? \"write\" : \"\")
+            v = first_value(L, n, \"filename_format\"); s = last_section(L, n)
+            printf \"%.0f %s %s %s %s\n\", job_bs(L, n), lat_kind(L, n), (dirs == \"\" ? \"-\" : dirs), (v == \"\" ? \"-\" : v), (s == \"\" ? \"-\" : s)
+        }
+        ROW[field_col(\"bw_r_qd\")] = 8; ROW[field_col(\"bw_w_qd\")] = 16; ROW[field_col(\"lat_r_nj\")] = 4
+        ROW[field_col(\"iops_w_fs\")] = \"1G\"; ROW[field_col(\"lat1m_w_qd\")] = \"x\"
+        split(\"bw lat iops lat1m\", K, \" \"); split(\"read|write|read write|-\", DS, \"|\")
+        for (k = 1; k <= 4; k++) for (j = 1; j <= 4; j++) {
+            split(\"\", D); if (DS[j] ~ /read/) D[\"read\"] = 1; if (DS[j] ~ /write/) D[\"write\"] = 1
+            s = pick_slot(K[k], D, ROW); print K[k], DS[j], (s == \"\" ? \"-\" : s)
+        }
+        print pick_engine(T0, O0, 0)
+        T1[\"libaio\"] = 2; T1[\"io_uring\"] = 1; O1[1] = \"libaio\"; O1[2] = \"io_uring\"; print pick_engine(T1, O1, 2)
+        T2[\"psync\"] = 1; T2[\"libaio\"] = 1; O2[1] = \"psync\"; O2[2] = \"libaio\"; print pick_engine(T2, O2, 2)
+        T3[\"mmap\"] = 1; T3[\"sync\"] = 1; O3[1] = \"mmap\"; O3[2] = \"sync\"; print pick_engine(T3, O3, 2)
+        T4[\"mmap\"] = 2; T4[\"libaio\"] = 2; O4[1] = \"mmap\"; O4[2] = \"libaio\"; print pick_engine(T4, O4, 2)
+        print engine_order()
+    }" "$d"/[a-g])
+    [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
 # The schema and the floor marker are spelled in bash (GEOM_SLOTS,
 # GEOM_NAMES, FLOOR_MARKER, which the awk layer reads) and in lib.py.
 t_assert "awk and python agree: the host-file schema and the floor marker" bash -c '
@@ -5418,7 +5469,7 @@ t_assert "build: a python heredoc body in the bash source is exactly its include
         !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
         inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
         inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 24 && bad == 0) }
+        END { exit !(seen == 18 && bad == 0) }
     " src/wekatester.sh'
 t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/py"
