@@ -82,12 +82,10 @@ def lat_kind(lines):
 # column -- its rows simply end early.
 GEOM_SLOTS = ("bw_r", "bw_w", "lat_r", "lat_w", "iops_r", "iops_w",
               "lat1m_r", "lat1m_w")
-GEOM_NAMES = ("bandwidthR", "bandwidthW", "latencyR", "latencyW",
-              "iopsR", "iopsW", "latency1mR", "latency1mW")
-HOSTFILE_COLS = 5 + len(GEOM_SLOTS)   # host, login, engine, cpus, dir, slots
 # the slots --line-rate measures again even when the host file carries them
 # (Frank, 2026-09-27): a recorded answer does not say which line rate it
-# stopped at; cal_shapes, apply_cal_results and the writeback all use it
+# stopped at; cal_shapes and apply_cal_results use it, the writeback the
+# bash LINE_RATE_SLOTS
 LINE_RATE_SLOTS = ("bw_r", "bw_w")
 FIELDS = ("login", "engine", "cpus", "dir") + tuple(
     f"{s}_{k}" for s in GEOM_SLOTS for k in ("nj", "fs", "nr", "qd"))
@@ -100,10 +98,11 @@ def slot_base(slot):
 # cal.results: host, the shape's ioengine ("-" when calibration chose none),
 # then (qd nr fs nj) per slot, every slot of the host-file schema in its
 # order. CAL_HEAD, CAL_TUPLE and CAL_COLS live HERE because two separate
-# parsers read this file -- apply_cal_results and the host-file writeback.
-# They drifted once (one moved to 4, the other stayed at 3) and the writeback
-# died on a file calibration had just written, after 11 minutes of measuring.
-# Neither may spell the numbers itself.
+# parsers read this file -- apply_cal_results, and the host-file writeback
+# (awk, which takes the width from the bash GEOM_SLOTS). They drifted once
+# (one moved to 4, the other stayed at 3) and the writeback died on a file
+# calibration had just written, after 11 minutes of measuring. The suite
+# feeds both a row built from these constants ("cal.results: one width").
 CAL_SLOTS = GEOM_SLOTS
 CAL_HEAD = 2
 CAL_TUPLE = 4
@@ -243,8 +242,9 @@ def place_reserve(order, socket, dpdk, core0, want):
 def probe_cores(path, base_list=""):
     """The cpus fio may run on for one host, counted in PHYSICAL cores
     (Frank's rule, 2026-09-25). ONE rule for the tuner, the calibration
-    shapes and usable_cores: a divergence would make a measured job count
-    describe a cpu set the staged jobs do not run on.
+    shapes, usable_cores and the pinning check (those two run its awk port,
+    which the suite holds to this): a divergence would make a measured job
+    count describe a cpu set the staged jobs do not run on.
       - weka's DPDK cores are whole cores. Weka pins each dedicated io thread
         to exactly ONE cpu (a single-cpu task mask; utility threads carry
         wide masks and float), and hives that core's SMT sibling off on
@@ -435,20 +435,6 @@ def fmt_cpulist(cpus):
             run = [c]
     if run: out.append(run)
     return ",".join(f"{r[0]}-{r[-1]}" if len(r) > 1 else f"{r[0]}" for r in out)
-
-def _kv(name):
-    return dict(kv.split("=", 1)
-                for kv in os.environ.get(name, "").split(",") if "=" in kv)
-
-ALIAS = _kv("WEKATESTER_HOST_ALIAS")     # name in the file -> address we use
-IDENT = _kv("WEKATESTER_HOST_IDENT")     # address -> "<name>/<machine-id>"
-
-def host_addr(cell):
-    """A host cell may be '<name>/<machine-id>' and may name the box by
-    something other than the address this run uses (local mode calls it
-    localhost). Strip the id, then map the name onto the address."""
-    name = cell.split("/", 1)[0].strip()
-    return ALIAS.get(name, name)
 
 def load_fs_groups(work, hosts):
     """host -> the members of its filesystem group, in host order, from

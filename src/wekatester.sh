@@ -623,31 +623,51 @@ FLOOR_MARKER="# wekatester-floor:"
 # lib.py's ENGINE_ORDER: the engine a tie goes to, best first, and the one a
 # set that names none gets.
 ENGINE_ORDER="io_uring libaio psync"
+# lib.py's LINE_RATE_SLOTS: the slots --line-rate measures again even when
+# the host file carries them -- a recorded answer does not say which line
+# rate it stopped at
+LINE_RATE_SLOTS="bw_r bw_w"
 
 IFS= read -r -d '' WEKA_AWK <<'AWKLIB' || :
 function awk_fail(msg) { print "ERROR: " msg > "/dev/stderr"; exit 1 }
 
-# python's str.strip() and str.split() whitespace, its ASCII part
-function strip(s) {
-    sub(/^[ \t\n\013\014\r\034\035\036\037]+/, "", s)
-    sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
+# python's str.strip() and str.split() whitespace, its ASCII part. The
+# common cases skip the regex: the probe readers run these on every line
+# of every host's probe.
+function strip(s,    c) {
+    c = substr(s, 1, 1)
+    if (c != "" && index(" \t\n\013\014\r\034\035\036\037", c)) sub(/^[ \t\n\013\014\r\034\035\036\037]+/, "", s)
+    c = substr(s, length(s), 1)
+    if (c != "" && index(" \t\n\013\014\r\034\035\036\037", c)) sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
     return s
 }
-function rstrip(s) {
-    sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
+function rstrip(s,    c) {
+    c = substr(s, length(s), 1)
+    if (c != "" && index(" \t\n\013\014\r\034\035\036\037", c)) sub(/[ \t\n\013\014\r\034\035\036\037]+$/, "", s)
     return s
 }
 function pysplit(s, F) {   # str.split(): F[1..n]
+    # only space, tab and newline: what awk splits on by itself
+    if (s !~ /[\013\014\r\034\035\036\037]/) return split(s, F, " ")
     split("", F)
     s = strip(s)
     return s == "" ? 0 : split(s, F, /[ \t\n\013\014\r\034\035\036\037]+/)
 }
 # int(): the number, or "" where python raises ValueError
 function py_int(s) {
+    if (s ~ /^[0-9]+$/) return s + 0
     s = strip(s)
     if (s !~ /^[+-]?[0-9]+(_[0-9]+)*$/) return ""
     gsub(/_/, "", s)
     return s + 0 + 0
+}
+# str.split(sep) for a one-character sep: macOS awk would split at a
+# newline as well, and a quoted host-file cell may hold one
+function lsplit(s, A, sep,    n, i) {
+    split("", A); n = 0
+    while ((i = index(s, sep)) > 0) { A[++n] = substr(s, 1, i - 1); s = substr(s, i + 1) }
+    A[++n] = s
+    return n
 }
 function replace_all(s, from, to,    i, out) {   # str.replace
     out = ""
@@ -709,9 +729,18 @@ function sort_arr(A, n, num,    gap, i, j, t) {
 # cpu sets: arrays keyed by cpu number
 function set_size(S,    k, n) { n = 0; for (k in S) n++; return n }
 function set_any(S,    k) { for (k in S) return 1; return 0 }
-function set_sorted(S, A,    k, n) {
-    split("", A); n = 0
-    for (k in S) A[++n] = k + 0
+function set_sorted(S, A,    k, n, lo, hi, c) {
+    split("", A); n = 0; lo = 0; hi = -1
+    for (k in S) {
+        A[++n] = k + 0
+        if (A[n] < lo) lo = A[n]
+        if (A[n] > hi) hi = A[n]
+    }
+    if (n > 8 && lo == 0 && hi < 4 * n + 64) {   # dense, as cpu sets are: count up
+        n = 0
+        for (c = 0; c <= hi; c++) if (c in S) A[++n] = c
+        return n
+    }
     sort_arr(A, n, 1)
     return n
 }
@@ -732,10 +761,10 @@ function fmt_cpulist(S,    A, n, i, j, out) {   # 0-3,8: runs collapsed
 # lib.py's parse_cpulist: 1, or 0 where it raises ValueError
 function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
     split("", S)
-    n = split(s, P, ",")
+    n = lsplit(s, P, ",")
     for (i = 1; i <= n; i++) {
         if (index(P[i], "-")) {
-            if (split(P[i], ab, "-") != 2) return 0
+            if (lsplit(P[i], ab, "-") != 2) return 0
             if ((a = py_int(ab[1])) == "" || (b = py_int(ab[2])) == "") return 0
             for (c = a; c <= b; c++) S[c] = 1
         } else if (P[i] != "") {
@@ -996,7 +1025,7 @@ function ini_get(KV, s, key, dflt) {
 function probe_cpu_fact(P, np, key, S,    i, F) {
     split("", S)
     for (i = 1; i <= np; i++)
-        if (pysplit(P[i], F) > 1 && F[1] == key) {
+        if (index(P[i], key) && pysplit(P[i], F) > 1 && F[1] == key) {
             if (F[2] != "-" && !parse_cpulist(F[2], S)) awk_fail("probe: bad cpu list on its " key " line: " F[2])
             return 1
         }
@@ -1015,15 +1044,15 @@ function probe_unbindable(P, np, U, UB,    B, BP, c) {   # measured, never a gue
 }
 # lib.py's probe_topology: TK[c] for every cpu it names, TS[c] its socket,
 # TL[c] its core's threads (a list); 1 when the probe carried topology
-function probe_topology(P, np, TK, TS, TL,    i, F, c, v, pkg, cid, sib, S, key, BY) {
+function probe_topology(P, np, TK, TS, TL,    i, F, c, v, pkg, cid, sib, self, S, key, BY) {
     split("", TK); split("", TS); split("", TL)
-    split("", pkg); split("", cid); split("", sib); split("", BY)
+    split("", pkg); split("", cid); split("", sib); split("", self); split("", BY)
     for (i = 1; i <= np; i++) {
-        if (pysplit(P[i], F) < 3 || substr(F[1], 1, 5) != "topo_" || F[2] !~ /^[0-9]+$/) continue
+        if (!index(P[i], "topo_") || pysplit(P[i], F) < 3 || substr(F[1], 1, 5) != "topo_" || F[2] !~ /^[0-9]+$/) continue
         c = F[2] + 0
         if (F[1] == "topo_physical_package_id") { if ((v = py_int(F[3])) != "") pkg[c] = v }
         else if (F[1] == "topo_core_id") { if ((v = py_int(F[3])) != "") cid[c] = v }
-        else if (F[1] == "topo_thread_siblings_list") { if (parse_cpulist(F[3], S)) sib[c] = F[3] }
+        else if (F[1] == "topo_thread_siblings_list" && parse_cpulist(F[3], S)) { sib[c] = join_sorted(S, ","); self[c] = c in S }
     }
     for (c in pkg) TK[c] = 1
     for (c in cid) TK[c] = 1
@@ -1038,7 +1067,7 @@ function probe_topology(P, np, TK, TS, TL,    i, F, c, v, pkg, cid, sib, S, key,
         }
     }
     for (c in TK) {
-        if ((c in sib) && parse_cpulist(sib[c], S) && (c in S)) TL[c] = join_sorted(S, ",")
+        if ((c in sib) && self[c]) TL[c] = sib[c]
         else if (c in cid) {
             key = TS[c] SUBSEP cid[c]
             if (!(key in BY)) awk_fail("probe: cpu " c " is missing from its own thread_siblings_list")
@@ -1144,6 +1173,7 @@ function probe_cores(P, np, base_list, R, PHYS, ALL,    U, UB, CORE, THR, ORD, n
 function probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R,    i, F, S, ncpus, weka, TK, TS, TL, A, n, c, m, T, nt, j, k, nk) {
     ncpus = 0; split("", weka)
     for (i = 1; i <= np; i++) {
+        if (!index(P[i], "ncpus") && !index(P[i], "weka_allowed")) continue
         if (pysplit(P[i], F) < 2) continue   # a bare isolated line: no isolated cpus
         if (F[1] == "ncpus" && F[2] ~ /^[0-9]+$/) ncpus = F[2] + 0
         else if (F[1] == "weka_allowed") {
@@ -1204,13 +1234,73 @@ function cores_summary(R, PHYS, ALL,    more, p, a) {   # lib.py's: the one line
 function probe_aio_room(P, np,    i, F, mx, nr) {
     mx = ""; nr = ""
     for (i = 1; i <= np; i++)
-        if (pysplit(P[i], F) == 2 && F[2] ~ /^[0-9]+$/) {
+        if (index(P[i], "aio_") && pysplit(P[i], F) == 2 && F[2] ~ /^[0-9]+$/) {
             if (F[1] == "aio_max_nr") mx = F[2] + 0
             else if (F[1] == "aio_nr") nr = F[2] + 0
         }
     if (mx == "") return ""
     mx -= (nr == "" ? 0 : nr)
     return mx < 0 ? 0 : mx
+}
+# --- the host file (CSV) ---
+# python's csv.reader with the default dialect -- "," between fields, a
+# field that STARTS with " is quoted, "" inside quotes is a quote, text
+# after a closing quote runs on unquoted (not strict), no skipinitialspace
+# -- over the lines L[1..n] of a file: a quoted field may span lines. The
+# record count is returned; record r has CN[r] fields, CV[r, 1..CN[r]].
+function csv_read(L, n, CN, CV,    r, i, s, len, k, c, st, f, nf) {
+    split("", CN); split("", CV); r = 0; st = 0
+    for (i = 1; i <= n; i++) {
+        s = L[i]; len = length(s)
+        if (st == 3) f = f "\n"              # the quoted field spans the line break
+        else { nf = 0; f = ""; st = 1 }      # 1: a field starts
+        for (k = 1; k <= len; k++) {
+            c = substr(s, k, 1)
+            if (st == 1) {
+                if (c == "\"") st = 3        # 3: inside quotes
+                else if (c == ",") CV[r + 1, ++nf] = ""
+                else { f = c; st = 2 }       # 2: an unquoted field
+            } else if (st == 2) {
+                if (c == ",") { CV[r + 1, ++nf] = f; f = ""; st = 1 }
+                else f = f c
+            } else if (st == 3) {
+                if (c == "\"") st = 4        # 4: a quote inside quotes
+                else f = f c
+            } else if (c == "\"") { f = f c; st = 3 }
+            else if (c == ",") { CV[r + 1, ++nf] = f; f = ""; st = 1 }
+            else { f = f c; st = 2 }
+        }
+        if (st == 3) continue
+        if (len) CV[r + 1, ++nf] = f         # a blank line is a record of no fields
+        CN[++r] = nf
+    }
+    if (st == 3) { CV[r + 1, ++nf] = f; CN[++r] = nf }   # the file ends inside quotes
+    return r
+}
+function csv_line(s, F,    L, CN, CV, k) {   # one line, as csv.reader([line]) parses it
+    L[1] = s
+    csv_read(L, 1, CN, CV)
+    split("", F)
+    for (k = 1; k <= CN[1]; k++) F[k] = CV[1, k]
+    return CN[1]
+}
+function csv_field(v) {   # csv.writer's QUOTE_MINIMAL, with no line terminator
+    if (!index(v, ",") && !index(v, "\"")) return v
+    gsub(/"/, "\"\"", v)
+    return "\"" v "\""
+}
+# name=value,... (the WEKATESTER_HOST_ALIAS and _IDENT environment) into M
+function kv_map(s, M,    n, P, i, p) {
+    split("", M)
+    n = lsplit(s, P, ",")
+    for (i = 1; i <= n; i++) if ((p = index(P[i], "="))) M[substr(P[i], 1, p - 1)] = substr(P[i], p + 1)
+}
+# A host cell may be <name>/<machine-id>, and may name the box by something
+# other than the address this run uses (local mode calls it localhost):
+# the id stripped, the name mapped onto the address
+function host_addr(cell, ALIAS,    name) {
+    name = cell; sub(/\/.*/, "", name); name = strip(name)
+    return (name in ALIAS) ? ALIAS[name] : name
 }
 AWKLIB
 
@@ -1222,6 +1312,7 @@ function layout_job() { return \"$LAYOUT_JOB\" }
 function layout_marker() { return \"$LAYOUT_MARKER\" }
 function floor_marker() { return \"$FLOOR_MARKER\" }
 function engine_order() { return \"$ENGINE_ORDER\" }
+function line_rate_slots() { return \"$LINE_RATE_SLOTS\" }
 $1" "${@:2}"
 }
 
@@ -3669,18 +3760,156 @@ check_cpu_pinning() {
     # local mode never ran establish_connections; the lifecycle still reads
     # the same per-host files
     [ -n "$AUTH_DIR" ] || { AUTH_DIR="$WORK_DIR/auth"; mkdir -p "$AUTH_DIR"; }
-    # One python for every host, not one per host behind six awks: the
-    # verdict is set arithmetic on the probe file and the host's row, and
-    # ~45ms of process starts per host before any judgment is 20s of serial
-    # nothing at 451 hosts. It writes one line per host that has a request,
+    # One awk for every host, not six for each: the verdict is set
+    # arithmetic on the probe file and the host's row, and ~45ms of process
+    # starts per host before any judgment is 20s of serial nothing at 451
+    # hosts. It writes one line per host that has a request,
     # in host order: host, the request, the taskset and cpu count the
     # messages quote back, the four cpu sets, the flags (comma-joined), and
     # the escalator prefix last (it has spaces) -- "-" for an empty field.
     # The bash below still speaks per host, unchanged.
-    pyrun "$WORK_DIR/targets.final" "$WORK_DIR/probe" "${AUTO_LEVEL:--}" "${HOSTS[@]}" \
-        > "$WORK_DIR/pin.verdicts" <<'PYEOF' || die "cpu pinning check failed"
-#@include py/check_cpu_pinning.py
-PYEOF
+    awkrun '
+    # a cpu list the way this check reads one: blanks around a part
+    # dropped, an empty part skipped
+    function expand(s, S,    n, P, i, p, a, b, c) {
+        split("", S)
+        n = lsplit(s, P, ",")
+        for (i = 1; i <= n; i++) {
+            if ((p = strip(P[i])) == "") continue
+            if (index(p, "-")) {
+                a = py_int(substr(p, 1, index(p, "-") - 1)); b = py_int(substr(p, index(p, "-") + 1))
+                if (a == "" || b == "") awk_fail("pinning: not a cpu list: " s)
+                for (c = a; c <= b; c++) S[c] = 1
+            } else {
+                if ((a = py_int(p)) == "") awk_fail("pinning: not a cpu list: " s)
+                S[a] = 1
+            }
+        }
+    }
+    function fact(P, np, key,    i, F) {   # the first "<key> <value>" line, as the awk did
+        for (i = 1; i <= np; i++) if (index(P[i], key) && pysplit(P[i], F) && F[1] == key) return F[2]
+        return ""
+    }
+    function fmt_or(S, none,    v) { v = fmt_cpulist(S); return v == "" ? none : v }
+    function flag(f) { flags = flags (flags == "" ? "" : ",") f }
+    BEGIN {
+        auto = ARGV[3] != "-"
+        # each host row, the first per host (targets_field reads the first)
+        if ((n = readlines(ARGV[1], L)) > 0)
+            for (i = 1; i <= n; i++) {
+                split(L[i], F, "\t")
+                if (!(F[1] in ROW)) ROW[F[1]] = (4 in F) ? F[4] : ""
+            }
+        for (a = 4; a < ARGC; a++) {
+            host = ARGV[a]; req_s = (host in ROW) ? ROW[host] : ""
+            # a host the file gives no cpu list is pinned all the same: fio
+            # never lands on the pinned cores of weka (Frank, 2026-09-29)
+            if ((nolist = req_s == "" || req_s == "-")) req_s = ""
+            if ((np = readlines(ARGV[2] "/" host, P)) < 0) {
+                if (nolist) continue   # never probed: nothing to pin against
+                np = 0
+            }
+            cur_s = fact(P, np, "taskset"); iso_s = fact(P, np, "isolated"); ncpus_s = fact(P, np, "ncpus")
+            priv = ""   # host_priv rule: the first "priv " line, the rest of it verbatim
+            for (i = 1; i <= np; i++) if (index(P[i], "priv ") == 1) { priv = substr(P[i], 6); break }
+            expand(req_s, REQ); expand(cur_s, CUR); expand(iso_s, ISO)
+            ncpus = ncpus_s ~ /^[0-9]+$/ ? ncpus_s + 0 : 0
+            # MEASURED facts (empty, untested, when the probe could not test)
+            tested = probe_cpu_fact(P, np, "bindable", BIND)
+            probe_cpu_fact(P, np, "bindable_priv", BINDP)
+            probe_universe(P, np, ncpus, U)
+            # same rule as the tuner: weka pins each dedicated io thread to
+            # exactly one cpu; wide masks are floating utility threads and
+            # MUST be ignored, or the union covers every cpu and everything
+            # "overlaps" (seen live)
+            split("", WEKA)
+            for (i = 1; i <= np; i++)
+                if (index(P[i], "weka_allowed") && pysplit(P[i], F) > 1 && F[1] == "weka_allowed") {
+                    expand(F[2], S)
+                    if (set_size(S) == 1) for (c in S) WEKA[c] = 1
+                }
+            # and a dedicated core is the WHOLE core: weka hives the SMT
+            # sibling of the io thread off too (WEKAPP-550768), as probe_cores
+            # counts it. fio never runs on either thread, whatever the list
+            # says (Frank, 2026-09-27).
+            probe_topology(P, np, TK, TS, TL)
+            nw = set_sorted(WEKA, W)
+            for (i = 1; i <= nw; i++)
+                if (W[i] in TK) { nt = split(TL[W[i]], T, ","); for (j = 1; j <= nt; j++) WEKA[T[j]] = 1 }
+            flags = ""
+            if (nolist && !set_any(U)) continue   # a probe that cannot say which cpus exist: nothing to pin to
+            if (nolist) {
+                # every cpu this login can bind WITHOUT privilege -- an
+                # unlisted host never escalates -- and, below, minus the
+                # cores of weka (whole) and the pair of core 0, exactly as a
+                # list naming them all would be
+                flag("nolist")
+                split("", REQ)
+                for (c in U) if (tested ? (c in BIND) : (!set_any(CUR) || (c in CUR))) REQ[c] = 1
+                if ((req_s = fmt_cpulist(REQ)) == "") req_s = "-"
+            }
+            # cpus the host does not have: fio rejects a cpus_allowed naming
+            # one -- on the daemonized SERVER, whose error text is lost -- so
+            # they are trimmed here with a note, the host file keeping the
+            # list as written. Only when the probe knows the cpus.
+            split("", PHANTOM)
+            if (set_any(U)) for (c in REQ) if (!(c in U)) PHANTOM[c] = 1
+            if (set_any(PHANTOM)) flag("phantom")
+            # cpus this host REFUSES to bind, measured: fio answers one of
+            # these with err=22 cpu_set_affinity, per job, on the daemonized
+            # server after the run has started (field client C, 2026-09-09)
+            split("", UNBIND)
+            if (tested) for (c in REQ) if (!(c in WEKA) && !(c in PHANTOM) && !(c in BIND) && !(c in BINDP)) UNBIND[c] = 1
+            if (set_any(UNBIND)) flag("unbindable")
+            # core 0 of socket 0 and its sibling always stay with the OS
+            # (Frank, 2026-09-25)
+            split("", PAIR)
+            if (0 in TK) { nt = split(TL[0], T, ","); for (j = 1; j <= nt; j++) PAIR[T[j]] = 1 }
+            else PAIR[0] = 1
+            split("", OS0)
+            for (c in REQ) if (c in PAIR) OS0[c] = 1
+            if (set_any(OS0)) flag("core0")
+            # the EFFECTIVE set: the request minus the cores of weka, the
+            # pair of core 0, and the cpus the host does not have or bind
+            split("", EFF)
+            for (c in REQ) if (!(c in WEKA) && !(c in PHANTOM) && !(c in UNBIND) && !(c in PAIR)) EFF[c] = 1
+            # A list covering every cpu fio could use is no choice: under -a
+            # the tuner applies the whole OS reserve as if the file gave none
+            # (probe_cores), so the effective set -- what the notes quote, the
+            # taskset of the fio server, the escalation check -- is the
+            # tuner set, or the notes would name reserve cpus fio never runs
+            # on and an "outside" verdict could escalate (or die) for them.
+            # Plain runs have no reserve: the rule above stands.
+            if (auto) {
+                probe_cores(P, np, nolist ? "" : req_s, R, PHYS, ALL)
+                if (nolist || R["catchall"]) {
+                    if (!nolist) flag("catchall")
+                    split("", EFF); for (c in ALL) EFF[c] = 1
+                }
+            }
+            # a mask mixing isolated and housekeeping cpus silently
+            # collapses onto the housekeeping partition -- worse than
+            # failing, it runs WRONG
+            iso_in = 0; iso_out = 0
+            if (set_any(ISO)) for (c in REQ) if (c in ISO) iso_in = 1; else iso_out = 1
+            if (iso_in && iso_out) flag("mixed")
+            # Which cpus need the escalator? MEASURED: the ones the probe
+            # could not bind plainly but could under it. Without that, the
+            # old rule stands -- isolated cpus assumed self-affinable, so
+            # only cpus outside both the current mask and the isolated set
+            # need privilege.
+            if (!set_any(EFF)) flag("allweka")
+            else if (tested) {
+                for (c in EFF) if (!(c in BIND)) { flag("outside"); break }
+            } else if (set_any(CUR)) {
+                for (c in EFF) if (!(c in CUR) && !(c in ISO)) { flag("outside"); break }
+            }
+            for (c in REQ) if (c in WEKA) { flag("overlap"); break }
+            w = join_sorted(WEKA, ",")
+            print host, req_s, (cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)
+        }
+    }' "$WORK_DIR/targets.final" "$WORK_DIR/probe" "${AUTO_LEVEL:--}" "${HOSTS[@]}" \
+        > "$WORK_DIR/pin.verdicts" || die "cpu pinning check failed"
     local dedicated effective phantom unbindable os0 vflags nolist_hosts=() nolist_eff=()
     while read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
         [ "$cur" != "-" ] || cur=""
@@ -3864,9 +4093,134 @@ check_capacity() {
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: cannot df on ${HOSTS[$i]}; its capacity is unchecked" >&2
     done
-    pyrun "$WORK_DIR" "${HOSTS[@]}" <<'PYEOF'
-#@include py/check_capacity.py
-PYEOF
+    list_staged "$WORK_DIR/staged.list" && awkrun '
+    function gib(b) { return sprintf("%.1f", b / 1073741824) }
+    function need_int(v, what) {   # int(), or a stop where python raised
+        if ((v = py_int(v)) == "") awk_fail("capacity: " what " is not a number")
+        return v
+    }
+    # one staged jobfile: numjobs x filesize x nrfiles, or numjobs x size=
+    # (fio: the job total across its files)
+    function footprint(path, L, n,    nj, fs, sz, nr, b, job) {
+        nj = first_value(L, n, "numjobs"); nj = need_int(nj == "" ? "1" : nj, path ": numjobs")
+        if ((fs = first_value(L, n, "filesize")) != "") {
+            if ((b = parse_size(fs)) == "") awk_fail("capacity: " path ": filesize=" fs " is not a byte count")
+            nr = first_value(L, n, "nrfiles")
+            return nj * b * need_int(nr == "" ? "1" : nr, path ": nrfiles")
+        }
+        if ((sz = first_value(L, n, "size")) != "") {
+            if ((b = parse_size(sz)) != "") return nj * b
+            job = path; sub(/.*\//, "", job)
+            print "WARNING: " job ": size=" sz " is not a byte count; it contributes nothing to the capacity estimate" > "/dev/stderr"
+        }
+        return 0
+    }
+    # the layout job: per job section numjobs x nrfiles x filesize, or
+    # numjobs x size=
+    function layout_footprint(L, n,    i, s, total, insec, nj, nr, b, perfile, k, v) {
+        total = 0; insec = 0
+        for (i = 1; i <= n; i++) {
+            s = strip(L[i])
+            if (s ~ /^\[.+\]$/) {
+                if (insec) total += nj * (perfile ? nr : 1) * b
+                insec = s != "[global]"; nj = 1; nr = 1; b = 0; perfile = 1
+                continue
+            }
+            if (!insec || !match(s, /^(numjobs|nrfiles|filesize|size)=[^ \t\n\013\014\r\034\035\036\037]+/)) continue
+            k = substr(s, 1, index(s, "=") - 1); v = substr(s, length(k) + 2, RLENGTH - length(k) - 1)
+            if (k == "numjobs") nj = need_int(v, "the layout numjobs")
+            else if (k == "nrfiles") nr = need_int(v, "the layout nrfiles")
+            else { if ((b = parse_size(v)) == "") b = 0; perfile = k == "filesize" }
+        }
+        if (insec) total += nj * (perfile ? nr : 1) * b
+        return total
+    }
+    BEGIN {
+        work = ARGV[1]
+        # load_fs_groups: the first host of each filesystem group prices
+        # its fleet-shared read set; without the groups file, one group
+        if ((n = readlines(work "/groups", L)) > 0)
+            for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2) GID[F[1]] = F[2]
+        for (a = 3; a < ARGC; a++) {
+            g = (ARGV[a] in GID) ? GID[ARGV[a]] : "1"
+            if (!(g in FIRST)) FIRST[g] = ARGV[a]
+        }
+        # each host staged files (the first block of a host listed twice)
+        if ((m = readlines(ARGV[2], M)) < 0) awk_fail("cannot read " ARGV[2])
+        last = ""
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            if (F[1] != last) { last = F[1]; take = !(last in NJOB); if (take) NJOB[last] = 0 }
+            if (!take) continue
+            if (F[2] == "") NODIR[last] = 1
+            else JOB[last, ++NJOB[last]] = F[2]
+        }
+        over = 0; npool = 0
+        for (a = 3; a < ARGC; a++) {
+            h = ARGV[a]
+            if (h in NODIR) continue
+            split("", NSV); nns = 0; layout = 0
+            for (j = 1; j <= NJOB[h] + 0; j++) {
+                p = JOB[h, j]; job = p; sub(/.*\//, "", job)
+                if (job == "000-wekatester-relayout.job" || job == "999-wekatester-unlink.job") continue
+                if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)
+                if (job == layout_job() || is_layout_marked(L, n)) { layout += layout_footprint(L, n); continue }
+                if ((ns = first_value(L, n, "filename_format")) == "") ns = "__default__:" job
+                # a group fleet-shared dataset is priced once, on its first host
+                if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
+                if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
+                if ((b = footprint(p, L, n)) > NSV[ns]) NSV[ns] = b
+            }
+            req = 0
+            for (k = 1; k <= nns; k++) req += NSV[NSK[k]]
+            if (layout > req) req = layout
+            # bytes the sweep verified as already laid out serve both the
+            # layout and the measured namespaces: a rerun only needs what is
+            # actually missing
+            credit = 0
+            if ((n = readlines(work "/probe/" h ".laidout", L)) >= 0) {
+                v = ""
+                for (i = 1; i <= n; i++) v = v (i > 1 ? "\n" : "") L[i]
+                v = strip(v)
+                if ((credit = v == "" ? 0 : py_int(v)) == "") credit = 0
+                else if (credit > req) credit = req
+            }
+            req -= credit
+            avail = 0; key = ""
+            if ((n = readlines(work "/df/" h, L)) >= 2) {
+                if (pysplit(L[2], F) < 4 || (avail = py_int(F[4])) == "") awk_fail(h ": cannot read the df line: " L[2])
+                avail *= 1024
+                # a weka filesystem is keyed by its name -- a stateless mount
+                # lists backends before it, and clients list them differently
+                # -- and its size, which tells two clusters same-named
+                # filesystems apart
+                if (n >= 3 && strip(L[3]) == "wekafs") { fs = F[1]; sub(/.*\//, "", fs); key = fs SUBSEP F[2] }
+            }
+            print "capacity: " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
+            # avail 0 = df unavailable, not a full filesystem: nothing to check
+            if (avail && req > avail) {
+                over = 1
+                print "ERROR: " h ": workload needs ~" gib(req) "GiB but only " gib(avail) "GiB is available" > "/dev/stderr"
+            }
+            if (key != "" && avail) {
+                if (!(key in PN)) { PN[key] = 0; PNEED[key] = 0; PAVAIL[key] = avail; PK[++npool] = key }
+                PH[key, ++PN[key]] = h; PNEED[key] += req
+                if (avail < PAVAIL[key]) PAVAIL[key] = avail
+            }
+        }
+        # every host fitting alone is not the fleet fitting: 3 hosts needing
+        # 640 GiB each passed against one 1000 GiB filesystem
+        sort_arr(PK, npool, 0)
+        for (i = 1; i <= npool; i++) {
+            key = PK[i]
+            if (PN[key] < 2 || PNEED[key] <= PAVAIL[key]) continue
+            over = 1; split(key, KF, SUBSEP); names = ""
+            for (j = 1; j <= PN[key] && j <= 8; j++) names = names (j > 1 ? " " : "") PH[key, j]
+            if (PN[key] > 8) names = names " (+" (PN[key] - 8) " more)"
+            print "ERROR: weka filesystem " KF[1] ": its " PN[key] " hosts (" names ") need ~" gib(PNEED[key]) "GiB together but only " gib(PAVAIL[key]) "GiB is available" > "/dev/stderr"
+        }
+        exit (over ? 2 : 0)
+    }' "$WORK_DIR" "$WORK_DIR/staged.list" "${HOSTS[@]}"
     case $? in
         0) return 0 ;;
         2) ;;
@@ -4058,8 +4412,7 @@ generate_layout() {   # generate_layout <setdir> <outdir>
 #
 # Two phases for that same reason: phase1 (pre-auth) = logins + initial
 # dirs from host lines and login-selector folding; phase2 (post engine
-# tests, results in a file as "host engine ok|fail" lines -- NOT stdin,
-# the python heredoc owns stdin) = everything.
+# tests, results in a file as "host engine ok|fail" lines) = everything.
 # Output, one host per line, tab-separated, "-" = unset:
 #   host login engine cpus dir, then nj/fs/nr/qd per slot in
 #   bw_r, bw_w, lat_r, lat_w, iops_r, iops_w, lat1m_r, lat1m_w order
@@ -4289,11 +4642,202 @@ writeback_targets() {
         > "$WORK_DIR/targets.hostrows" || : > "$WORK_DIR/targets.hostrows"
     local h ident=""
     for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
+    list_staged "$WORK_DIR/staged.list" &&
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
     WEKATESTER_HOST_IDENT=$ident \
-    pyrun "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" <<'PYEOF' || die "host file writeback failed ($wb)"
-#@include py/writeback_targets.py
-PYEOF
+    awkrun '
+    function slurp(path,    L, n, i, v) {   # open(path).read().strip(); slurped: it exists
+        slurped = (n = readlines(path, L)) >= 0; v = ""
+        for (i = 1; i <= n; i++) v = v (i > 1 ? "\n" : "") L[i]
+        return strip(v)
+    }
+    # Values compare by what they mean, not how they are spelled: 5G is
+    # 5120M, 2-4 is 2,3,4 (but 2,4 is not 2-4) -- a line whose values all
+    # hold is left exactly as it is (Frank, 2026-10-02).
+    function norm(k, v,    S, b) {
+        if (k == "cpus") return parse_cpulist(v, S) ? "c" fmt_cpulist(S) : "s" v
+        if (k ~ /_fs$/) return (b = parse_size(v)) != "" ? "n" sprintf("%.0f", b) : "s" v
+        if (k ~ /_(nj|nr|qd)$/) return (b = py_int(v)) != "" ? "n" sprintf("%.0f", b) : "s" v
+        return "s" v
+    }
+    function geom(h, slot,    q, v, out, any) {   # nj/fs/nr/qd, the trailing blanks dropped
+        out = ""; any = 0
+        for (q = 1; q <= 4; q++) {
+            v = ((h, slot "_" TUPLE[q]) in WANT) ? WANT[h, slot "_" TUPLE[q]] : ""
+            if (v != "") any = 1
+            out = out (q > 1 ? "/" : "") v
+        }
+        if (!any) return ""
+        sub(/\/+$/, "", out)
+        return out
+    }
+    function render(h,    cell, row, k, s, n, G) {
+        # a row the operator wrote keeps its own spelling of the host,
+        # machine-id or not -- automation only names a machine it is adding
+        cell = (h in SEEN_CELL) ? SEEN_CELL[h] : (h in IDENT) ? IDENT[h] : h
+        row = csv_field(cell)
+        for (k = 1; k <= 4; k++) row = row "," csv_field(((h, FIELD[k]) in WANT) ? WANT[h, FIELD[k]] : "")
+        for (s = 1; s <= nslot; s++) G[s] = geom(h, SLOT[s])
+        n = nslot
+        while (n > 6 && G[n] == "") n--   # no 1MiB latency geometry: the row stays in the old width
+        for (s = 1; s <= n; s++) row = row "," csv_field(G[s])
+        return row
+    }
+    function own_line(line,    F, h) {   # the address of the host whose own line this is, or ""
+        if (!csv_line(line, F)) return ""
+        h = strip(F[1])
+        if (h == "" || substr(h, 1, 1) == "#" || tolower(h) == "host" || !(host_addr(h, ALIAS) in WANTED)) return ""
+        OWN_CELL = h
+        return host_addr(h, ALIAS)
+    }
+    BEGIN {
+        wb = ARGV[1]; mode = ARGV[2]; work = ARGV[3]; line_gbps = ARGV[4]
+        kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); kv_map(ENVIRON["WEKATESTER_HOST_IDENT"], IDENT)
+        nslot = split(geom_slots(), SLOT, " "); split("nj fs nr qd", TUPLE, " ")
+        split("login engine cpus dir", FIELD, " "); nfield = 4
+        for (s = 1; s <= nslot; s++) for (q = 1; q <= 4; q++) FIELD[++nfield] = SLOT[s] "_" TUPLE[q]
+        n = split(line_rate_slots(), F, " ")
+        for (i = 1; i <= n; i++) LINE_RATE[F[i]] = 1
+        # what each host OWN row provides (resolve_targets hostonly): the
+        # last full-width line per host
+        n = readlines(work "/targets.hostrows", L)
+        for (i = 1; i <= n; i++) if (split(L[i], F, "\t") == nfield + 1) HROW[F[1]] = L[i]
+        for (h in HROW) {
+            split(HROW[h], F, "\t")
+            for (f = 1; f <= nfield; f++) if (F[f + 1] != "-") HAVE[h, FIELD[f]] = F[f + 1]
+        }
+        # The measured knees first (cal.results is pure measurement --
+        # targets.final would also carry CLI-merged values, which are not
+        # calibration to record), then the STAGED variants for whatever was
+        # not measured. A malformed line is a schema break, not a skip:
+        # apply_cal_results dies on the same seam. CAL_COLS as lib.py
+        # derives it: the host, its engine, then (qd nr fs nj) per slot.
+        ncal = 2 + 4 * nslot
+        n = readlines(work "/cal.results", L)
+        for (i = 1; i <= n; i++) {
+            if (!(m = pysplit(L[i], F))) continue
+            if (m != ncal) awk_fail("cal.results: malformed line (want " ncal " fields): " rstrip(L[i]))
+            split("", T); got = 0
+            for (s = 1; s <= nslot; s++) {
+                b = 2 + 4 * (s - 1)
+                if (F[b + 1] != "-") { T[SLOT[s] "_qd"] = F[b + 1]; T[SLOT[s] "_nr"] = F[b + 2]; T[SLOT[s] "_fs"] = F[b + 3]; got = 1 }
+                # a measured tuple always carries its numjobs: the answer of
+                # bandwidth IS a job count (the first to reach line rate), so
+                # is that of latency (the widest still at the floor), and the
+                # iops re-split may have moved it off one job per cpu. It is
+                # also what marks the tuple as MEASURED -- the staged tuples
+                # recorded below never carry one, so the cache of calibration
+                # cannot mistake a tuned guess for a measurement.
+                if (F[b + 4] != "-") { T[SLOT[s] "_nj"] = F[b + 4]; got = 1 }
+            }
+            if (!got) continue
+            for (f = 1; f <= nfield; f++) delete MEAS[F[1], FIELD[f]]
+            for (k in T) MEAS[F[1], k] = T[k]
+        }
+        # each host staged files (the first block of a host listed twice)
+        if ((m = readlines(work "/staged.list", M)) < 0) awk_fail("cannot read " work "/staged.list")
+        last = ""
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            if (F[1] != last) { last = F[1]; take = !(last in NJOB); if (take) NJOB[last] = 0 }
+            if (take && F[2] != "") JOB[last, ++NJOB[last]] = F[2]
+        }
+        nup = 0
+        for (a = 5; a < ARGC; a++) {
+            h = ARGV[a]; split("", D); split("", DP)
+            for (f = 1; f <= nfield; f++) if ((h, FIELD[f]) in MEAS) { D[FIELD[f]] = MEAS[h, FIELD[f]]; DP[FIELD[f]] = 1 }
+            v = slurp(work "/auth/" h ".user")
+            if (slurped) { D["login"] = v; DP["login"] = 1 }
+            # the cpu list fio may run on here, as the tuner resolved it: a
+            # staged job names only the subset its own job count runs on
+            # (physical cores alone at N or fewer jobs), so no single job is
+            # the list to record
+            v = slurp(work "/usable/" h)
+            if (slurped && !("cpus" in DP)) { D["cpus"] = v; DP["cpus"] = 1 }
+            for (j = 1; j <= NJOB[h] + 0; j++) {
+                p = JOB[h, j]; job = p; sub(/.*\//, "", job)
+                if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)
+                if (job == layout_job() || is_layout_marked(L, n)) continue   # the layout is a barrier, not a test: it records nothing
+                if (is_floor_marked(L, n)) continue   # its one-job geometry is forced, not something to record
+                lat = bw = iops = 0
+                for (i = 1; i <= n; i++) {
+                    if (index(L[i], "# report") != 1) continue
+                    nw = pysplit(L[i], W)
+                    for (k = 3; k <= nw; k++) { if (W[k] == "latency") lat = 1; else if (W[k] == "bandwidth") bw = 1; else if (W[k] == "iops") iops = 1 }
+                }
+                # precedence latency > bandwidth > iops, same as the tuner; a
+                # 1MiB latency file (a -b twin) records into the lat1m slot
+                kind = lat ? lat_kind(L, n) : bw ? "bw" : iops ? "iops" : ""
+                if (!("engine" in DP)) { D["engine"] = first_value(L, n, "ioengine"); DP["engine"] = 1 }
+                if (!("cpus" in DP)) { D["cpus"] = first_value(L, n, "cpus_allowed"); DP["cpus"] = 1 }
+                if (!("dir" in DP)) { D["dir"] = first_value(L, n, "directory"); DP["dir"] = 1 }
+                if (kind == "") continue
+                # a measured direction already carries its own tuple, so the
+                # staged tuple fills only unmeasured slots. A staged numjobs
+                # is never recorded: the tuner re-derives it from the usable
+                # cores every run, and a recorded count would only go stale
+                # (weka re-pins, cpu list edits) -- and the next calibration
+                # would test only that guess, since a recorded value pins its
+                # knob.
+                file_directions(L, n, DIR)
+                for (q = 1; q <= 2; q++) {
+                    if (!((q == 1 ? "read" : "write") in DIR)) continue
+                    for (t = 2; t <= 4; t++) {
+                        v = first_value(L, n, t == 2 ? "filesize" : t == 3 ? "nrfiles" : "iodepth")
+                        k = kind "_" (q == 1 ? "r" : "w") "_" TUPLE[t]
+                        if (v != "" && !(k in DP)) { D[k] = v; DP[k] = 1 }
+                    }
+                }
+            }
+            # The host desired line: its own row, plus what the run derived
+            # for whatever that row left unset (or everything, under -g).
+            # Values a generic row supplied are not the host own, so a host
+            # that ran on a generic cpu list gets its own line carrying the
+            # list that actually executed.
+            for (f = 1; f <= nfield; f++) {
+                k = FIELD[f]; delete WANT[h, k]
+                if ((h, k) in HAVE) WANT[h, k] = HAVE[h, k]
+            }
+            for (f = 1; f <= nfield; f++) {
+                k = FIELD[f]
+                if (!(k in DP) || D[k] == "") continue
+                # identity, credentials and the operator OWN cpu list are
+                # never overwritten, -g included
+                if ((k == "login" || k == "cpus") && ((h, k) in HAVE)) continue
+                if (((h, k) in HAVE) && norm(k, HAVE[h, k]) == norm(k, D[k])) continue   # the row keeps its own spelling
+                # the bandwidth tuples --line-rate MEASURED again replace the
+                # row; a staged guess for those slots never does
+                fresh = line_gbps != "-" && ((h, k) in MEAS) && (substr(k, 1, length(k) - 3) in LINE_RATE)
+                if (mode == "overwrite" || !((h, k) in HAVE) || fresh) WANT[h, k] = D[k]
+            }
+            # an update when the line no longer says what holds
+            same = 1; any = 0
+            for (f = 1; f <= nfield; f++) {
+                k = FIELD[f]
+                if ((h, k) in WANT) any = 1
+                if (((h, k) in WANT) != ((h, k) in HAVE) || ((h, k) in WANT) && norm(k, WANT[h, k]) != norm(k, HAVE[h, k])) same = 0
+            }
+            if (any && !same && !(h in WANTED)) { WANTED[h] = 1; nup++ }
+        }
+        if (!nup) { print "host file: nothing to record"; exit 0 }
+        # The host file is only ever added to (Frank, 2026-10-02): a host
+        # own line is commented out and its new version written directly
+        # below it; a host with no line of its own gets one appended at the
+        # end. Nothing is deleted or rewritten in place, and a generic
+        # (host-less) row is never touched.
+        if ((n = readlines(wb, L)) < 0) awk_fail("cannot read " wb)
+        for (i = 1; i <= n; i++)
+            if ((addr = own_line(L[i])) != "" && !(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
+        no = 0
+        for (i = 1; i <= n; i++) {
+            if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
+            O[++no] = "# superseded by -a: " L[i]
+            if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
+        }
+        for (a = 5; a < ARGC; a++) if ((ARGV[a] in WANTED) && !(ARGV[a] in PLACED)) O[++no] = render(ARGV[a])
+        writelines(wb, O, no)
+        print "host file: recorded " nup " host line(s) in " wb " (" mode ")"
+    }' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" || die "host file writeback failed ($wb)"
 }
 
 # The host's destination dir: the finished resolution when it exists, the
@@ -4323,9 +4867,96 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
 # host's OWN row and nothing else -- what the writeback merges against, so
 # a generic (host-less) row's defaults are never mistaken for the host's.
 resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
-    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") pyrun "$@" <<'PYEOF'
-#@include py/resolve_targets.py
-PYEOF
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") awkrun 'BEGIN {
+        phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
+        kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS)
+        nslot = split(geom_slots(), SLOT, " "); split(geom_names(), GNAME, " ")
+        split("nj fs nr qd", TUPLE, " "); ncols = 5 + nslot
+        split("login engine cpus dir", FIELD, " "); nfield = 4
+        for (s = 1; s <= nslot; s++) for (q = 1; q <= 4; q++) FIELD[++nfield] = SLOT[s] "_" TUPLE[q]
+        # ---- parse: one entry per row, its fields in the order they count ----
+        if ((n = readlines(path, L)) < 0) awk_fail("cannot read host file: " path)
+        nrec = csv_read(L, n, CN, CV); ne = 0
+        for (r = 1; r <= nrec; r++) {
+            all = ""
+            for (k = 1; k <= CN[r]; k++) all = all CV[r, k]
+            if (!CN[r] || strip(all) == "") continue
+            if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
+            if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
+            for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
+            ne++; nk = 0
+            if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
+            if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }
+            if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = C[5] }
+            # geometry: "bandwidthR:12/10G/1/8" or a bare "12/10G/1/8";
+            # empty parts are unset
+            for (s = 1; s <= nslot; s++) {
+                if ((raw = C[5 + s]) == "") continue
+                if ((p = index(raw, ":"))) {
+                    pfx = substr(raw, 1, p - 1)
+                    if (tolower(strip(pfx)) != tolower(GNAME[s]))
+                        awk_fail(path ":" r ": column for " GNAME[s] " carries prefix \047" pfx "\047")
+                    raw = substr(raw, p + 1)
+                }
+                np = lsplit(raw, PART, "/")
+                for (q = 1; q <= 4 && q <= np; q++)
+                    if (strip(PART[q]) != "") { EK[ne, ++nk] = SLOT[s] "_" TUPLE[q]; EV[ne, nk] = strip(PART[q]) }
+            }
+            ELINE[ne] = r
+            if ((EHOST[ne] = host_addr(C[1], ALIAS)) != "") {
+                if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
+                h = EHOST[ne]
+                if (h in HLINE) {
+                    # two spellings of one machine -- most likely the same
+                    # short name carrying different machine-ids, which the
+                    # run cannot tell apart because both resolve to the same
+                    # address
+                    extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
+                    awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
+                }
+                HLINE[h] = r; HCELL[h] = C[1]
+                ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 3
+            } else {
+                # host-less: login and engine are SELECTORS; login is never assigned
+                ELOGIN[ne] = C[2]; EENG[ne] = C[3]; ENSEL[ne] = (C[2] != "") + (C[3] != "")
+            }
+            ENK[ne] = nk
+        }
+        # ---- phase2 input: the engine test results ----
+        if (phase == "phase2" && results != "-") {
+            if ((n = readlines(results, L)) < 0) awk_fail("cannot read " results)
+            for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 3 && F[3] == "ok") PASSED[F[1], F[2]] = 1
+        }
+        # ---- resolve per host ----
+        for (a = 6; a < ARGC; a++) {
+            h = ARGV[a]; split("", CFG); split("", SN); split("", SL)
+            for (e = 1; e <= ne; e++)   # the host line first: the most specific, unique
+                if (EHOST[e] == h)
+                    for (j = 1; j <= ENK[e]; j++) { k = EK[e, j]; CFG[k] = EV[e, j]; SN[k] = ENSEL[e]; SL[k] = ELINE[e] }
+            login = ("login" in CFG) ? CFG["login"] : ""
+            # host-less lines, most selectors first, ties to the first line
+            # (none in hostonly: their values are defaults, not the host own)
+            for (sel = 2; sel >= 0 && phase != "hostonly"; sel--)
+                for (e = 1; e <= ne; e++) {
+                    if (EHOST[e] != "" || ENSEL[e] != sel) continue
+                    if (ELOGIN[e] != "" && ELOGIN[e] != login) continue
+                    # an engine selector needs test results; it folds in later
+                    if (EENG[e] != "" && (phase != "phase2" || !((h, EENG[e]) in PASSED))) continue
+                    for (j = 1; j <= ENK[e]; j++) {
+                        k = EK[e, j]; v = EV[e, j]
+                        if (k == "login") continue
+                        if (!(k in CFG)) { CFG[k] = v; SN[k] = sel; SL[k] = ELINE[e] }
+                        else if (SN[k] == sel && CFG[k] != v)
+                            print "WARNING: " path ": host \047" h "\047 field \047" k "\047: line " ELINE[e] " conflicts with equally specific line " SL[k] "; keeping line " SL[k] > "/dev/stderr"
+                    }
+                }
+            if (cli_engine != "-") CFG["engine"] = cli_engine   # the CLI beats the file
+            if (cli_dir != "-") CFG["dir"] = cli_dir
+            line = h
+            for (f = 1; f <= nfield; f++) line = line "\t" ((FIELD[f] in CFG) && CFG[FIELD[f]] != "" ? CFG[FIELD[f]] : "-")
+            print line
+        }
+    }' "$@"
 }
 
 # --- customize workflow (-C) ------------------------------------------------------

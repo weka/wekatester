@@ -3350,15 +3350,39 @@ print(\" \".join(ENGINE_ORDER))")
         print engine_order()
     }" "$d"/[a-g])
     [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
-# The schema and the floor marker are spelled in bash (GEOM_SLOTS,
-# GEOM_NAMES, FLOOR_MARKER, which the awk layer reads) and in lib.py.
+# The host file is read and written by awk now, and python's csv module is
+# the behaviour it keeps: held to the module itself, record for record.
+t_assert "awk and python agree: the host-file CSV, read and written" bash -c '
+    d=$(mktemp -d)
+    printf "h1,ubuntu,io_uring,\"8,10,12\",/mnt/w\nh2, \"8,10\",x\"y,\"a\"\"b\",\"q\"tail\n\n   \n,,,,\r\nh3,\"multi\nline\",z\n#c,\"x\",\"open\nh4,\"last\n" > "$d/hl.csv"
+    py=$(python3 -c "
+import csv, sys
+for row in csv.reader(open(sys.argv[1], newline=\"\")):
+    print(len(row), \"|\".join(row).replace(chr(10), \"<nl>\"))
+for row in ([\"h1\", \"8,10\", \"a\\\"b\", \"\", \" s \"], [\"x\", \"\"]):
+    w = csv.writer(sys.stdout, lineterminator=\"\"); w.writerow(row); print()
+" "$d/hl.csv")
+    aw=$(source ./wekatester; awkrun "BEGIN {
+        n = readlines(ARGV[1], L); r = csv_read(L, n, CN, CV)
+        for (i = 1; i <= r; i++) {
+            out = \"\"
+            for (k = 1; k <= CN[i]; k++) out = out (k > 1 ? \"|\" : \"\") CV[i, k]
+            gsub(/\n/, \"<nl>\", out); print CN[i], out
+        }
+        print csv_field(\"h1\") \",\" csv_field(\"8,10\") \",\" csv_field(\"a\\\"b\") \",\" csv_field(\"\") \",\" csv_field(\" s \")
+        print csv_field(\"x\") \",\" csv_field(\"\")
+    }" "$d/hl.csv")
+    [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
+# The schema, the floor marker, the engine order and the line-rate slots
+# are spelled in bash (the awk layer reads them from there) and in lib.py.
 t_assert "awk and python agree: the host-file schema and the floor marker" bash -c '
     source ./wekatester
-    py=$(pyrun <<< "print(\" \".join(GEOM_SLOTS)); print(\" \".join(GEOM_NAMES)); print(FLOOR_MARKER)") &&
-    aw=$(awkrun "BEGIN { print geom_slots(); print geom_names(); print floor_marker() }") &&
+    py=$(pyrun <<< "print(\" \".join(GEOM_SLOTS)); print(FLOOR_MARKER); print(\" \".join(ENGINE_ORDER)); print(\" \".join(LINE_RATE_SLOTS))") &&
+    aw=$(awkrun "BEGIN { print geom_slots(); print floor_marker(); print engine_order(); print line_rate_slots() }") &&
     [ "$py" = "$GEOM_SLOTS
-$GEOM_NAMES
-$FLOOR_MARKER" ] && [ "$aw" = "$py" ] || { printf "%s\n--\n%s\n" "$py" "$aw" >&2; false; }'
+$FLOOR_MARKER
+$ENGINE_ORDER
+$LINE_RATE_SLOTS" ] && [ "$aw" = "$py" ] || { printf "%s\n--\n%s\n" "$py" "$aw" >&2; false; }'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
@@ -5469,7 +5493,7 @@ t_assert "build: a python heredoc body in the bash source is exactly its include
         !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
         inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
         inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 18 && bad == 0) }
+        END { exit !(seen == 14 && bad == 0) }
     " src/wekatester.sh'
 t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/py"
