@@ -1522,7 +1522,7 @@ t_assert "python floor: every inline python heredoc parses" bash -c '
                 || { echo "does not parse: $f" >&2; bad=1; }
         done
     done
-    [ "$n" -gt 10 ] || { echo "only found $n blocks -- the extractor is broken" >&2; exit 1; }
+    [ "$n" -ge 10 ] || { echo "only found $n blocks -- the extractor is broken" >&2; exit 1; }
     [ "$bad" -eq 0 ]'
 
 # An apostrophe in a comment inside a bash -c '...' body closes the string
@@ -5476,6 +5476,27 @@ t_assert "staging: a --client list that overflows one shell argument dies before
     c=$( (source ./wekatester; FIO_BIN=/usr/bin/fio; TARGET_DIR=/dev/shm/x; HOSTS=(h1 h2); fio_client_cmd 011-bw.job) ) &&
     [ "$c" = "'"'"'/usr/bin/fio'"'"' --output-format=json --eta=never --client=h1 '"'"'/dev/shm/x/h1/011-bw.job'"'"' --client=h2 '"'"'/dev/shm/x/h2/011-bw.job'"'"'" ] || { echo "$c" >&2; false; }'
 
+# --- fio JSON in awk (Frank, 2026-10-05: no jq, no python) ---
+t_assert "json_flat: fio one-key-per-line and compact JSON flatten alike; strings unescape; an empty object leaves a mark; no JSON is 2, broken JSON is 3" bash -c '
+    d=$(mktemp -d)
+    printf "fio: a log line first\n{\n  \"fio version\" : \"fio-3.28\",\n  \"client_stats\" : [\n    {\n      \"jobname\" : \"bw\",\n      \"hostname\" : \"h1\",\n      \"read\" : {\n        \"bw_bytes\" : 2147483648,\n        \"lat_ns\" : { \"mean\" : 150000.000000 }\n      },\n      \"trim\" : {}\n    }\n  ]\n}\n" > "$d/pretty.json"
+    printf "{\"client_stats\":[{\"jobname\":\"bw\",\"hostname\":\"h1\",\"read\":{\"bw_bytes\":2147483648,\"lat_ns\":{\"mean\":150000.000000}},\"trim\":{}}],\"fio version\":\"fio-3.28\"}" > "$d/compact.json"
+    printf "{ \"s\": \"a \\\\\"q\\\\\" b\" }" > "$d/esc.json"
+    printf "no json\n" > "$d/none"; printf "{ \"a\": [1, }\n" > "$d/bad"
+    (source ./wekatester
+     a=$(json_flat "$d/pretty.json" | LC_ALL=C sort); b=$(json_flat "$d/compact.json" | LC_ALL=C sort)
+     [ -n "$a" ] && [ "$a" = "$b" ] &&
+     printf "%s\n" "$a" | grep -qx "client_stats.0.read.lat_ns.mean	150000.000000" &&
+     printf "%s\n" "$a" | grep -qx "client_stats.0.trim	{}" &&
+     [ "$(json_flat "$d/esc.json")" = "s	a \"q\" b" ] || { printf "%s\n" "$a"; json_flat "$d/esc.json"; exit 1; } >&2
+     json_flat "$d/none" > "$d/o"; [ $? -eq 2 ] && [ ! -s "$d/o" ] || exit 1
+     json_flat "$d/bad" > "$d/o" 2> "$d/e"; [ $? -eq 3 ] && grep -q "offset" "$d/e")'
+t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" bash -c '
+    for f in json_flat errno_text cal_values cal_lat_values check_fio_errors summarize summarize_report summ_one; do
+        body=$(sed -n "/^$f() {/,/^}/p" src/wekatester.sh); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }
+        printf "%s\n" "$body" | grep -q "python3\|pyrun\|PYEOF" && { echo "$f still uses python" >&2; exit 1; }
+    done; true'
+
 # --- build: the committed script is the assembly of src/ (plan B, 2026-10-05) ---
 # Both src/ and the assembled wekatester are committed; these keep them equal
 # and keep every Python body out of the bash source.
@@ -5493,8 +5514,11 @@ t_assert "build: a python heredoc body in the bash source is exactly its include
         !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
         inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
         inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 14 && bad == 0) }
+        END { exit !(seen == 10 && bad == 0) }
     " src/wekatester.sh'
+t_assert "build: no bash function is defined twice in the source" bash -c '
+    dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" src/wekatester.sh | sed "s/() *{//" | sort | uniq -d)
+    [ -z "$dup" ] || { echo "defined twice: $dup" >&2; false; }'
 t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/py"
     printf "#!/usr/bin/env bash\npyrun <<\"PYEOF\"\n#@include py/nope.py\nPYEOF\n" > "$d/src/wekatester.sh"

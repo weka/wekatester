@@ -1328,6 +1328,94 @@ sha256_hex() {
     printf '%s' "${out%% *}"
 }
 
+# --- fio JSON in awk (Frank, 2026-10-05: no jq, no python) -------------------
+# json_flat <file>: fio's JSON as "path<TAB>value" lines, one per scalar, e.g.
+# client_stats.3.read.bw_bytes<TAB>2147483648. A tokenizer, not a line
+# matcher, so fio's one-key-per-line output and compact JSON read the same.
+# Text before the first "{" (fio's own log lines) is skipped. Exit 2: no JSON
+# at all; exit 3: the JSON does not parse (the offset is on stderr).
+json_flat() {   # json_flat <file>
+    LC_ALL=C awk '
+    { buf = buf $0 "\n" }
+    function ws() { while (i <= n) { c = substr(buf, i, 1); if (c != " " && c != "\t" && c != "\n" && c != "\r") break; i++ } }
+    function fail(what) { printf "json: %s at offset %d\n", what, i > "/dev/stderr"; exit 3 }
+    function str(   out, c, e) {
+        # at the opening quote; returns the unescaped text, i past the closing quote
+        i++; out = ""
+        while (i <= n) {
+            c = substr(buf, i, 1)
+            if (c == "\"") { i++; return out }
+            if (c == "\\") {
+                e = substr(buf, i + 1, 1); i += 2
+                if (e == "n") out = out "\n"; else if (e == "t") out = out "\t"
+                else if (e == "r") out = out "\r"; else if (e == "u") { out = out "?"; i += 4 }
+                else out = out e
+                continue
+            }
+            out = out c; i++
+        }
+        fail("unterminated string")
+    }
+    function value(path,   c, k, idx, v) {
+        ws(); if (i > n) fail("unexpected end")
+        c = substr(buf, i, 1)
+        if (c == "{") {
+            i++; ws()
+            if (substr(buf, i, 1) == "}") { i++; printf "%s\t{}\n", path; return }
+            while (1) {
+                ws(); if (substr(buf, i, 1) != "\"") fail("expected a key")
+                k = str(); ws()
+                if (substr(buf, i, 1) != ":") fail("expected :"); i++
+                value(path == "" ? k : path "." k)
+                ws(); c = substr(buf, i, 1); i++
+                if (c == "}") return
+                if (c != ",") fail("expected , or }")
+            }
+        }
+        if (c == "[") {
+            i++; ws(); idx = 0
+            if (substr(buf, i, 1) == "]") { i++; printf "%s\t[]\n", path; return }
+            while (1) {
+                value(path "." idx); idx++
+                ws(); c = substr(buf, i, 1); i++
+                if (c == "]") return
+                if (c != ",") fail("expected , or ]")
+            }
+        }
+        if (c == "\"") { v = str(); printf "%s\t%s\n", path, v; return }
+        v = ""
+        while (i <= n) {
+            c = substr(buf, i, 1)
+            if (c == "," || c == "}" || c == "]" || c == " " || c == "\n" || c == "\t" || c == "\r") break
+            v = v c; i++
+        }
+        if (v == "") fail("unexpected character")
+        printf "%s\t%s\n", path, v
+    }
+    END {
+        n = length(buf); i = index(buf, "{")
+        if (i == 0) exit 2
+        value("")
+    }' "$1"
+}
+
+# Linux strerror for the errno fio reports (the workers are Linux, whatever
+# the controller is); the bare number when unknown.
+errno_text() {   # errno_text <n>
+    case "$1" in
+        1) printf 'Operation not permitted' ;;      2) printf 'No such file or directory' ;;
+        4) printf 'Interrupted system call' ;;      5) printf 'Input/output error' ;;
+        9) printf 'Bad file descriptor' ;;          11) printf 'Resource temporarily unavailable' ;;
+        12) printf 'Cannot allocate memory' ;;      13) printf 'Permission denied' ;;
+        16) printf 'Device or resource busy' ;;     17) printf 'File exists' ;;
+        19) printf 'No such device' ;;              20) printf 'Not a directory' ;;
+        21) printf 'Is a directory' ;;              22) printf 'Invalid argument' ;;
+        24) printf 'Too many open files' ;;         27) printf 'File too large' ;;
+        28) printf 'No space left on device' ;;     30) printf 'Read-only file system' ;;
+        110) printf 'Connection timed out' ;;       122) printf 'Disk quota exceeded' ;;
+    esac
+}
+
 # -a takes a level and, for the measuring levels, an optional per-rung
 # duration: "cal:15" runs each ladder rung for 15 measured seconds instead of
 # the 30s default. This is the CALIBRATION rung length; -x/--duration sets
@@ -2029,9 +2117,27 @@ stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|la
 # cal-* count, so aggregates ("All clients") and any foreign section can
 # never pollute the sum.
 cal_values() {   # cal_values <cur.json> <bw|iops>
-    python3 - "$1" "$2" <<'PYEOF'
-#@include py/cal_values.py
-PYEOF
+    local key
+    case "$2" in (bw) key=bw_bytes ;; (iops) key=iops ;;
+        (*) echo "ERROR: cal_values: unknown mode: $2 (bw|iops)" >&2; return 1 ;; esac
+    [ -r "$1" ] || { echo "ERROR: cal_values: cannot read $1" >&2; return 1; }
+    local flat rc
+    flat=$(json_flat "$1"); rc=$?
+    case $rc in
+        2) echo "ERROR: cal_values: no JSON in $1" >&2; return 1 ;;
+        3) echo "ERROR: cal_values: cannot parse fio JSON in $1" >&2; return 1 ;;
+    esac
+    printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v key="$key" -v path="$1" '
+        function idx(p,   a) { split(p, a, "."); return a[2] }
+        $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2 }
+        $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
+        $1 ~ ("^client_stats\\.[0-9]+\\.(read|write)\\." key "$") { v[idx($1)] += $2 }
+        END {
+            for (i in job) if (substr(job[i], 1, 4) == "cal-") {
+                h = (i in host) ? host[i] : "?"; tot[h] += v[i]; any = 1 }
+            if (!any) { printf "ERROR: cal_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
+            for (h in tot) printf "%s %d\n", h, tot[h] | "LC_ALL=C sort"
+        }'
 }
 
 # Per-client latency cell result: "<host> <mean-us> <iops>" -- fio's total
@@ -2039,9 +2145,35 @@ PYEOF
 # the IOPS delivered at it. Entries of one host are folded together weighted
 # by their IO count, so a cell without group_reporting still reads right.
 cal_lat_values() {   # cal_lat_values <json> <read|write>
-    python3 - "$1" "$2" <<'PYEOF'
-#@include py/cal_lat_values.py
-PYEOF
+    [ -r "$1" ] || { echo "ERROR: cal_lat_values: cannot read $1" >&2; return 1; }
+    local flat rc
+    flat=$(json_flat "$1"); rc=$?
+    case $rc in
+        2) echo "ERROR: cal_lat_values: no JSON in $1" >&2; return 1 ;;
+        3) echo "ERROR: cal_lat_values: cannot parse fio JSON in $1" >&2; return 1 ;;
+    esac
+    printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v d="$2" -v path="$1" '
+        function idx(p,   a) { split(p, a, "."); return a[2] }
+        $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
+        $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
+        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.lat_ns\\.mean$") { lat[idx($1)] = $2 }
+        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.total_ios$") { ios[idx($1)] = $2 }
+        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.iops$") { iops[idx($1)] = $2 }
+        END {
+            # entries in file order: the first per host seeds, the rest fold in by IO count
+            for (k = 1; k <= n; k++) {
+                i = order[k]
+                if (substr(job[i], 1, 4) != "cal-") continue
+                h = (i in host) ? host[i] : "?"
+                us = lat[i] / 1000.0; io = ios[i] + 0; ip = iops[i] + 0
+                if (!(h in seen)) { seen[h] = 1; L[h] = us; I[h] = ip; N[h] = io; continue }
+                t = N[h] + io
+                if (t > 0) L[h] = (L[h] * N[h] + us * io) / t
+                I[h] += ip; N[h] = t
+            }
+            for (h in seen) { any = 1; printf "%s %.3f %d\n", h, L[h], I[h] | "LC_ALL=C sort" }
+            if (!any) { printf "ERROR: cal_lat_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
+        }'
 }
 
 # Fill '-' geometry in targets.final from the measured tuples, one precedence
@@ -5970,9 +6102,49 @@ finalize_run_dir() {
 # reports neither signal still cannot slip through the run: the first
 # measured job then finds no files and trips the zero-IO check itself.
 check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
-    python3 - "$1" "$2" <<'PYEOF'
-#@include py/check_fio_errors.py
-PYEOF
+    local path=$1 mode=$2 flat rc
+    flat=$(json_flat "$path"); rc=$?
+    case $rc in
+        2) echo "$path: no JSON in fio output" >&2; return 1 ;;
+        3) echo "$path: cannot parse fio JSON" >&2; return 1 ;;
+    esac
+    local bad
+    bad=$(printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v mode="$mode" '
+        function idx(p,   a) { split(p, a, "."); return a[2] }
+        $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
+        $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
+        $1 ~ /^client_stats\.[0-9]+\.error$/ { err[idx($1)] = $2 }
+        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.total_ios$/ { moved[idx($1)] += $2 }
+        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.io_bytes$/ { moved[idx($1)] += $2; hasio[idx($1) "." $1] = 1 }
+        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.bw_bytes$/ { bw[idx($1)] += $2 }
+        END {
+            for (k = 1; k <= n; k++) {
+                i = order[k]
+                if (job[i] == "All clients") continue
+                stats++
+                e = err[i] + 0
+                if (e) { h = (i in host) ? host[i] : job[i]; printf "E\t%s\t%s\t%d\n", h, job[i], e; anybad = 1 }
+                h = (i in host) ? host[i] : job[i]; last[h] = i; hosts[h] = 1
+            }
+            if (!stats) { print "NONE"; exit }
+            if (mode == "measured" && !anybad)
+                for (h in hosts) { i = last[h]
+                    # io_bytes when fio gives it, else bw_bytes (older fio) -- per direction
+                    m = moved[i] + (i in bwonly ? 0 : 0)
+                    if (moved[i] + bw[i] == 0) printf "Z\t%s\n", h | "LC_ALL=C sort" }
+        }')
+    [ "$bad" != NONE ] || { echo "$path: fio returned no per-job stats -- the jobs did not run" >&2; return 1; }
+    [ -n "$bad" ] || return 0
+    local line kind h job e desc
+    while IFS=$'\t' read -r kind h job e; do
+        case "$kind" in
+            E) desc=$(errno_text "$e"); echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
+            Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2 ;;
+        esac
+    done <<<"$bad"
+    # fio's own log text precedes the JSON and names the underlying cause
+    LC_ALL=C awk 'index($0, "{") == 1 { exit } /[Ee]rror|ERROR|[Ff]ailed|FAILED/ { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print "ERROR: " $0; if (++n == 3) exit }' "$path" >&2
+    return 1
 }
 
 # fio cannot be trusted to create the directory tree a filename_format
@@ -6288,13 +6460,140 @@ run_jobs() {
 # Parse fio JSON results and print the human summary.
 # $1 = a results .json file, or a run-bundle .tgz: every results file inside
 #      the bundle is summarized in job order, read straight from the archive
-#      in memory -- nothing is extracted to disk.
+#      extracted once to a temp dir that is removed afterwards.
 # $2 = report items ("bandwidth iops latency"; empty = all)
 # $3 = expected hosts (space-separated; empty = don't check, e.g. -s mode)
 summarize() {
-    python3 - "$1" "$2" "${3:-}" <<'PYEOF' || die "failed to summarize $1"
-#@include py/summarize.py
-PYEOF
+    summarize_report "$1" "$2" "${3:-}" || die "failed to summarize $1"
+}
+
+summarize_report() {   # summarize_report <path> <items> <expected>
+    local path=$1 items=${2:-} expected=${3:-} tmp
+    [ -n "$items" ] || items="bandwidth latency iops"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/wt.summ.XXXXXX") || return 1
+    if tar -tf "$path" > "$tmp/list" 2> "$tmp/tar.err"; then
+        tar -xf "$path" -C "$tmp" 2> "$tmp/tar.err" || { echo "cannot extract $path" >&2; rm -rf "${tmp:?}"; return 1; }
+        local marker="# wekatester-layout: generated" f job skip results
+        # layout results are barriers, not measurements: the reserved names,
+        # plus any bundled jobfile that carries the layout marker (/dev/null
+        # keeps awk off stdin when there is no jobfile at all)
+        skip=" 000-wekatester-layout 000-wekatester-relayout 999-wekatester-unlink "
+        skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
+            | xargs -0 env LC_ALL=C awk -v m="$marker" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
+        results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
+        [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; rm -rf "${tmp:?}"; return 1; }
+        while IFS= read -r f; do
+            job=${f##*/}; job=${job#results_}; job=${job%.json}
+            case "$skip" in *" $job "*) continue ;; esac
+            echo "==== $job ===="
+            summ_one "$f" "${f##*/}" "$items" "" bundle
+        done <<<"$results"
+        rm -rf "${tmp:?}"; return 0
+    fi
+    rm -rf "${tmp:?}"
+    summ_one "$path" "$path" "$items" "$expected" file
+}
+
+# summ_one <file> <label> <items> <expected> <file|bundle>: the report for one
+# results file. In file mode an error goes to stderr and returns 1; in a
+# bundle it prints as "    (reason)" and the next file still gets reported.
+summ_one() {
+    local f=$1 label=$2 items=$3 expected=$4 mode=$5 flat rc out err="${TMPDIR:-/tmp}/wt.jsonerr.$$"
+    flat=$(json_flat "$f" 2> "$err"); rc=$?
+    case $rc in
+        2) out="ERR	$label: no JSON in fio output" ;;
+        3) out="ERR	$label: cannot parse fio JSON: $(sed 's/^json: //' "$err")" ;;
+        *) out=$(printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
+        function idx(p,   a) { split(p, a, "."); return a[2] }
+        function key(p,   a, n, k) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
+        function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB/s", n / 2^30)
+                         if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
+        function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
+                          if (ns >= 1e3) return sprintf("%.1f us", ns / 1e3); return sprintf("%.0f ns", ns) }
+        function fi(n,   s, r) { s = sprintf("%.0f", n); r = ""; while (length(s) > 3) { r = "," substr(s, length(s) - 2) r; s = substr(s, 1, length(s) - 3) } return s r "/s" }
+        # a value the report needs; the FIRST one missing names the layout
+        # error, as the python KeyError did: the direction when it is absent
+        # altogether, else the leaf key
+        function val(i, k,   kk, n) {
+            if ((i "." k) in has) return v[i "." k]
+            if (missing == "") { n = split(k, kk, "."); missing = ((i "." kk[1]) in dirhas) ? kk[n] : kk[1] }
+            return 0 }
+        # per-host min and max of metric m ("bw", "iops", "lat.read", "lat.write"), when they differ
+        function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
+            if (nh < 2) return ""
+            first = 1
+            for (h in hosts) {
+                i = last[h]
+                if (m == "bw") x = val(i, "read.bw_bytes") + val(i, "write.bw_bytes")
+                else if (m == "iops") x = val(i, "read.iops") + val(i, "write.iops")
+                else x = val(i, substr(m, 5) ".lat_ns.mean")
+                if (first || x < lo || (x == lo && h < loh)) { lo = x; loh = h }
+                if (first || x > hi || (x == hi && h > hih)) { hi = x; hih = h }
+                first = 0
+            }
+            if (lo == hi) return ""
+            if (kind == "bw") return "  (min " fb(lo) " " loh ", max " fb(hi) " " hih ")"
+            if (kind == "iops") return "  (min " fi(lo) " " loh ", max " fi(hi) " " hih ")"
+            return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
+        }
+        $1 ~ /^client_stats\.[0-9]+\./ {
+            i = idx($1); k = key($1)
+            if (i > maxi) maxi = i
+            if (k == "jobname") job[i] = $2
+            else if (k == "hostname") host[i] = $2
+            else { v[i "." k] = $2 + 0; has[i "." k] = 1; split(k, kk, "."); dirhas[i "." kk[1]] = 1 }
+            seen[i] = 1
+        }
+        END {
+            for (i = 0; i <= maxi; i++) {
+                if (!(i in seen)) continue
+                if (job[i] == "All clients") { alls = i; hasall = 1; continue }
+                h = (i in host) ? host[i] : ((i in job) ? job[i] : "?")
+                if (!(h in hosts)) { hosts[h] = 1; nh++ }
+                last[h] = i
+            }
+            if (!hasall) {
+                if (nh == 1) { for (h in hosts) alls = last[h] }
+                else { printf "ERR\t%s: no %sAll clients%s aggregate found\n", label, "\047", "\047"; exit }
+            }
+            if (expected != "") {
+                n = split(expected, ex, " "); miss = ""; nm = 0
+                for (j = 1; j <= n; j++) if (ex[j] != "" && !(ex[j] in hosts)) { miss = miss (nm ? ", " : "") ex[j]; nm++ }
+                if (nm) { printf "ERR\t%s: no results from %d of %d host(s): %s\n", label, nm, n, miss; exit }
+            }
+            nl = 0; missing = ""
+            if (index(items, " bandwidth ")) {
+                r = val(alls, "read.bw_bytes"); w = val(alls, "write.bw_bytes")
+                if (r) L[++nl] = "read bandwidth: " fb(r)
+                if (w) L[++nl] = "write bandwidth: " fb(w)
+                if (r && w) L[++nl] = "total bandwidth: " fb(r + w)
+                if (r || w) L[++nl] = "average bandwidth: " fb(nh ? (r + w) / nh : 0) " per host" spread("bw", "bw")
+            }
+            if (index(items, " iops ")) {
+                r = val(alls, "read.iops"); w = val(alls, "write.iops")
+                if (r) L[++nl] = "read iops: " fi(r)
+                if (w) L[++nl] = "write iops: " fi(w)
+                if (r && w) L[++nl] = "total iops: " fi(r + w)
+                if (r || w) L[++nl] = "average iops: " fi(nh ? (r + w) / nh : 0) " per host" spread("iops", "iops")
+            }
+            if (index(items, " latency ")) {
+                rl = val(alls, "read.lat_ns.mean"); if (rl) L[++nl] = "read latency: " fl(rl) spread("lat.read", "lat")
+                wl = val(alls, "write.lat_ns.mean"); if (wl) L[++nl] = "write latency: " fl(wl) spread("lat.write", "lat")
+                ri = val(alls, "read.total_ios"); wi = val(alls, "write.total_ios")
+                if (rl && wl && (ri + wi)) L[++nl] = "average latency: " fl((rl * ri + wl * wi) / (ri + wi)) " (IO-weighted)"
+            }
+            if (missing != "") { printf "ERR\t%s: not the fio JSON layout this summary reads: KeyError(%s%s%s)\n", label, "\047", missing, "\047"; exit }
+            if (!nl) L[++nl] = "(no non-zero metrics to report)"
+            for (j = 1; j <= nl; j++) print "    " L[j]
+        }') ;;
+    esac
+    rm -f "$err"
+    case "$out" in
+        "ERR	"*)
+            if [ "$mode" = bundle ]; then printf '    (%s)\n\n' "${out#ERR	}"; return 0; fi
+            printf '%s\n' "${out#ERR	}" >&2; return 1 ;;
+    esac
+    printf '%s\n\n' "$out"
 }
 
 # --- main ----------------------------------------------------------------------
