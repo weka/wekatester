@@ -527,15 +527,9 @@ warn and continue (useful when `df` under-reports, e.g. a filesystem that
 is thin-provisioned or still rebalancing). If `df` returns nothing usable
 for a host, that host goes unchecked, with a warning.
 
-# Source layout and build
+# Source
 
-`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is assembled, not hand-edited:
-
-- `src/wekatester.sh` — the bash. Each Python heredoc holds one `#@include py/<name>.py` line in place of its body.
-- `src/py/*.py` — the Python, one file per heredoc; `lib.py` is the shared library `pyrun` prepends to each of the others at run time.
-- `./build` — bash and awk; splices the pieces into `./wekatester` (`./build <path>` writes elsewhere).
-
-Both the sources and the assembled `wekatester` are committed. Edit under `src/`, run `./build`, run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's). The suite fails when the committed script and the assembly differ, when an include names a missing file, or when a Python body is left in the bash source.
+`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is bash and awk throughout: the rules more than one part needs (the core rule, the host-file schema, the seed sizes, the layout, JSON) live once, in the awk library `awkrun` prepends to every program. Edit `wekatester` itself, then run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's).
 
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:

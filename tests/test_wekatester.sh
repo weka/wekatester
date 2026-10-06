@@ -181,20 +181,16 @@ t_assert "probe snippet measures which cpus can actually be bound" bash -c '
 t_assert "probe facts: an absent bindable line means UNTESTED, never none" bash -c '
     d=$(mktemp -d)
     printf "ncpus 8\n" > "$d/p"
-    (source ./wekatester; pyrun "$d/p" <<"EOF"
-import sys
-p = sys.argv[1]
-s, tested = probe_cpu_fact(p, "bindable")
-assert not tested and s == set(), (s, tested)
-assert probe_unbindable(p, set(range(8))) == set(), "a guess, not a measurement"
-assert probe_universe(p, 8) == set(range(8))
-open(p, "a").write("bindable -\nonline 0-3\n")
-s, tested = probe_cpu_fact(p, "bindable")
-assert tested and s == set(), (s, tested)
-assert probe_unbindable(p, set(range(8))) == set(range(8))
-assert probe_universe(p, 8) == {0, 1, 2, 3}
-EOF
-    )'
+    facts() { (source ./wekatester; awkrun "BEGIN {
+        np = readlines(ARGV[1], P); t = probe_cpu_fact(P, np, \"bindable\", S)
+        for (c = 0; c < 8; c++) U8[c] = 1
+        probe_unbindable(P, np, U8, UB); probe_universe(P, np, 8, U)
+        print t \"|\" join_sorted(S, \",\") \"|\" join_sorted(UB, \",\") \"|\" join_sorted(U, \",\")
+    }" "$d/p"); }
+    # untested: no cpus refused -- a guess is not a measurement
+    [ "$(facts)" = "0|||0,1,2,3,4,5,6,7" ] || { echo "untested: $(facts)" >&2; exit 1; }
+    printf "bindable -\nonline 0-3\n" >> "$d/p"
+    [ "$(facts)" = "1||0,1,2,3,4,5,6,7|0,1,2,3" ] || { echo "tested: $(facts)" >&2; false; }'
 
 # --- tuner: fabricate probe dir + jobfile, run auto_tune ---
 t_assert "tuner writes per-host variants" bash -c '
@@ -1456,55 +1452,13 @@ t_assert "cal_evidence: quiet copies but does not repeat what check_fio_errors a
             cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1) 2>&1 )
     [ -s "$r/cal/res-x.json" ] && [ -s "$r/cal/x.h1.job" ] &&
     case "$out" in *"fio said"*) echo "$out" >&2; false;; *) true;; esac'
-# --- python floor: the workers are older than this laptop ---
-# The inline python has to run on the WORKERS, and a Weka client is commonly
-# RHEL 8, which ships python 3.6. A developer box running 3.9+ will happily
-# execute a 3.8-only call and say nothing, and the failure then lands in the
-# field halfway through a calibration -- which is exactly how
-# statistics.fmean got in (it is 3.8+, and it took out -a cal:30 on field client A
-# after six minutes of measuring). Grep for the ones that would do it again.
-t_assert "python floor: no stdlib or syntax newer than 3.6 in the inline python" bash -c '
-    # API and syntax added after 3.6, spelled as they would appear here
-    pat="statistics\.fmean|st\.fmean"
-    pat="$pat|statistics\.quantiles|st\.quantiles|statistics\.multimode|st\.multimode"
-    pat="$pat|statistics\.geometric_mean|statistics\.harmonic_mean"
-    pat="$pat|math\.prod|math\.dist|math\.perm|math\.comb|math\.isqrt"
-    pat="$pat|\.removeprefix\(|\.removesuffix\(|functools\.cached_property"
-    pat="$pat|shlex\.join|graphlib|importlib\.metadata"
-    hits=$(grep -nE "$pat" ./wekatester | grep -v "^[0-9]*: *#" | grep -v "not statistics\." || true)
-    [ -z "$hits" ] || { printf "post-3.6 API in the inline python:\n%s\n" "$hits" >&2; false; }'
-# Every inline python block has to at least PARSE. A syntax error in a heredoc
-# is invisible until the branch that runs it runs, which for a calibration
-# verdict is minutes into a real run on a real client.
-t_assert "python floor: every inline python heredoc parses" bash -c '
-    d=$(mktemp -d); n=0; bad=0
-    # each block is "<<\x27TAG\x27" ... TAG, with the python between; pull them
-    # out by tag and compile each one. The tag comes out with a second grep
-    # (tr has no \x escape, so the quotes survived and no block was ever
-    # found); a start line may go on past the tag ("|| return 1"); CSVEOF is
-    # data for cat, not python.
-    for tag in $(grep -oE "<<.[A-Z][A-Z0-9]*EOF." ./wekatester | grep -oE "[A-Z][A-Z0-9]*EOF" | sort -u); do
-        [ "$tag" != CSVEOF ] || continue
-        awk -v t="$tag" "
-            \$0 ~ (\"<<.\" t \".\") { inb = 1; next }
-            inb && \$0 == t             { inb = 0; print \"###SPLIT###\"; next }
-            inb                        { print }
-        " ./wekatester > "$d/$tag.raw"
-        [ -s "$d/$tag.raw" ] || continue
-        i=0
-        while IFS= read -r line; do
-            case "$line" in ("###SPLIT###") i=$((i + 1)); continue;; esac
-            printf "%s\n" "$line" >> "$d/$tag.$i.py"
-        done < "$d/$tag.raw"
-        for f in "$d/$tag".*.py; do
-            [ -f "$f" ] || continue
-            n=$((n + 1))
-            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" \
-                || { echo "does not parse: $f" >&2; bad=1; }
-        done
-    done
-    [ "$n" -ge 1 ] || { echo "only found $n blocks -- the extractor is broken" >&2; exit 1; }
-    [ "$bad" -eq 0 ]'
+# --- no python: bash and awk only ---
+# The script once carried 3,480 lines of python, every one of them added
+# without being asked for (Frank, 2026-10-05: bash first is binding); the
+# last of it went 2026-10-06. Keep it that way.
+t_assert "no python: the script runs none" bash -c '
+    hits=$(grep -nE "python3|pyrun|PYEOF|#@include" ./wekatester || true)
+    [ -z "$hits" ] || { printf "python in the script:\n%s\n" "$hits" >&2; false; }'
 
 # An apostrophe in a comment inside a bash -c '...' body closes the string
 # early: the rest of the body becomes arguments to bash, and the test passes
@@ -1843,10 +1797,10 @@ t_assert "cores_summary: cores a host-file list leaves out, or the host cannot b
     d=$(mktemp -d); printf "ncpus 8\n" > "$d/p"
     # lab 3, 2026-09-27: a list written back by a calibration printed
     # "16 physical - 6 weka DPDK - 1 reserved (0-1) = N=7"
-    out=$(source ./wekatester; pyrun "$d/p" <<< "import sys; print(cores_summary(probe_cores(sys.argv[1], \"4-11\")))")
+    out=$(cores_line "$d/p" 4-11)
     case "$out" in "8 physical core(s) (no topology: one per cpu) - 0 weka DPDK - 1 reserved for the OS (0) - 3 outside the host-file cpu list = N=4: "*) ;; *) echo "4-11: $out" >&2; exit 1;; esac
     printf "ncpus 8\nonline 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/p"
-    out=$(source ./wekatester; pyrun "$d/p" <<< "import sys; print(cores_summary(probe_cores(sys.argv[1])))")
+    out=$(cores_line "$d/p")
     case "$out" in "8 physical core(s) (no topology: one per cpu) - 0 weka DPDK - 2 reserved for the OS (0 1) - 2 unbindable = N=4: "*) ;; *) echo "unbindable: $out" >&2; false;; esac'
 
 # --- cal_values: per-client rung values from fio client JSON ---
@@ -3175,10 +3129,7 @@ t_assert "writeback: with --line-rate a measured bandwidth tuple replaces the ho
 # layer's own constants going through both.
 t_assert "cal.results: one width, both parsers accept what the shared layer defines" bash -c '
     d=$(mktemp -d); mkdir -p "$d/jobs" "$d/auth"
-    row=$( (source ./wekatester; pyrun <<"PYW"
-print("h1 libaio " + " ".join(["4", "2", "1024M", "3"] * len(CAL_SLOTS)))
-PYW
-    ) )
+    row=$(source ./wekatester; r="h1 libaio"; for s in $GEOM_SLOTS; do r="$r 4 2 1024M 3"; done; echo "$r")
     printf "%s\n" "$row" > "$d/cal.results"
     : > "$d/engine.results"
     # parser 1: apply_cal_results
@@ -3261,19 +3212,18 @@ t_assert "pinning: only the cores weka's node processes own are excluded (field 
     [ "$(cat "$d/auth/h1.cpus")" = "4-13,28-55" ]'
 # The shared python layer is the single encoding of the schema and the
 # direction rule; pin its load-bearing numbers so a drift fails here first.
-t_assert "pylib: one schema for fields, slot bases, and the direction rule" bash -c '
+t_assert "schema: one spelling of the fields, the slot columns and the direction rule" bash -c '
     source ./wekatester
-    a=$(pyrun <<< "print(len(FIELDS), slot_base(\"bw_r\"), slot_base(\"iops_w\"), len(CAL_SLOTS), CAL_HEAD, CAL_COLS)") &&
-    [ "$a" = "36 5 25 8 2 34" ] &&
-    c=$(pyrun <<< "print(\" \".join(CAL_SLOTS))") &&
-    [ "$c" = "bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w" ] &&
+    a=$(awkrun "BEGIN { n = split(geom_slots(), S, \" \"); print 4 + 4 * n, field_col(\"bw_r_nj\"), field_col(\"iops_w_nj\"), field_col(\"lat1m_w_qd\"), n, 2 + 4 * n }") &&
+    [ "$a" = "36 6 26 37 8 34" ] &&
+    [ "$GEOM_SLOTS" = "bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w" ] &&
     d=$(mktemp -d) && write_targets_template "$d/t.csv" >/dev/null &&
     head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd$" &&
-    b=$(pyrun <<< "print(\" \".join(sorted(file_directions([\"[x]\", \"rw=randrw:8\"]))))") &&
+    b=$(awkrun "BEGIN { L[1] = \"[x]\"; L[2] = \"rw=randrw:8\"; file_directions(L, 2, D); print ((\"read\" in D) ? \"read\" : \"-\"), ((\"write\" in D) ? \"write\" : \"-\") }") &&
     [ "$b" = "read write" ]'
-# The jobfile rules the staging awks and the tuner (python) both apply:
-# held to one answer, input for input.
-t_assert "awk and python agree: parse_size, first_value, last_section, job_bs, lat_kind, file_directions, pick_slot and pick_engine" bash -c '
+# The jobfile rules, held to the answers the python gave them before it went
+# (tests/golden/jobfile-rules.txt), input for input.
+t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind, file_directions, pick_slot and pick_engine give the recorded answers" bash -c '
     d=$(mktemp -d)
     printf "# report latency\n[global]\nbs=4k\nrw=randread\n[lat]\nbs=1M\n" > "$d/a"
     printf "[global]\nrw=randrw:8\nblocksize=1Mi,4k\n[x]\n[y]\nrw=write\n" > "$d/b"
@@ -3282,22 +3232,6 @@ t_assert "awk and python agree: parse_size, first_value, last_section, job_bs, l
     printf "\n" > "$d/f"
     printf "[a]]\nrw=rw\n[b]x\nbs=2M\n[global]\n" > "$d/g"
     sizes="5G 1.5GiB 4k 4096 512m 1Mi 2MiB 1Gb 1GIB 50%% 1G-2G x .5G 5. 10T 7i 0 3.99k"
-    py=$(source ./wekatester; pyrun "$d"/[a-g] <<< "import sys
-for s in \"$sizes\".split():
-    try:
-        print(parse_size(s))
-    except ValueError:
-        print(\"ValueError\")
-for p in sys.argv[1:]:
-    L = open(p).read().splitlines()
-    print(job_bs(L), lat_kind(L), \" \".join(sorted(file_directions(L))) or \"-\", first_value(L, \"filename_format\") or \"-\", last_section(L) or \"-\")
-rows = {\"bw_r_qd\": \"8\", \"bw_w_qd\": \"16\", \"lat_r_nj\": \"4\", \"iops_w_fs\": \"1G\", \"lat1m_w_qd\": \"x\"}
-for kind in (\"bw\", \"lat\", \"iops\", \"lat1m\"):
-    for dirs in ({\"read\"}, {\"write\"}, {\"read\", \"write\"}, set()):
-        print(kind, \" \".join(sorted(dirs)) or \"-\", pick_slot(kind, dirs, lambda k: rows.get(k, \"\")) or \"-\")
-for t in ({}, {\"libaio\": 2, \"io_uring\": 1}, {\"psync\": 1, \"libaio\": 1}, {\"mmap\": 1, \"sync\": 1}, {\"mmap\": 2, \"libaio\": 2}):
-    print(pick_engine(t))
-print(\" \".join(ENGINE_ORDER))")
     aw=$(source ./wekatester; awkrun "BEGIN {
         n = split(\"$sizes\", Z, \" \")
         for (i = 1; i <= n; i++) print ((v = parse_size(Z[i])) == \"\" ? \"ValueError\" : sprintf(\"%.0f\", v))
@@ -3321,7 +3255,7 @@ print(\" \".join(ENGINE_ORDER))")
         T4[\"mmap\"] = 2; T4[\"libaio\"] = 2; O4[1] = \"mmap\"; O4[2] = \"libaio\"; print pick_engine(T4, O4, 2)
         print engine_order()
     }" "$d"/[a-g])
-    [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
+    want=$(cat tests/golden/jobfile-rules.txt) && [ -n "$aw" ] && [ "$aw" = "$want" ] || { printf "want:\n%s\nawk:\n%s\n" "$want" "$aw" >&2; false; }'
 # The host file is read and written by awk now, and python's csv module is
 # the behaviour it keeps: held to the module itself, record for record.
 t_assert "awk and python agree: the host-file CSV, read and written" bash -c '
@@ -3346,15 +3280,14 @@ for row in ([\"h1\", \"8,10\", \"a\\\"b\", \"\", \" s \"], [\"x\", \"\"]):
     }" "$d/hl.csv")
     [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
 # The schema, the floor marker, the engine order and the line-rate slots
-# are spelled in bash (the awk layer reads them from there) and in lib.py.
-t_assert "awk and python agree: the host-file schema and the floor marker" bash -c '
+# are spelled in bash; the awk layer reads them from there.
+t_assert "schema: the awk layer reads the schema, the floor marker, the engine order and the line-rate slots from bash" bash -c '
     source ./wekatester
-    py=$(pyrun <<< "print(\" \".join(GEOM_SLOTS)); print(FLOOR_MARKER); print(\" \".join(ENGINE_ORDER)); print(\" \".join(LINE_RATE_SLOTS))") &&
     aw=$(awkrun "BEGIN { print geom_slots(); print floor_marker(); print engine_order(); print line_rate_slots() }") &&
-    [ "$py" = "$GEOM_SLOTS
+    [ "$aw" = "$GEOM_SLOTS
 $FLOOR_MARKER
 $ENGINE_ORDER
-$LINE_RATE_SLOTS" ] && [ "$aw" = "$py" ] || { printf "%s\n--\n%s\n" "$py" "$aw" >&2; false; }'
+$LINE_RATE_SLOTS" ] || { printf "%s\n" "$aw" >&2; false; }'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
@@ -4055,27 +3988,16 @@ topo_fixture() {
 export -f topo_fixture
 t_assert "probe_cores: N counts physical cores; weka's DPDK cores leave with their siblings, core 0's pair stays with the OS" bash -c '
     d=$(mktemp -d); topo_fixture "$d/p" 16 adjacent 12 14
-    (source ./wekatester; pyrun "$d/p" <<"EOF"
-import sys
-c = probe_cores(sys.argv[1])
-assert c["n"] == 4 and c["ncores"] == 8 and c["dpdk"] == 2, c
-assert c["phys"] == [4, 6, 8, 10] and c["all"] == list(range(4, 12)), c
-assert c["reserved"] == [[0, 1], [2, 3]] and c["smt"] and c["topo"], c
-EOF
-    )'
+    # n ncores dpdk catchall unlisted unbound topo weka_core0 | phys | all | reserved
+    out=$(cores_facts "$d/p")
+    [ "$out" = "4 8 2 0 0 0 1 0|4,6,8,10|4,5,6,7,8,9,10,11|0-1 2-3" ] || { echo "$out" >&2; false; }'
 t_assert "probe_cores: siblings numbered i and i+8 are found from the topology, not by adjacency" bash -c '
     d=$(mktemp -d); topo_fixture "$d/p" 16 split 6 7
-    (source ./wekatester; pyrun "$d/p" <<"EOF"
-import sys
-c = probe_cores(sys.argv[1])
-assert c["n"] == 4 and c["phys"] == [2, 3, 4, 5], c
-assert c["all"] == [2, 3, 4, 5, 10, 11, 12, 13], c
-assert c["reserved"] == [[0, 8], [1, 9]], c
-EOF
-    )'
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "${head%% *}" = 4 ] && [ "$phys" = 2,3,4,5 ] && [ "$all" = 2,3,4,5,10,11,12,13 ] && [ "$res" = "0,8 1,9" ] || { echo "$head|$phys|$all|$res" >&2; false; }'
 t_assert "cores_summary: with weka on core 0, a host-file list reserves nothing more and the sum still adds up" bash -c '
     d=$(mktemp -d); printf "ncpus 8\nweka_allowed 0\nweka_allowed 7\n" > "$d/p"
-    out=$(source ./wekatester; pyrun "$d/p" <<< "import sys; print(cores_summary(probe_cores(sys.argv[1], \"2-6\")))")
+    out=$(cores_line "$d/p" 2-6)
     case "$out" in "8 physical core(s) (no topology: one per cpu) - 2 weka DPDK - 0 reserved for the OS (none) - 1 outside the host-file cpu list = N=5: "*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "probe_cores: a list covering every cpu fio could use counts as none, however it is spelled; a narrower one is the operator reserve" bash -c '
     d=$(mktemp -d)
@@ -4084,46 +4006,39 @@ t_assert "probe_cores: a list covering every cpu fio could use counts as none, h
     topo_fixture "$d/p" 32 adjacent 2 4 6 8 10 12
     # field client B: 64 cores without SMT, weka on 48-63: N=41
     { printf "ncpus 64\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/q"
-    (source ./wekatester; pyrun "$d/p" "$d/q" <<"EOF"
-import sys
-p, q = sys.argv[1], sys.argv[2]
-for l in ("", "0-31", "1-31", "14-31", "0-63"):
-    c = probe_cores(p, l)
-    assert c["n"] == 7 and c["all"] == list(range(18, 32)), (l, c)
-    assert c["catchall"] == bool(l), (l, c)
-# the list a calibration writes back leaves the rest of the reserve out: it
-# stays an operator list, and the log line says where the 2 cores went
-c = probe_cores(p, "18-31")
-assert c["n"] == 7 and not c["catchall"] and c["unlisted"] == 2, c
-assert "- 1 reserved for the OS (0-1) - 2 outside the host-file cpu list = N=7" in cores_summary(c), cores_summary(c)
-# leaving out a cpu fio could use is a choice: 16-31 gets 14-15 back
-assert probe_cores(p, "16-31")["n"] == 8
-for l in ("0-255", "0-47", "1-255", "1-47"):
-    c = probe_cores(q, l)
-    assert c["n"] == 41 and c["catchall"], (l, c)
-assert probe_cores(q, "2-47")["n"] == 46
-EOF
-    )'
+    # n ncores dpdk catchall unlisted unbound topo weka_core0 | phys | all | reserved
+    all="18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+    for l in "" 0-31 1-31 14-31 0-63; do
+        IFS="|" read -r head _ a _ <<< "$(cores_facts "$d/p" "$l")"; read -r n _ _ ca _ <<< "$head"
+        [ "$n" = 7 ] && [ "$a" = "$all" ] && [ "$ca" = "$([ -n "$l" ] && echo 1 || echo 0)" ] || { echo "list [$l]: $head $a" >&2; exit 1; }
+    done
+    # the list a calibration writes back leaves the rest of the reserve out: it
+    # stays an operator list, and the log line says where the 2 cores went
+    IFS="|" read -r head _ _ _ <<< "$(cores_facts "$d/p" 18-31)"; read -r n _ _ ca ul _ <<< "$head"
+    [ "$n" = 7 ] && [ "$ca" = 0 ] && [ "$ul" = 2 ] || { echo "18-31: $head" >&2; exit 1; }
+    case "$(cores_line "$d/p" 18-31)" in *"- 1 reserved for the OS (0-1) - 2 outside the host-file cpu list = N=7"*) ;; *) echo "18-31 summary" >&2; exit 1;; esac
+    # leaving out a cpu fio could use is a choice: 16-31 gets 14-15 back
+    [ "$(cores_facts "$d/p" 16-31 | cut -d" " -f1)" = 8 ] || { echo "16-31" >&2; exit 1; }
+    for l in 0-255 0-47 1-255 1-47; do
+        IFS="|" read -r head _ _ _ <<< "$(cores_facts "$d/q" "$l")"; read -r n _ _ ca _ <<< "$head"
+        [ "$n" = 41 ] && [ "$ca" = 1 ] || { echo "q [$l]: $head" >&2; exit 1; }
+    done
+    [ "$(cores_facts "$d/q" 2-47 | cut -d" " -f1)" = 46 ] || { echo "2-47" >&2; false; }'
 t_assert "probe_cores: two sockets reserve core 0 and the next of socket 0, then the first two of socket 1; 5-8 DPDK cores add one" bash -c '
     d=$(mktemp -d)
     { printf "ncpus 64\nonline 0-63\n"
       for c in $(seq 24 31); do printf "weka_allowed %s\n" "$c"; done
       for c in $(seq 0 63); do k=$(( c % 32 ))
           printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s,%s\n" $c $(( k / 16 )) $c $k $c $k $(( k + 32 )); done; } > "$d/p"
-    (source ./wekatester; pyrun "$d/p" <<"EOF"
-import sys
-c = probe_cores(sys.argv[1])
-assert c["ncores"] == 32 and c["dpdk"] == 8 and c["sockets"] == 2, c
-assert [t[0] for t in c["reserved"]] == [0, 16, 1, 17, 2], c["reserved"]
-assert c["n"] == 32 - 8 - 5, c
-EOF
-    )'
-# usable_cores and the pinning check run the core rule in awk, the tuner and
-# the calibration shapes in python (lib.py): two spellings of ONE rule, held
-# to the same answer on every probe shape the suite knows -- topology or
+    # 32 cores, 8 of them DPDK, 5 reserved: 0 and 1 of socket 0, 16 and 17 of
+    # socket 1, then 2 -- each with its sibling
+    IFS="|" read -r head _ _ res <<< "$(cores_facts "$d/p")"; read -r n nc dp _ <<< "$head"
+    [ "$nc" = 32 ] && [ "$dp" = 8 ] && [ "$n" = 19 ] && [ "$res" = "0,32 16,48 1,33 17,49 2,34" ] || { echo "$head|$res" >&2; false; }'
+# The core rule, held to the answers the python gave it before it went
+# (tests/golden/probe-cores.txt) on every probe shape the suite knows -- topology or
 # none, SMT adjacent or split, two sockets, offline and unbindable cpus,
 # weka on core 0 -- for no list, operator lists, and catch-alls.
-t_assert "awk and python agree: probe_cores, cores_summary, reserve_count and probe_aio_room, probe for probe and list for list" bash -c '
+t_assert "probe_cores, cores_summary, reserve_count and probe_aio_room give the recorded answers, probe for probe and list for list" bash -c '
     d=$(mktemp -d)
     topo_fixture "$d/p1" 32 adjacent 2 4 6 8 10 12
     topo_fixture "$d/p2" 16 split 6 7
@@ -4137,12 +4052,6 @@ t_assert "awk and python agree: probe_cores, cores_summary, reserve_count and pr
     printf "engines psync \n" > "$d/p7"
     { printf "ncpus 6\nonline 2-7\n"
       for c in 2 3 4 5 6 7; do printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\n" $c $(( c / 4 )) $c $(( c / 2 )); done; } > "$d/p8"
-    py=$(source ./wekatester; pyrun "$d"/p* <<< "import sys
-for p in sys.argv[1:]:
-    for l in (\"\", \"0-3\", \"2-6\", \"4-11\", \"18-31\", \"16-31\", \"0-63\", \"1-255\"):
-        c = probe_cores(p, l)
-        print(c[\"n\"], \",\".join(map(str, c[\"phys\"])), \",\".join(map(str, c[\"all\"])), int(c[\"catchall\"]), probe_aio_room(p), cores_summary(c))
-print(\" \".join(str(reserve_count(n, k)) for n in range(1, 70) for k in range(0, 20)))")
     aw=$(source ./wekatester; awkrun "BEGIN {
         nl = split(\"-|0-3|2-6|4-11|18-31|16-31|0-63|1-255\", LS, \"|\")
         for (i = 1; i < ARGC; i++) {
@@ -4155,22 +4064,26 @@ print(\" \".join(str(reserve_count(n, k)) for n in range(1, 70) for k in range(0
         for (n = 1; n < 70; n++) for (k = 0; k < 20; k++) out = out (out == \"\" ? \"\" : \" \") reserve_count(n, k)
         print out
     }" "$d"/p*)
-    [ -n "$py" ] && [ "$py" = "$aw" ] || { printf "python:\n%s\nawk:\n%s\n" "$py" "$aw" >&2; false; }'
+    want=$(cat tests/golden/probe-cores.txt) && [ -n "$aw" ] && [ "$aw" = "$want" ] || { printf "want:\n%s\nawk:\n%s\n" "$want" "$aw" >&2; false; }'
 t_assert "reserve rules: 2 up to 24 cores, 4 above, +1 per 4 DPDK past 4, at most 12 and half; round-robin placement" bash -c '
-    (source ./wekatester; pyrun <<"EOF"
-assert reserve_count(8, 2) == 2 and reserve_count(24, 4) == 2 and reserve_count(25, 4) == 4
-assert reserve_count(64, 5) == 5 and reserve_count(64, 8) == 5 and reserve_count(64, 9) == 6
-assert reserve_count(200, 64) == 12, "at most 12"
-assert reserve_count(4, 8) == 2, "never more than half the cores"
-assert reserve_count(2, 0) == 1, "core 0 always"
-order = list(range(8))
-one = dict((k, 0) for k in order)
-assert place_reserve(order, one, set(), 0, 4) == [0, 1, 2, 3]
-four = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3}
-assert place_reserve(order, four, set(), 0, 4) == [0, 2, 4, 6], "one core per socket"
-assert place_reserve(order, one, {0, 1}, 0, 2) == [2, 3], "a DPDK core is never reserved, not even core 0"
-EOF
-    )'
+    out=$(source ./wekatester; awkrun "
+    function placed(SOCK, DP, want,    n, R, i, s) {
+        n = place_reserve(ORD, 8, SOCK, DP, 0, want, R); s = \"\"
+        for (i = 1; i <= n; i++) s = s (i > 1 ? \",\" : \"\") R[i]
+        return s
+    }
+    BEGIN {
+        print reserve_count(8, 2), reserve_count(24, 4), reserve_count(25, 4), reserve_count(64, 5), reserve_count(64, 8), reserve_count(64, 9), reserve_count(200, 64), reserve_count(4, 8), reserve_count(2, 0)
+        for (k = 0; k < 8; k++) { ORD[k + 1] = k; ONE[k] = 0; FOUR[k] = int(k / 2) }
+        split(\"\", NONE); D01[0] = 1; D01[1] = 1
+        print placed(ONE, NONE, 4); print placed(FOUR, NONE, 4); print placed(ONE, D01, 2)
+    }")
+    # at most 12, never more than half the cores, core 0 always; one core per
+    # socket; a DPDK core is never reserved, not even core 0
+    [ "$out" = "2 2 4 5 5 6 12 2 1
+0,1,2,3
+0,2,4,6
+2,3" ] || { echo "$out" >&2; false; }'
 t_assert "usable_cores: a client too small for its DPDK cores stops, naming the arithmetic" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     # lab 3 as built: 8 cores, 6 of them weka DPDK -- the reserve wants 3, gets 2
@@ -4389,9 +4302,10 @@ t_assert "probe: the kernel's aio limit and use come along as aio_max_nr and aio
     out=$(WEKATESTER_SYSROOT=$r bash -c "$cmd" 2>&1)
     printf "%s\n" "$out" | grep -qx "aio_max_nr 65536" && printf "%s\n" "$out" | grep -qx "aio_nr 1024" &&
     printf "%s\n" "$out" > "$d/p" &&
-    [ "$(source ./wekatester; pyrun "$d/p" <<< "import sys; print(probe_aio_room(sys.argv[1]))")" = 64512 ] &&
+    room() { (source ./wekatester; awkrun "BEGIN { np = readlines(ARGV[1], P); r = probe_aio_room(P, np); print (r == \"\" ? \"None\" : r) }" "$1"); }
+    [ "$(room "$d/p")" = 64512 ] &&
     printf "ncpus 4\n" > "$d/q" &&
-    [ "$(source ./wekatester; pyrun "$d/q" <<< "import sys; print(probe_aio_room(sys.argv[1]))")" = None ]'
+    [ "$(room "$d/q")" = None ]'
 t_assert "cal_plan: libaio stops a queue ladder at the kernel's aio room, and says how to go deeper" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     # field client B, 2026-09-25: 188 jobs x 512 set up more aio events than 65,536;
@@ -5129,10 +5043,10 @@ t_assert "writeback: values are compared by meaning -- 1024M is 1G, so the line 
     done'
 t_assert "writeback: cpu lists compare as sets -- 2-4 is 2,3,4 but 2,4 is not 2-4" bash -c '
     d=$(mktemp -d)
-    r=$( (source ./wekatester; pyrun <<"PYN"
-print(parse_cpulist("2-4") == parse_cpulist("2,3,4"), parse_cpulist("2,4") == parse_cpulist("2-4"))
-PYN
-    ) )
+    r=$(source ./wekatester; awkrun "BEGIN {
+        parse_cpulist(\"2-4\", A); parse_cpulist(\"2,3,4\", B); parse_cpulist(\"2,4\", C)
+        print (join_sorted(A, \",\") == join_sorted(B, \",\") ? \"True\" : \"False\"), (join_sorted(C, \",\") == join_sorted(A, \",\") ? \"True\" : \"False\")
+    }")
     [ "$r" = "True False" ] || { echo "$r" >&2; false; }'
 
 # -l re-tuned calibrated settings for the fleet run, against calibration's
@@ -5746,39 +5660,14 @@ t_assert "probe: reports the open-file and process limits, soft and hard" bash -
     printf "%s\n" "$(probe_stub)" | grep -qE "^limits [0-9a-z]+ [0-9a-z]+ [0-9a-z]+ [0-9a-z]+$"'
 t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" bash -c '
     for f in json_flat errno_text cal_values cal_lat_values check_fio_errors summarize summarize_report summ_one; do
-        body=$(sed -n "/^$f() {/,/^}/p" src/wekatester.sh); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }
+        body=$(sed -n "/^$f() {/,/^}/p" ./wekatester); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }
         printf "%s\n" "$body" | grep -q "python3\|pyrun\|PYEOF" && { echo "$f still uses python" >&2; exit 1; }
     done; true'
 
-# --- build: the committed script is the assembly of src/ (plan B, 2026-10-05) ---
-# Both src/ and the assembled wekatester are committed; these keep them equal
-# and keep every Python body out of the bash source.
-t_assert "build: ./build reproduces the committed wekatester byte for byte, executable" bash -c '
-    t=$(mktemp)
-    ./build "$t" && cmp -s "$t" wekatester && [ -x "$t" ]'
-t_assert "build: every include names a src/py file, each file is included exactly once, and the bash source parses" bash -c '
-    bash -n src/wekatester.sh &&
-    inc=$(awk "/^#@include /{print \$2}" src/wekatester.sh | sort) &&
-    files=$(cd src && ls py/*.py | sort) &&
-    [ -n "$inc" ] && [ "$inc" = "$files" ] &&
-    [ "$(printf "%s\n" "$inc" | uniq -d | wc -l)" -eq 0 ]'
-t_assert "build: a python heredoc body in the bash source is exactly its include line -- no Python left behind" bash -c '
-    awk "
-        !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
-        inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
-        inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 1 && bad == 0) }
-    " src/wekatester.sh'
-t_assert "build: no bash function is defined twice in the source" bash -c '
-    dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" src/wekatester.sh | sed "s/() *{//" | sort | uniq -d)
+# --- the source: one file ---
+t_assert "source: no bash function is defined twice" bash -c '
+    dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" ./wekatester | sed "s/() *{//" | sort | uniq -d)
     [ -z "$dup" ] || { echo "defined twice: $dup" >&2; false; }'
-t_assert "build: a missing include stops the build with its name, and leaves the target alone" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/src/py"
-    printf "#!/usr/bin/env bash\npyrun <<\"PYEOF\"\n#@include py/nope.py\nPYEOF\n" > "$d/src/wekatester.sh"
-    cp build "$d/build"; printf "keep\n" > "$d/wekatester"
-    err=$(cd "$d" && ./build 2>&1) && { echo "built: $err" >&2; exit 1; }
-    case "$err" in *"cannot read src/py/nope.py"*) ;; *) echo "$err" >&2; exit 1;; esac
-    [ "$(cat "$d/wekatester")" = keep ]'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

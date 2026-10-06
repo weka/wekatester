@@ -373,3 +373,15 @@ set_fixture() {   # creates $SETFIX with two jobfiles in distinct namespaces
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=big/$jobnum\n[create]\ncreate_only=1\n[bw]\nrw=read\niodepth=1\n' > "$SETFIX/011-bw.job"
     printf '# report iops\n[global]\nfilesize=2G\nnumjobs=8\ndirectory=/orig\nioengine=libaio\nfilename_format=small.$jobnum\nnrfiles=3\n[create]\ncreate_only=1\n[io]\nbs=4k\nrw=randread\niodepth=8\n' > "$SETFIX/031-iops.job"
 }
+
+# --- probe_cores in awk, for one probe file and an optional host-file list ---
+cores_line() {   # cores_line <probe> [cpu-list]: the summary line the logs print
+    (source ./wekatester; awkrun 'BEGIN { np = readlines(ARGV[1], P); probe_cores(P, np, ARGV[2], R, PH, AL); print cores_summary(R, PH, AL) }' "$1" "${2:-}")
+}
+cores_facts() {   # cores_facts <probe> [cpu-list]: "n ncores dpdk catchall unlisted unbound topo weka_core0|phys|all|reserved"
+    (source ./wekatester; awkrun 'BEGIN {
+        np = readlines(ARGV[1], P); probe_cores(P, np, ARGV[2], R, PH, AL)
+        print R["n"], R["ncores"], R["dpdk"], R["catchall"], R["unlisted"], R["unbound"], R["topo"], (R["weka_core0"] ? 1 : 0) "|" join_sorted(PH, ",") "|" join_sorted(AL, ",") "|" R["res"]
+    }' "$1" "${2:-}")
+}
+export -f cores_line cores_facts
