@@ -4013,6 +4013,10 @@ t_assert "cal_plan max: the guards still stop a job count the fixed iodepth cann
     case "$out" in *"stopped short of numjobs=32 iodepth=32: libaio would set up 1024 aio events and the kernel has room for 600"*) ;; *) echo "$out" >&2; exit 1;; esac
     out=$(plan_sim "$d" bw read io_uring 16 0 0 lvl=safe fq=1 fn=1 confirm=0 pin_qd=4 pin_nj=12)
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 12 4 1;" ] || { cat "$d/asked" >&2; false; }'
+t_assert "cal_plan max: a sync engine runs the job counts at iodepth 1, as the ladders give it" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(plan_sim "$d" bw read psync 16 0 0 lvl=max fq=16 fn=4 confirm=0)
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 4;numjobs 16 1 4;numjobs 32 1 4;" ] || { cat "$d/asked" >&2; false; }'
 
 # --- N from physical cores (Frank, 2026-09-25): topology, the reserve, placement ---
 # topo_fixture <file> <ncpus> <adjacent|split> <weka cpus...>: a probe file with

@@ -63,11 +63,13 @@ if PNR:
     NRL, NR = [PNR], PNR
 QD1 = PQD or 1                                     # the qd of the qd1 rungs
 NRX = [x for x in NRL if x != NR]
-# safe and max: one iodepth and one nrfiles per type, pins first
+# safe and max: one iodepth and one nrfiles per type, pins first; a sync
+# engine keeps one IO in flight per job, as the ladders give it
 def fixed_geom():
     q = K.get("fq", "1")
     n = K.get("fn", "1")
-    return (PQD or (int(q) if q.isdigit() else 1), PNR or (int(n) if n.isdigit() else 1))
+    return (PQD or (1 if sync else int(q) if q.isdigit() else 1),
+            PNR or (int(n) if n.isdigit() else 1))
 pinned = ", ".join("%s=%d" % (n, v) for n, v in (("numjobs", PNJ), ("iodepth", PQD),
                                                   ("nrfiles", PNR)) if v)
 

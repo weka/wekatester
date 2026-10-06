@@ -1481,6 +1481,15 @@ errno_text() {   # errno_text <n>
         24) printf 'Too many open files' ;;         27) printf 'File too large' ;;
         28) printf 'No space left on device' ;;     30) printf 'Read-only file system' ;;
         110) printf 'Connection timed out' ;;       122) printf 'Disk quota exceeded' ;;
+        # the ones a network filesystem adds
+        6) printf 'No such device or address' ;;    23) printf 'Too many open files in system' ;;
+        32) printf 'Broken pipe' ;;                 36) printf 'File name too long' ;;
+        38) printf 'Function not implemented' ;;    39) printf 'Directory not empty' ;;
+        61) printf 'No data available' ;;           95) printf 'Operation not supported' ;;
+        104) printf 'Connection reset by peer' ;;   107) printf 'Transport endpoint is not connected' ;;
+        111) printf 'Connection refused' ;;         112) printf 'Host is down' ;;
+        113) printf 'No route to host' ;;           116) printf 'Stale file handle' ;;
+        125) printf 'Operation canceled' ;;
     esac
 }
 
@@ -2220,7 +2229,8 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
             for (i in job) if (substr(job[i], 1, 4) == "cal-") {
                 h = (i in host) ? host[i] : "?"; tot[h] += v[i]; any = 1 }
             if (!any) { printf "ERROR: cal_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
-            for (h in tot) printf "%s %d\n", h, tot[h] | "LC_ALL=C sort"
+            # %.0f: a byte rate passes 2^31 at 2 GiB/s, where %d clips on some awks
+            for (h in tot) printf "%s %.0f\n", h, tot[h] | "LC_ALL=C sort"
         }'
 }
 
@@ -3195,7 +3205,7 @@ classify_mount_line() {
 # untimed prompt, and a weka client that restarts in between leaves its
 # mount point an empty directory on the root disk. Exit 4: not wekafs now.
 create_dest_cmd() {   # create_dest_cmd <dir>
-    printf '%s' "d='$1'; p=\$d; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$(findmnt -T \"\$p\" -n -o FSTYPE)\" = wekafs ] || exit 4; mkdir -p -- '$1'"
+    printf '%s' "p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$(findmnt -T \"\$p\" -n -o FSTYPE)\" = wekafs ] || exit 4; mkdir -p -- '$1'"
 }
 
 # Remote snippet for a destination that does not exist: print its nearest
@@ -4426,10 +4436,16 @@ probe_workers() {
     if [ -n "$ENGINE" ]; then
         # one awk for the fleet: the hosts whose engines line lacks it
         local lack
-        lack=$(awk -v e="$ENGINE" '
-            FNR == 1 { if (NR > 1 && !ok) printf "%s%s", (n++ ? " " : ""), h; h = FILENAME; sub(/.*\//, "", h); ok = 0 }
-            $1 == "engines" { for (i = 2; i <= NF; i++) if ($i == e) ok = 1 }
-            END { if (NR && !ok) printf "%s%s", (n++ ? " " : ""), h }' "${HOSTS[@]/#/$WORK_DIR/probe/}")
+        # (an empty or unreadable probe lacks it too, as the grep said)
+        lack=$(awkrun 'BEGIN {
+            for (a = 3; a < ARGC; a++) {
+                ok = 0; m = readlines(ARGV[2] "/" ARGV[a], L)
+                for (i = 1; i <= m && !ok; i++)
+                    if ((nw = pysplit(L[i], W)) && W[1] == "engines")
+                        for (k = 2; k <= nw; k++) if (W[k] == ARGV[1]) ok = 1
+                if (!ok) printf "%s%s", (n++ ? " " : ""), ARGV[a]
+            }
+        }' "$ENGINE" "$WORK_DIR/probe" "${HOSTS[@]}")
         [ -z "$lack" ] \
             || die "ioengine '$ENGINE' is not available (fio --enghelp) on: $lack"
     fi
@@ -6465,9 +6481,8 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
         $1 ~ /^client_stats\.[0-9]+\.error$/ { err[idx($1)] = $2 }
-        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.total_ios$/ { moved[idx($1)] += $2 }
-        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.io_bytes$/ { moved[idx($1)] += $2; hasio[idx($1) "." $1] = 1 }
-        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.bw_bytes$/ { bw[idx($1)] += $2 }
+        # anything a direction moved -- ios, bytes, or (older fio) only a rate
+        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.(total_ios|io_bytes|bw_bytes)$/ { moved[idx($1)] += $2 }
         END {
             for (k = 1; k <= n; k++) {
                 i = order[k]
@@ -6479,10 +6494,7 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
             }
             if (!stats) { print "NONE"; exit }
             if (mode == "measured" && !anybad)
-                for (h in hosts) { i = last[h]
-                    # io_bytes when fio gives it, else bw_bytes (older fio) -- per direction
-                    m = moved[i] + (i in bwonly ? 0 : 0)
-                    if (moved[i] + bw[i] == 0) printf "Z\t%s\n", h | "LC_ALL=C sort" }
+                for (h in hosts) if (moved[last[h]] + 0 == 0) printf "Z\t%s\n", h | "LC_ALL=C sort"
         }')
     [ "$bad" != NONE ] || { echo "$path: fio returned no per-job stats -- the jobs did not run" >&2; return 1; }
     [ -n "$bad" ] || return 0
@@ -6493,8 +6505,13 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
             Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2 ;;
         esac
     done <<<"$bad"
-    # fio's own log text precedes the JSON and names the underlying cause
-    LC_ALL=C awk 'index($0, "{") == 1 { exit } /[Ee]rror|ERROR|[Ff]ailed|FAILED/ { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print "ERROR: " $0; if (++n == 3) exit }' "$path" >&2
+    # fio's own log text precedes the JSON and names the underlying cause:
+    # everything before the first "{" (where json_flat starts), wherever on
+    # its line that falls, matched without regard to case
+    LC_ALL=C awk '
+        { p = index($0, "{"); s = p ? substr($0, 1, p - 1) : $0; l = tolower(s) }
+        index(l, "error") || index(l, "failed") { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); print "ERROR: " s; if (++n == 3) exit }
+        p { exit }' "$path" >&2
     return 1
 }
 
@@ -6826,18 +6843,20 @@ summarize() {
 }
 
 summarize_report() {   # summarize_report <path> <items> <expected>
-    local path=$1 items=${2:-} expected=${3:-} tmp
+    local path=$1 items=${2:-} expected=${3:-} tmp list
     [ -n "$items" ] || items="bandwidth latency iops"
-    tmp=$(mktemp -d "${TMPDIR:-/tmp}/wt.summ.XXXXXX") || return 1
-    if tar -tf "$path" > "$tmp/list" 2> "$tmp/tar.err"; then
+    # a run bundle is an archive that lists entries: bsdtar takes an empty
+    # file for an empty archive, and that is a results file with no JSON
+    if [ -s "$path" ] && list=$(tar -tf "$path" 2>&1) && [ -n "$list" ]; then
+        tmp=$(mktemp -d "${TMPDIR:-/tmp}/wt.summ.XXXXXX") || return 1
         tar -xf "$path" -C "$tmp" 2> "$tmp/tar.err" || { echo "cannot extract $path" >&2; rm -rf "${tmp:?}"; return 1; }
-        local marker="# wekatester-layout: generated" f job skip results
+        local f job skip results
         # layout results are barriers, not measurements: the reserved names,
         # plus any bundled jobfile that carries the layout marker (/dev/null
         # keeps awk off stdin when there is no jobfile at all)
-        skip=" 000-wekatester-layout 000-wekatester-relayout 999-wekatester-unlink "
+        skip=" ${LAYOUT_JOB%.job} 000-wekatester-relayout ${UNLINK_JOB%.job} "
         skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
-            | xargs -0 env LC_ALL=C awk -v m="$marker" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
+            | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
         [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; rm -rf "${tmp:?}"; return 1; }
         while IFS= read -r f; do
@@ -6848,7 +6867,6 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         done <<<"$results"
         rm -rf "${tmp:?}"; return 0
     fi
-    rm -rf "${tmp:?}"
     summ_one "$path" "$path" "$items" "$expected" file
 }
 
@@ -6863,7 +6881,7 @@ summ_one() {
         3) out="ERR	$label: cannot parse fio JSON: ${JSON_ERR#json: }" ;;
         *) out=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
-        function key(p,   a, n, k) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
+        function key(p,   a, n, k, j) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
         function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB/s", n / 2^30)
                          if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
         function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
