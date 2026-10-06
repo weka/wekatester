@@ -5401,29 +5401,19 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 
 
 stage_variants() {
-    local srcdir=$1 host tuner_tier
+    local srcdir=$1 host
     if [ -n "$AUTO_LEVEL" ]; then
-        # Calibration layers its measured tuples on top of max's rules
-        # (through targets.final), so cal and brutal size EXACTLY like max
-        # otherwise -- the tuner python only knows safe/max, on purpose, so a
-        # new tier can never silently fall through its tier=="max" checks as
-        # an unrecognized value (engine forcing, small-file namespace)
-        # missing both its own handling and max's.
-        tuner_tier=$AUTO_LEVEL
-        cal_mode && tuner_tier=max
-        # The fleet-shared read set exists because calibration's read cells
-        # measured it, so only cal and brutal stage reads onto it. safe and
-        # max stage every file on the client's own grid, the one plain runs
-        # use, so alternating the two never lays out a second read grid.
-        local ns=""
-        if cal_mode; then
-            ns=$(cal_namespace "$srcdir") \
-                || die "cannot derive the calibration namespace from $srcdir"
-        fi
+        # The tuner has no rules per level (every level calibrates): it lays
+        # the measured tuples and the host file over the jobfiles, per host.
+        # Reads go to the fleet-shared read set wherever the format can
+        # address it, because that is what the read cells measured.
+        local ns
+        ns=$(cal_namespace "$srcdir") \
+            || die "cannot derive the calibration namespace from $srcdir"
         WEKATESTER_TIER_LABEL=$AUTO_LEVEL \
         WEKATESTER_NS="$ns" \
-        WEKATESTER_IOPS_NOLAT=$(cal_mode && echo 1 || echo 0) \
-        auto_tune "$srcdir" "$WORK_DIR" "$tuner_tier" "$DIRECTORY" \
+        WEKATESTER_IOPS_NOLAT=1 \
+        auto_tune "$srcdir" "$WORK_DIR" "$AUTO_LEVEL" "$DIRECTORY" \
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi

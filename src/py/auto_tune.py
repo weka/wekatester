@@ -9,9 +9,10 @@ if len(sys.argv) < 8 or sys.argv[5] not in ("0", "1"):
              "<ignore_capacity 0|1> <targets-final|-> <host>...")
 
 src, work, tier, directory = sys.argv[1:5]
-# rules run on `tier`; the log wears the operator's own level (-a cal runs
-# max's rules with measured knees layered on top -- printing "max" there
-# read as the wrong mode being used)
+# Every -a level calibrates (Frank, 2026-10-05), so the tuner has no rules of
+# its own per level any more: the level only labels the log and the staged
+# files. What a job runs comes from the host file and calibration
+# (targets.final); a slot neither of them fills keeps the jobfile's own value.
 label = os.environ.get("WEKATESTER_TIER_LABEL") or tier
 # the unified namespace splits the STAGED jobs the same way it splits the
 # calibration cells: read-only jobs run on the fleet-shared dataset, anything
@@ -35,11 +36,6 @@ if targets_path != "-" and os.path.exists(targets_path):
 
 def target(h, key):
     return TARGETS.get(h, {}).get(key, "")
-
-SMALL_FILESIZE = "1G"
-IOPS_NRFILES = 2   # per job: enough that no job pounds a single inode
-LAT_NRFILES = 8    # the one QD1 latency job still walks a small spread
-IODEPTH_CAP = 128; OUTSTANDING_PER_CORE = 64
 
 def warn(msg): print(f"WARNING: {msg}", file=sys.stderr)
 
@@ -146,8 +142,6 @@ def cpus_for(h, nj):
     c = cores_for(h)
     return c["phys"] if nj <= c["n"] else c["all"]
 
-min_usable = min(len(usable_for(h)) for h in hosts)
-
 for h in hosts:
     _iso, _use = set(facts[h]["isolated"]), set(usable_for(h))
     if _iso and (_use & _iso) and (_use - _iso):
@@ -219,8 +213,8 @@ for h in hosts:
 
 def derive_layout_variant(h):
     """Re-derive layout sections from this host's already-tuned variants, so
-    the layout covers what will actually run (the tuned numjobs, and at max
-    tier the tuned iops/latency filesize and nrfiles).
+    the layout covers what will actually run: the measured numjobs,
+    filesize and nrfiles of every job.
     Twin of generate_layout in the bash layer -- keep the rules in sync:
     one section per pruned contributor, never one independent-max section,
     or the layout over-provisions by the cross-product of the divergences."""
@@ -330,63 +324,19 @@ for job in jobs:
         is_latency = "latency" in items
         is_bw = "bandwidth" in items and not is_latency
         # Precedence latency > bandwidth > iops: a mixed bandwidth+iops file
-        # is measuring bandwidth, and per spec bandwidth-file layout
-        # (filesize/nrfiles) is part of the measurement and must stay
-        # untouched, so it must not also take the iops small-file path.
+        # is measuring bandwidth, so it takes the bandwidth slot of the host
+        # file and keeps its latency accounting.
         is_iops = "iops" in items and not is_latency and not is_bw
-        usable_n = len(usable_for(h))
         best = common_engines[0] if common_engines else None
-
+        # an engine the jobfile names that some host cannot run gives way to
+        # the best one every host can; calibration's measured engine (the
+        # host-file column) overrides this below
         cur_engines = {m.group(1) for l in lines
                        for m in [re.match(r"^ioengine=(\S+)", l)] if m}
         missing = any(e not in f["engines"]
                       for e in cur_engines for f in facts.values())
-        if best and (tier == "max" or missing):
+        if best and missing:
             out = override(out, "ioengine", best)
-
-        if not is_latency:
-            if tier == "safe":
-                out = override(out, "numjobs", str(min_usable))
-            else:  # max
-                out = override(out, "numjobs", str(usable_n))
-                cur_depth = max([int(m.group(1)) for l in lines
-                                 for m in [re.match(r"^iodepth=(\d+)", l)] if m] or [1])
-                if is_bw:
-                    out = override(out, "iodepth", str(max(cur_depth, 8)))
-                if is_iops:
-                    # outstanding-per-host = OUTSTANDING_PER_CORE * usable_n spread
-                    # over numjobs = usable_n jobs reduces to OUTSTANDING_PER_CORE
-                    # per job; cap at IODEPTH_CAP, never go below the current depth.
-                    depth = max(cur_depth, min(IODEPTH_CAP, OUTSTANDING_PER_CORE))
-                    out = override(out, "iodepth", str(depth))
-
-        if tier == "max" and (is_iops or is_latency):
-            # The file NAMESPACE is deliberately left alone: -a runs and
-            # plain runs must share one grid, or alternating modes lays out
-            # two full grids that cannot credit each other (seen live:
-            # a 37-minute relayout right after a complete one, because the
-            # old wt-small redirect gave -a its own iops namespace).
-            out = override(out, "filesize", SMALL_FILESIZE)
-            # File spread, stated directly: two 1G files per job so no job
-            # pounds a single inode; the one-job latency test gets 8 so its
-            # QD1 stream still walks a small spread. NOT a cache bound --
-            # per the spec's "Working-set sizing (max tier) -- CORRECTED
-            # 2026-08-18", weka backends hold no user data in RAM. (The old
-            # 8GiB "working set floor" was an inherited guess this max(2,..)
-            # arithmetic always dominated anyway; it is gone.)
-            if is_latency:
-                nr = LAT_NRFILES
-                out = override(out, "nrfiles", str(nr))
-                out = override(out, "file_service_type", "random")
-            else:
-                nr = IOPS_NRFILES
-                out = override(out, "nrfiles", str(nr))
-            # fio divides size= across nrfiles, so a size= left over from the
-            # original large-file layout would resize the 1G files right back
-            # down. Rewrite it to match filesize=1G per file -- but only where
-            # the source set it: inserting size= would cap a job that had no cap.
-            if any(re.match(r"^size=", l) for l in lines):
-                out = override(out, "size", f"{nr}G")
 
         # host-file values land LAST: the file beats the tuner, per type AND
         # direction. A single-direction file takes its own slot; a mixed file
@@ -459,11 +409,10 @@ for job in jobs:
     kind = "latency" if is_latency else ("bandwidth" if is_bw else "iops" if is_iops else "all")
     print(f"auto[{label}]: {job} type={kind}")
 
-# Layout jobs last: the tuned variants above are their ground truth at BOTH
-# tiers -- safe re-tunes numjobs too, and a layout built from the un-tuned
-# sources would create the source superset (e.g. 64 jobs' worth of 10G files
-# for a run tuned down to 5 jobs). A pristine (never-edited) layout is
-# re-derived per host; an edited one is the operator's word -- stage it with
+# Layout jobs last: the tuned variants above are their ground truth -- a
+# layout built from the un-tuned sources would create the source superset
+# (e.g. 64 jobs' worth of 10G files for a run calibrated to 5 jobs). A
+# pristine (never-edited) layout is re-derived per host; an edited one is the operator's word -- stage it with
 # corrections only and say so once.
 for job in sorted(layout_set):
     lines = open(os.path.join(src, job)).read().splitlines()

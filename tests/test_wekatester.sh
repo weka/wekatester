@@ -202,57 +202,37 @@ t_assert "core mismatch warns" bash -c '
     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
     case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
-# --- tuner: tier rules (Task 6) ---
-t_assert "safe: numjobs = min usable cores" bash -c '
+# --- tuner: no rules per level (2026-10-05): the host file and calibration decide ---
+t_assert "tuner: no level rule -- where the host file and calibration are silent a job keeps the jobfile geometry and engine" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 3\nweka_allowed 4\nweka_allowed 5\nengines io_uring libaio \n" > "$FIX/probe/h2"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^numjobs=1$" "$FIX/jobs/h1/011-bw.job"'   # h2: 6 cores - 3 weka - 2 reserved = 1, the min
-t_assert "max: numjobs per host" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 6\nweka_allowed 3\nweka_allowed 4\nweka_allowed 5\nengines io_uring libaio \n" > "$FIX/probe/h2"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^numjobs=3$" "$FIX/jobs/h1/011-bw.job" && grep -q "^numjobs=1$" "$FIX/jobs/h2/011-bw.job"'
-t_assert "max: bw ioengine upgraded to io_uring" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^ioengine=io_uring$" "$FIX/jobs/h1/011-bw.job"'
-t_assert "safe: engine untouched when available" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
-t_assert "safe: engine fixed when missing on one host" bash -c '
+    printf "# report iops\n[global]\nfilesize=10G\nsize=40G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+    printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
+    printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
+    for lvl in safe max cal brutal; do
+        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 - h1 h2) >/dev/null 2>&1 || { echo "-a $lvl: auto_tune failed" >&2; exit 1; }
+        for h in h1 h2; do
+            b="$FIX/jobs/$h/011-bw.job"; m="$FIX/jobs/$h/012-mixed-bw.job"; i="$FIX/jobs/$h/031-iops.job"; l="$FIX/jobs/$h/021-lat.job"
+            if ! { grep -qx "numjobs=4" "$b" && grep -qx "filesize=10G" "$b" && grep -qx "iodepth=1" "$b" &&
+                   grep -qx "numjobs=4" "$m" && grep -qx "filesize=10G" "$m" &&
+                   grep -qx "numjobs=4" "$i" && grep -qx "iodepth=8" "$i" && grep -qx "filesize=10G" "$i" && grep -qx "size=40G" "$i" &&
+                   grep -qx "numjobs=1" "$l" && grep -qx "iodepth=1" "$l" && grep -qx "filesize=10G" "$l" &&
+                   [ "$(cat "$b" "$m" "$i" "$l" | grep -c "^ioengine=libaio$")" -eq 4 ] &&
+                   ! grep -q "^nrfiles=\|^file_service_type=\|wt-small" "$b" "$m" "$i" "$l"; }; then
+                echo "-a $lvl, $h:" >&2; cat "$b" "$m" "$i" "$l" >&2; exit 1
+            fi
+        done
+    done'
+t_assert "tuner: a jobfile engine one host lacks gives way to the best engine every host has" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nioengine=io_uring\nnumjobs=2\nfilesize=1G\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
     printf "ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines libaio psync \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
-t_assert "latency: numjobs/iodepth untouched, small files applied at max" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/021-lat.job"
-    grep -q "^numjobs=1$" "$v" && grep -q "^iodepth=1$" "$v" &&
-    grep -q "^filesize=1G$" "$v" && ! grep -q "wt-small" "$v" &&
-    grep -q "^file_service_type=random$" "$v"'
 t_assert "mixed report treats file as latency" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops latency\n[global]\nnumjobs=4\nioengine=libaio\nfilesize=1G\n[j]\nrw=randwrite\niodepth=8\n" > "$FIX/src/022-mixed.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     grep -q "^numjobs=4$" "$FIX/jobs/h1/022-mixed.job"'
-t_assert "max: iops iodepth and nrfiles derived" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/031-iops.job"
-    # IOPS_NRFILES: two 1G files per job, stated directly
-    grep -q "^iodepth=64$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v"'
-t_assert "mixed bandwidth+iops keeps bandwidth file layout" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/012-mixed-bw.job"
-    grep -q "^numjobs=3$" "$v" && grep -q "^filesize=10G$" "$v" && ! grep -q "wt-small" "$v"'
 
 # --- capacity check (universal: every run, per host, from staged variants) ---
 cap() {   # cap <tier> <ignore 0|1> <host>... -- stages via auto_tune, then checks
@@ -295,9 +275,9 @@ t_assert "namespace-aware formula: distinct namespaces sum" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     out=$( cap max 0 h1 h2 2>&1 )
-    # bw: 3 jobs x 1 file x 10G = 30GiB; iops (2 files/job): 3 jobs x 2 files x 1G
-    # = 6GiB -- distinct namespaces, so the two sum to 36GiB
-    case "$out" in *"capacity: h1 needs ~36.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    # bw: 4 jobs x 1 file x 10G = 40GiB; iops: 4 jobs x 1 file x 10G = 40GiB
+    # -- distinct namespaces, so the two sum to 80GiB, not the max 40
+    case "$out" in *"capacity: h1 needs ~80.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "garbage\n" > "$FIX/probe/_df"
@@ -346,20 +326,6 @@ t_assert "auto staging with override stages every host" bash -c '
     { test -f "$FIX/jobs/h1/011-bw.job" ||
       { echo "coordinator h1 not staged: argument shift?" >&2; false; }; } &&
     test -f "$FIX/jobs/h2/011-bw.job"'
-# The calibration engine does not exist yet (tasks 3-6), so cal must
-# size EXACTLY like max in the meantime: stage_variants normalizes the tier
-# it hands to auto_tune, rather than the tuner python learning a third value
-# that would silently miss max-gated rules (engine forcing, small-file ns).
-t_assert "cal sizes exactly like max: small-file namespace lands via stage_variants" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester
-     WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=cal
-     stage_variants "$FIX/src") >/dev/null 2>&1
-    v="$FIX/jobs/h1/031-iops.job"
-    ! grep -q "wt-small" "$v" &&
-    grep -q "^filesize=1G$" "$v" && grep -q "^nrfiles=2$" "$v" &&
-    grep -q "^ioengine=io_uring$" "$v"'
 
 # --- signal handling: INT/TERM must end the run, not just clean up ---
 # Regression: `trap cleanup EXIT INT TERM` ran cleanup and then CONTINUED at the
@@ -413,7 +379,7 @@ t_assert "an existing [global] is never duplicated" bash -c '
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
     [ "$(grep -c "^\[global\]$" "$FIX/jobs/h1/011-bw.job")" -eq 1 ]'
 
-# --- capacity model: namespaces, size=, small-file size rewrite ---
+# --- capacity model: namespaces, size= ---
 # fio expands the default filename_format ($jobname...) per section, so two
 # jobfiles that set no filename_format own separate files and must SUM. They
 # used to share one literal default key and collapse to a max, under-counting
@@ -422,17 +388,17 @@ t_assert "capacity: jobfiles without filename_format sum, not max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/012-bw2.job"
     out=$( cap safe 0 h1 2>&1 )
-    case "$out" in *"capacity: h1 needs ~60.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~80.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: jobfiles sharing one filename_format take the max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     j="# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nfilename_format=shared.\$jobnum.\$filenum\nioengine=libaio\n[j]\nrw=read\n"
     printf "$j" > "$FIX/src/011-bw.job"
     printf "$j" > "$FIX/src/012-bw2.job"
     out=$( cap safe 0 h1 2>&1 )
-    case "$out" in *"capacity: h1 needs ~30.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: size= without filesize counts numjobs x size" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "# report bandwidth\n[global]\nsize=4G\nnrfiles=4\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
+    printf "# report bandwidth\n[global]\nsize=4G\nnrfiles=4\nnumjobs=3\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
     out=$( cap safe 0 h1 2>&1 )
     case "$out" in *"capacity: h1 needs ~12.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: a percentage size= contributes 0 instead of crashing" bash -c '
@@ -442,19 +408,6 @@ t_assert "capacity: a percentage size= contributes 0 instead of crashing" bash -
     rc=$?
     [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc: $out" >&2; false; } &&
     case "$out" in *"capacity: h1 needs ~0.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "max: small-file redirect rewrites size= to nrfiles x 1G" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report iops\n[global]\nfilesize=10G\nsize=40G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/031-iops.job"
-    # nrfiles = 2 (IOPS_NRFILES), so size= is rewritten to 2 x 1G
-    grep -q "^nrfiles=2$" "$v" && grep -q "^filesize=1G$" "$v" && grep -q "^size=2G$" "$v"'
-t_assert "max: latency size= follows the capped nrfiles" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    printf "# report latency\n[global]\nfilesize=10G\nsize=40G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/021-lat.job"
-    grep -q "^nrfiles=8$" "$v" && grep -q "^size=8G$" "$v"'
 t_assert "size= is never inserted where the jobfile had none" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
@@ -967,15 +920,23 @@ t_assert "staging: a set with its own layout file is not regenerated" bash -c '
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
      stage_jobfiles >/dev/null
      grep -q "sha256=0000" "$WORK_DIR/set/000-wekatester-layout.job")'
-t_assert "tuner: pristine layout at max is re-derived per host (tuned geometry)" bash -c '
+t_assert "tuner: a pristine layout is re-derived per host at every level, covering what each host runs" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/000-wekatester-layout.job"
-    grep -q "re-derived by wekatester auto\[max\]" "$v" &&
-    ! grep -q "wt-small" "$v" && grep -q "^nrfiles=2$" "$v" &&
-    grep -q "^cpus_allowed=2-4$" "$v"'
+    # h1 measured 3 bandwidth jobs and 3 iops jobs of two 1G files; h2 has no row
+    row=(h1); for i in $(seq 1 36); do row+=(-); done
+    row[5]=3; row[21]=3; row[22]=1G; row[23]=2; row[24]=8
+    (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+    for lvl in safe max cal brutal; do
+        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+        v1="$FIX/jobs/h1/000-wekatester-layout.job"; v2="$FIX/jobs/h2/000-wekatester-layout.job"
+        grep -q "re-derived by wekatester auto\[$lvl\]" "$v1" && grep -q "re-derived by wekatester auto\[$lvl\]" "$v2" &&
+        grep -qx "numjobs=3" "$v1" && ! grep -qx "numjobs=4" "$v1" && grep -qx "nrfiles=2" "$v1" && grep -qx "filesize=1G" "$v1" &&
+        grep -qx "cpus_allowed=2-4" "$v1" &&
+        grep -qx "numjobs=4" "$v2" && ! grep -qx "numjobs=3" "$v2" && ! grep -q "^nrfiles=" "$v2" ||
+            { echo "-a $lvl:" >&2; cat "$v1" "$v2" >&2; exit 1; }
+    done'
 t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
@@ -1023,7 +984,7 @@ t_assert "tuner capacity: layout job does not double the required total" bash -c
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     out=$( cap safe 0 h1 h2 2>/dev/null )
-    case "$out" in *"capacity: h1 needs ~30.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 
 # --- customize workflow ---
 t_assert "resolve: bare name creates under ./fio-jobfiles and copies" bash -c '
@@ -1132,13 +1093,6 @@ t_assert "generator: dominated geometry is pruned to one section" bash -c '
     (source ./wekatester; generate_layout "$S" "$S") >/dev/null
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 1 ] && grep -q "^numjobs=64$" "$f"'
-t_assert "tuner: pristine layout re-derived at SAFE tier too (tuned numjobs)" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
-    v="$FIX/jobs/h1/000-wekatester-layout.job"
-    grep -q "re-derived by wekatester auto\[safe\]" "$v" && grep -q "^numjobs=3$" "$v" &&
-    ! grep -q "^numjobs=4$" "$v"'
 t_assert "capacity: layout union raises required above per-namespace max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     rm -f "$FIX/src/011-bw.job"
@@ -1146,10 +1100,10 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\nioengine=libaio\ndirectory=/orig\n[b]\nrw=read\niodepth=1\n" > "$FIX/src/012-b.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
     out=$( cap safe 0 h1 h2 2>/dev/null )
-    # a: numjobs=3 nrfiles=1 -> 3 files; b: numjobs=3 nrfiles=27 -> 81 files;
-    # union = 81G/host; namespace max = 81G -- equal here, so assert the
-    # per-host requirement is the union value, proving layout_footprint runs
-    case "$out" in *"capacity: h1 needs ~81.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+    # a: 4 jobs x 1 file = 4G; b: 2 jobs x 27 files = 54G, the namespace max;
+    # the layout lays out both sections, 58G/host, so the union raises the
+    # per-host requirement above 54G, proving layout_footprint runs
+    case "$out" in *"capacity: h1 needs ~58.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
     source ./tests/helpers.sh
     tmp=$(mktemp -d); cd "$tmp"
@@ -1619,10 +1573,10 @@ t_assert "ssh: the master-socket directory stays short enough for a unix socket 
     [ "$out" = "$w/c" ] || { echo "$out" >&2; false; }'
 t_assert "capacity: hosts on one weka filesystem are checked against it together, not one at a time" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    # 50 GiB free on one weka filesystem; each host alone needs ~30
+    # 50 GiB free on one weka filesystem; each host alone needs ~40
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n10.0.1.1,10.0.1.2/default 104857600 0 52428800 1%% /mnt/weka\nwekafs\n" > "$FIX/probe/_df"
     err=$( cap max 0 h1 h2 2>&1 >/dev/null ) && { echo "passed: $err" >&2; exit 1; }
-    case "$err" in *"ERROR: weka filesystem default: its 2 hosts (h1 h2) need ~60.0GiB together but only 50.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
+    case "$err" in *"ERROR: weka filesystem default: its 2 hosts (h1 h2) need ~80.0GiB together but only 50.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
     # the same df without the wekafs line: local disks, one per host, each fits
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/nvme0n1 104857600 0 52428800 1%% /mnt/weka\n" > "$FIX/probe/_df"
     out=$( cap max 0 h1 h2 2>&1 ) || { echo "failed: $out" >&2; false; }'
@@ -3011,7 +2965,7 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
      grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=libaio$" "$v2" &&
      grep -q "^numjobs=32$" "$v2" &&
      grep -q "^numjobs=4$" "$l1" && grep -q "^filesize=1G$" "$l1" && grep -q "^nrfiles=2$" "$l1")'
-t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per host" bash -c '
+t_assert "tuner: host-file dir/cpus/geometry/engine land per host; a host without a row keeps the jobfile values" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     { printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9"
       for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
@@ -3024,7 +2978,7 @@ t_assert "tuner: host-file dir/cpus/geometry/engine beat the tuned values per ho
     # survive -- the same effective set the calibration ladder measures
     grep -q "^cpus_allowed=2,4$" "$v1" &&
     grep -q "^numjobs=3$" "$v1" && grep -q "^filesize=2G$" "$v1" && grep -q "^iodepth=9$" "$v1" &&
-    grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=io_uring$" "$v2"'
+    grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=libaio$" "$v2"'
 # The STAGED jobs must never name a cpu the host does not have: the fio
 # SERVER rejects the jobfile and its error text is lost, so the layout dies
 # with "the jobs did not run" and nothing else (field client B 2026-08-28 -- the
@@ -4166,8 +4120,8 @@ t_assert "tuner: a job count at or below N runs one job per physical core; above
     row 4 > "$FIX/targets.final"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     grep -qx "cpus_allowed=4,6,8,10" "$FIX/jobs/h1/011-bw.job" || { grep cpus_allowed "$FIX/jobs/h1/011-bw.job" >&2; exit 1; }
-    # h2 has no host-file row: max runs a job on every usable thread, 8 > N
-    grep -qx "numjobs=8" "$FIX/jobs/h2/011-bw.job" && grep -qx "cpus_allowed=4-11" "$FIX/jobs/h2/011-bw.job" &&
+    # h2 has no host-file row: it keeps the jobfile 4 jobs, N here, one per physical core
+    grep -qx "numjobs=4" "$FIX/jobs/h2/011-bw.job" && grep -qx "cpus_allowed=4,6,8,10" "$FIX/jobs/h2/011-bw.job" &&
     row 8 > "$FIX/targets.final" &&
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1 &&
     grep -qx "cpus_allowed=4-11" "$FIX/jobs/h1/011-bw.job"'
@@ -4931,7 +4885,7 @@ t_assert "capacity: each filesystem group's shared set is priced once, and group
     cp "$FIX/probe/h1" "$FIX/probe/h3"; cp "$FIX/probe/h1" "$FIX/probe/h4"
     printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=\$filenum/\$jobnum\n[bw]\nrw=read\niodepth=1\n" > "$FIX/src/011-bw.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
-    # 50 GiB free on one weka filesystem; one shared set is 3 jobs x 10G
+    # 50 GiB free on one weka filesystem; one shared set is 4 jobs x 10G
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n10.0.1.1/default 104857600 0 52428800 1%% /mnt/weka\nwekafs\n" > "$FIX/probe/_df"
     chk() { (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
         IGNORE_CAPACITY=0; WORK_DIR=$FIX; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka
@@ -4942,7 +4896,7 @@ t_assert "capacity: each filesystem group's shared set is priced once, and group
     out=$(chk 2>&1) || { echo "one group should fit: $out" >&2; exit 1; }
     printf "h1 1\nh2 1\nh3 2\nh4 2\n" > "$FIX/groups"
     err=$(chk 2>&1 >/dev/null) && { echo "two groups passed: $err" >&2; exit 1; }
-    case "$err" in *"weka filesystem default: its 4 hosts (h1 h2 h3 h4) need ~60.0GiB together but only 50.0GiB is available"*) true;; *) echo "$err" >&2; false;; esac'
+    case "$err" in *"weka filesystem default: its 4 hosts (h1 h2 h3 h4) need ~80.0GiB together but only 50.0GiB is available"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "cal_shapes: one representative per shape per filesystem group" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2 h3 h4

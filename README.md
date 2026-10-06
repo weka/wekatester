@@ -178,7 +178,7 @@ Unattended forms:
 - `-n` — dry run: everything is resolved, generated and staged, then the full paths of the created files, every staged jobfile's contents, and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and with `-a`, `-t` or `-e` the ioengines are proven with small one-file fio jobs. The pinning check runs too, so a dry run stops where the real run would. Combine with `-C` to prepare a set for manual editing.
 - `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too).
 
-A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it. A pristine layout job under `-a max` is re-derived per host so it lays out the tuned namespaces (including the small-file working set).
+A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it. A pristine layout job under `-a` is re-derived per host so it lays out what that host will run: its measured job counts and file geometry.
 
 `-C` needs a terminal for its editors and prompts; without one it refuses to run unless `-r` or `-n` is given. Prompts read the terminal directly, so they work fine under `... | tee run.log`.
 
