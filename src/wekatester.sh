@@ -464,7 +464,7 @@ attaching is the way to pass a value that starts with a dash.
                           (N/2, N, 2N, 4N of N usable physical cores),
                           iodepth, nrfiles and the ioengine per test type:
                           bandwidth toward NIC line rate, the most iops,
-                          the most jobs at the latency floor
+                          the lowest latency at N jobs over nrfiles
                           brutal: the cal search with no early stops --
                           every rung of every ladder is measured. Slow
                           :secs sets the measured seconds per cell (default
@@ -1913,9 +1913,9 @@ CAL_SCRATCH=".wekatester-cal"
 #              not a lever); "reached" is CAL_LINE_PCT (95) percent of it
 #   iops       the client's maximum 4k random IOPS, with fio's latency
 #              accounting off -- the iops test records no latency
-#   latency    the floor (one job at queue depth 1), then as many jobs as keep
-#              the latency within CAL_FLOOR_PCT (5) percent of it: the most
-#              IOPS the client does AT the floor. Not a knee. Under -b the
+#   latency    N jobs (one per physical core) at queue depth 1, the nrfiles
+#              ladder only, the lowest mean wins (Frank, 2026-10-05); the
+#              one-job twin runs beside it in the measured run. Under -b the
 #              same again at 1MiB blocks (lat1m), its own test and slot.
 #
 # WHERE IT IS MEASURED. Clients are grouped into SHAPES by their hardware --
@@ -1983,20 +1983,15 @@ CAL_BW_QD_LADDER=${CAL_BW_QD_LADDER:-"1 2 4 8 16"}   # bandwidth iodepths at
                          # 2N x qd1 isolates what the siblings add)
 CAL_IOPS_QD_LADDER=${CAL_IOPS_QD_LADDER:-"1 2 4 8 16 32 64 128 256 512"}
 CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
-CAL_FLOOR_PCT=${CAL_FLOOR_PCT:-5}  # latency: a rung is "at the floor" within this
-CAL_FLOOR_REPS=${CAL_FLOOR_REPS:-3}   # readings of the one-job floor cell; the
-                         # floor is the LOWEST of them -- contention only ever
-                         # adds latency, the mirror of throughput's best reading
-CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # THE TIE BAND: cells within this percent
-                         # of the best reading are tied, and the tie goes to the
-                         # least outstanding IO (numjobs x iodepth), then fewer
-                         # jobs, the shallower queue, the tabled file count. 98.5 is
-                         # measured: on field client B it resolved all four ladders
-                         # to a unique rung at 99.5-100% of the peak, while 99.5
-                         # destabilised every one -- a band cannot be tighter
-                         # than the peak's own measurement error
-CAL_SHAPE_THR=${CAL_SHAPE_THR:-2}   # percent a ladder rung must beat the best so
-                         # far by to count as progress
+CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # the engine tie band: engines whose reading
+                         # is within this percent of the best are tied, and the
+                         # tie goes to ENGINE_ORDER
+CAL_SHAPE_THR=${CAL_SHAPE_THR:-3}   # THE LEADER RULE (Frank, 2026-10-05): a cell
+                         # takes the lead only when at least this percent better
+                         # than the leader -- for bandwidth and iops, at every
+                         # level; a ladder ends after CAL_STOP_BELOW rungs in a
+                         # row fail to. Latency has no threshold: the lowest mean
+                         # wins
 CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs without progress that
                          # end a ladder (cal only; brutal measures every rung)
 CAL_CONFIRM=${CAL_CONFIRM:-3}   # before a peak is picked, the top cells get a
@@ -2018,13 +2013,12 @@ cal_knobs() {
     if brutal_mode; then
         exh=1; conf=$BRUTAL_CONFIRM
     fi
-    printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" "floor=$CAL_FLOOR_PCT" \
-        "band=$CAL_KNEE_PCT" "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
+    printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" \
+        "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
         "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
         "bwqd=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')" \
-        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')" \
-        "floorreps=$CAL_FLOOR_REPS"
+        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')"
 }
 
 # One calibration cell, staged as a jobfile for ONE host. Pure: every input
@@ -2438,25 +2432,24 @@ PYEOF
 #              ladder at or below N. Short of it: 2N and 4N, each walking
 #              iodepth (CAL_BW_QD_LADDER) for every nrfiles (CAL_NR_LADDER),
 #              again stopping at the target; 4N only when 2N beat N (cal).
-#              Never reached, or line rate unknown: the peak -- the top
-#              CAL_CONFIRM cells re-measured, the best reading wins, and
-#              inside CAL_KNEE_PCT the least outstanding IO. A reading 5%
-#              above line rate means the line rate is not the ceiling, and
-#              the search falls back to the peak.
+#              Never reached, or line rate unknown: the leader -- the top
+#              CAL_CONFIRM cells re-measured, then the cells walked in ladder
+#              order, a cell taking the lead only CAL_SHAPE_THR (3) percent
+#              ahead (Frank, 2026-10-05). A reading 5% above line rate means
+#              the line rate is not the ceiling, and the leader decides.
 #   iops       N/2 and N at iodepth=1 nrfiles=1 -- no ladder at or below N
 #              (Frank, 2026-09-25). Then 2N and 4N: the queue ladder
 #              CAL_IOPS_QD_LADDER at nrfiles=1 until it flattens, then nrfiles
 #              2 and 4 at that count's winning iodepth and one step deeper; 4N
-#              only when 2N beat N. Then the peak rule above. Brutal walks the
+#              only when 2N beat N. Then the leader rule above. Brutal walks the
 #              whole queue ladder at every file count at 2N and 4N, as far
 #              as the guards below let it.
-#   latency    the floor: CAL_FLOOR_REPS readings of one job at qd1, lowest
-#   lat1m      wins. Then numjobs 2, 4 ... N/2, N at qd1 nrfiles=1, and 2N and
-#              4N at qd1 with each nrfiles of CAL_NR_LADDER (the lowest counts),
-#              while the latency stays within CAL_FLOOR_PCT of the floor; a
-#              rung that leaves the band gets one re-measure before it is
-#              believed. The answer is the last rung inside the band. lat1m is
-#              the same search at 1MiB blocks (-b).
+#   latency    N jobs at qd1, one cell per nrfiles of CAL_NR_LADDER, at every
+#   lat1m      level; the lowest mean wins, no threshold, equal means keep
+#              the fewer files. lat1m is the same search at 1MiB blocks (-b).
+#   safe, max  (lvl=safe|max) bandwidth and iops measure numjobs N/2, N and
+#              2N only, at the iodepth and nrfiles the caller fixes per type
+#              (fq, fn), every rung, the leader rule deciding.
 # Every cell keeps a job's data at FILESIZE_MIB, split over its files
 # (nrfiles=4 reads 4 x 1280M of 5G files): a file ladder that also grew the
 # data would measure the working set, not the file count (WEKAPP-289548: the
@@ -2467,7 +2460,8 @@ PYEOF
 # Two guards end a 2N/4N queue ladder early, and the verdict names each cell
 # they refused: the memory guard (numjobs x iodepth x bs past <memcap>) and,
 # with libaio, the kernel's aio room (numjobs x iodepth past the aio= knob:
-# the shape's tightest member). The qd1 rungs, the latency ladders and the
+# the shape's tightest member); under safe and max they stop the job counts
+# the fixed iodepth cannot fit. The qd1 rungs, the latency ladders and the
 # engine cells are not guarded: they need at most ~16N aio events, far
 # inside the default 65,536 room.
 cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...

@@ -51,7 +51,7 @@ attaching is the way to pass a value that starts with a dash.
                           (N/2, N, 2N, 4N of N usable physical cores),
                           iodepth, nrfiles and the ioengine per test type:
                           bandwidth toward NIC line rate, the most iops,
-                          the most jobs at the latency floor
+                          the lowest latency at N jobs over nrfiles
                           brutal: the cal search with no early stops --
                           every rung of every ladder is measured. Slow
                           :secs sets the measured seconds per cell (default
@@ -220,10 +220,10 @@ what the cluster can do.
   accounting off. The iops test records no latency, so the calibration cells
   and the staged iops jobs both run with `disable_lat`, `disable_clat`,
   `disable_slat` and `norandommap`.
-- **Latency** — the floor, one job at queue depth 1, and then as many jobs as
-  keep the latency within 5% of it (`CAL_FLOOR_PCT`). That is the most IOPS
-  the client does *at* the floor, not a knee. The shipped latency jobs report
-  IOPS beside latency for that reason. With `-b` the same again at 1 MiB.
+- **Latency** — N jobs, one per physical core, at queue depth 1. The only
+  ladder is nrfiles, and the lowest mean latency wins, with no threshold. The
+  one-job twin below runs beside it, so a single stream and full load
+  compare. With `-b` the same again at 1 MiB.
 
 Under `-a cal` and `-a brutal` every latency test also runs as a **one-job
 twin** (`021-latencyR-1job.job`, just before its original): numjobs, iodepth
@@ -312,18 +312,19 @@ engine.
 **At or below N there is no queue or file ladder**: every cell runs iodepth 1
 and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
 for bandwidth (`CAL_BW_QD_LADDER`) and 1–512 for IOPS (`CAL_IOPS_QD_LADDER`) —
-run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs that
-fail to beat the best by 2%, and 4N runs only when 2N beat N.
+run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs in a
+row that fail to take the lead (see the leader rule), and 4N runs only when 2N
+beat N by that much.
 
 - **Bandwidth** walks numjobs 1, 2, 4 … N/2, N. The first rung at 95% of line
   rate is the answer. If none reaches it, 2N and 4N walk iodepth for every
   nrfiles, and again the first cell at 95% is the answer. If nothing reaches
-  line rate, or line rate is unknown, the peak rule below decides. A reading
+  line rate, or line rate is unknown, the leader rule below decides. A reading
   more than 5% *above* line rate means line rate is not this client's ceiling,
-  and the search falls back to the peak.
+  and the leader rule decides then too.
 - **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
   nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at that count's
-  winning iodepth and one step deeper. The peak rule decides. With libaio,
+  winning iodepth and one step deeper. The leader rule decides. With libaio,
   every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
   by default), so the probe reads the room left on every client, and a 2N/4N
   queue-ladder cell past the room of the shape's tightest member is not run:
@@ -334,19 +335,18 @@ fail to beat the best by 2%, and 4N runs only when 2N beat N.
   staged, any libaio job past its host's room — a host-file answer recorded
   when the limit was higher, `-e libaio` over an answer another engine found —
   gets a warning naming `fs.aio-max-nr` before it runs.
-- **Latency** takes three readings of one job at queue depth 1, and the floor
-  is the *lowest*, because contention only ever adds latency. Numjobs then
-  widens 2, 4 … N/2, N, and on to 2N and 4N with each nrfiles, at queue depth
-  1, while the latency stays within 5% of the floor. A rung that leaves the
-  band is re-measured once before it is believed. The answer is the last rung
-  inside the band. With `-b` the 1 MiB latency test gets the same search.
+- **Latency** runs N jobs at queue depth 1 with each nrfiles (1, 2, 4): three
+  cells. The lowest mean latency wins, with no threshold; equal means keep the
+  fewer files. Numjobs is not searched: the one-job twin is the other end of
+  the comparison. With `-b` the 1 MiB latency test gets the same search.
 
-**The peak rule.** The top three cells (`CAL_CONFIRM`) get a second reading.
-Contention only subtracts, so a second chance can raise a cell and never lower
-it, and the best reading is what a cell is credited with. The highest best
-reading wins. Inside 98.5% of it (`CAL_KNEE_PCT`) the cheapest cell wins: the
-least outstanding IO (numjobs × iodepth), then fewer jobs, then the shallower
-queue, then the tabled file count.
+**The leader rule** (bandwidth and IOPS, every level). The top three cells
+(`CAL_CONFIRM`) get a second reading. Contention only subtracts, so a second
+chance can raise a cell and never lower it, and the best reading is what a
+cell is credited with. Then the cells are walked in the order the ladder
+measured them, and a cell takes the lead only when it is at least 3%
+(`CAL_SHAPE_THR`) better than the leader. The last leader is the answer, so
+a deeper or wider setting has to earn its place by a clear margin.
 
 Every write cell is followed by `CAL_SETTLE` (10s), so the next cell does not
 start inside the previous one's destage backlog. The first field grids showed
@@ -360,9 +360,9 @@ MemTotal is not run, and the log says so.
 `-a brutal` runs the same search with every early stop disabled: every
 combination of job count, iodepth and nrfiles the ladders define is measured,
 and the top five cells get a second reading (`BRUTAL_CONFIRM`). Bandwidth takes
-the peak instead of the first rung at line rate. With the default ladders that
-is about 120 IOPS cells, 35 bandwidth cells and 12 latency cells per direction,
-some 330 per shape, or about three hours at 30s cells. Use `cal` for the answer
+the leader instead of the first rung at line rate. With the default ladders that
+is about 120 IOPS cells, 35 bandwidth cells and 3 latency cells per direction,
+some 320 per shape, or about three hours at 30s cells. Use `cal` for the answer
 cheaply, and `brutal` when the stopping rules themselves are the suspect.
 
 ### Calibration measures what the test will run

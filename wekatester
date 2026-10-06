@@ -464,7 +464,7 @@ attaching is the way to pass a value that starts with a dash.
                           (N/2, N, 2N, 4N of N usable physical cores),
                           iodepth, nrfiles and the ioengine per test type:
                           bandwidth toward NIC line rate, the most iops,
-                          the most jobs at the latency floor
+                          the lowest latency at N jobs over nrfiles
                           brutal: the cal search with no early stops --
                           every rung of every ladder is measured. Slow
                           :secs sets the measured seconds per cell (default
@@ -2442,9 +2442,9 @@ CAL_SCRATCH=".wekatester-cal"
 #              not a lever); "reached" is CAL_LINE_PCT (95) percent of it
 #   iops       the client's maximum 4k random IOPS, with fio's latency
 #              accounting off -- the iops test records no latency
-#   latency    the floor (one job at queue depth 1), then as many jobs as keep
-#              the latency within CAL_FLOOR_PCT (5) percent of it: the most
-#              IOPS the client does AT the floor. Not a knee. Under -b the
+#   latency    N jobs (one per physical core) at queue depth 1, the nrfiles
+#              ladder only, the lowest mean wins (Frank, 2026-10-05); the
+#              one-job twin runs beside it in the measured run. Under -b the
 #              same again at 1MiB blocks (lat1m), its own test and slot.
 #
 # WHERE IT IS MEASURED. Clients are grouped into SHAPES by their hardware --
@@ -2512,20 +2512,15 @@ CAL_BW_QD_LADDER=${CAL_BW_QD_LADDER:-"1 2 4 8 16"}   # bandwidth iodepths at
                          # 2N x qd1 isolates what the siblings add)
 CAL_IOPS_QD_LADDER=${CAL_IOPS_QD_LADDER:-"1 2 4 8 16 32 64 128 256 512"}
 CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
-CAL_FLOOR_PCT=${CAL_FLOOR_PCT:-5}  # latency: a rung is "at the floor" within this
-CAL_FLOOR_REPS=${CAL_FLOOR_REPS:-3}   # readings of the one-job floor cell; the
-                         # floor is the LOWEST of them -- contention only ever
-                         # adds latency, the mirror of throughput's best reading
-CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # THE TIE BAND: cells within this percent
-                         # of the best reading are tied, and the tie goes to the
-                         # least outstanding IO (numjobs x iodepth), then fewer
-                         # jobs, the shallower queue, the tabled file count. 98.5 is
-                         # measured: on field client B it resolved all four ladders
-                         # to a unique rung at 99.5-100% of the peak, while 99.5
-                         # destabilised every one -- a band cannot be tighter
-                         # than the peak's own measurement error
-CAL_SHAPE_THR=${CAL_SHAPE_THR:-2}   # percent a ladder rung must beat the best so
-                         # far by to count as progress
+CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # the engine tie band: engines whose reading
+                         # is within this percent of the best are tied, and the
+                         # tie goes to ENGINE_ORDER
+CAL_SHAPE_THR=${CAL_SHAPE_THR:-3}   # THE LEADER RULE (Frank, 2026-10-05): a cell
+                         # takes the lead only when at least this percent better
+                         # than the leader -- for bandwidth and iops, at every
+                         # level; a ladder ends after CAL_STOP_BELOW rungs in a
+                         # row fail to. Latency has no threshold: the lowest mean
+                         # wins
 CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs without progress that
                          # end a ladder (cal only; brutal measures every rung)
 CAL_CONFIRM=${CAL_CONFIRM:-3}   # before a peak is picked, the top cells get a
@@ -2547,13 +2542,12 @@ cal_knobs() {
     if brutal_mode; then
         exh=1; conf=$BRUTAL_CONFIRM
     fi
-    printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" "floor=$CAL_FLOOR_PCT" \
-        "band=$CAL_KNEE_PCT" "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
+    printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" \
+        "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
         "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
         "bwqd=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')" \
-        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')" \
-        "floorreps=$CAL_FLOOR_REPS"
+        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')"
 }
 
 # One calibration cell, staged as a jobfile for ONE host. Pure: every input
@@ -3418,25 +3412,24 @@ PYEOF
 #              ladder at or below N. Short of it: 2N and 4N, each walking
 #              iodepth (CAL_BW_QD_LADDER) for every nrfiles (CAL_NR_LADDER),
 #              again stopping at the target; 4N only when 2N beat N (cal).
-#              Never reached, or line rate unknown: the peak -- the top
-#              CAL_CONFIRM cells re-measured, the best reading wins, and
-#              inside CAL_KNEE_PCT the least outstanding IO. A reading 5%
-#              above line rate means the line rate is not the ceiling, and
-#              the search falls back to the peak.
+#              Never reached, or line rate unknown: the leader -- the top
+#              CAL_CONFIRM cells re-measured, then the cells walked in ladder
+#              order, a cell taking the lead only CAL_SHAPE_THR (3) percent
+#              ahead (Frank, 2026-10-05). A reading 5% above line rate means
+#              the line rate is not the ceiling, and the leader decides.
 #   iops       N/2 and N at iodepth=1 nrfiles=1 -- no ladder at or below N
 #              (Frank, 2026-09-25). Then 2N and 4N: the queue ladder
 #              CAL_IOPS_QD_LADDER at nrfiles=1 until it flattens, then nrfiles
 #              2 and 4 at that count's winning iodepth and one step deeper; 4N
-#              only when 2N beat N. Then the peak rule above. Brutal walks the
+#              only when 2N beat N. Then the leader rule above. Brutal walks the
 #              whole queue ladder at every file count at 2N and 4N, as far
 #              as the guards below let it.
-#   latency    the floor: CAL_FLOOR_REPS readings of one job at qd1, lowest
-#   lat1m      wins. Then numjobs 2, 4 ... N/2, N at qd1 nrfiles=1, and 2N and
-#              4N at qd1 with each nrfiles of CAL_NR_LADDER (the lowest counts),
-#              while the latency stays within CAL_FLOOR_PCT of the floor; a
-#              rung that leaves the band gets one re-measure before it is
-#              believed. The answer is the last rung inside the band. lat1m is
-#              the same search at 1MiB blocks (-b).
+#   latency    N jobs at qd1, one cell per nrfiles of CAL_NR_LADDER, at every
+#   lat1m      level; the lowest mean wins, no threshold, equal means keep
+#              the fewer files. lat1m is the same search at 1MiB blocks (-b).
+#   safe, max  (lvl=safe|max) bandwidth and iops measure numjobs N/2, N and
+#              2N only, at the iodepth and nrfiles the caller fixes per type
+#              (fq, fn), every rung, the leader rule deciding.
 # Every cell keeps a job's data at FILESIZE_MIB, split over its files
 # (nrfiles=4 reads 4 x 1280M of 5G files): a file ladder that also grew the
 # data would measure the working set, not the file count (WEKAPP-289548: the
@@ -3447,7 +3440,8 @@ PYEOF
 # Two guards end a 2N/4N queue ladder early, and the verdict names each cell
 # they refused: the memory guard (numjobs x iodepth x bs past <memcap>) and,
 # with libaio, the kernel's aio room (numjobs x iodepth past the aio= knob:
-# the shape's tightest member). The qd1 rungs, the latency ladders and the
+# the shape's tightest member); under safe and max they stop the job counts
+# the fixed iodepth cannot fit. The qd1 rungs, the latency ladders and the
 # engine cells are not guarded: they need at most ~16N aio events, far
 # inside the default 65,536 room.
 cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...
@@ -3461,13 +3455,17 @@ memcap = float(sys.argv[7])
 hist = sys.argv[8]
 K = dict(kv.split("=", 1) for kv in sys.argv[9:] if "=" in kv)
 EXH = K.get("exh") == "1"
-LINE, FLOORPCT, BAND = float(K["line"]), float(K["floor"]), float(K["band"])
+# the level: safe and max search numjobs only, at a fixed iodepth and
+# nrfiles (fq/fn, set per type by the caller); cal and brutal walk the
+# ladders (Frank, 2026-10-05)
+LVL = K.get("lvl", "cal")
+FIXED = LVL in ("safe", "max")
+LINE = float(K["line"])
 THR, STOP, CONFIRM = float(K["thr"]), int(K["stop"]), int(K["confirm"])
 RT, NR = K["rt"], int(K["nr"])
 def lad(key):
     return sorted(set(int(x) for x in K[key].split(",") if x.strip()))
 NRL, BWQD, IOPSQD = lad("nrc"), lad("bwqd"), lad("iopsqd")
-FLOORREPS = max(1, int(K["floorreps"]))
 SYNC = ("psync", "sync", "pvsync", "pvsync2", "vsync")
 sync = eng in SYNC
 if sync:
@@ -3493,7 +3491,7 @@ def doubling(lo, hi):
 BW_LOW = sorted(set(doubling(1, N) + [N2]))      # at or below N: nrfiles=1 iodepth=1
 HIGH = [2 * N, 4 * N]                              # the siblings in: the ladders
 IOPS_LOW = sorted(set([N2, N]))
-LAT_LOW = sorted(set(doubling(2, N) + [N2, N]) - {1}) if N >= 2 else []
+FIXED_NJ = sorted(set([N2, N, 2 * N]))             # safe and max: the only job counts
 
 # Host-file values pin their knob (Frank, 2026-10-02): a pinned value is the
 # ONLY value that knob takes, on every rung, whatever the rung's own rule
@@ -3504,29 +3502,34 @@ def pin(key):
     return int(v) if v.isdigit() and int(v) > 0 else None
 PNJ, PQD, PNR = pin("pin_nj"), pin("pin_qd"), pin("pin_nr")
 if PNJ:
-    BW_LOW = IOPS_LOW = LAT_LOW = [PNJ] if PNJ <= N else []
+    BW_LOW = IOPS_LOW = [PNJ] if PNJ <= N else []
     HIGH = [PNJ] if PNJ > N else []
+    FIXED_NJ = [PNJ]
 if PQD:
     BWQD, IOPSQD = [PQD], [PQD]
 if PNR:
     NRL, NR = [PNR], PNR
 QD1 = PQD or 1                                     # the qd of the qd1 rungs
 NRX = [x for x in NRL if x != NR]
+# safe and max: one iodepth and one nrfiles per type, pins first
+def fixed_geom():
+    q = K.get("fq", "1")
+    n = K.get("fn", "1")
+    return (PQD or (int(q) if q.isdigit() else 1), PNR or (int(n) if n.isdigit() else 1))
 pinned = ", ".join("%s=%d" % (n, v) for n, v in (("numjobs", PNJ), ("iodepth", PQD),
                                                   ("nrfiles", PNR)) if v)
 
 if act == "budget":
-    if ctype == "bw":
+    if ctype in ("lat", "lat1m"):
+        n = len(NRL)
+    elif FIXED:
+        n = len(FIXED_NJ) + CONFIRM
+    elif ctype == "bw":
         n = len(BW_LOW) + len(HIGH) * len(NRL) * len(BWQD) + CONFIRM
-    elif ctype == "iops":
-        if EXH:
-            n = len(IOPS_LOW) + len(HIGH) * len(NRL) * len(IOPSQD) + CONFIRM
-        else:
-            n = len(IOPS_LOW) + len(HIGH) * (len(IOPSQD) + 2 * len(NRX)) + CONFIRM
-    elif PNJ:
-        n = FLOORREPS * (len(NRL) if PNJ > N else 1)
+    elif EXH:
+        n = len(IOPS_LOW) + len(HIGH) * len(NRL) * len(IOPSQD) + CONFIRM
     else:
-        n = FLOORREPS + 2 * (len(LAT_LOW) + len(HIGH) * len(NRL))
+        n = len(IOPS_LOW) + len(HIGH) * (len(IOPSQD) + 2 * len(NRX)) + CONFIRM
     print(n)
     sys.exit(0)
 
@@ -3557,12 +3560,16 @@ def finish(key, msg):
     print("done %d %d %d %s" % (key[0], key[1], key[2], msg))
     sys.exit(0)
 
+def ahead(v, lead):
+    """The leader rule (Frank, 2026-10-05): a reading takes the lead only
+    when it is at least THR percent better than the leader's."""
+    return lead <= 0 or v >= lead * (1 + THR / 100)
+
 def plateau(vals):
-    """True once STOP consecutive rungs failed to beat the best so far by
-    more than THR percent."""
+    """True once STOP consecutive rungs failed to take the lead."""
     top, miss = 0.0, 0
     for v in vals:
-        if top <= 0 or v > top * (1 + THR / 100):
+        if ahead(v, top):
             top, miss = v, 0
         else:
             miss += 1
@@ -3571,20 +3578,24 @@ def plateau(vals):
     return False
 
 def cheap(k):
-    # inside the tie band the cheapest cell wins: the least outstanding IO,
-    # then fewer jobs (job threads cost cpu, queue depth does not), then the
-    # shallower queue, then the tabled file count
+    # which of the top cells a confirm pass re-measures first: the least
+    # outstanding IO, then fewer jobs, then the shallower queue
     return (k[0] * k[1], k[0], k[1], k[2] != NR, k[2])
 
-def tiepick(keys, decision=False):
-    top = max(best(k, decision) for k in keys)
-    return min((k for k in keys if best(k, decision) >= top * BAND / 100), key=cheap)
+def leader(keys, decision=False):
+    """Walk the cells in the order the ladder measured them; a cell takes
+    the lead only when it beats the leader by THR percent."""
+    lead = None
+    for k in keys:
+        if lead is None or ahead(best(k, decision), best(lead, decision)):
+            lead = k
+    return lead
 
 def confirm_then_pick(keys):
     for k in sorted(keys, key=lambda k: (-best(k, True),) + cheap(k))[:CONFIRM]:
         if len(reads(k)) < 2:
             cell("confirm", k)
-    return tiepick(keys)
+    return leader(keys)
 
 def human(v):
     if ctype == "bw":
@@ -3629,6 +3640,32 @@ def guard(k):
 def reading(k):
     n = len(reads(k))
     return "%s (best of %d)" % (human(best(k)), n) if n > 1 else human(best(k))
+
+if FIXED and ctype in ("bw", "iops"):
+    # safe and max: numjobs N/2, N and 2N at one iodepth and nrfiles (safe
+    # 1 and 1; max the largest any cal or brutal search has chosen across
+    # the labs and field runs so far), every rung measured, the leader wins
+    qd, nr = fixed_geom()
+    keys = []
+    for nj in FIXED_NJ:
+        k = (nj, qd, nr)
+        if not fits(k):
+            guard(k)
+            break    # both guards grow with numjobs: a wider count cannot fit either
+        if best(k, True) is None:
+            cell("numjobs", k)
+        keys.append(k)
+    if not keys:
+        sys.exit("ERROR: cal_plan: -a %s: no job count fits at iodepth=%d (%s)"
+                 % (LVL, qd, "; ".join(notes)))
+    k = confirm_then_pick(keys)
+    line_note = ""
+    if ctype == "bw" and linerate > 0:
+        line_note = " = %.1f%% of the %.2f GiB/s line rate" % (
+            best(k) * 100 / linerate, linerate / float(1 << 30))
+    finish(k, "%s -> %s%s (-a %s: numjobs %s at iodepth %d nrfiles %d, the leader by %g%%; %s)%s"
+           % (geo(k), reading(k), line_note, LVL, ", ".join(str(x[0]) for x in keys), qd, nr,
+              THR, where(k[0]), ("; " + "; ".join(notes)) if notes else ""))
 
 if ctype == "bw":
     target = linerate * LINE / 100 if linerate > 0 else 0.0
@@ -3686,16 +3723,16 @@ if ctype == "bw":
             # 2N was never measured (so it did not "lose"), and both guards
             # grow with numjobs x iodepth, so 4N cannot fit either
             break
-        if not EXH and nj == 2 * N and top2 <= top1 * (1 + THR / 100):
-            notes.append("2N (%d jobs, siblings in) did not beat N; 4N was not tried" % nj)
+        if not EXH and nj == 2 * N and not ahead(top2, top1):
+            notes.append("2N (%d jobs, siblings in) did not beat N by %g%%; 4N was not tried" % (nj, THR))
             break
     k = confirm_then_pick(done1 + done2)
     if EXH:
-        why = "the peak of every rung measured"
+        why = "the leader of every rung measured, by %g%%" % THR
     elif target:
-        why = "never reached %g%% of line rate; the peak" % LINE
+        why = "never reached %g%% of line rate; the leader by %g%%" % (LINE, THR)
     else:
-        why = "the peak"
+        why = "the leader by %g%%" % THR
     finish(k, "%s -> %s%s (%s, %s)%s" % (geo(k), reading(k), of_line(k), why,
                                         where(k[0]), note()))
 
@@ -3728,7 +3765,7 @@ if ctype == "iops":
                     break
         if not mine:
             break    # a guard (memory or aio room) stopped this job count before its first cell
-        top = tiepick(mine, True)
+        top = leader(mine, True)
         if not EXH:
             for nr in NRX:
                 for qd in sorted(set([top[1], min(top[1] * 2, max(IOPSQD))])):
@@ -3739,71 +3776,34 @@ if ctype == "iops":
                         cell("nrfiles", k)
                     pool.append(k)
                     mine.append(k)
-        top = tiepick(mine, True)
+        top = leader(mine, True)
         trail.append("%d jobs %s at iodepth %d nrfiles %d"
                      % (nj, human(best(top, True)), top[1], top[2]))
-        if not EXH and nj == 2 * N and best(top, True) <= top_low * (1 + THR / 100):
-            notes.append("2N (%d jobs, siblings in) did not beat N; 4N was not tried" % nj)
+        if not EXH and nj == 2 * N and not ahead(best(top, True), top_low):
+            notes.append("2N (%d jobs, siblings in) did not beat N by %g%%; 4N was not tried" % (nj, THR))
             break
     k = confirm_then_pick(pool)
     finish(k, "%s -> %s (%s; %s)%s" % (geo(k), reading(k), ", ".join(trail), where(k[0]),
                                       ("; " + "; ".join(notes)) if notes else ""))
 
 if ctype in ("lat", "lat1m"):
-    if PNJ:
-        # the job count is pinned: no floor to widen from, no band -- the
-        # pinned cell's lowest reading is the answer (each nrfiles past N,
-        # unless that is pinned too)
-        keys = [(PNJ, QD1, nr) for nr in (NRL if PNJ > N else [NR])]
-        for k in keys:
-            if len(reads(k)) < FLOORREPS:
-                cell("pinned", k)
-        bk = min(keys, key=lambda k: (min(reads(k)), k[2]))
-        finish(bk, "%s%s -> %.1f us (lowest of %d), %s IOPS; %s"
-               % ("1MiB " if ctype == "lat1m" else "", geo(bk), min(reads(bk)),
-                  len(reads(bk)), format(int(aux(bk) or 0), ","), "; ".join(notes)))
-    fk = (1, QD1, NR)
-    fl = reads(fk)
-    if len(fl) < FLOORREPS:
-        cell("floor", fk)
-    floor = min(fl)
-    limit = floor * (1 + FLOORPCT / 100)
-    last_in, first_out, detail = fk, None, []
-    for nj in LAT_LOW + HIGH:
-        # at or below N nrfiles=1 only; past it every file count, the lowest counts
-        keys = [(nj, QD1, NR)] if nj <= N else [(nj, QD1, nr) for nr in NRL]
-        for k in keys:
-            if not reads(k):
-                cell("widen" if k[2] == NR else "nrfiles", k)
-        if first_out is not None:
-            continue    # brutal measures on; the answer is already decided
-        bk = min(keys, key=lambda k: (min(reads(k)), k[2]))
-        if len(keys) > 1:
-            detail.append("numjobs=%d: %s" % (nj, ", ".join(
-                "nrfiles %d %.1f us" % (k[2], min(reads(k))) for k in keys)))
-        if min(reads(bk)) <= limit:
-            last_in = bk
-            continue
-        if len(reads(bk)) < 2:
-            cell("recheck", bk)
-        first_out = bk
-        if not EXH:
-            break
-    at = min(reads(last_in))
-    msg = ("%sfloor %.1f us (lowest of %d at numjobs=1), band <= %.1f us; "
-           "numjobs=%d nrfiles=%d stays at the floor (%s): %.1f us, %s IOPS"
-           % ("1MiB " if ctype == "lat1m" else "", floor, len(fl), limit, last_in[0],
-              last_in[2], where(last_in[0]), at, format(int(aux(last_in) or 0), ",")))
-    if first_out is not None:
-        msg += "; numjobs=%d left the band at %.1f us (re-measured)" % (
-            first_out[0], min(reads(first_out)))
-    else:
-        msg += "; every rung to numjobs=%d (4N) stayed inside the band" % (4 * N)
-    if detail:
-        msg += "; " + "; ".join(detail)
+    # every level (Frank, 2026-10-05): N jobs -- one per physical core, the
+    # siblings idle -- at iodepth 1, and the only ladder is nrfiles; the
+    # lowest mean latency wins, no threshold. The one-job test runs beside
+    # it in the measured run, so a single stream and full load compare.
+    nj = PNJ or N
+    keys = [(nj, QD1, nr) for nr in NRL]
+    for k in keys:
+        if not reads(k):
+            cell("nrfiles", k)
+    bk = min(keys, key=lambda k: (min(reads(k)), k[2]))
+    msg = ("%s%s -> %.1f us, %s IOPS (the lowest mean of nrfiles %s at %d jobs, %s)"
+           % ("1MiB " if ctype == "lat1m" else "", geo(bk), min(reads(bk)),
+              format(int(aux(bk) or 0), ","), ", ".join(
+                  "%d %.1f us" % (k[2], min(reads(k))) for k in keys), nj, where(nj)))
     if notes:
         msg += "; " + "; ".join(notes)
-    finish(last_in, msg)
+    finish(bk, msg)
 
 sys.exit("ERROR: cal_plan: unknown cell type: %s" % ctype)
 PYEOF

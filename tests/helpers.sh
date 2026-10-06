@@ -299,7 +299,7 @@ export -f cal_sim_fixture
 plan_sim() {   # plan_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
     local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act phase nj qd nr rt n=0 knobs
     shift 7
-    knobs="exh=0 line=95 floor=5 band=98.5 thr=2 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 floorreps=3 $*"
+    knobs="exh=0 line=95 band=98.5 thr=3 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 $*"
     : > "$d/hist"; : > "$d/asked"
     while [ "$n" -lt 300 ]; do
         act=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
