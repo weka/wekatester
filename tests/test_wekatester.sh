@@ -1503,7 +1503,7 @@ t_assert "python floor: every inline python heredoc parses" bash -c '
                 || { echo "does not parse: $f" >&2; bad=1; }
         done
     done
-    [ "$n" -ge 3 ] || { echo "only found $n blocks -- the extractor is broken" >&2; exit 1; }
+    [ "$n" -ge 2 ] || { echo "only found $n blocks -- the extractor is broken" >&2; exit 1; }
     [ "$bad" -eq 0 ]'
 
 # An apostrophe in a comment inside a bash -c '...' body closes the string
@@ -5767,7 +5767,7 @@ t_assert "build: a python heredoc body in the bash source is exactly its include
         !inpy && match(\$0, /<<.(PY|PYLIB)EOF./) { tag = substr(\$0, RSTART + 3, RLENGTH - 4); inpy = 1; n = 0; ok = 0; next }
         inpy && \$0 == tag { seen++; if (n != 1 || !ok) bad++; inpy = 0; next }
         inpy { n++; ok = (\$0 ~ /^#@include py\/[a-z_]+\.py\$/) }
-        END { exit !(seen == 3 && bad == 0) }
+        END { exit !(seen == 2 && bad == 0) }
     " src/wekatester.sh'
 t_assert "build: no bash function is defined twice in the source" bash -c '
     dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" src/wekatester.sh | sed "s/() *{//" | sort | uniq -d)

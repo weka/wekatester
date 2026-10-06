@@ -1148,7 +1148,7 @@ function place_reserve(ORD, nk, SOCK, DPDK, core0, want, RES,    n, i, s, ns, SO
 # cores -- ONE rule for the tuner, the calibration shapes, usable_cores and
 # the pinning check; the python says why for every step. R gets n, ncores,
 # dpdk, nres and res (the reserved cores' threads, for the summary),
-# unlisted, unbound, topo and catchall; PHYS one thread per usable core,
+# weka_core0 (weka holds core 0), unlisted, unbound, topo and catchall; PHYS one thread per usable core,
 # ALL every thread of them. In three parts: awk caps a function at 50
 # parameters and locals together.
 function probe_cores(P, np, base_list, R, PHYS, ALL,    U, UB, CORE, THR, ORD, nk, SOCK, DPDK, core0, B, RES, nres, SKIP, S, i, j, k, T, nt, t, inb, use, unlisted, unbound, res) {
@@ -1190,6 +1190,7 @@ function probe_cores(P, np, base_list, R, PHYS, ALL,    U, UB, CORE, THR, ORD, n
     }
     R["n"] = use; R["ncores"] = nk; R["dpdk"] = set_size(DPDK)
     R["nres"] = nres; R["res"] = res == "" ? "none" : res
+    R["weka_core0"] = core0 != "" && (core0 in DPDK)
     R["unlisted"] = unlisted; R["unbound"] = unbound
 }
 # The host's cpus and cores: U the cpus it has, UB those it refuses to
@@ -1358,6 +1359,107 @@ function fs_groups(work, H, nh, GF, GM,    L, n, i, F, G, g, FIRST, ALL) {
         else { FIRST[g] = H[i]; ALL[g] = H[i] }
     }
     for (i = 1; i <= nh; i++) { g = (H[i] in G) ? G[H[i]] : "1"; GF[H[i]] = FIRST[g]; GM[H[i]] = ALL[g] }
+}
+# --- layout derivation: generate_layout's, and the staged re-derivation's ---
+# One namespace per filename_format -- or, for a job without one, per its
+# measured section name -- collects CONTRIBUTORS: each job's geometry. One
+# section per (pruned) contributor lays out exactly the union of files the
+# jobs will open. A single independent-max section (max numjobs x max
+# nrfiles x max filesize) would instead create the full cross-product grid,
+# over-provisioning disk by integer factors whenever the geometries diverge
+# -- and the capacity guard would never see it coming. lay_reset, then
+# lay_add per jobfile and lay_engine per jobfile whose engine counts, then
+# lay_sections appends the create sections to B.
+function lay_reset() {
+    split("", LAY_NS); split("", LAY_TALLY); split("", LAY_EORD); LAY_NNS = 0; LAY_NE = 0
+}
+function lay_engine(L, n,    eng) {
+    if ((eng = first_value(L, n, "ioengine")) == "") return
+    if (!(eng in LAY_TALLY)) LAY_EORD[++LAY_NE] = eng
+    LAY_TALLY[eng]++
+}
+function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c) {
+    # No filename_format: fio default naming embeds the job section name, so
+    # the layout section must carry the SAME name as the measured (last)
+    # section of the file, or it would create differently-named files.
+    if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
+    else {
+        if ((sec = last_section(L, n)) == "") sec = fname
+        key = "__jobname__:" sec
+    }
+    fs = first_value(L, n, "filesize"); sz = first_value(L, n, "size"); sb = -1
+    # size=50% and the like are not derivable: no size of their own
+    if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
+    if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
+    nj = first_value(L, n, "numjobs"); nj = nj == "" ? 1 : py_int(nj)
+    nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
+    if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
+    if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
+    k = LAY_NS[key]; c = ++LAY_NC[k]
+    LAY_CNJ[k, c] = nj; LAY_CNR[k, c] = nr; LAY_CSB[k, c] = sb; LAY_CFS[k, c] = fs; LAY_CSZ[k, c] = sz
+}
+# prune keeps only contributors no kept contributor grid fully covers:
+# sorted widest first (stably: ties keep file order), a duplicate or
+# dominated entry always meets its dominator first
+function lay_prune(k, KEPT,    n, I, i, j, t, nk, a, b, dom) {
+    n = LAY_NC[k]
+    for (i = 1; i <= n; i++) {
+        t = i
+        for (j = i - 1; j >= 1 && lay_wider(k, t, I[j]); j--) I[j + 1] = I[j]
+        I[j + 1] = t
+    }
+    nk = 0
+    for (i = 1; i <= n; i++) {
+        a = I[i]; dom = 0
+        for (j = 1; j <= nk && !dom; j++) {
+            b = KEPT[j]
+            dom = LAY_CNJ[k, a] <= LAY_CNJ[k, b] && LAY_CNR[k, a] <= LAY_CNR[k, b] && LAY_CSB[k, a] <= LAY_CSB[k, b]
+        }
+        if (!dom) KEPT[++nk] = a
+    }
+    return nk
+}
+function lay_wider(k, a, b) {   # does contributor a sort before b?
+    if (LAY_CNJ[k, a] != LAY_CNJ[k, b]) return LAY_CNJ[k, a] > LAY_CNJ[k, b]
+    if (LAY_CNR[k, a] != LAY_CNR[k, b]) return LAY_CNR[k, a] > LAY_CNR[k, b]
+    return LAY_CSB[k, a] > LAY_CSB[k, b]
+}
+function lay_sections(B, nb,    KS, q, k, nk, KEPT, prev, x, c, cnt, sec, fmt) {   # the new line count
+    for (k = 1; k <= LAY_NNS; k++) KS[k] = LAY_KEY[k]
+    sort_arr(KS, LAY_NNS, 0)
+    cnt = 0
+    for (q = 1; q <= LAY_NNS; q++) {
+        k = LAY_NS[KS[q]]; nk = lay_prune(k, KEPT); prev = ""
+        for (x = 1; x <= nk; x++) {
+            c = KEPT[x]; cnt++
+            # A jobname namespace (no filename_format) names its files after
+            # the section, so a lone contributor keeps that name; several
+            # need distinct names for wait_for, so the default naming of fio
+            # ($jobname.$jobnum.$filenum) is spelled out.
+            if (LAY_SEC[k] != "" && nk == 1) { sec = LAY_SEC[k]; fmt = LAY_FMT[k] }
+            else if (LAY_SEC[k] != "") { sec = "layout-" cnt; fmt = LAY_SEC[k] ".$jobnum.$filenum" }
+            else { sec = "layout-" cnt; fmt = LAY_FMT[k] }
+            B[++nb] = ""
+            B[++nb] = "[" sec "]"
+            # Contributors of one namespace have overlapping grids and must
+            # not lay out the same file concurrently (an extend in fio can
+            # unlink a file another section is mid-write on), so they chain
+            # via wait_for. Distinct namespaces touch disjoint files: those
+            # sections run in parallel -- a global stonewall here would only
+            # slow the layout.
+            if (prev != "") B[++nb] = "wait_for=" prev
+            prev = sec
+            B[++nb] = "create_only=1"
+            B[++nb] = "blocksize=1Mi"
+            if (fmt != "") B[++nb] = "filename_format=" fmt
+            if (LAY_CFS[k, c] != "") B[++nb] = "filesize=" LAY_CFS[k, c]
+            else if (LAY_CSZ[k, c] != "") B[++nb] = "size=" LAY_CSZ[k, c]
+            else B[++nb] = "# WARNING: no derivable file size in this namespace (" LAY_KEY[k] ")"
+            if (LAY_CNR[k, c] > 1) B[++nb] = "nrfiles=" LAY_CNR[k, c]
+            B[++nb] = "numjobs=" LAY_CNJ[k, c]
+        }
+    }
+    return nb
 }
 # One cal.results line into F: the host, its engine, then (qd nr fs nj) per
 # slot, every slot of the host-file schema in its order; 0 for a blank line.
@@ -1926,8 +2028,8 @@ cal_required() {   # cal_required <setdir> [bulk 0|1]
     }' "${2:-0}" "${files[@]}"
 }
 
-# Usable cores for ONE host, by the tuner's own rule (probe_cores in the
-# shared layer) -- the same arithmetic auto_tune's facts block does for its
+# Usable cores for ONE host, by staging's own rule (probe_cores in the
+# shared layer) -- the same arithmetic stage_hosts does under -a for its
 # cpus_allowed/numjobs stamping, and the one the calibration shapes use to
 # size their cells (a divergence would make a measured job count describe a
 # cpu set the staged jobs do not run on). ONE rule, in physical cores: every
@@ -5222,20 +5324,6 @@ probe_workers() {
         || die "cannot df $DIRECTORY on $MASTER"
 }
 
-# One-shot tuner: reads all probe facts and all jobfiles, writes every
-# per-host variant. Python because the rules are per-section, per-type,
-# per-tier -- data transformation, not orchestration.
-#
-# usage: auto_tune <src> <work> <tier> <directory> <ignore_capacity> <host>...
-# where <ignore_capacity> is 1 to downgrade the over-capacity abort to a
-# warning (--ignore-capacity), 0 to abort. Returns nonzero on any failure,
-# including the capacity check, so the caller aborts before fio starts.
-auto_tune() {
-    pyrun "$@" <<'PYEOF' || return 1
-#@include py/auto_tune.py
-PYEOF
-}
-
 # --- capacity check (every run) ----------------------------------------------------
 # Per host: group that host's STAGED variants by filename_format namespace
 # (absent -> the jobfile's own key: fio's default naming makes each file own
@@ -5432,71 +5520,16 @@ generate_layout() {   # generate_layout <setdir> <outdir>
         [ -f "$f" ] && files+=("$f")
     done
     # prints the namespace count, then the body the marker's digest covers
-    out=$(awkrun '
-    # One namespace collects CONTRIBUTORS -- each source job geometry.
-    # Emitting one section per (pruned) contributor lays out exactly the
-    # union of files the jobs will open. A single independent-max section
-    # (max numjobs x max nrfiles x max filesize) would instead create the
-    # full cross-product grid, over-provisioning disk by integer factors
-    # whenever the geometries diverge -- and the capacity guard would never
-    # see it coming. prune keeps only contributors no kept contributor grid
-    # fully covers: sorted widest first (stably: ties keep file order), a
-    # duplicate or dominated entry always meets its dominator first.
-    function prune(k, KEPT,    n, I, i, j, t, nk, a, b, dom) {
-        n = NC[k]
-        for (i = 1; i <= n; i++) {
-            t = i
-            for (j = i - 1; j >= 1 && wider(k, t, I[j]); j--) I[j + 1] = I[j]
-            I[j + 1] = t
-        }
-        nk = 0
-        for (i = 1; i <= n; i++) {
-            a = I[i]; dom = 0
-            for (j = 1; j <= nk && !dom; j++) {
-                b = KEPT[j]
-                dom = CNJ[k, a] <= CNJ[k, b] && CNR[k, a] <= CNR[k, b] && CSB[k, a] <= CSB[k, b]
-            }
-            if (!dom) KEPT[++nk] = a
-        }
-        return nk
-    }
-    function wider(k, a, b) {   # does contributor a sort before b?
-        if (CNJ[k, a] != CNJ[k, b]) return CNJ[k, a] > CNJ[k, b]
-        if (CNR[k, a] != CNR[k, b]) return CNR[k, a] > CNR[k, b]
-        return CSB[k, a] > CSB[k, b]
-    }
-    BEGIN {
-        nns = 0; ne = 0; directory = ""
+    out=$(awkrun 'BEGIN {
+        lay_reset(); directory = ""
         for (a = 2; a < ARGC; a++) {
             f = ARGV[a]; sub(/.*\//, "", f)
             if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
             if (f == layout_job() || is_layout_marked(L, n)) continue   # never derive layout from layout
-            # No filename_format: fio default naming embeds the job section
-            # name, so the layout section must carry the SAME name as the
-            # measured (last) section of the file, or it would create
-            # differently-named files.
-            if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
-            else {
-                if ((sec = last_section(L, n)) == "") sec = f
-                key = "__jobname__:" sec
-            }
-            if ((eng = first_value(L, n, "ioengine")) != "") {
-                if (!(eng in TALLY)) EORD[++ne] = eng
-                TALLY[eng]++
-            }
+            lay_add(L, n, f, ARGV[a]); lay_engine(L, n)
             if (directory == "") directory = first_value(L, n, "directory")
-            fs = first_value(L, n, "filesize"); sz = first_value(L, n, "size"); sb = -1
-            # size=50% and the like are not derivable: no size of their own
-            if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
-            if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
-            nj = first_value(L, n, "numjobs"); nj = nj == "" ? 1 : py_int(nj)
-            nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
-            if (nj == "" || nr == "") awk_fail(ARGV[a] ": numjobs and nrfiles must be numbers")
-            if (!(key in NS)) { NS[key] = ++nns; KEY[nns] = key; SEC[nns] = sec; FMT[nns] = fmt; NC[nns] = 0 }
-            k = NS[key]; c = ++NC[k]
-            CNJ[k, c] = nj; CNR[k, c] = nr; CSB[k, c] = sb; CFS[k, c] = fs; CSZ[k, c] = sz
         }
-        if (!nns) awk_fail("no jobfiles to derive a layout from in " ARGV[1])
+        if (!LAY_NNS) awk_fail("no jobfiles to derive a layout from in " ARGV[1])
         nb = 0
         B[++nb] = "# Auto-generated by wekatester: lays out every file the set\047s jobs"
         B[++nb] = "# will use, as the first job of the run -- a cross-client barrier, so"
@@ -5513,42 +5546,9 @@ generate_layout() {   # generate_layout <setdir> <outdir>
         # sweep deletes and recreates.
         B[++nb] = "fallocate=none"
         B[++nb] = "create_serialize=0"
-        B[++nb] = "ioengine=" pick_engine(TALLY, EORD, ne)
-        for (k = 1; k <= nns; k++) KS[k] = KEY[k]
-        sort_arr(KS, nns, 0)
-        cnt = 0
-        for (q = 1; q <= nns; q++) {
-            k = NS[KS[q]]; nk = prune(k, KEPT); prev = ""
-            for (x = 1; x <= nk; x++) {
-                c = KEPT[x]; cnt++
-                # A jobname namespace (no filename_format) names its files
-                # after the section, so a lone contributor keeps that name;
-                # several need distinct names for wait_for, so the default
-                # naming of fio ($jobname.$jobnum.$filenum) is spelled out.
-                if (SEC[k] != "" && nk == 1) { sec = SEC[k]; fmt = FMT[k] }
-                else if (SEC[k] != "") { sec = "layout-" cnt; fmt = SEC[k] ".$jobnum.$filenum" }
-                else { sec = "layout-" cnt; fmt = FMT[k] }
-                B[++nb] = ""
-                B[++nb] = "[" sec "]"
-                # Contributors of one namespace have overlapping grids and
-                # must not lay out the same file concurrently (an extend in
-                # fio can unlink a file another section is mid-write on), so
-                # they chain via wait_for. Distinct namespaces touch disjoint
-                # files: those sections run in parallel -- a global stonewall
-                # here would only slow the layout.
-                if (prev != "") B[++nb] = "wait_for=" prev
-                prev = sec
-                B[++nb] = "create_only=1"
-                B[++nb] = "blocksize=1Mi"
-                if (fmt != "") B[++nb] = "filename_format=" fmt
-                if (CFS[k, c] != "") B[++nb] = "filesize=" CFS[k, c]
-                else if (CSZ[k, c] != "") B[++nb] = "size=" CSZ[k, c]
-                else B[++nb] = "# WARNING: no derivable file size in this namespace (" KEY[k] ")"
-                if (CNR[k, c] > 1) B[++nb] = "nrfiles=" CNR[k, c]
-                B[++nb] = "numjobs=" CNJ[k, c]
-            }
-        }
-        print nns
+        B[++nb] = "ioengine=" pick_engine(LAY_TALLY, LAY_EORD, LAY_NE)
+        nb = lay_sections(B, nb)
+        print LAY_NNS
         for (i = 1; i <= nb; i++) print rstrip(B[i])
     }' "$1" ${files[@]+"${files[@]}"}) || return 1
     n=${out%%$'\n'*}; body=${out#*$'\n'}
@@ -6491,10 +6491,10 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 
 
 stage_variants() {
-    local srcdir=$1 host
+    local srcdir=$1
     if [ -n "$AUTO_LEVEL" ]; then
-        # The tuner has no rules per level (every level calibrates): it lays
-        # the measured tuples and the host file over the jobfiles, per host.
+        # No rules per level (every level calibrates): staging lays the
+        # measured tuples and the host file over the jobfiles, per host.
         # Reads go to the fleet-shared read set wherever the format can
         # address it, because that is what the read cells measured.
         local ns
@@ -6507,97 +6507,414 @@ stage_variants() {
             "$IGNORE_CAPACITY" "${WORK_DIR}/targets.final" "${HOSTS[@]}" || die "auto tuning failed"
         return
     fi
-    # Plain staging: one awk for every host and jobfile does the directory
-    # override and the host-file geometry (pick_slot -- the same resolver
-    # the tuner and apply_targets_geometry use), and names the hosts whose
-    # geometry changed. Per host and jobfile this was 2-3 grep/awk for the
-    # directory, a python plus up to 4 awk/mv for the geometry, then per
-    # host a python for pristineness and a grep/awk/mv per file for the
-    # engine: ~50 process starts per host and jobfile, serial, none of them
-    # waiting on a worker.
-    local changed pristine="" f files=() dirs=()
-    [ -d "$srcdir" ] || die "per-host jobfile staging failed (no $srcdir)"
-    for f in "$srcdir"/[0-9]*; do
-        [ -f "$f" ] && files+=("$f")
-    done
-    for host in "${HOSTS[@]}"; do dirs+=("$WORK_DIR/jobs/$host"); done
-    [ ${#dirs[@]} -eq 0 ] || mkdir -p "${dirs[@]}" || die "per-host jobfile staging failed"
-    changed=$(awkrun 'BEGIN {
-        work = ARGV[1]; directory = ARGV[2]; nh = ARGV[3]
+    stage_hosts plain "$srcdir" "$DIRECTORY" - - "${HOSTS[@]}" \
+        || die "per-host jobfile staging failed"
+    # host-file engine (final resolution) applies per host, to every staged
+    # file including a re-derived layout; the global -e post-pass in
+    # stage_jobfiles still runs after this and wins
+    [ -f "$WORK_DIR/targets.final" ] || return 0
+    stage_host_engines
+}
+
+# -a staging: the jobfiles laid over with what calibration and the host
+# file say, per host (stage_hosts auto). Every -a level calibrates (Frank,
+# 2026-10-05), so there are no rules per level: the level only labels the
+# log and the staged files.
+#   auto_tune <src> <work> <tier> <directory> <ignore_capacity 0|1> <targets-final|-> <host>...
+# The environment carries the rest: WEKATESTER_TIER_LABEL (the label, else
+# <tier>), WEKATESTER_NS (unified...: read-only jobs read the fleet-shared
+# set) and WEKATESTER_IOPS_NOLAT=1 (iops jobs run with latency accounting
+# off, as their cells did). <ignore_capacity> is checked, not used: the
+# capacity check is check_capacity's, for every run.
+auto_tune() {
+    # Validate the flag slot before using the rest: an old-style call would
+    # shift a positional into the host list and drop a host from staging,
+    # silently. Wrong quietly is worse than not running.
+    if [ $# -lt 7 ] || { [ "$5" != 0 ] && [ "$5" != 1 ]; }; then
+        echo "ERROR: auto_tune: usage: <src> <work> <tier> <directory> <ignore_capacity 0|1> <targets-final|-> <host>..." >&2
+        return 1
+    fi
+    local src=$1 work=$2 tier=$3 dir=$4 targets=$6
+    shift 6
+    WORK_DIR=$work stage_hosts auto "$src" "$dir" "${WEKATESTER_TIER_LABEL:-$tier}" "$targets" "$@"
+}
+
+# Per-host staging, one awk for the fleet, in both modes: every jobfile of
+# <src> becomes jobs/<host>/<file> with the host's destination and its
+# host-file geometry (pick_slot: a single-direction file takes its own slot,
+# a mixed file the deeper-queued direction's whole tuple, never a blend).
+# Under -a (auto) the variants also carry what calibration measured on:
+#   - the cpus: probe_cores' rule, in physical cores -- N/2 and N jobs on
+#     one thread per core, more on every thread of those cores (what the
+#     cell with that job count ran on); the host file's own list is the base
+#     when it gives one, a catch-all counting as none;
+#   - in the unified namespace a read-only job reads the fleet-shared set
+#     ("shared." + its format): the files the read cells calibrated on;
+#   - an engine some host cannot run gives way to the best one every host
+#     can, and the host-file engine (calibration's, by then) beats both;
+#   - a latency test's one-job twin runs at numjobs=iodepth=nrfiles=1, with
+#     the data per job of its calibrated original;
+#   - iops jobs run with latency accounting off, as their cells did;
+#   - a header naming the level and the cores, and usable/<host> (every
+#     thread fio may use there) for the host-file writeback.
+# Host-file values land after everything derived: the file beats the tuner,
+# per type AND direction. Then the layout: a pristine (never-edited) layout
+# is re-derived from each host's staged variants (derive_layouts) -- for
+# every host under -a, for the hosts whose geometry the host file changed
+# otherwise; an edited one is the operator's word and is kept, with a
+# warning. Writes $WORK_DIR/staged.kinds: "J <file>" per job, "L <file>"
+# per layout job, "H <host>" per host, "C <host>" per host whose geometry
+# the host file changed.
+stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <targets|-> <host>...
+    local mode=$1 src=$2 dir=$3 label=$4 targets=$5 f files=() dirs=() h kind name changed=() pristine=1
+    shift 5
+    [ -d "$src" ] || { echo "ERROR: staging: no jobfile set at $src" >&2; return 1; }
+    for f in "$src"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
+    for h in "$@"; do dirs+=("$WORK_DIR/jobs/$h"); done
+    [ "$mode" = plain ] || dirs+=("$WORK_DIR/usable")
+    mkdir -p "${dirs[@]}" || return 1
+    # Pristineness is judged on the SOURCE layout, once for the fleet: the
+    # staged copies always differ from its sha (the directory override
+    # edits them)
+    layout_variant_pristine "$src" || pristine=0
+    awkrun '
+    function warn(msg) { print "WARNING: " msg > "/dev/stderr" }
+    function warn_once(msg) {   # per-host loops would otherwise repeat the same warning
+        if (!(msg in WARNED)) { WARNED[msg] = 1; warn(msg) }
+    }
+    function ceil_div(a, b,    c) { c = int(a / b); return c * b < a ? c + 1 : c }
+    BEGIN {
+        mode = ARGV[1]; work = ARGV[2]; directory = ARGV[3]; label = ARGV[4]; targets = ARGV[5]
+        pristine = ARGV[6] == "1"; nf = ARGV[7] + 0; auto = mode == "auto"
+        ns_unified = auto && index(ENVIRON["WEKATESTER_NS"], "unified") == 1
+        nolat = auto && ENVIRON["WEKATESTER_IOPS_NOLAT"] == "1"
         split("nj fs nr qd", TUPLE, " "); split("numjobs filesize nrfiles iodepth", KNOB, " ")
-        for (i = 1; i <= nh; i++) H[i] = ARGV[3 + i]
-        nf = 0
-        for (a = 4 + nh; a < ARGC; a++) {
-            nf++; SRC[nf] = ARGV[a]; sub(/.*\//, "", SRC[nf])
-            if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
-            NL[nf] = n
-            for (k = 1; k <= n; k++) SL[nf, k] = L[k]
+        # the jobfiles in name order, as the set lists them
+        for (a = 1; a <= nf; a++) { NM[a] = ARGV[7 + a]; sub(/.*\//, "", NM[a]); PATHOF[NM[a]] = ARGV[7 + a] }
+        sort_arr(NM, nf, 0)
+        for (j = 1; j <= nf; j++) {
+            if ((n = readlines(PATHOF[NM[j]], L)) < 0) awk_fail("cannot read " PATHOF[NM[j]])
+            NL[j] = n
+            for (k = 1; k <= n; k++) SL[j, k] = L[k]
+            LAY[j] = NM[j] == layout_job() || is_layout_marked(L, n)
         }
-        # host_dir rule: the finished resolution when it exists, the
-        # pre-auth phase otherwise, the global -d as the fallback; geometry
-        # needs the finished one. The first row per host counts, as
-        # targets_field reads it.
-        has_final = (n = readlines(work "/targets.final", T)) >= 0
-        if (!has_final) n = readlines(work "/targets.phase1", T)
-        for (i = 1; i <= n; i++) {
-            split(T[i], F, "\t")
-            if (!(F[1] in ROWS)) ROWS[F[1]] = T[i]
+        nh = 0
+        for (a = 8 + nf; a < ARGC; a++) H[++nh] = ARGV[a]
+        # the host rows, the first per host: under -a the file named, else
+        # the finished resolution when it exists, the pre-auth phase
+        # otherwise -- geometry needs the finished one
+        if (auto) { has_final = targets != "-" && targets != ""; n = has_final ? readlines(targets, T) : 0 }
+        else {
+            has_final = (n = readlines(work "/targets.final", T)) >= 0
+            if (!has_final) n = readlines(work "/targets.phase1", T)
         }
-        out = ""
-        for (i = 1; i <= nh; i++) {
-            h = H[i]; split("", ROW)
-            if ((hr = (h in ROWS))) split(ROWS[h], ROW, "\t")
-            if ((hd = row_get(ROW, "dir")) == "") hd = directory
-            geo = 0
-            for (j = 1; j <= nf; j++) {
+        for (i = 1; i <= n; i++) { split(T[i], F, "\t"); if (!(F[1] in ROWS)) ROWS[F[1]] = T[i] }
+        if (auto) auto_facts()
+        kinds = work "/staged.kinds"
+        printf "" > kinds
+        for (j = 1; j <= nf; j++) print (LAY[j] ? "L " : "J ") NM[j] > kinds
+        for (x = 1; x <= nh; x++) print "H " H[x] > kinds
+        for (x = 1; x <= nh; x++) {
+            h = H[x]; split("", ROW)
+            if (h in ROWS) lsplit(ROWS[h], ROW, "\t")
+            if ((HD[h] = row_get(ROW, "dir")) == "") HD[h] = directory
+        }
+        # job by job, host by host: the order the notes come out in
+        for (j = 1; j <= nf; j++)
+            for (x = 1; x <= nh; x++) {
+                h = H[x]; split("", ROW)
+                if ((hr = (h in ROWS))) lsplit(ROWS[h], ROW, "\t")
+                if (auto && LAY[j] && pristine) continue   # derive_layouts writes it
                 n = NL[j]
                 for (k = 1; k <= n; k++) L[k] = SL[j, k]
                 # directory= wherever it appears; jobfiles without one get it
                 # right after [global], and jobfiles with no [global] at all
                 # get the section created at the top -- otherwise fio would
                 # silently write to the server cwd
-                n = override_lines(L, n, "directory", hd)
-                if (has_final && hr && SRC[j] != layout_job() && !is_layout_marked(L, n)) {
-                    # precedence latency > bandwidth > iops, same as the
-                    # tuner; a 1MiB latency file (a -b twin) takes lat1m
-                    kind = report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
-                    if (kind != "") {
-                        file_directions(L, n, D)
-                        if ((slot = pick_slot(kind, D, ROW)) != "")
-                            for (q = 1; q <= 4; q++) {
-                                if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
-                                n = override_lines(L, n, KNOB[q], v)
-                                geo = 1
-                            }
-                    }
+                n = override_lines(L, n, "directory", HD[h])
+                if (auto) n = auto_job(j, h, ROW, L, n)
+                else if (has_final && hr && !LAY[j] && (kind = job_kind(j)) != "") {
+                    file_directions_of(j, D)
+                    if ((slot = pick_slot(kind, D, ROW)) != "")
+                        for (q = 1; q <= 4; q++) {
+                            if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
+                            n = override_lines(L, n, KNOB[q], v)
+                            GEO[h] = 1
+                        }
                 }
-                writelines(work "/jobs/" h "/" SRC[j], L, n)
+                writelines(work "/jobs/" h "/" NM[j], L, n)
             }
-            if (geo) out = out (out == "" ? "" : " ") h
+        for (x = 1; x <= nh; x++) if (GEO[H[x]]) print "C " H[x] > kinds
+        close(kinds)
+        if (!auto) exit 0
+        for (j = 1; j <= nf; j++) {
+            if (LAY[j]) continue
+            k = job_kind(j)
+            print "auto[" label "]: " NM[j] " type=" (k == "" ? "all" : k == "bw" ? "bandwidth" : k == "iops" ? "iops" : "latency")
         }
-        print out
-    }' "$WORK_DIR" "$DIRECTORY" ${#HOSTS[@]} "${HOSTS[@]}" ${files[@]+"${files[@]}"}) \
-        || die "per-host jobfile staging failed"
-    for host in $changed; do
-        # host-file geometry changed this host's grid: its layout must
-        # describe THAT grid, so re-derive it from the staged variants --
-        # unless the operator hand-edited the layout, which is preserved
-        # with the same warning the tuner gives. Pristineness is judged on
-        # the SOURCE layout, once for the fleet: the staged copies always
-        # differ from its sha (the directory override edits them).
-        [ -n "$pristine" ] || { layout_variant_pristine "$srcdir" && pristine=1 || pristine=0; }
+        for (j = 1; j <= nf; j++) {
+            if (!LAY[j]) continue
+            if (!pristine) warn_once(NM[j] ": user-edited layout staged as-is; it may not match the auto-tuned geometry (regenerate with -g)")
+            print "auto[" label "]: " NM[j] " type=layout"
+        }
+    }
+    # A job type by its report directive, precedence latency > bandwidth >
+    # iops: a mixed bandwidth+iops file is measuring bandwidth, so it takes
+    # the bandwidth slot and keeps its latency accounting. A 1MiB latency
+    # file (a -b twin) is lat1m. "" for no directive: it runs as written.
+    function job_kind(j,    n, k, L) {
+        n = NL[j]
+        for (k = 1; k <= n; k++) L[k] = SL[j, k]
+        return report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
+    }
+    function file_directions_of(j, D,    n, k, L) {
+        n = NL[j]
+        for (k = 1; k <= n; k++) L[k] = SL[j, k]
+        file_directions(L, n, D)
+    }
+    # The facts -a staging needs, per host: its cpus (probe_cores, the host
+    # file list its base), engines and weka cores, with the warnings they
+    # raise, in host order; usable/<host> for the writeback.
+    function auto_facts(    x, h, np, P, i, F, m, c, S, nodes, WK, ISO, R, PHYS, ALL, base, e, ok, y, NC1, NW1, fleet, v, IS) {
+        for (x = 1; x <= nh; x++) {
+            h = H[x]
+            if ((np = readlines(work "/probe/" h, P)) < 0) awk_fail("cannot read " work "/probe/" h)
+            PN[h] = np
+            for (i = 1; i <= np; i++) PL[h, i] = P[i]
+            NCPU[h] = 0; nodes = 0; split("", WK); ENGS[h] = " "; ISOL[h] = ""
+            for (i = 1; i <= np; i++) {
+                if (!(m = pysplit(P[i], F))) continue
+                if (F[1] == "ncpus") { if ((NCPU[h] = py_int(F[2])) == "") awk_fail("probe: " h ": bad ncpus line: " P[i]) }
+                else if (F[1] == "wekanode" && m > 1) nodes = py_int(F[2]) + 0
+                else if (F[1] == "isolated" && m > 1) ISOL[h] = F[2]
+                else if (F[1] == "weka_allowed") {
+                    # weka pins each dedicated io thread to exactly one CPU (a
+                    # single-CPU task-level mask); utility threads have wide
+                    # masks and float across CPUs. Only single-CPU masks are
+                    # dedicated cores -- wide masks must be ignored or the
+                    # union of every thread mask collapses to "all CPUs" and
+                    # usable cores vanish.
+                    if (!parse_cpulist(F[2], S)) awk_fail("probe: bad cpu list on a weka_allowed line: " F[2])
+                    if (set_size(S) == 1) for (c in S) WK[c] = 1
+                }
+                else if (F[1] == "engines") { ENGS[h] = " "; for (y = 2; y <= m; y++) ENGS[h] = ENGS[h] F[y] " " }
+            }
+            NWEKA[h] = set_size(WK); WEKAL[h] = fmt_cpulist(WK)
+            probe_cores(P, np, "", R, PHYS, ALL)
+            FN[h] = R["n"]
+            if (R["weka_core0"])
+                warn(h ": weka has pinned a dedicated core on core 0 -- that core and its sibling belong to the OS; fio stays off it regardless")
+            # the pin detection is the only thing keeping fio off weka
+            # cores; if weka is running and none were found, say so rather
+            # than silently handing fio the whole machine
+            if (nodes && !NWEKA[h])
+                warn(h ": " nodes " wekanode process(es) running but no pinned cores detected -- fio will be allowed on every cpu, including weka\047s; check that this weka pins its io threads")
+        }
+        NC1 = ""; NW1 = ""; c = 0; y = 0
+        for (x = 1; x <= nh; x++) {
+            h = H[x]
+            if (x > 1 && NCPU[h] != NCPU[H[1]]) c = 1
+            if (x > 1 && NWEKA[h] != NWEKA[H[1]]) y = 1
+        }
+        if (c) { v = ""; for (x = 1; x <= nh; x++) v = v (x > 1 ? ", " : "") H[x] "=" NCPU[H[x]]; warn("system core counts differ between hosts: " v) }
+        if (y) { v = ""; for (x = 1; x <= nh; x++) v = v (x > 1 ? ", " : "") H[x] "=" NWEKA[H[x]]; warn("weka core counts differ between hosts: " v) }
+        # the best engine every host can run, in ENGINE_ORDER
+        m = split(engine_order(), F, " "); COMMON = ""
+        for (i = 1; i <= m && COMMON == ""; i++) {
+            ok = 1
+            for (x = 1; x <= nh && ok; x++) if (!index(ENGS[H[x]], " " F[i] " ")) ok = 0
+            if (ok) COMMON = F[i]
+        }
+        # the nj contract: the operator cpu list is the base when the file
+        # gives one -- minus cpus the host does not have, weka cores and
+        # core 0 pair --, and probe_cores own rule over every cpu otherwise,
+        # including for a list that covers every cpu fio could use (a
+        # catch-all counts as no list)
+        for (x = 1; x <= nh; x++) {
+            h = H[x]; np = PN[h]
+            for (i = 1; i <= np; i++) P[i] = PL[h, i]
+            base = ""
+            if (h in ROWS) { lsplit(ROWS[h], F, "\t"); base = row_get(F, "cpus") }
+            probe_cores(P, np, base, R, PHYS, ALL)
+            if (base == "" && R["n"] < 1)
+                awk_fail(h ": no cpus left for fio -- " cores_summary(R, PHYS, ALL) "; mount weka with fewer cores, use a larger client, or name the cpus in the host file, fewer than fio could use (a narrower list is the operator\047s own reserve)")
+            if (base != "" && R["n"] < 1 && R["catchall"])
+                awk_fail(h ": the host file\047s cpu list (" base ") covers every cpu fio could use, which counts as no list, and the OS reserve then leaves fio no cpus -- " cores_summary(R, PHYS, ALL) "; mount weka with fewer cores, use a larger client, or list fewer cpus (a narrower list is the operator\047s own reserve)")
+            if (base != "" && R["n"] < 1)
+                awk_fail(h ": the host file\047s cpu list (" base ") leaves fio no cpus -- every one is weka\047s, core 0\047s pair, or not on this host")
+            CN[h] = R["n"]; CPH[h] = fmt_cpulist(PHYS); CAL[h] = fmt_cpulist(ALL); NALL[h] = set_size(ALL)
+            CSUM[h] = cores_summary(R, PHYS, ALL)
+            if (ISOL[h] != "" && parse_cpulist(ISOL[h], IS) && set_any(IS)) {
+                c = 0; y = 0
+                for (v in ALL) if (v in IS) c = 1; else y = 1
+                if (c && y) print "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" > "/dev/stderr"
+            }
+        }
+        for (x = 1; x <= nh; x++) { v = work "/usable/" H[x]; print CAL[H[x]] > v; close(v) }
+        # an engine the jobfile names that some host cannot run gives way
+        # to the best one every host can
+        for (j = 1; j <= nf; j++) {
+            MISSING[j] = 0
+            for (k = 1; k <= NL[j]; k++) {
+                if ((e = key_value(SL[j, k], "ioengine")) == "") continue
+                for (x = 1; x <= nh; x++) if (!index(ENGS[H[x]], " " e " ")) MISSING[j] = 1
+            }
+        }
+    }
+    # One job variant for one host under -a, on lines L (directory already
+    # set): the new line count. The order of the overrides is the order the
+    # lines land in.
+    function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no, S0) {
+        if (LAY[j]) {
+            # an edited layout: staged with corrections only
+            return override_lines(L, n, "cpus_allowed", CAL[h])
+        }
+        # usable is the operator list minus weka pinned cores -- the same
+        # effective set the calibration cells were measured on. The host
+        # file keeps the list AS WRITTEN; only what executes is declared
+        # here, so calibration and measurement cannot disagree.
+        n = override_lines(L, n, "cpus_allowed", CAL[h])
+        file_directions_of(j, D)
+        if (ns_unified && ("read" in D) && !("write" in D)) {
+            # a read-only job measures the SHARED dataset: the same files for
+            # every client, exactly the files the read cells calibrated on;
+            # stamp_unique_names leaves "shared." formats alone
+            for (i = 1; i <= NL[j]; i++) S0[i] = SL[j, i]
+            fmt = first_value(S0, NL[j], "filename_format")
+            n = override_lines(L, n, "filename_format", "shared." (fmt != "" ? fmt : "$jobname.$jobnum.$filenum"))
+        }
+        if (COMMON != "" && MISSING[j]) n = override_lines(L, n, "ioengine", COMMON)
+        kind = job_kind(j)
+        floor = 0
+        for (i = 1; i <= 3 && i <= NL[j]; i++) if (index(SL[j, i], floor_marker()) == 1) floor = 1
+        if (kind != "" && (slot = pick_slot(kind, D, ROW)) != "")
+            for (q = 1; q <= 4; q++) {
+                if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
+                if (q == 1 && v ~ /^[0-9]+$/ && !floor) {
+                    # The host file is the operator, so this is honoured.
+                    # Past every thread of the usable cores is the 4N rung
+                    # of a calibration (two jobs per thread on an SMT host)
+                    # and gets a note; past 4N it matches no rung and is
+                    # probably stale (seen live on field client B: 52 jobs
+                    # in a 46-cpu mask), so it gets the warning.
+                    cap = NALL[h]; nn = CN[h]
+                    if (v + 0 > 4 * nn)
+                        warn_once(h ": host-file " slot "_nj=" v " exceeds 4N (" 4 * nn "; N=" nn " usable physical cores) -- split affinity will run " ceil_div(v + 0, cap) " jobs on some cpus")
+                    else if (v + 0 > cap)
+                        print "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)" > "/dev/stderr"
+                }
+                n = override_lines(L, n, KNOB[q], v)
+            }
+        if (floor) {
+            # the one-job twin of a latency test: one stream per client at
+            # numjobs=iodepth=nrfiles=1, with the same data per job as its
+            # calibrated original (the calibration floor own geometry)
+            fs = slot != "" ? row_get(ROW, slot "_fs") : ""
+            nr = slot != "" ? row_get(ROW, slot "_nr") : ""
+            n = override_lines(L, n, "numjobs", "1"); n = override_lines(L, n, "iodepth", "1"); n = override_lines(L, n, "nrfiles", "1")
+            if (fs != "" && nr ~ /^[0-9]+$/ && (b = parse_size(fs)) != "") {
+                v = int(b * nr / 1048576)
+                n = override_lines(L, n, "filesize", (v > 1 ? v : 1) "M")
+            }
+        }
+        if ((v = row_get(ROW, "engine")) != "") n = override_lines(L, n, "ioengine", v)
+        if (kind == "iops" && nolat) {
+            # the iops test records no latency, and its calibration cells
+            # measured with the accounting off -- the staged job must run
+            # what was measured
+            n = override_lines(L, n, "disable_lat", "1"); n = override_lines(L, n, "disable_clat", "1")
+            n = override_lines(L, n, "disable_slat", "1"); n = override_lines(L, n, "norandommap", "1")
+        }
+        # the job count is final now: N/2 and N jobs run one per physical
+        # core, more spread over the siblings too -- what the calibration
+        # cell with this count ran on
+        nj = first_value(L, n, "numjobs")
+        n = override_lines(L, n, "cpus_allowed", (nj ~ /^[0-9]+$/ ? nj + 0 : 1) <= CN[h] ? CPH[h] : CAL[h])
+        no = 0
+        O[++no] = "# generated by wekatester auto[" label "] for " h
+        O[++no] = "# usable cores: " CSUM[h] " (of " NCPU[h] " cpus, weka: " (WEKAL[h] != "" ? WEKAL[h] : "none") ")"
+        for (i = 1; i <= n; i++) O[++no] = L[i]
+        split("", L)
+        for (i = 1; i <= no; i++) L[i] = O[i]
+        return no
+    }' "$mode" "$WORK_DIR" "$dir" "$label" "$targets" "$pristine" ${#files[@]} ${files[@]+"${files[@]}"} "$@" \
+        || return 1
+    while read -r kind name; do [ "$kind" != C ] || changed+=("$name"); done < "$WORK_DIR/staged.kinds"
+    if [ "$mode" = auto ]; then
+        [ "$pristine" -eq 0 ] || derive_layouts auto "$label" "$dir" "$@" || return 1
+    elif [ ${#changed[@]} -gt 0 ]; then
+        # host-file geometry changed these hosts' grids: each layout must
+        # describe THAT grid
         if [ "$pristine" -eq 1 ]; then
-            generate_layout "$WORK_DIR/jobs/$host" "$WORK_DIR/jobs/$host" >/dev/null \
-                || die "per-host layout derivation failed for $host"
+            derive_layouts plain - "$dir" "${changed[@]}" || return 1
         else
-            log "WARNING: $host: hand-edited layout kept as authored; it may not match the host-file geometry" >&2
+            for h in "${changed[@]}"; do
+                log "WARNING: $h: hand-edited layout kept as authored; it may not match the host-file geometry" >&2
+            done
         fi
-    done
-    # host-file engine (final resolution) applies per host, to every staged
-    # file including a re-derived layout; the global -e post-pass in
-    # stage_jobfiles still runs after this and wins
-    [ -f "$WORK_DIR/targets.final" ] || return 0
-    stage_host_engines
+    fi
+}
+
+# Each host's layout job(s), re-derived from its STAGED variants
+# (staged.kinds names them), so the layout covers what will actually run:
+# the numjobs, filesize and nrfiles every job runs there. The rules are
+# generate_layout's (lay_add, lay_sections). Under -a the shared read set of a
+# filesystem group is laid out ONCE, by its first host's layout, for EVERY
+# reader in the group -- hosts of different shapes read it with different
+# job counts and the widest decides what must exist; N clients racing to
+# create (and the sweep to credit) the same files would be N times the
+# work. No sha in the marker: it is re-derived every run, so nothing
+# compares it.
+derive_layouts() {   # derive_layouts <plain|auto> <label|-> <directory> <host>...
+    awkrun 'BEGIN {
+        mode = ARGV[1]; label = ARGV[2]; directory = ARGV[3]; work = ARGV[4]
+        nh = 0
+        for (a = 5; a < ARGC; a++) H[++nh] = ARGV[a]
+        if ((n = readlines(work "/staged.kinds", K)) < 0) awk_fail("cannot read " work "/staged.kinds")
+        nj = 0; nl = 0
+        for (i = 1; i <= n; i++) {
+            if (substr(K[i], 1, 2) == "J ") JOB[++nj] = substr(K[i], 3)
+            else if (substr(K[i], 1, 2) == "L ") LAYN[++nl] = substr(K[i], 3)
+        }
+        # plain staging always re-derived the layout job, set or no set
+        if (!nl) { if (mode == "auto") exit 0; LAYN[++nl] = layout_job() }
+        # the whole fleet groups: a group first member lays out its set
+        nall = 0
+        for (i = 1; i <= n; i++) if (substr(K[i], 1, 2) == "H ") ALLH[++nall] = substr(K[i], 3)
+        fs_groups(work, ALLH, nall, GF, GM)
+        for (x = 1; x <= nh; x++) {
+            h = H[x]; lay_reset(); hdir = ""
+            for (j = 1; j <= nj; j++) {
+                p = work "/jobs/" h "/" JOB[j]
+                if ((m = readlines(p, V)) < 0) awk_fail("cannot read " p)
+                if (hdir == "") hdir = first_value(V, m, "directory")
+                lay_engine(V, m)
+                if (mode == "auto" && index(first_value(V, m, "filename_format"), "shared.") == 1) {
+                    if (GF[h] != h) continue   # its group first lays the set out
+                    nr = split(GM[h], RD, " ")
+                } else { nr = 1; RD[1] = h }
+                for (r = 1; r <= nr; r++) {
+                    if (RD[r] == h) { lay_add(V, m, JOB[j], p); continue }
+                    q = work "/jobs/" RD[r] "/" JOB[j]
+                    if ((mr = readlines(q, RL)) < 0) awk_fail("cannot read " q)
+                    lay_add(RL, mr, JOB[j], q)
+                }
+            }
+            nb = 0; split("", B)
+            B[++nb] = layout_marker() (mode == "auto" ? " (re-derived by wekatester auto[" label "] from this host\047s tuned variants)" : " (re-derived by wekatester from this host\047s staged variants)")
+            B[++nb] = "[global]"
+            B[++nb] = "directory=" (hdir != "" ? hdir : directory)
+            if (mode == "auto") {
+                if (readlines(work "/usable/" h, U) < 1) awk_fail("cannot read " work "/usable/" h)
+                B[++nb] = "cpus_allowed=" U[1]
+            }
+            B[++nb] = "create_serialize=0"
+            B[++nb] = "fallocate=none"
+            B[++nb] = "ioengine=" pick_engine(LAY_TALLY, LAY_EORD, LAY_NE)
+            nb = lay_sections(B, nb)
+            for (i = 1; i <= nl; i++) writelines(work "/jobs/" h "/" LAYN[i], B, nb)
+        }
+    }' "$1" "$2" "$3" "$WORK_DIR" "${@:4}"
 }
 
 # Each host's host-file engine (targets.final) onto every one of its staged
