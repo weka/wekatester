@@ -3563,10 +3563,18 @@ t_assert "mount guard: missing -d under forcedirect wekafs is created unattended
                 (p=*)       echo "PROBE[$1]" >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode && echo rc=0) 2>&1 )
+    # the hosts are created in parallel: each its mkdir, then its probe
     case "$out" in
-        *"h1: /mnt/weka/wt does not exist; /mnt/weka is a wekafs mount"*"h2: /mnt/weka/wt does not exist"*"does not exist on 2 host(s); creating it (unattended)"*"MKDIR[h1] mkdir -p -- '"'"'/mnt/weka/wt'"'"'"*"h1: created /mnt/weka/wt"*"PROBE[h1]"*"MKDIR[h2]"*"PROBE[h2]"*rc=0*) true;;
-        *) echo "$out" >&2; false;;
-    esac'
+        *"h1: /mnt/weka/wt does not exist; /mnt/weka is a wekafs mount"*"h2: /mnt/weka/wt does not exist"*"does not exist on 2 host(s); creating it (unattended)"*"MKDIR["*rc=0*) ;;
+        *) echo "$out" >&2; exit 1;;
+    esac
+    for h in h1 h2; do
+        case "$out" in
+            *"MKDIR[$h] mkdir -p -- "?"/mnt/weka/wt"?*"PROBE[$h]"*) ;;
+            *) echo "$h: $out" >&2; exit 1;;
+        esac
+        case "$out" in *"$h: created /mnt/weka/wt"*) ;; *) echo "$h: $out" >&2; exit 1;; esac
+    done'
 t_assert "mount guard: missing -d without -r needs a terminal and creates nothing" bash -c '
     err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
             source ./wekatester
@@ -5545,6 +5553,45 @@ t_assert "fio JSON: a results file is flattened once -- the error check and the 
      # a check always parses afresh: the same path may hold a new run
      check_fio_errors "$d/c.json" measured && [ "$(wc -l < "$d/n")" -eq 3 ]) ||
         { cat "$d/out" "$d/n" >&2; false; }'
+t_assert "fleet phases start as many processes for 40 hosts as for 3: -x/-e stamping, the sysinfo split, the layout directories, the destination table, the machine ids" bash -c '
+    count() {   # count <hosts> -> the processes the phases started; their results checked
+        local n=$1 d h i hs="" r t
+        d=$(mktemp -d); mkdir -p "$d/bin" "$d/w/jobs" "$d/w/probe" "$d/run"
+        for t in awk grep mv cat mkdir cp sed tr head tail; do
+            r=$(command -v "$t") || continue
+            printf "#!/bin/sh\necho %s >> \"%s/calls\"\nexec %s \"\$@\"\n" "$t" "$d" "$r" > "$d/bin/$t"; chmod +x "$d/bin/$t"
+        done
+        for i in $(seq 1 "$n"); do
+            h=h$i; hs="$hs $h"; mkdir -p "$d/w/jobs/$h"
+            printf "[global]\nfilename_format=d/\$jobnum/f\nnumjobs=2\ndirectory=/mnt/w\n[a]\nrw=read\n" > "$d/w/jobs/$h/000-wekatester-layout.job"
+            printf "[global]\nruntime=10\n[a]\nrw=read\n" > "$d/w/jobs/$h/011-r.job"
+            printf "=== WEKATESTER_SYSINFO uname ===\nLinux\n=== WEKATESTER_SYSINFO cmdline ===\nro\n" > "$d/w/sysinfo.$h"
+            printf "ncpus 8\nident ABC$i\n" > "$d/w/probe/$h"
+            printf "$h\t-\t-\t-\t/mnt/$h\n" >> "$d/w/targets.final"
+        done
+        : > "$d/calls"
+        (export PATH="$d/bin:$PATH"; source ./wekatester
+         WORK_DIR=$d/w; RUN_DIR=$d/run; HOSTS=($hs); DIRECTORY=/mnt/x; LOCAL_MODE=0
+         run_host() { :; }
+         override_staged measured runtime 30 time_based 1 &&
+         split_sysinfo "$WORK_DIR/sysinfo." "" &&
+         ensure_layout_dirs 000-wekatester-layout.job &&
+         load_host_dirs && [ "${HOST_DIRS[$((n - 1))]}" = "/mnt/h$n" ] &&
+         ids=$(host_idents) && [ "${ids%%,*}" = "h1=h1/abc1" ]) || { echo "the phases failed at $n hosts" >&2; return 1; }
+        grep -qx "runtime=30" "$d/w/jobs/h$n/011-r.job" && grep -qx "time_based=1" "$d/w/jobs/h$n/011-r.job" &&
+        ! grep -q "runtime" "$d/w/jobs/h$n/000-wekatester-layout.job" &&
+        grep -qx "Linux" "$d/run/sysinfo/h$n/uname" && grep -qx "ro" "$d/run/sysinfo/h$n/cmdline" &&
+        [ "$(grep -c "mkdir -p" "$d/w/layout-dirs.cmd")" -eq "$n" ] &&
+        grep -q "^h$n	mkdir -p ./mnt/w/d/0. ./mnt/w/d/1.$" "$d/w/layout-dirs.cmd" ||
+            { echo "wrong results at $n hosts" >&2; return 1; }
+        wc -l < "$d/calls"
+    }
+    a=$(count 3) && b=$(count 40) && [ "$a" -eq "$b" ] || { echo "3 hosts: $a processes, 40 hosts: $b" >&2; false; }'
+t_assert "targets_column: one line per host in the order given; the first row per host counts; - and no row are empty" bash -c '
+    d=$(mktemp -d)
+    printf "a\tu1\te1\t-\t/d/a\nb\t-\t-\t-\t-\na\tu2\te2\t-\t/d/a2\n" > "$d/t"
+    out=$(source ./wekatester; targets_column 5 "$d/t" b c a | tr "\n" "|")
+    [ "$out" = "||/d/a|" ] || { echo "[$out]" >&2; false; }'
 t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" bash -c '
     for f in json_flat errno_text cal_values cal_lat_values check_fio_errors summarize summarize_report summ_one; do
         body=$(sed -n "/^$f() {/,/^}/p" src/wekatester.sh); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }

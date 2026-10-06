@@ -697,6 +697,17 @@ function path_join(a, b) {   # os.path.join(a, b)
     return a (substr(a, length(a)) == "/" ? "" : "/") b
 }
 function squote(s) { return "\047" s "\047" }
+# The commands that delete the dataset files <pattern> names under <hd>:
+# every $var a wildcard, find bounded at the pattern's own depth so nothing
+# outside the grid is touched, then the directories that leaves empty.
+function dataset_remove_cmd(pattern, hd,    glob, depth, cmd) {
+    glob = vars_to_glob(pattern)
+    depth = 1 + count_char(glob, "/")
+    cmd = sprintf("find %s -maxdepth %d -type f -path %s -delete", squote(hd), depth, squote(hd "/" glob))
+    if (index(glob, "/"))
+        cmd = cmd sprintf(" && find %s -maxdepth %d -type d -path %s -empty -delete", squote(hd), depth - 1, squote(hd "/" substr(glob, 1, match(glob, /\/[^\/]*$/) - 1)))
+    return cmd
+}
 
 # open(path).read().splitlines() into L[1..n]; -1 when it cannot be read
 function readlines(path, L,    n, r, line, m, k, parts) {
@@ -2769,14 +2780,7 @@ BUDEOF
 # (the sweep's glob derivation: every $var a wildcard, find bounded at the
 # format's own depth), then whatever directories that leaves empty.
 cal_remove_cmd() {   # cal_remove_cmd <name> <sep> <fmt> <hd>
-    awkrun 'BEGIN {
-        glob = vars_to_glob(ARGV[1] ARGV[2] ARGV[3]); hd = ARGV[4]
-        depth = 1 + count_char(glob, "/")
-        cmd = sprintf("find %s -maxdepth %d -type f -path %s -delete", squote(hd), depth, squote(hd "/" glob))
-        if (index(glob, "/"))
-            cmd = cmd sprintf(" && find %s -maxdepth %d -type d -path %s -empty -delete", squote(hd), depth - 1, squote(hd "/" substr(glob, 1, match(glob, /\/[^\/]*$/) - 1)))
-        print cmd
-    }' "$@"
+    awkrun 'BEGIN { print dataset_remove_cmd(ARGV[1] ARGV[2] ARGV[3], ARGV[4]) }' "$@"
 }
 
 # -u, after the last measured job (main): the calibration dataset -- in the
@@ -2785,26 +2789,47 @@ cal_remove_cmd() {   # cal_remove_cmd <name> <sep> <fmt> <hd>
 # private scratch the whole scratch dir. Never from calibrate itself: the
 # measured jobs still use the unified dataset, and a failed run keeps it.
 cal_remove_dataset() {
-    local host i ucmd pids=() hs=()
-    for host in "${HOSTS[@]}"; do
-        if [ -z "$CAL_NS_DIR" ]; then
-            # unified: this host's write set, and -- from the first host of
-            # each filesystem group only -- the group's fleet-shared read
-            # set, deleted by the same glob derivation the sweep uses
-            if [ "$host" = "$(group_first "$host")" ]; then
-                ucmd=$(cal_remove_cmd shared "." "$CAL_FMT" "$(host_dir "$host")") \
-                    || die "cannot derive the shared dataset removal command"
+    local i kind host ucmd args=() pids=() hs=() cmds="$WORK_DIR/cal-remove.cmds" gf=-
+    load_host_dirs
+    if [ -n "$CAL_NS_DIR" ]; then
+        for i in "${!HOSTS[@]}"; do
+            run_host "${HOSTS[$i]}" "rm -rf '${HOST_DIRS[$i]}$CAL_NS_DIR'" &
+            pids+=($!); hs+=("${HOSTS[$i]}")
+        done
+    else
+        # unified: this host's write set, and -- from the first host of
+        # each filesystem group only, before its own -- the group's
+        # fleet-shared read set; one awk derives every command
+        [ ! -s "$WORK_DIR/groups" ] || gf="$WORK_DIR/groups"
+        for i in "${!HOSTS[@]}"; do
+            host_name_v "${HOSTS[$i]}"
+            args+=("${HOSTS[$i]}" "$HOST_NAME" "${HOST_DIRS[$i]}")
+        done
+        awkrun 'BEGIN {
+            sep = ARGV[1]; fmt = ARGV[2]; ng = 0
+            # group_first: the first host of each group in the groups file;
+            # a host it does not list is its own; no groups file, the first host
+            if (ARGV[3] != "-")
+                while ((getline line < ARGV[3]) > 0)
+                    if (split(line, F, " ") == 2) { ng++; G[F[1]] = F[2]; if (!(F[2] in FIRST)) FIRST[F[2]] = F[1] }
+            for (a = 4; a + 2 < ARGC; a += 3) {
+                h = ARGV[a]
+                first = ng ? (!(h in G) || FIRST[G[h]] == h) : (a == 4)
+                if (first) print "S\t" h "\t" dataset_remove_cmd("shared." fmt, ARGV[a + 2])
+                print "P\t" h "\t" dataset_remove_cmd(ARGV[a + 1] sep fmt, ARGV[a + 2])
+            }
+        }' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" \
+            "${args[@]}" > "$cmds" || die "cannot derive the dataset removal commands"
+        while IFS=$'\t' read -r kind host ucmd; do
+            if [ "$kind" = S ]; then
                 run_host "$host" "$ucmd" \
                     || log "WARNING: could not remove the shared dataset" >&2
+            else
+                run_host "$host" "$ucmd" &
+                pids+=($!); hs+=("$host")
             fi
-            ucmd=$(cal_remove_cmd "$(host_name "$host")" "${CAL_SEP:-.}" "$CAL_FMT" "$(host_dir "$host")") \
-                || die "$host: cannot derive the dataset removal command"
-            run_host "$host" "$ucmd" &
-        else
-            run_host "$host" "rm -rf '$(host_dir "$host")$CAL_NS_DIR'" &
-        fi
-        pids+=($!); hs+=("$host")
-    done
+        done < "$cmds"
+    fi
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" \
             || log "WARNING: could not remove the calibration dataset on ${hs[$i]}" >&2
@@ -2919,7 +2944,8 @@ calibrate() {
         for host in "${HOSTS[@]}"; do
             # the data files carry host_name (local mode: the box's short
             # hostname), so both it and the address must stay clear
-            [ "$host" != shared ] && [ "$(host_name "$host")" != shared ] \
+            host_name_v "$host"
+            [ "$host" != shared ] && [ "$HOST_NAME" != shared ] \
                 || die "the host name 'shared' is reserved for the fleet-shared read dataset ($host)"
         done
         CAL_NS_DIR=""; CAL_SEP="."
@@ -3087,16 +3113,20 @@ preflight() {
 # wekafs must be mounted forcedirect: fio's direct=1 asks for O_DIRECT per
 # file, but only the forcedirect mount mode keeps the wekafs client cache
 # out of the IO path entirely. Non-wekafs targets are not our call.
-classify_mount_line() {
+classify_mount_line() {   # prints the verdict and leaves it in MOUNT_VERDICT
     set -- $1
     local fstype=${1:-} opts=${2:-}
-    [ "$fstype" = "wekafs" ] || { echo "skip"; return; }
-    case ",$opts," in
-        *,forcedirect,*) echo "ok" ;;
-        *,writecache,*)  echo "fail writecache" ;;
-        *,readcache,*)   echo "fail readcache" ;;
-        *)               echo "fail unknown" ;;
-    esac
+    if [ "$fstype" != "wekafs" ]; then
+        MOUNT_VERDICT=skip
+    else
+        case ",$opts," in
+            *,forcedirect,*) MOUNT_VERDICT=ok ;;
+            *,writecache,*)  MOUNT_VERDICT="fail writecache" ;;
+            *,readcache,*)   MOUNT_VERDICT="fail readcache" ;;
+            *)               MOUNT_VERDICT="fail unknown" ;;
+        esac
+    fi
+    echo "$MOUNT_VERDICT"
 }
 
 # Remote snippet for a destination that does not exist: print its nearest
@@ -3115,7 +3145,8 @@ missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
 probe_writable() {   # probe_writable <host> <dir>
     # the same session drops the host's name into the run's group file
     # there: collect_fs_groups hashes it once every host is through
-    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$(host_name "$1")' >> '$2/$GROUP_FILE'}"
+    host_name_v "$1"
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$HOST_NAME' >> '$2/$GROUP_FILE'}"
 }
 
 # --- filesystem groups (Frank, 2026-10-02) --------------------------------------
@@ -3136,9 +3167,10 @@ collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
     local i h hd pids=() sum n=0 line
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
+    load_host_dirs
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        ( run_host "$h" "sha256sum '$(host_dir "$h")/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
         pids[$i]=$!
     done
     : > "$WORK_DIR/fsgroup/sums"
@@ -3147,17 +3179,17 @@ collect_fs_groups() {
         sum=""
         if wait "${pids[$i]}"; then read -r sum _ < "$WORK_DIR/fsgroup/$i.sum" || sum=""; fi
         case "$sum" in
-            (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file $(host_dir "$h")/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
+            (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
         esac
         printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
     done
     pids=()
-    for h in "${HOSTS[@]}"; do
-        run_host "$h" "rm -f '$(host_dir "$h")/$GROUP_FILE'" &
+    for i in "${!HOSTS[@]}"; do
+        run_host "${HOSTS[$i]}" "rm -f '${HOST_DIRS[$i]}/$GROUP_FILE'" &
         pids+=($!)
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove $(host_dir "${HOSTS[$i]}")/$GROUP_FILE" >&2
+        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
     done
     awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
     n=$(awk '{print $2}' "$WORK_DIR/groups" | sort -u | wc -l | tr -d ' ')
@@ -3253,14 +3285,17 @@ verify_mount_mode() {
     local td pids=() hds=() rcs=() lines=() ancs=() msgs=() probe=()
     td=$(mktemp -d "${WORK_DIR:-${TMPDIR:-/tmp}}/mnt.XXXXXX") \
         || die "cannot create a scratch dir for the mount check"
+    load_host_dirs
     for i in "${!HOSTS[@]}"; do
-        hds[$i]=$(host_dir "${HOSTS[$i]}")
+        hds[$i]=${HOST_DIRS[$i]}
         ( run_host "${HOSTS[$i]}" "findmnt -T '${hds[$i]}' -n -o FSTYPE,OPTIONS" > "$td/$i.mnt" ) &
         pids[$i]=$!
     done
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}"; rcs[$i]=$?
-        lines[$i]=$(cat "$td/$i.mnt")
+        # findmnt -n prints one line: read it, no $(cat) per host
+        line=""; IFS= read -r line < "$td/$i.mnt" || :
+        lines[$i]=$line
     done
     # findmnt fails for a path that does not exist: classify the nearest
     # ancestor that does, and remember that the destination is missing
@@ -3284,7 +3319,7 @@ verify_mount_mode() {
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
-        verdict=$(classify_mount_line "${lines[$i]}")
+        classify_mount_line "${lines[$i]}" > /dev/null; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ;;
             skip) if [ -n "$anc" ]; then
@@ -3354,15 +3389,24 @@ verify_mount_mode() {
                 log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is a wekafs mount"
             done
             confirm_create_dirs "${#missing[@]}"
+            # one fan-out, each host its mkdir and then its write probe
+            local rc
+            pids=()
+            for i in "${!missing[@]}"; do
+                ( run_host "${missing[$i]}" "mkdir -p -- '${missing_dirs[$i]}'" || exit 2
+                  probe_writable "${missing[$i]}" "${missing_dirs[$i]}" || exit 3 ) &
+                pids[$i]=$!
+            done
             for i in "${!missing[@]}"; do
                 host=${missing[$i]}; hd=${missing_dirs[$i]}
-                if ! run_host "$host" "mkdir -p -- '$hd'"; then
+                wait "${pids[$i]}"; rc=$?
+                if [ "$rc" -eq 2 ]; then
                     failed+=("$host: cannot create $hd -- $(write_fix_hint "${missing_parents[$i]}")")
                     write_fail=1
                     continue
                 fi
                 log "$host: created $hd"
-                probe_writable "$host" "$hd" \
+                [ "$rc" -eq 0 ] \
                     || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                          write_fail=1; }
             done
@@ -3419,8 +3463,8 @@ start_fio_servers() {
     local pids=() failed=() host i priv cpus launch base
     for host in "${HOSTS[@]}"; do
         priv=""; cpus=""
-        [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
-        [ ! -s "$AUTH_DIR/$host.cpus" ] || cpus=$(cat "$AUTH_DIR/$host.cpus")
+        [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
+        [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
         base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
         # a requested cpu list pins the server (children inherit the mask);
         # a recorded escalator means the mask cannot be self-applied -- but
@@ -3443,10 +3487,14 @@ start_fio_servers() {
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
     done
+    # one grep for the fleet: the launches that reported a root fio
+    local roots
+    roots=$(grep -l "WEKATESTER_FIO_AS=root" "${HOSTS[@]/#/$WORK_DIR/launch.}") || :
     for host in "${HOSTS[@]}"; do
-        [ ! -f "$WORK_DIR/launch.$host" ] \
-            || ! grep -q "WEKATESTER_FIO_AS=root" "$WORK_DIR/launch.$host" \
-            || log "NOTE: $host: fio runs as root (no runuser drop-back) -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2
+        case $'\n'"$roots"$'\n' in
+            (*$'\n'"$WORK_DIR/launch.$host"$'\n'*)
+                log "NOTE: $host: fio runs as root (no runuser drop-back) -- files it creates are root-owned, and a later unprivileged run on them will fail with EACCES" >&2 ;;
+        esac
     done
     [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
     # let the listeners settle before the first coordinator connect; the
@@ -3525,7 +3573,7 @@ cleanup() {
             # (seen live: "Operation not permitted" teardowns, orphan healed
             # only by the NEXT privileged run's pre-start sweep)
             priv=""
-            [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || priv=$(cat "$AUTH_DIR/$host.priv")
+            [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
             run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
             pids+=($!)
         done
@@ -3539,9 +3587,15 @@ cleanup() {
         # -O exit talks only to the socket; the trailing hostname is unused.
         # -q silences ssh's "Exit request sent." banner -- a status line, not a
         # result: a failed -O exit still reports its failure on stderr.
+        # every master at once: one ssh per socket in turn was seconds of
+        # teardown at a few hundred hosts
+        pids=()
         for f in "${CTRL_DIR:-$WORK_DIR/c}"/*; do
-            [ -S "$f" ] && ssh -q -O exit -o ControlPath="$f" unused-host-arg
+            [ -S "$f" ] || continue
+            ssh -q -O exit -o ControlPath="$f" unused-host-arg &
+            pids+=($!)
         done
+        [ ${#pids[@]} -eq 0 ] || wait "${pids[@]}" || true
         rm -rf "$WORK_DIR"
         # a socket dir of its own (make_ctrl_dir) lives outside the work dir
         case "$CTRL_DIR" in ("$WORK_DIR"/*|"") ;; (*) rm -rf "$CTRL_DIR" ;; esac
@@ -3644,11 +3698,17 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
 REMAINING=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() effs=() left=() i n=0 eff
-    for host in "${REMAINING[@]}"; do
-        # a credential's own login wins; else the host file pins this host's
+    local host pids=() effs=() left=() i n=0 eff logins=()
+    # a credential's own login wins; else the host file pins this host's
+    # (one awk for the round, not one per host)
+    if [ -z "$3" ] && [ -f "$WORK_DIR/targets.phase1" ]; then
+        while IFS= read -r eff; do logins+=("$eff"); done \
+            < <(targets_column 2 "$WORK_DIR/targets.phase1" "${REMAINING[@]}")
+    fi
+    for i in "${!REMAINING[@]}"; do
+        host=${REMAINING[$i]}
         eff=$3
-        [ -n "$eff" ] || eff=$(targets_field "$host" 2)
+        [ -n "$eff" ] || eff=${logins[$i]:-}
         effs+=("${eff:-.}")
         attempt_host "$2" "$host" "$eff" "$4" &
         pids+=($!)
@@ -3845,9 +3905,12 @@ test_engines() {
     cand=$(printf '%s\n' $cand | awk '!seen[$0]++' | tr '\n' ' ')
     [ -n "${cand// /}" ] || return 0
     log "proving ioengine candidates on ${#HOSTS[@]} host(s):$(printf ' %s' $cand)"
-    for host in "${HOSTS[@]}"; do
+    load_host_dirs
+    local i
+    for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
         (
-            hd=$(host_dir "$host")
+            hd=${HOST_DIRS[$i]}
             avail=$(awk '$1 == "engines" {$1 = ""; print}' "$WORK_DIR/probe/$host")
             for c in $cand; do
                 case " $avail " in
@@ -3882,7 +3945,7 @@ test_engines() {
                 else
                     echo "$host $c fail" >> "$results"
                     if grep -q WEKATESTER_ENGINE_STUCK "$WORK_DIR/et/$host.$c.out"; then
-                        log "WARNING: $host: ioengine $c test is STUCK in uninterruptible IO -- abandoned; direct IO on $(host_dir "$host") may be broken on this host" >&2
+                        log "WARNING: $host: ioengine $c test is STUCK in uninterruptible IO -- abandoned; direct IO on $hd may be broken on this host" >&2
                     else
                         log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
                     fi
@@ -3900,14 +3963,25 @@ test_engines() {
     # rewrite each probe's engines line to the proven subset (untested
     # engines are dropped only in auto mode, where the list WAS the tests)
     if [ -n "$AUTO_LEVEL" ]; then
-        local ok none=() c
-        for host in "${HOSTS[@]}"; do
-            ok=$(awk -v h="$host" '$1 == h && $3 == "ok" {printf " %s", $2}' "$results")
-            [ -n "$ok" ] || none+=("$host")
-            awk -v ok="$ok" '$1 == "engines" {print "engines" ok; next} {print}' \
-                "$WORK_DIR/probe/$host" > "$WORK_DIR/probe/$host.new"
-            mv "$WORK_DIR/probe/$host.new" "$WORK_DIR/probe/$host"
-        done
+        local none=() c nolist
+        # one awk for the fleet: each probe's engines line becomes the
+        # engines that passed there, in test order; the hosts where none
+        # did come back one per line
+        nolist=$(awkrun 'BEGIN {
+            if ((n = readlines(ARGV[1], R)) < 0) awk_fail("cannot read " ARGV[1])
+            for (i = 1; i <= n; i++)
+                if (split(R[i], F, " ") == 3 && F[3] == "ok") OK[F[1]] = OK[F[1]] " " F[2]
+            for (a = 3; a < ARGC; a++) {
+                h = ARGV[a]; p = ARGV[2] "/" h
+                if ((m = readlines(p, L)) < 0) awk_fail("cannot read " p)
+                for (i = 1; i <= m; i++) if (split(L[i], W, " ") && W[1] == "engines") L[i] = "engines" OK[h]
+                writelines(p, L, m)
+                if (OK[h] == "") print h
+            }
+        }' "$results" "$WORK_DIR/probe" "${HOSTS[@]}") || die "cannot record the proven ioengines"
+        while IFS= read -r host; do
+            [ -z "$host" ] || none+=("$host")
+        done <<<"$nolist"
         # -a stages every job on a proven engine; a host with none would
         # only fail later, in a calibration cell or a measured job, under an
         # error that no longer names the cause. The workdir dies with the
@@ -3924,13 +3998,17 @@ test_engines() {
     fi
     # a PINNED engine failing anywhere is fatal, naming host and evidence
     if [ -n "$ENGINE" ]; then
-        for host in "${HOSTS[@]}"; do
-            grep -q "^$host $ENGINE ok$" "$results" || {
-                # the workdir dies with the process: quote the evidence now
-                [ ! -f "$WORK_DIR/et/$host.$ENGINE.out" ] || tail -5 "$WORK_DIR/et/$host.$ENGINE.out" >&2
-                die "ioengine '$ENGINE' failed its test job on $host (fio output above)"
-            }
-        done
+        # one awk: the first host, in host order, without a passing test of it
+        host=$(awk 'BEGIN {
+            while ((getline line < ARGV[2]) > 0)
+                if (split(line, F, " ") == 3 && F[2] == ARGV[1] && F[3] == "ok") ok[F[1]] = 1
+            for (a = 3; a < ARGC; a++) if (!(ARGV[a] in ok)) { print ARGV[a]; exit }
+        }' "$ENGINE" "$results" "${HOSTS[@]}")
+        if [ -n "$host" ]; then
+            # the workdir dies with the process: quote the evidence now
+            [ ! -f "$WORK_DIR/et/$host.$ENGINE.out" ] || tail -5 "$WORK_DIR/et/$host.$ENGINE.out" >&2
+            die "ioengine '$ENGINE' failed its test job on $host (fio output above)"
+        fi
     fi
 }
 
@@ -3943,15 +4021,23 @@ finalize_targets() {
         "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
-    for host in "${HOSTS[@]}"; do
-        eng=$(targets_field "$host" 3 "$WORK_DIR/targets.final")
-        [ -z "$eng" ] && continue
-        { [ -f "$WORK_DIR/engine.results" ] \
-              && grep -q "^$host $eng ok$" "$WORK_DIR/engine.results"; } || {
-            [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
-            die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
+    # one awk for the fleet: the first host, in host order, whose host-file
+    # engine did not pass its test there
+    local bad
+    bad=$(awk 'BEGIN {
+        while ((getline line < ARGV[1]) > 0) { split(line, F, "\t"); if (!(F[1] in eng)) eng[F[1]] = F[3] }
+        while ((getline line < ARGV[2]) > 0)
+            if (split(line, F, " ") == 3 && F[3] == "ok") ok[F[1] " " F[2]] = 1
+        for (a = 3; a < ARGC; a++) {
+            h = ARGV[a]; e = (h in eng) ? eng[h] : "-"
+            if (e != "-" && e != "" && !((h " " e) in ok)) { print h " " e; exit }
         }
-    done
+    }' "$WORK_DIR/targets.final" "$WORK_DIR/engine.results" "${HOSTS[@]}")
+    if [ -n "$bad" ]; then
+        host=${bad%% *}; eng=${bad#* }
+        [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
+        die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
+    fi
 }
 
 # cpus_allowed enforcement. A host with a requested cpu list must either
@@ -4204,7 +4290,9 @@ check_cpu_pinning() {
             printf '%s\n' "$priv" > "$AUTH_DIR/$host.priv"
         fi
         printf '%s\n' "$effective" > "$AUTH_DIR/$host.cpus"
-        debug "$host: fio server will run ${priv:+$([ "$need_priv" -eq 1 ] && printf 'under %s ' "$priv")}taskset -c $effective"
+        local under=""
+        [ -z "$priv" ] || [ "$need_priv" -ne 1 ] || under="under $priv "
+        debug "$host: fio server will run ${under}taskset -c $effective"
     done < "$WORK_DIR/pin.verdicts"
     if [ ${#nolist_hosts[@]} -gt 0 ]; then
         log "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
@@ -4246,12 +4334,14 @@ probe_workers() {
     # -e names an engine explicitly, and the probe already knows what each
     # worker's fio can load -- refuse now rather than fail at job start.
     if [ -n "$ENGINE" ]; then
-        for host in "${HOSTS[@]}"; do
-            grep "^engines " "$WORK_DIR/probe/$host" | grep -qw "$ENGINE" \
-                || bad+=("$host")
-        done
-        [ ${#bad[@]} -eq 0 ] \
-            || die "ioengine '$ENGINE' is not available (fio --enghelp) on: ${bad[*]}"
+        # one awk for the fleet: the hosts whose engines line lacks it
+        local lack
+        lack=$(awk -v e="$ENGINE" '
+            FNR == 1 { if (NR > 1 && !ok) printf "%s%s", (n++ ? " " : ""), h; h = FILENAME; sub(/.*\//, "", h); ok = 0 }
+            $1 == "engines" { for (i = 2; i <= NF; i++) if ($i == e) ok = 1 }
+            END { if (NR && !ok) printf "%s%s", (n++ ? " " : ""), h }' "${HOSTS[@]/#/$WORK_DIR/probe/}")
+        [ -z "$lack" ] \
+            || die "ioengine '$ENGINE' is not available (fio --enghelp) on: $lack"
     fi
 
     # df is the only master-side fact the tuner needs. The backend-RAM query
@@ -4289,10 +4379,12 @@ PYEOF
 check_capacity() {
     local host pids=() i failed=0
     mkdir -p "$WORK_DIR/df"
-    for host in "${HOSTS[@]}"; do
+    load_host_dirs
+    for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
         # the fs type rides along (a third line): hosts on one weka
         # filesystem draw from one pool, checked together below
-        run_host "$host" "df -kP '$(host_dir "$host")' && { findmnt -T '$(host_dir "$host")' -n -o FSTYPE 2>&1 || :; }" > "$WORK_DIR/df/$host" &
+        run_host "$host" "df -kP '${HOST_DIRS[$i]}' && { findmnt -T '${HOST_DIRS[$i]}' -n -o FSTYPE 2>&1 || :; }" > "$WORK_DIR/df/$host" &
         pids+=($!)
     done
     for i in "${!pids[@]}"; do
@@ -4738,12 +4830,18 @@ local_short_hostname() {
 # once by resolve_local_mode (LOCAL_NAME) and derived on demand for a
 # caller that runs without it; "localhost" only when the box has no name.
 host_name() {   # host_name <host>
-    local n
+    host_name_v "$1"
+    printf '%s' "$HOST_NAME"
+}
+# host_name into HOST_NAME, without the subshell a $(host_name) costs: the
+# loops over the fleet use this -- remotely the name is the address itself,
+# and a fork per host to say so added up
+host_name_v() {   # host_name_v <host> -> HOST_NAME
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        n=${LOCAL_NAME:-$(local_short_hostname)}
-        printf '%s' "${n:-$1}"
+        HOST_NAME=${LOCAL_NAME:-$(local_short_hostname)}
+        HOST_NAME=${HOST_NAME:-$1}
     else
-        printf '%s' "$1"
+        HOST_NAME=$1
     fi
 }
 
@@ -4754,13 +4852,41 @@ host_identity() {   # host_identity <host>
     [ -n "$id" ] && printf '%s/%s' "$n" "$id" || printf '%s' "$n"
 }
 
+# "addr=<host_identity>,..." for the fleet: one awk reads every id the
+# probe carried; only a host whose probe has none goes through
+# host_identity, and its round trip, on its own.
+host_idents() {
+    local h i=0 out="" files=() ids=() id
+    for h in "${HOSTS[@]}"; do
+        [ ! -s "$WORK_DIR/probe/$h" ] || files+=("$WORK_DIR/probe/$h")
+    done
+    if [ ${#files[@]} -gt 0 ]; then
+        while IFS= read -r id; do ids+=("$id"); done < <(awk '
+            FNR == 1 && NR > 1 { print id; id = "" }
+            $1 == "ident" && !got[FILENAME]++ { id = tolower($2) }
+            END { print id }' "${files[@]}")
+    fi
+    for h in "${HOSTS[@]}"; do
+        id=""
+        if [ -s "$WORK_DIR/probe/$h" ]; then id=${ids[$i]:-}; i=$((i + 1)); fi
+        if [ -n "$id" ]; then
+            host_name_v "$h"; out="$out${out:+,}$h=$HOST_NAME/$id"
+        else
+            out="$out${out:+,}$h=$(host_identity "$h")"
+        fi
+    done
+    printf '%s' "$out"
+}
+
 # name=address pairs for the CSV readers, so a row written as
 # "client-a/<id>" resolves to the address the run actually uses.
 host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
-    local h n out=""
+    # remotely every name is its address: there is nothing to alias
+    [ "$LOCAL_MODE" -eq 1 ] || return 0
+    local h out=""
     for h in "$@"; do
-        n=$(host_name "$h")
-        [ "$n" = "$h" ] || out="$out${out:+,}$n=$h"
+        host_name_v "$h"
+        [ "$HOST_NAME" = "$h" ] || out="$out${out:+,}$HOST_NAME=$h"
     done
     printf '%s' "$out"
 }
@@ -4846,7 +4972,7 @@ writeback_targets() {
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
         > "$WORK_DIR/targets.hostrows" || : > "$WORK_DIR/targets.hostrows"
     local h ident=""
-    for h in "${HOSTS[@]}"; do ident="$ident${ident:+,}$h=$(host_identity "$h")"; done
+    ident=$(host_idents)
     list_staged "$WORK_DIR/staged.list" &&
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
     WEKATESTER_HOST_IDENT=$ident \
@@ -5055,6 +5181,44 @@ host_dir() {   # host_dir <host>
         d=$(targets_field "$1" 5)
     fi
     printf '%s' "${d:-$DIRECTORY}"
+}
+
+# One host-file column for many hosts, one line each in the order given
+# ("" for no row, or "-"): targets_field's rule -- the first row per host
+# counts -- in one awk instead of one per host.
+targets_column() {   # targets_column <fieldno> <file> <host>...
+    awk 'BEGIN {
+        while ((getline line < ARGV[2]) > 0) {
+            split(line, F, "\t")
+            if (!(F[1] in v)) v[F[1]] = F[ARGV[1] + 0]
+        }
+        for (a = 3; a < ARGC; a++) {
+            x = (ARGV[a] in v) ? v[ARGV[a]] : ""
+            if (x == "-") x = ""
+            print x
+        }
+    }' "$@"
+}
+
+# Every host's destination in HOSTS order, into HOST_DIRS: host_dir's rule
+# (the finished host-file resolution, else the pre-auth phase, else -d) for
+# the fleet in one awk. A phase that walks the fleet loads it once rather
+# than an awk per host; the resolution can change between phases (phase1,
+# then final; -C refreshes it), so each such phase loads it again.
+HOST_DIRS=()
+load_host_dirs() {
+    local f="" d i=0
+    HOST_DIRS=()
+    if [ -f "$WORK_DIR/targets.final" ]; then f="$WORK_DIR/targets.final"
+    elif [ -f "$WORK_DIR/targets.phase1" ]; then f="$WORK_DIR/targets.phase1"
+    fi
+    if [ -z "$f" ]; then
+        for d in "${HOSTS[@]}"; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
+        return 0
+    fi
+    while IFS= read -r d; do
+        HOST_DIRS[i]=${d:-$DIRECTORY}; i=$((i + 1))
+    done < <(targets_column 5 "$f" "${HOSTS[@]}")
 }
 
 host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
@@ -5633,24 +5797,29 @@ layout_variant_pristine() {   # layout_variant_pristine <dir>
 # job and pulled to position one; appending to JOBFILES pins it last.
 UNLINK_JOB="999-wekatester-unlink.job"
 stage_unlink_variants() {
-    local host src
     is_layout_file "$SET_DIR/${JOBFILES[0]}" \
         || die "no layout job at position one; cannot derive the -u unlink job"
-    for host in "${HOSTS[@]}"; do
-        src="$WORK_DIR/jobs/$host/${JOBFILES[0]}"
-        [ -f "$src" ] || die "no staged layout variant for $host; cannot derive the -u unlink job"
-        awk -v marker="$LAYOUT_MARKER" '
-            index($0, marker) == 1 { next }
-            /^filesize=/ { print "filesize=4k"; next }
-            /^size=/     { print "filesize=4k"; next }
-            /^(blocksize|bs)=/ { print "blocksize=4k"; next }
-            { print }
-        ' "$src" > "$WORK_DIR/jobs/$host/$UNLINK_JOB" \
-            || die "cannot derive the -u unlink job for $host from $src"
-        # every section must unlink: a hand-written layout may have no
-        # [global] at all, and override_variant_key creates one then
-        override_variant_key "$WORK_DIR/jobs/$host/$UNLINK_JOB" unlink 1
-    done
+    # one awk for the fleet, every host's from its own staged layout variant
+    awkrun 'BEGIN {
+        lay = ARGV[1]; unl = ARGV[2]; jobs = ARGV[3]
+        for (a = 4; a < ARGC; a++) {
+            h = ARGV[a]; src = jobs "/" h "/" lay
+            if ((n = readlines(src, L)) < 0)
+                awk_fail("no staged layout variant for " h "; cannot derive the -u unlink job")
+            m = 0; split("", O)
+            for (i = 1; i <= n; i++) {
+                if (index(L[i], layout_marker()) == 1) continue
+                if (L[i] ~ /^filesize=/ || L[i] ~ /^size=/) O[++m] = "filesize=4k"
+                else if (L[i] ~ /^(blocksize|bs)=/) O[++m] = "blocksize=4k"
+                else O[++m] = L[i]
+            }
+            # every section must unlink: a hand-written layout may have no
+            # [global] at all, and override_lines creates one then
+            m = override_lines(O, m, "unlink", "1")
+            writelines(jobs "/" h "/" unl, O, m)
+        }
+    }' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "${HOSTS[@]}" \
+        || die "cannot derive the -u unlink job"
     JOBFILES+=("$UNLINK_JOB")
 }
 
@@ -5658,17 +5827,35 @@ stage_unlink_variants() {
 # insert into [global] (created if missing) so fio cannot quietly fall back
 # to a per-file default. Same three cases as the directory override.
 override_variant_key() {   # override_variant_key <file> <key> <value>
-    local f=$1 key=$2 val=$3 tmp="$1.tmp.$$"
-    if grep -q "^$key=" "$f"; then
-        awk -v k="$key" -v v="$val" \
-            'index($0, k "=") == 1 { print k "=" v; next } { print }' "$f" > "$tmp"
-    elif grep -q '^\[global\]' "$f"; then
-        awk -v k="$key" -v v="$val" \
-            '{ print } /^\[global\]/ && !ins { print k "=" v; ins = 1 }' "$f" > "$tmp"
-    else
-        { printf '[global]\n%s=%s\n' "$key" "$val"; cat "$f"; } > "$tmp"
-    fi
-    mv "$tmp" "$f"
+    awkrun 'BEGIN {
+        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+        n = override_lines(L, n, ARGV[2], ARGV[3])
+        writelines(ARGV[1], L, n)
+    }' "$@"
+}
+
+# The same for every staged variant of the fleet -- or, with "measured",
+# every one that is not a layout job -- in one awk: -e and -x stamp each of
+# a few hundred hosts' dozen files, and four processes per file and key
+# was minutes at that size.
+override_staged() {   # override_staged <all|measured> <key> <value> [<key> <value>]...
+    list_staged "$WORK_DIR/staged.list" || return 1
+    awkrun 'BEGIN {
+        which = ARGV[2]; nk = 0
+        for (a = 3; a + 1 < ARGC; a += 2) { K[++nk] = ARGV[a]; V[nk] = ARGV[a + 1] }
+        if ((m = readlines(ARGV[1], M)) < 0) awk_fail("cannot read " ARGV[1])
+        for (i = 1; i <= m; i++) {
+            split(M[i], F, "\t")
+            if (F[2] == "") continue
+            if ((n = readlines(F[2], L)) < 0) awk_fail("cannot read " F[2])
+            if (which == "measured") {
+                job = F[2]; sub(/.*\//, "", job)
+                if (job == layout_job() || is_layout_marked(L, n)) continue
+            }
+            for (k = 1; k <= nk; k++) n = override_lines(L, n, K[k], V[k])
+            writelines(F[2], L, n)
+        }
+    }' "$WORK_DIR/staged.list" "$@"
 }
 
 # fio in client/server mode silently prefixes generated filenames with its
@@ -5702,7 +5889,8 @@ stamp_unique_names() {
     for host in "${HOSTS[@]}"; do
         cpus=""
         [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
-        args+=("$host" "$(host_name "$host")" "${cpus:--}")
+        host_name_v "$host"
+        args+=("$host" "$HOST_NAME" "${cpus:--}")
     done
     [ ${#args[@]} -gt 0 ] || return 0
     list_staged "$WORK_DIR/staged.list" && awkrun '
@@ -5962,21 +6150,16 @@ stage_jobfiles() {
         # -e is an explicit operator choice: it beats the jobfiles and the
         # tuner in every staged variant -- including the layout job, and so
         # everything derived from it below (rebuild and unlink variants).
-        for v in "$WORK_DIR"/jobs/*/*; do
-            [ -f "$v" ] && override_variant_key "$v" ioengine "$ENGINE"
-        done
+        override_staged all ioengine "$ENGINE" \
+            || die "cannot stamp -e $ENGINE into the staged jobfiles"
     fi
     # the engine and every job's geometry are final here
     check_aio_room
     if [ -n "$DURATION" ]; then
         # one duration for every MEASURED job; layout and unlink keep their
         # own timing -- they run to completion, not to a clock
-        for v in "$WORK_DIR"/jobs/*/*; do
-            [ -f "$v" ] || continue
-            is_layout_file "$v" && continue
-            override_variant_key "$v" runtime "$DURATION"
-            override_variant_key "$v" time_based 1
-        done
+        override_staged measured runtime "$DURATION" time_based 1 \
+            || die "cannot stamp -x $DURATION into the staged jobfiles"
     fi
     # after every per-host override, before the derived variants inherit it
     stamp_unique_names
@@ -6070,15 +6253,26 @@ snapshot_sysinfo() {
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: could not capture system info on ${hs[$i]}" >&2
     done
+    split_sysinfo "$WORK_DIR/sysinfo." ""
+}
+
+# Each host's captured "=== WEKATESTER_SYSINFO <item> ===" sections into
+# sysinfo/<host>/<item><suffix> under the run directory: one mkdir and one
+# awk for the fleet, each output closed as the next opens.
+split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
+    local host dirs=() files=()
     for host in "${HOSTS[@]}"; do
-        [ -s "$WORK_DIR/sysinfo.$host" ] || continue
-        mkdir -p "$RUN_DIR/sysinfo/$host" \
-            || { log "WARNING: cannot create $RUN_DIR/sysinfo/$host" >&2; continue; }
-        awk -v dir="$RUN_DIR/sysinfo/$host" '
-            /^=== WEKATESTER_SYSINFO / { out = dir "/" $3; next }
-            out { print > out }
-        ' "$WORK_DIR/sysinfo.$host"
+        [ -s "$1$host" ] || continue
+        dirs+=("$RUN_DIR/sysinfo/$host"); files+=("$1$host")
     done
+    [ ${#files[@]} -gt 0 ] || return 0
+    mkdir -p "${dirs[@]}" \
+        || { log "WARNING: cannot create the per-host directories under $RUN_DIR/sysinfo" >&2; return 0; }
+    WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
+        FNR == 1 { if (out != "") close(out); out = ""; host = substr(FILENAME, length(ENVIRON["WT_PFX"]) + 1) }
+        /^=== WEKATESTER_SYSINFO / { if (out != "") close(out); out = ENVIRON["WT_ROOT"] "/" host "/" $3 ENVIRON["WT_SFX"]; next }
+        out != "" { print > out }
+    ' "${files[@]}"
 }
 
 # Pressure and load, captured TWICE per run -- at start and again as the
@@ -6113,14 +6307,7 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: could not capture pressure ($label) on ${hs[$i]}" >&2
     done
-    for host in "${HOSTS[@]}"; do
-        [ -s "$WORK_DIR/pressure.$label.$host" ] || continue
-        mkdir -p "$RUN_DIR/sysinfo/$host" || continue
-        awk -v dir="$RUN_DIR/sysinfo/$host" -v lbl="$label" '
-            /^=== WEKATESTER_SYSINFO / { out = dir "/" $3 "-" lbl; next }
-            out { print > out }
-        ' "$WORK_DIR/pressure.$label.$host"
-    done
+    split_sysinfo "$WORK_DIR/pressure.$label." "-$label"
 }
 
 # The bundle must show what actually ran: the per-host staged variants. The
@@ -6220,13 +6407,18 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
 # So the grid's directories are derived from the staged layout variant and
 # made here, before any layout job runs. Flat namespaces derive nothing.
 ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
-    local host cmd i pids=() hs=()
-    for host in "${HOSTS[@]}"; do
-        # every directory each section's filename_format implies under its
-        # directory=, a section's own keys over [global]'s; mkdir -p lines
-        # of 400, so the remote command stays far below ssh's packet limit
-        cmd=$(awkrun 'BEGIN {
-            if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+    local host cmd i pids=() hs=() args=() out="$WORK_DIR/layout-dirs.cmd"
+    for host in "${HOSTS[@]}"; do args+=("$host" "$WORK_DIR/jobs/$host/$1"); done
+    # every directory each section's filename_format implies under its
+    # directory=, a section's own keys over [global]'s; mkdir -p lines
+    # of 400, so the remote command stays far below ssh's packet limit.
+    # One awk for the fleet -- "<host><tab><command>" for each host that
+    # needs any -- not one per host ahead of the fan-out.
+    awkrun 'BEGIN {
+        for (a = 1; a + 1 < ARGC; a += 2) {
+            host = ARGV[a]; path = ARGV[a + 1]
+            if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
+            split("", KV); split("", SN); split("", seen); split("", D)
             ns = 0; cur = ""   # "": before any section, where keys count for nothing
             for (i = 1; i <= n; i++) {
                 line = strip(L[i]); c = substr(line, 1, 1)
@@ -6259,7 +6451,9 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
                 }
                 for (j = 1; j <= nc; j++) if (index(C[j], "$")) break
                 if (j <= nc) {
-                    print "WARNING: cannot pre-create directories for [" name "]: unsupported variable in " squote(pre) > "/dev/stderr"
+                    # the same file on every host says it once, not once per host
+                    msg = "WARNING: cannot pre-create directories for [" name "]: unsupported variable in " squote(pre)
+                    if (!(msg in said)) { said[msg] = 1; print msg > "/dev/stderr" }
                     continue
                 }
                 base = ((s, "directory") in KV) ? KV[s, "directory"] : KV["g", "directory"]
@@ -6270,12 +6464,13 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
             out = ""
             for (i = 1; i <= nd; i++)
                 out = out ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p") " " squote(D[i])
-            print out
-        }' "$WORK_DIR/jobs/$host/$1") || die "cannot derive the layout directory set for $host"
-        [ -n "$cmd" ] || continue
+            if (out != "") print host "\t" out
+        }
+    }' "${args[@]}" > "$out" || die "cannot derive the layout directory set"
+    while IFS=$'\t' read -r host cmd; do
         run_host "$host" "$cmd" &
         pids+=($!); hs+=("$host")
-    done
+    done < "$out"
     # scoped wait, as always: the run-log tees are siblings here
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "cannot pre-create layout directories on ${hs[$i]}"
@@ -6373,12 +6568,13 @@ sweep_layout_grid() {
     for host in $nofa; do
         log "WARNING: $host: the staged layout job does not set fallocate=none; an interrupted layout could leave full-size hollow files this sweep would credit as complete" >&2
     done
-    for host in "${HOSTS[@]}"; do
-        spec=$(<"$WORK_DIR/probe/$host.gridspec")
-        [ -n "$spec" ] || continue
-        hd=$(host_dir "$host")
+    load_host_dirs
+    for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
+        [ -s "$WORK_DIR/probe/$host.gridspec" ] || continue
+        hd=${HOST_DIRS[$i]}
         cmd=""
-        while IFS="$(printf '\t')" read -r sz glob depth tot; do
+        while IFS=$'\t' read -r sz glob depth tot; do
             [ -n "$sz" ] || continue
             # sufficiency, not equality: a file LARGER than the grid expects
             # still serves every job (fio reads/writes its first N bytes),
@@ -6392,9 +6588,7 @@ sweep_layout_grid() {
             cmd="$cmd find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" ! -size +$((sz - 1))c -delete; \
                  find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -size +$((sz - 1))c \
                      | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
-        done <<SPECEOF
-$spec
-SPECEOF
+        done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
         ( run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
             > "$WORK_DIR/probe/$host.laidout" ) &
