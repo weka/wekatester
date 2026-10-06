@@ -1312,6 +1312,25 @@ function csv_line(s, F,    L, CN, CV, k) {   # one line, as csv.reader([line]) p
     for (k = 1; k <= CN[1]; k++) F[k] = CV[1, k]
     return CN[1]
 }
+# One cal.results line into F: the host, its engine, then (qd nr fs nj) per
+# slot, every slot of the host-file schema in its order; 0 for a blank line.
+# Two parsers read the file (apply_cal_results, the writeback) and they once
+# disagreed on the width: the writeback died on a file calibration had just
+# written, after 11 minutes of measuring. Any other width is a schema break,
+# not a skip -- dropping the line would discard a measurement without a word.
+function cal_results_split(line, F,    m, S, w) {
+    if (!(m = pysplit(line, F))) return 0
+    w = 2 + 4 * split(geom_slots(), S, " ")
+    if (m != w) awk_fail("cal.results: malformed line (want " w " fields): " rstrip(line))
+    return m
+}
+function commas(v,    s, out) {   # format(int(v), ","): a count, thousands grouped
+    s = sprintf("%.0f", int(v)); out = ""
+    while (length(s) > 3 && substr(s, length(s) - 3, 1) ~ /[0-9]/) {
+        out = "," substr(s, length(s) - 2) out; s = substr(s, 1, length(s) - 3)
+    }
+    return s out
+}
 function csv_field(v) {   # csv.writer's QUOTE_MINIMAL, with no line terminator
     if (!index(v, ",") && !index(v, "\"")) return v
     gsub(/"/, "\"\"", v)
@@ -1781,37 +1800,53 @@ brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 #
 # Report type comes from the '# report' directive:
 #   - 'latency' anywhere in the directive wins the whole file and asks for
-#     the latency search only -- the floor, then the widest numjobs still at
-#     it ('# report iops latency' is a latency file). Same rule the tuner
-#     applies to the same file (see report_items in auto_tune).
+#     the latency search only -- N jobs at iodepth 1 over the nrfiles
+#     ladder ('# report iops latency' is a latency file). Same rule staging
+#     applies to the same file.
 #   - otherwise 'bandwidth' -> bw and 'iops' -> iops, and a directive naming
 #     both types contributes both.
-#   - NO directive at all -> counted as bandwidth: the summarizer's fallback
-#     reports every metric for such a file, so no single type is named, and
-#     their shape (large sequential files, no bs=4k) is bandwidth-like.
-# This is NOT the tuner's classification, and deliberately so: it asks for a
-# superset of the ladders whose knees the tuner can currently apply, in two
-# cases.
-#   1. No directive: the tuner's report_items falls back to naming all three
-#      items, so latency wins there and the file is staged as a latency file
-#      (kind_key 'lat'). A bw knee measured for it is cached in hostlist.csv,
-#      not applied to that file at staging.
-#   2. '# report bandwidth iops': the tuner's precedence is latency > bw >
-#      iops, so it stages that file as bandwidth only, and apply_targets_
-#      geometry picks bw for it too -- the iops knee this asks for does not
-#      land on that file either.
-# Over-asking is the safe direction of that mismatch (a knee nobody applies
-# costs ~30s per step once; a knee never measured leaves a guessed queue depth
-# in place for the whole run), and the knee-application rule at staging
-# decides what actually lands -- see the wire-in.
+#   - NO directive at all: no type, so nothing to calibrate -- the file runs
+#     as written (Frank, 2026-10-06), as staging leaves it.
+# '# report bandwidth iops' asks for one search more than staging applies:
+# its precedence is latency > bw > iops, so that file runs the bandwidth
+# answer and the iops one only lands in the host file. Over-asking is the
+# safe direction (a search nobody applies costs its cells once; one never
+# made leaves the jobfile's guess in place for the whole run).
 # Direction comes from each job section's effective rw= (the section's own
 # value, else [global]'s): read/randread -> read, write/randwrite -> write,
 # the mixed forms -> both. A file that names no rw= anywhere contributes no
 # direction, hence no ladder.
 cal_required() {   # cal_required <setdir> [bulk 0|1]
-    pyrun "$1" "${2:-0}" <<'PYEOF' || return 1
-#@include py/cal_required.py
-PYEOF
+    local f files=()
+    [ -d "$1" ] || { echo "ERROR: cal_required: not a jobfile set directory: $1" >&2; return 1; }
+    for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
+    [ ${#files[@]} -gt 0 ] || return 0
+    awkrun 'BEGIN {
+        bulk = ARGV[1] == "1"; nn = 0
+        for (a = 2; a < ARGC; a++) {
+            name = ARGV[a]; sub(/.*\//, "", name)
+            if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cal_required: cannot read " ARGV[a])
+            if (name == layout_job() || is_layout_marked(L, n)) continue   # a layout job measures nothing
+            file_directions(L, n, D)
+            if (report_has(L, n, "latency")) {
+                # a 1MiB latency file is its own search (lat1m), and under
+                # -b every 4k latency file gains a 1MiB twin at staging
+                kind = lat_kind(L, n)
+                for (d in D) {
+                    NEED[kind " " d] = 1
+                    if (bulk && kind == "lat") NEED["lat1m " d] = 1
+                }
+                continue
+            }
+            for (d in D) {
+                if (report_has(L, n, "bandwidth")) NEED["bw " d] = 1
+                if (report_has(L, n, "iops")) NEED["iops " d] = 1
+            }
+        }
+        for (k in NEED) OUT[++nn] = k
+        sort_arr(OUT, nn, 0)
+        for (i = 1; i <= nn; i++) print OUT[i]
+    }' "${2:-0}" "${files[@]}"
 }
 
 # Usable cores for ONE host, by the tuner's own rule (probe_cores in the
@@ -2294,10 +2329,49 @@ apply_cal_results() {
     # -g forces a re-measure -- and a re-measure someone forced should WIN:
     # its tuples replace host-file values instead of only filling gaps. So
     # does --line-rate's, for the bandwidth slots it measured again.
-    pyrun "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" \
-          "${LINE_RATE_GBPS:--}" <<'PYEOF' || die "cannot apply the calibration results"
-#@include py/apply_cal_results.py
-PYEOF
+    awkrun 'BEGIN {
+        res = ARGV[1]; final = ARGV[2]; force = ARGV[3] == "1"; lr = ARGV[4] != "-"
+        nslot = split(geom_slots(), SLOT, " ")
+        n = split(line_rate_slots(), F, " ")
+        for (i = 1; i <= n; i++) LRS[F[i]] = 1
+        ncols = 5 + 4 * nslot   # the host, login engine cpus dir, then nj fs nr qd per slot
+        if ((n = readlines(res, L)) < 0) awk_fail("cannot read " res)
+        nk = 0
+        for (i = 1; i <= n; i++) {
+            if (!(m = cal_results_split(L[i], F))) continue
+            if (!(F[1] in KH)) KHOST[++nk] = F[1]
+            KH[F[1]] = 1
+            for (c = 2; c <= m; c++) K[F[1], c] = F[c]
+        }
+        no = 0
+        if ((n = readlines(final, T)) >= 0)
+            for (i = 1; i <= n; i++) { lsplit(T[i], F, "\t"); ROW[F[1]] = T[i]; ORD[++no] = F[1] }
+        sort_arr(KHOST, nk, 0)
+        for (x = 1; x <= nk; x++) {
+            h = KHOST[x]
+            if (h in ROW) nc = lsplit(ROW[h], R, "\t")
+            else { split("", R); R[1] = h; nc = 1; ORD[++no] = h }
+            while (nc < ncols) R[++nc] = "-"
+            if (K[h, 2] != "-" && (force || R[3] == "-")) R[3] = K[h, 2]
+            for (s = 1; s <= nslot; s++) {
+                # The host file values pinned the search (cal_shapes), so the
+                # measured tuple already carries them: fill mode adds only
+                # what was searched, and every field of the row was measured
+                # together. cal.results holds qd nr fs nj, the row nj fs nr qd.
+                c = 3 + 4 * (s - 1); b = 6 + 4 * (s - 1)
+                win = force || (lr && (SLOT[s] in LRS))
+                for (q = 0; q < 4; q++)
+                    if ((v = K[h, c + q]) != "-" && (win || R[b + 3 - q] == "-")) R[b + 3 - q] = v
+            }
+            row = R[1]
+            for (c = 2; c <= nc; c++) row = row "\t" R[c]
+            ROW[h] = row
+        }
+        for (i = 1; i <= no; i++) OUT[i] = ROW[ORD[i]]
+        if (no) writelines(final, OUT, no)
+        else { printf "" > final; close(final) }
+    }' "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" "${LINE_RATE_GBPS:--}" \
+        || die "cannot apply the calibration results"
 }
 
 # Only the cell's own file belongs on the master -- the per-host dirs
@@ -2616,9 +2690,39 @@ PYEOF
 # the type winners are tallied and pick_engine settles the tally the same
 # way. Prints "<engine> <what each type said>".
 cal_engine_pick() {   # cal_engine_pick <engine-cells-file>
-    pyrun "$1" "$CAL_KNEE_PCT" <<'PYEOF'
-#@include py/cal_engine_pick.py
-PYEOF
+    awkrun 'BEGIN {
+        band = ARGV[2] + 0
+        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cal_engine_pick: cannot read " ARGV[1])
+        for (i = 1; i <= n; i++) {
+            if (pysplit(L[i], F) < 3) continue
+            t = F[1]; any = 1
+            C[t, ++CN[t]] = F[2]; V[t, CN[t]] = F[3] + 0
+        }
+        if (!any) awk_fail("cal_engine_pick: no engine cells in " ARGV[1])
+        no = split(engine_order(), O, " ")
+        for (j = 1; j <= no; j++) RANK[O[j]] = j - 1
+        split("bw iops lat", TY, " "); said = ""; nt = 0
+        for (x = 1; x <= 3; x++) {
+            t = TY[x]
+            if (!(m = CN[t] + 0)) continue
+            ext = V[t, 1]   # the best reading: lowest for latency
+            for (i = 2; i <= m; i++) if (t == "lat" ? V[t, i] < ext : V[t, i] > ext) ext = V[t, i]
+            show = ""; win = ""
+            for (i = 1; i <= m; i++) {
+                e = C[t, i]; v = V[t, i]
+                show = show (i > 1 ? ", " : "") (t == "lat" ? sprintf("%s %.1f us", e, v) : t == "bw" ? sprintf("%s %.2f GiB/s", e, v / 1073741824) : e " " commas(v))
+                r = (e in RANK) ? RANK[e] : no
+                # inside the band of the best, the first in ENGINE_ORDER; the
+                # best is always inside its own band, whatever rounding says
+                # of best x band / 100 (the python died there at band 100)
+                if ((v == ext || (t == "lat" ? v <= ext * (2 - band / 100) : v >= ext * band / 100)) && (win == "" || r < wr)) { win = e; wr = r }
+            }
+            if (!(win in TALLY)) TORD[++nt] = win
+            TALLY[win]++
+            said = said (said == "" ? "" : "; ") t ": " show " -> " win
+        }
+        print pick_engine(TALLY, TORD, nt), said
+    }' "$1" "$CAL_KNEE_PCT"
 }
 
 # Run one cell solo on <rep> and leave its reading in $WORK_DIR/cal/reading:
@@ -2944,12 +3048,34 @@ PYEOF
 # try (the engine cells run the pins too). Over: an alert naming the shape,
 # the slot and the room, and a stop; the host file is not touched.
 cal_aio_preflight() {   # cal_aio_preflight <shapes>
-    pyrun "$1" <<'PYEOF'
-#@include py/cal_aio_preflight.py
-PYEOF
+    awkrun 'BEGIN {
+        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+        bad = 0
+        for (i = 1; i <= n; i++) {
+            if (lsplit(L[i], P, "\t") < 12) continue
+            pinned = P[8]; aio = P[10]; lib = pinned == "libaio"
+            if (pinned == "-") { m = lsplit(P[7], E, ","); for (k = 1; k <= m; k++) if (E[k] == "libaio") lib = 1 }
+            if (!lib || aio !~ /^[0-9]+$/) continue
+            m = pysplit(P[11], W)
+            for (k = 1; k <= m; k++) {
+                if (!(e = index(W[k], "="))) continue
+                nv = lsplit(substr(W[k], e + 1), V, "/")
+                q = V[1]; j = nv >= 4 ? V[4] : "-"
+                if (q !~ /^[0-9]+$/ && j !~ /^[0-9]+$/) continue
+                ev = (j ~ /^[0-9]+$/ ? j : 1) * (q ~ /^[0-9]+$/ ? q : 1)
+                if (ev <= aio + 0) continue
+                bad = 1
+                if (j !~ /^[0-9]+$/) j = "1 (open)"
+                if (q !~ /^[0-9]+$/) q = "1 (open)"
+                how = pinned == "libaio" ? "pinned" : "one of the engines calibration tries"
+                printf "ERROR: shape %s (%s): %s pinned at numjobs=%s iodepth=%s needs %.0f aio events at once with libaio (%s), and the kernel has room for %s there (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr, pin another ioengine (-e or the host file), or change the pin\n", P[1], P[2], substr(W[k], 1, e - 1), j, q, ev, how, aio > "/dev/stderr"
+            }
+        }
+        exit bad ? 3 : 0   # not 2: an awk that dies on its own exits 2
+    }' "$1"
     case $? in
         0) return 0 ;;
-        2) die "calibration would exceed the kernel's aio room (above); nothing was run and the host file is unchanged" ;;
+        3) die "calibration would exceed the kernel's aio room (above); nothing was run and the host file is unchanged" ;;
         *) die "cannot check the calibration pins against the kernel's aio room" ;;
     esac
 }
@@ -5211,11 +5337,9 @@ writeback_targets() {
         # not measured. A malformed line is a schema break, not a skip:
         # apply_cal_results dies on the same seam. CAL_COLS as lib.py
         # derives it: the host, its engine, then (qd nr fs nj) per slot.
-        ncal = 2 + 4 * nslot
         n = readlines(work "/cal.results", L)
         for (i = 1; i <= n; i++) {
-            if (!(m = pysplit(L[i], F))) continue
-            if (m != ncal) awk_fail("cal.results: malformed line (want " ncal " fields): " rstrip(L[i]))
+            if (!cal_results_split(L[i], F)) continue
             split("", T); got = 0
             for (s = 1; s <= nslot; s++) {
                 b = 2 + 4 * (s - 1)
