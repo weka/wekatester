@@ -5553,7 +5553,7 @@ t_assert "fio JSON: a results file is flattened once -- the error check and the 
      # a check always parses afresh: the same path may hold a new run
      check_fio_errors "$d/c.json" measured && [ "$(wc -l < "$d/n")" -eq 3 ]) ||
         { cat "$d/out" "$d/n" >&2; false; }'
-t_assert "fleet phases start as many processes for 40 hosts as for 3: -x/-e stamping, the sysinfo split, the layout directories, the destination table, the machine ids" bash -c '
+t_assert "fleet phases start as many processes for 40 hosts as for 3: -x/-e stamping, the sysinfo split, the layout directories, the destination table, the machine ids, the seed jobfile push" bash -c '
     count() {   # count <hosts> -> the processes the phases started; their results checked
         local n=$1 d h i hs="" r t
         d=$(mktemp -d); mkdir -p "$d/bin" "$d/w/jobs" "$d/w/probe" "$d/run"
@@ -5568,16 +5568,20 @@ t_assert "fleet phases start as many processes for 40 hosts as for 3: -x/-e stam
             printf "=== WEKATESTER_SYSINFO uname ===\nLinux\n=== WEKATESTER_SYSINFO cmdline ===\nro\n" > "$d/w/sysinfo.$h"
             printf "ncpus 8\nident ABC$i\n" > "$d/w/probe/$h"
             printf "$h\t-\t-\t-\t/mnt/$h\n" >> "$d/w/targets.final"
+            mkdir -p "$d/w/cal/$h"; printf "[cell]\nrw=read\n" > "$d/w/cal/$h/c.job"
         done
         : > "$d/calls"
         (export PATH="$d/bin:$PATH"; source ./wekatester
          WORK_DIR=$d/w; RUN_DIR=$d/run; HOSTS=($hs); DIRECTORY=/mnt/x; LOCAL_MODE=0
          run_host() { :; }
+         copy_to_master() { :; }
+         cal_push c.job $hs &&
          override_staged measured runtime 30 time_based 1 &&
          split_sysinfo "$WORK_DIR/sysinfo." "" &&
          ensure_layout_dirs 000-wekatester-layout.job &&
          load_host_dirs && [ "${HOST_DIRS[$((n - 1))]}" = "/mnt/h$n" ] &&
          ids=$(host_idents) && [ "${ids%%,*}" = "h1=h1/abc1" ]) || { echo "the phases failed at $n hosts" >&2; return 1; }
+        cmp -s "$d/w/cal/h$n/c.job" "$d/w/cal/.push/h$n/c.job" &&
         grep -qx "runtime=30" "$d/w/jobs/h$n/011-r.job" && grep -qx "time_based=1" "$d/w/jobs/h$n/011-r.job" &&
         ! grep -q "runtime" "$d/w/jobs/h$n/000-wekatester-layout.job" &&
         grep -qx "Linux" "$d/run/sysinfo/h$n/uname" && grep -qx "ro" "$d/run/sysinfo/h$n/cmdline" &&

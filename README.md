@@ -1,7 +1,7 @@
 # wekatester
 Performance test weka clusters (or any network/parallel filesystem) with distributed fio.
 
-wekatester is a single bash script with an embedded python3 result summarizer. There is nothing to install: it needs only bash, an OpenSSH client, and python3 (stdlib only) on the machine you run it from, plus fio on the workers. The workers are Linux hosts reachable by ssh — or, with no server on the command line, the local host itself, in which case the OpenSSH client is not needed either.
+wekatester is a single bash script; it reads fio's results with awk. There is nothing to install: it needs only bash, awk and an OpenSSH client on the machine you run it from, plus fio on the workers. `-a` also needs python3 (stdlib only) there: the calibration planner and the tuner are python. The workers are Linux hosts reachable by ssh — or, with no server on the command line, the local host itself, in which case the OpenSSH client is not needed either.
 
 # Basics
 fio is a benchmark for IO, and is quite popular. However, running it in a distributed fashion across multiple servers can be a bit of a bear to manage, and the output can be quite difficult to read.
@@ -529,7 +529,7 @@ for a host, that host goes unchecked, with a warning.
 
 # Source layout and build
 
-`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash and ssh there, fio on the workers, and python3 on the controller. It is assembled, not hand-edited:
+`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there (python3 too for `-a`), and fio on the workers. It is assembled, not hand-edited:
 
 - `src/wekatester.sh` — the bash. Each Python heredoc holds one `#@include py/<name>.py` line in place of its body.
 - `src/py/*.py` — the Python, one file per heredoc; `lib.py` is the shared library `pyrun` prepends to each of the others at run time.

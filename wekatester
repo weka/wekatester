@@ -177,7 +177,9 @@ host_ssh_opts() {   # host_ssh_opts <host>
     fi
     printf '%s' "$CONTROL_OPTS"
     if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.user" ]; then
-        printf ' -o User=%s' "$(cat "$AUTH_DIR/$1.user")"
+        local u=""
+        IFS= read -r u < "$AUTH_DIR/$1.user" || :
+        printf ' -o User=%s' "$u"
     fi
 }
 
@@ -2859,12 +2861,19 @@ PYEOF
 # accumulate every staged cell, so shipping whole dirs would grow with every
 # cell measured. One staging tree, one scp per push.
 cal_push() {   # cal_push <basename> <host>...
-    local base=$1 h; shift
+    local base=$1 h dirs=(); shift
     rm -rf "$WORK_DIR/cal/.push" || return 1
-    for h in "$@"; do
-        mkdir -p "$WORK_DIR/cal/.push/$h" || return 1
-        cp "$WORK_DIR/cal/$h/$base" "$WORK_DIR/cal/.push/$h/" || return 1
-    done
+    for h in "$@"; do dirs+=("$WORK_DIR/cal/.push/$h"); done
+    mkdir -p "${dirs[@]}" || return 1
+    # one awk copies every host's jobfile: a seed can name the whole fleet,
+    # and a cp per host was a process per host
+    awkrun 'BEGIN {
+        for (a = 3; a < ARGC; a++) {
+            src = ARGV[1] "/" ARGV[a] "/" ARGV[2]
+            if ((n = readlines(src, L)) < 0) awk_fail("cannot read " src)
+            writelines(ARGV[1] "/.push/" ARGV[a] "/" ARGV[2], L, n)
+        }
+    }' "$WORK_DIR/cal" "$base" "$@" || return 1
     copy_to_master "$WORK_DIR/cal/.push"/* "$TARGET_DIR.cal/"
 }
 
@@ -2914,6 +2923,8 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag.json"
     hd=$(host_dir "$host")
     root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
+    host_name_v "$host"
+    local hname=$HOST_NAME
     [ "${CAL_NS_DIR-unset}" != "" ] || unified=1
     mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
     rm -f "$WORK_DIR/cal/$host/truncfail"
@@ -2933,7 +2944,7 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     [ "$unified" -eq 1 ] || [ "$rnj" -le "$wantnj" ] || wantnj=$rnj
     subdirs=""
     if [ "$maxf" -gt 0 ] && [ "$wantnj" -gt 0 ]; then
-        subdirs=$(cal_scratch_dirs "$(host_name "$host")" "${CAL_SEP:-.cal.}" \
+        subdirs=$(cal_scratch_dirs "$hname" "${CAL_SEP:-.cal.}" \
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$wantnj" $((maxf - 1))) \
             || die "$host: cannot derive the calibration namespace directories"
     fi
@@ -2960,18 +2971,36 @@ SUBDIREOF
     # the missing files (round robin, by file) into its own view of the one
     # directory, on its own cpus and engine. A member's line is
     # "<host> <dir> <cpus> <engine>"; the rep comes first.
-    local members="$WORK_DIR/cal/$host/seed.members" m mdir mcpus meng active
+    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- margs=()
     printf '%s\t%s\t%s\t%s\n' "$host" "$root" "$cpus" "$eng" > "$members"
     if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ]; then
-        for m in $(group_members "$host"); do
-            [ "$m" != "$host" ] || continue
-            mcpus=$(awk -F'\t' -v h="$m" '$1 == h {print $2; exit}' "$WORK_DIR/cal/hostinfo")
-            meng=$(awk -F'\t' -v h="$m" '$1 == h {print $3; exit}' "$WORK_DIR/cal/hostinfo")
-            mdir=$(host_dir "$m")
-            printf '%s\t%s\t%s\t%s\n' "$m" "$mdir" "$mcpus" "${meng:-$eng}" >> "$members"
-        done
+        # the rest of its group, in host order, each with its destination,
+        # cpus and engine: one awk, where each member cost three and a
+        # group can be the whole fleet
+        load_host_dirs
+        [ ! -s "$WORK_DIR/groups" ] || gf="$WORK_DIR/groups"
+        for i in "${!HOSTS[@]}"; do margs+=("${HOSTS[$i]}" "${HOST_DIRS[$i]}"); done
+        awk 'BEGIN {
+            rep = ARGV[1]; eng = ARGV[2]; ng = 0
+            # group_members: the groups file says who shares the rep group;
+            # without one, every host does
+            if (ARGV[3] != "-")
+                while ((getline line < ARGV[3]) > 0)
+                    if (split(line, F, " ") == 2) { ng++; G[F[1]] = F[2] }
+            while ((getline line < ARGV[4]) > 0) {
+                split(line, F, "\t")
+                if (!(F[1] in CPU)) { CPU[F[1]] = F[2]; ENG[F[1]] = F[3] }
+            }
+            for (a = 5; a + 1 < ARGC; a += 2) {
+                m = ARGV[a]
+                if (m == rep) continue
+                if (ng && !((rep in G) && (m in G) && G[m] == G[rep])) continue
+                printf "%s\t%s\t%s\t%s\n", m, ARGV[a + 1], CPU[m], (ENG[m] != "" ? ENG[m] : eng)
+            }
+        }' "$host" "$eng" "$gf" "$WORK_DIR/cal/hostinfo" "${margs[@]}" >> "$members" \
+            || die "$host: cannot list its filesystem group for the shared seed"
     fi
-    want=$(pyrun "$(host_name "$host")" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
+    want=$(pyrun "$hname" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
                "$job" "$WORK_DIR/cal" "$WORK_DIR/cal/$host/scratch.list" \
                "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" "$dense" \
                "$tlist" "$CAL_NR $CAL_NR_LADDER" "$members" \
@@ -4402,22 +4431,39 @@ PYEOF
 # shapes a calibration would measure, and the pins they must run checked
 # against each shape's kernel aio room -- everything this needs (the probe,
 # the proven engines, the host file, the filesystem groups) is known by then.
-# A pin past the room stops the run here; calibrate works the shapes out again.
+# A pin past the room stops the run here; calibrate and the dry-run report
+# take the ladders and the shapes from here rather than work them out again.
 cal_preflight() {
     cal_mode || return 0
-    local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
-    ladders=$(cal_required "$capdir" "$BULK") || die "cannot inspect $capdir for calibration"
-    [ -n "$ladders" ] || return 0
+    local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)}
+    cal_ladders_once || die "cannot inspect $capdir for calibration"
+    [ -n "$CAL_LADDERS" ] || return 0
     mkdir -p "$WORK_DIR/cal" || die "cannot create $WORK_DIR/cal"
-    cal_shapes "$WORK_DIR/cal/shapes" "$ladders" > "$WORK_DIR/cal/shapes.txt" \
-        || die "cannot group the hosts into client shapes"
+    cal_shapes_once || die "cannot group the hosts into client shapes"
     cal_aio_preflight "$WORK_DIR/cal/shapes"
+}
+
+# What the set calibrates (cal_required) and the shapes it calibrates on
+# (cal_shapes, into cal/shapes and cal/shapes.txt): each is a python over
+# the set or the whole fleet's probe files, and nothing either reads
+# changes between the preflight and the calibration -- worked out once.
+CAL_LADDERS=""; CAL_LADDERS_DONE=0; CAL_SHAPES_DONE=0
+cal_ladders_once() {   # -> CAL_LADDERS
+    [ "$CAL_LADDERS_DONE" -eq 0 ] || return 0
+    CAL_LADDERS=$(cal_required "${SET_DIR_OVERRIDE:-$(workload_src_dir)}" "$BULK") || return 1
+    CAL_LADDERS_DONE=1
+}
+cal_shapes_once() {   # cal/shapes and cal/shapes.txt for CAL_LADDERS
+    [ "$CAL_SHAPES_DONE" -eq 0 ] || return 0
+    cal_shapes "$WORK_DIR/cal/shapes" "$CAL_LADDERS" > "$WORK_DIR/cal/shapes.txt" || return 1
+    CAL_SHAPES_DONE=1
 }
 
 calibrate() {
     cal_mode || return 0
     local capdir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} ladders
-    ladders=$(cal_required "$capdir" "$BULK") || die "cannot inspect $capdir for calibration"
+    cal_ladders_once || die "cannot inspect $capdir for calibration"
+    ladders=$CAL_LADDERS
     if [ -z "$ladders" ]; then
         log "cal: nothing to calibrate in this set (no measurable jobs)"
         return 0
@@ -4452,8 +4498,7 @@ calibrate() {
     fi
     mkdir -p "$WORK_DIR/cal"
     local shapes="$WORK_DIR/cal/shapes" line host i pids hs
-    cal_shapes "$shapes" "$ladders" > "$WORK_DIR/cal/shapes.txt" \
-        || die "cannot group the hosts into client shapes"
+    cal_shapes_once || die "cannot group the hosts into client shapes"
     while IFS= read -r line; do log "cal: $line"; done < "$WORK_DIR/cal/shapes.txt"
     run_host "$MASTER" "mkdir -p '$TARGET_DIR.cal'" \
         || die "cannot create $TARGET_DIR.cal on $MASTER"
@@ -7148,6 +7193,8 @@ load_host_dirs() {
     while IFS= read -r d; do
         HOST_DIRS[i]=${d:-$DIRECTORY}; i=$((i + 1))
     done < <(targets_column 5 "$f" "${HOSTS[@]}")
+    # a host the awk never answered for still gets -d, as host_dir gives it
+    while [ "$i" -lt ${#HOSTS[@]} ]; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
 }
 
 host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
@@ -7212,11 +7259,12 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engi
                     extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
                     awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
                 }
-                HLINE[h] = r; HCELL[h] = C[1]
+                HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne
                 ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 3
             } else {
                 # host-less: login and engine are SELECTORS; login is never assigned
                 ELOGIN[ne] = C[2]; EENG[ne] = C[3]; ENSEL[ne] = (C[2] != "") + (C[3] != "")
+                HL[++nhl] = ne   # the host-less lines, in file order
             }
             ENK[ne] = nk
         }
@@ -7228,15 +7276,19 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engi
         # ---- resolve per host ----
         for (a = 6; a < ARGC; a++) {
             h = ARGV[a]; split("", CFG); split("", SN); split("", SL)
-            for (e = 1; e <= ne; e++)   # the host line first: the most specific, unique
-                if (EHOST[e] == h)
-                    for (j = 1; j <= ENK[e]; j++) { k = EK[e, j]; CFG[k] = EV[e, j]; SN[k] = ENSEL[e]; SL[k] = ELINE[e] }
+            # the host line first: the most specific, unique -- looked up,
+            # not scanned for: a scan per host was hosts x lines
+            if (h in HENT) {
+                e = HENT[h]
+                for (j = 1; j <= ENK[e]; j++) { k = EK[e, j]; CFG[k] = EV[e, j]; SN[k] = ENSEL[e]; SL[k] = ELINE[e] }
+            }
             login = ("login" in CFG) ? CFG["login"] : ""
             # host-less lines, most selectors first, ties to the first line
             # (none in hostonly: their values are defaults, not the host own)
             for (sel = 2; sel >= 0 && phase != "hostonly"; sel--)
-                for (e = 1; e <= ne; e++) {
-                    if (EHOST[e] != "" || ENSEL[e] != sel) continue
+                for (q = 1; q <= nhl; q++) {
+                    e = HL[q]
+                    if (ENSEL[e] != sel) continue
                     if (ELOGIN[e] != "" && ELOGIN[e] != login) continue
                     # an engine selector needs test results; it folds in later
                     if (EENG[e] != "" && (phase != "phase2" || !((h, EENG[e]) in PASSED))) continue
@@ -7484,11 +7536,12 @@ dry_run_report() {
     log "dry run: nothing was executed; details of what would have run:"
     if cal_mode; then
         local caldir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} call
-        call=$(cal_required "$caldir" "$BULK") || call=""
+        call=""
+        ! cal_ladders_once || call=$CAL_LADDERS
         if [ -n "$call" ]; then
             log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
             mkdir -p "$WORK_DIR/cal"
-            if cal_shapes "$WORK_DIR/cal/shapes" "$call" > "$WORK_DIR/cal/shapes.txt"; then
+            if cal_shapes_once; then
                 while IFS= read -r line; do log "  $line"; done < "$WORK_DIR/cal/shapes.txt"
             else
                 log "WARNING: could not group the hosts into shapes" >&2
@@ -8798,7 +8851,9 @@ main() {
     # staging dir exists and long before the first connection: a bad key path
     # costs nothing to report and leaves nothing behind.
     validate_credentials
-    command -v python3 >/dev/null || die "python3 is required for result parsing"
+    # python runs only the calibration planner and the tuner: -a's
+    [ -z "$AUTO_LEVEL" ] || command -v python3 >/dev/null \
+        || die "python3 is required for -a (the calibration planner and the tuner)"
     # -C's editors and prompts need a terminal; a missing one (or a bogus
     # $EDITOR) costs nothing to report now and everything to discover after
     # ten minutes of setup. Unattended forms (-r, -n) skip the terminal.
