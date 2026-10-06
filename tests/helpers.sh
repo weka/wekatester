@@ -20,7 +20,10 @@ case "$1" in
 esac
 TASKSETEOF
     chmod +x "$stub"/*
-    (source ./wekatester; FIO_BIN=fio; PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
+    # an empty sysroot: on Linux the live /sys would otherwise answer for
+    # the cpus this stub fakes
+    mkdir -p "$stub/root"
+    (source ./wekatester; FIO_BIN=fio; WEKATESTER_SYSROOT=$stub/root PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
 }
 export -f probe_stub
 
@@ -47,6 +50,16 @@ signal_fixture() {
     printf '#!/bin/sh\ntouch "%s/started"\nexec sleep 5\n' "$SIG" > "$SIG/ssh"
     chmod +x "$SIG/ssh"
     PATH="$SIG:$PATH"
+}
+
+# A suite started in the background of a non-interactive shell runs with
+# SIGINT ignored, every child inherits it, and no trap can catch a signal
+# ignored on entry: the signal tests would fail for a reason that is not
+# wekatester's. Say so instead.
+signal_trappable() {   # signal_trappable <INT|TERM>
+    case "$(trap -p "$1")" in
+        (*"'' SIG$1"*) echo "this suite was started with SIG$1 ignored (launched with & from a non-interactive shell?) -- run it in the foreground" >&2; return 1 ;;
+    esac
 }
 
 # Block until the stubbed ssh has run, so a signal cannot race process startup.

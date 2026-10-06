@@ -336,7 +336,7 @@ t_assert "auto staging with override stages every host" bash -c '
 # statement after the signal, so a Ctrl-C left later phases running against a
 # torn-down world (misleading errors, or an exit 0 that measured nothing).
 t_assert "SIGTERM during preflight exits 143" bash -c '
-    source ./tests/helpers.sh; signal_fixture
+    source ./tests/helpers.sh; signal_trappable TERM || exit 1; signal_fixture
     ./wekatester h1 > "$SIG/log" 2>&1 &
     pid=$!
     signal_wait_started || { echo "stub ssh never started" >&2; exit 1; }
@@ -348,7 +348,7 @@ t_assert "SIGTERM during preflight exits 143" bash -c '
 # own process group so the INT trap is reachable at all. Its job-status notice
 # goes to stderr, so keep stderr captured and only surface it on failure.
 t_assert "SIGINT during preflight exits 130" bash -c '
-    source ./tests/helpers.sh; signal_fixture
+    source ./tests/helpers.sh; signal_trappable INT || exit 1; signal_fixture
     noise=$( (set -m
               ./wekatester h1 > "$SIG/log" 2>&1 &
               pid=$!

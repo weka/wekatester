@@ -2229,7 +2229,8 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
             for (i in job) if (substr(job[i], 1, 4) == "cal-") {
                 h = (i in host) ? host[i] : "?"; tot[h] += v[i]; any = 1 }
             if (!any) { printf "ERROR: cal_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
-            # %.0f: a byte rate passes 2^31 at 2 GiB/s, where %d clips on some awks
+            # %.0f, not %d: Ubuntu mawk (1.3.4 20200120) clamps %d at
+            # 2^31-1, and a client past ~2.1 GB/s then read 2147483647
             for (h in tot) printf "%s %.0f\n", h, tot[h] | "LC_ALL=C sort"
         }'
 }
@@ -2265,7 +2266,7 @@ cal_lat_values() {   # cal_lat_values <json> <read|write>
                 if (t > 0) L[h] = (L[h] * N[h] + us * io) / t
                 I[h] += ip; N[h] = t
             }
-            for (h in seen) { any = 1; printf "%s %.3f %d\n", h, L[h], I[h] | "LC_ALL=C sort" }
+            for (h in seen) { any = 1; printf "%s %.3f %.0f\n", h, L[h], I[h] | "LC_ALL=C sort" }
             if (!any) { printf "ERROR: cal_lat_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
         }'
 }
@@ -3914,8 +3915,9 @@ probe_remote_cmd() {
     # A failure is a "weka_net_err" line naming it, never silence; no weka
     # CLI at all is "weka_cli absent". Virtual netdevs (veth, bridges,
     # bonds) are skipped: weka's dataplane NICs are always bus devices.
-    # WEKATESTER_SYSROOT prefixes /proc and /sys for the suite's fake trees;
-    # no worker ever has it set.
+    # WEKATESTER_SYSROOT prefixes /proc and /sys for the suite's fake trees
+    # (and lscpu, which reads the live machine, runs only without it); no
+    # worker ever has it set.
     #
     # The last two facts are MEASURED, not inferred: for every online cpu,
     # can a process on this box actually bind to it (taskset -c <cpu> true),
@@ -3927,18 +3929,18 @@ probe_remote_cmd() {
     # field client C, 2026-09-09: a brutal bw-write rung died on it). The old
     # rule assumed every isolated cpu was self-affinable; measuring costs
     # one fork per cpu, once, and cannot be wrong.
-    printf '%s' "echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
+    printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
-        echo \"isolated \$([ -f /sys/devices/system/cpu/isolated ] && cat /sys/devices/system/cpu/isolated)\"; \
-        echo \"online \$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online)\"; \
+        echo \"isolated \$([ -f \"\$_sr/sys/devices/system/cpu/isolated\" ] && cat \"\$_sr/sys/devices/system/cpu/isolated\")\"; \
+        echo \"online \$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\")\"; \
         echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
         _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
         if command -v taskset >/dev/null; then \
-            _on=\$([ -r /sys/devices/system/cpu/online ] && cat /sys/devices/system/cpu/online); \
+            _on=\$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\"); \
             _ids=\$(printf '%s' \"\${_on:-0-\$(( \$(getconf _NPROCESSORS_ONLN) - 1 ))}\" | awk 'BEGIN {RS = \",\"} {n = split(\$0, a, \"-\"); if (n == 2) {for (i = a[1]; i <= a[2]; i++) print i} else if (length(\$0)) print \$0 + 0}'); \
             _bd=; _bp=; for c in \$_ids; do \
                 if _o=\$(taskset -c \$c true 2>&1); then _bd=\"\$_bd,\$c\"; \
@@ -3947,8 +3949,7 @@ probe_remote_cmd() {
             [ -n \"\$_bd\" ] || _bd=,-; [ -n \"\$_bp\" ] || _bp=,-; \
             echo \"bindable \${_bd#,}\"; echo \"bindable_priv \${_bp#,}\"; \
         fi; \
-        _m=; if command -v lscpu >/dev/null; then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
-        _sr=\${WEKATESTER_SYSROOT:-}; \
+        _m=; if [ -z \"\$_sr\" ] && command -v lscpu >/dev/null; then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \
         echo \"cpu_model \${_m:--}\"; \
         echo \"memtotal_kb \$([ -r \"\$_sr/proc/meminfo\" ] && awk '/^MemTotal:/ {print \$2; exit}' \"\$_sr/proc/meminfo\")\"; \
