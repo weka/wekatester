@@ -1716,13 +1716,13 @@ t_assert "cal_required: '# report iops latency' asks only for the latency search
     test "$(cal_set '# report iops latency
 [io]
 rw=randwrite')" = "lat write|"
-# No directive: the summarizer reports everything for such a file and its
-# large sequential shape is bandwidth-like, so it counts as bandwidth.
-t_assert "cal_required: a file with no report directive counts as bandwidth" \
+# No directive names no type: such a file is not calibrated and runs as
+# written (Frank, 2026-10-06) -- the tuner lays no slot over it either.
+t_assert "cal_required: a file with no report directive is not calibrated" \
     test "$(cal_set '[global]
 bs=1M
 [seq]
-rw=write')" = "bw write|"
+rw=write')" = ""
 t_assert "cal_required: one directive naming two types asks for both" \
     test "$(cal_set '# report bandwidth iops
 [both]
@@ -1738,12 +1738,13 @@ bs=4k
 [overrides]
 rw=randwrite')" = "iops read|iops write|"
 # A prose comment is not a directive (bare "# report" matches nothing either),
-# so such a file falls into the no-directive case rather than being skipped.
+# so such a file is the no-directive case -- not calibrated -- even when the
+# comment names a type a loose parser would take for one.
 t_assert "cal_required: '# reporting notes' is not a directive" \
-    test "$(cal_set '# reporting notes: nothing to see
+    test "$(cal_set '# reporting bandwidth notes: nothing to see
 # report
 [seq]
-rw=read')" = "bw read|"
+rw=read')" = ""
 t_assert "cal_required: layout jobs are skipped, real jobs are not" \
     test "$(cal_set '# wekatester-layout: generated sha256=abc
 [layout-1]
@@ -5190,7 +5191,35 @@ t_assert "tuner: the shared read set is laid out for the widest reader, on the f
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
     l1=$FIX/jobs/h1/000-wekatester-layout.job; l2=$FIX/jobs/h2/000-wekatester-layout.job
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$l1" && grep -qx "numjobs=9" "$l1" &&
-    ! grep -q "shared\." "$l2" || { cat "$l1" "$l2" >&2; false; }'
+    ! grep -q "shared\." "$l2" || { cat "$l1" "$l2" >&2; exit 1; }
+    # h2 has nothing of its own to lay out: it sits the layout out, as fio
+    # would refuse its section-less jobfile (Cursor Bugbot on PR #47)
+    out=$(source ./wekatester; WORK_DIR=$FIX; HOSTS=(h1 h2); FIO_BIN=fio; TARGET_DIR=/t
+          job_clients 000-wekatester-layout.job | tr "\n" " "
+          echo "| $(fio_client_cmd 000-wekatester-layout.job h1)")
+    case "$out" in ("h1 | "*"--client=h1 "*) ;; (*) echo "[$out]" >&2; exit 1;; esac
+    case "$out" in (*--client=h2*) echo "h2 still a client: [$out]" >&2; false;; (*) true;; esac'
+t_assert "tuner: a file with no report directive keeps its own geometry -- no slot is laid over it" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "[global]\nfilesize=2G\nnumjobs=5\nioengine=libaio\n[plain]\nrw=randread\nbs=4k\niodepth=7\n" > "$FIX/src/041-plain.job"
+    # bandwidth, latency and iops read slots all carry a job count
+    row=(h1); for i in $(seq 1 36); do row+=(-); done
+    row[5]=3; row[13]=4; row[21]=6; row[24]=32
+    (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    v=$FIX/jobs/h1/041-plain.job
+    grep -qx "numjobs=5" "$v" && grep -qx "iodepth=7" "$v" && grep -qx "filesize=2G" "$v" &&
+    grep -qx "numjobs=3" "$FIX/jobs/h1/011-bw.job" || { cat "$v" >&2; false; }'
+t_assert "tuner: a hand-written layout under the reserved name is the operator's layout, staged as authored" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\ndirectory=/orig\n[lay]\ncreate_only=1\nnumjobs=2\nfilesize=1G\n" > "$FIX/src/000-wekatester-layout.job"
+    row=(h1); for i in $(seq 1 36); do row+=(-); done; row[5]=3
+    (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+    out=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) 2>&1 )
+    v=$FIX/jobs/h1/000-wekatester-layout.job
+    grep -qx "numjobs=2" "$v" && ! grep -qx "numjobs=3" "$v" &&
+    case "$out" in (*"000-wekatester-layout.job: user-edited layout staged as-is"*"000-wekatester-layout.job type=layout"*) true;; (*) false;; esac ||
+        { echo "$out" >&2; cat "$v" >&2; false; }'
 t_assert "shipped sets: the latency jobs report IOPS beside latency" bash -c '
     for f in fio-jobfiles/default/021-latencyR.job fio-jobfiles/default/022-latencyW.job \
              fio-jobfiles/2x400Gb/021-latencyR.job fio-jobfiles/2x400Gb/022-latencyW.job \

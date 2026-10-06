@@ -151,11 +151,15 @@ for h in hosts:
 
 # --- jobfiles ---
 def report_items(path):
+    # A jobfile with no '# report' line names no type: it is not calibrated
+    # and no type's geometry is laid over it -- it runs as written, on the
+    # host's directory, cpus and engine (Frank, 2026-10-06). cal_required
+    # and the bash layer's report_has read it the same way.
     items = []
     for line in open(path):
         m = re.match(r"^#\s*report\s+(.*)", line)
         if m: items += m.group(1).split()
-    return items or ["bandwidth", "latency", "iops"]
+    return items
 
 def override(lines, key, value):
     """Replace key= wherever it appears; else insert into [global].
@@ -184,8 +188,13 @@ def override(lines, key, value):
     return ins
 
 LAYOUT_MARKER = "# wekatester-layout: generated"
+LAYOUT_JOB = "000-wekatester-layout.job"
 
 def is_layout(path):
+    # the reserved name or the marker, as is_layout_file and generate_layout
+    # read it: a hand-written layout under that name is the operator's layout
+    if os.path.basename(path) == LAYOUT_JOB:
+        return True
     with open(path) as fp:
         return any(next(fp, "").startswith(LAYOUT_MARKER) for _ in range(3))
 

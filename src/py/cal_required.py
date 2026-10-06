@@ -39,8 +39,10 @@ for f in sorted(os.listdir(src)):
             if bulk and kind == "lat":
                 needed.add(f"lat1m {d}")
         continue
+    # no '# report' line: no type, so nothing to calibrate -- it runs as
+    # written (Frank, 2026-10-06), as the tuner stages it
     types = []
-    if "bandwidth" in items or not items: types.append("bw")
+    if "bandwidth" in items: types.append("bw")
     if "iops" in items: types.append("iops")
     for t in types:
         for d in file_directions(lines):

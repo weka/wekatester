@@ -6786,12 +6786,31 @@ sweep_layout_grid() {
 # full-rate multi-minute layout write starves the fio server's control
 # thread past the poll timeout (seen live: "timeout on cmd SEND_ETA ...
 # client timed out" 15 minutes into a 3.3TB relayout).
-fio_client_cmd() {   # fio_client_cmd <job>
-    local host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
-    for host in "${HOSTS[@]}"; do
-        cmd="$cmd --client=$host '$TARGET_DIR/$host/$1'"
+fio_client_cmd() {   # fio_client_cmd <job> [host...]: every host, or the ones named
+    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
+    shift
+    [ $# -gt 0 ] || set -- "${HOSTS[@]}"
+    for host in "$@"; do
+        cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
     done
     printf '%s' "$cmd"
+}
+
+# The hosts whose staged <job> holds a job section, one per line, in host
+# order. A layout variant can hold none: a filesystem-group follower whose
+# files are all the group's shared read set, which the group's first host
+# lays out, is left a [global] alone -- and fio refuses a jobfile with no
+# job in it. Such a host sits the layout (and the -u unlink derived from
+# it) out; the coordinator still waits for every host that lays out. A
+# variant that cannot be read is kept, so fio says what is wrong with it.
+job_clients() {   # job_clients <job>
+    awkrun 'BEGIN {
+        for (a = 3; a < ARGC; a++) {
+            n = readlines(ARGV[1] "/" ARGV[a] "/" ARGV[2], L); has = n < 0
+            for (i = 1; i <= n && !has; i++) { s = strip(L[i]); if (s ~ /^\[.+\]$/ && s != "[global]") has = 1 }
+            if (has) print ARGV[a]
+        }
+    }' "$WORK_DIR/jobs" "$1" "${HOSTS[@]}"
 }
 
 # That command line grows with the fleet, and the master's shell receives
@@ -6832,7 +6851,7 @@ early_client_cmdline_check() {
 }
 
 run_jobs() {
-    local job outfile report cmd host t0 t1
+    local job outfile report cmd host t0 lclients=()
     echo
     for job in "${JOBFILES[@]}"; do
         cmd=$(fio_client_cmd "$job")
@@ -6848,31 +6867,47 @@ run_jobs() {
             # skips the rest. No markers, no wholesale rebuilds: evidence
             # decided per file.
             ensure_layout_dirs "$job"
-            log "laying out files ($job) on ${#HOSTS[@]} host(s)..."
+            mapfile -t lclients < <(job_clients "$job")
+            if [ ${#lclients[@]} -eq 0 ]; then
+                log "layout: nothing to lay out ($job)"
+                echo
+                continue
+            fi
+            [ ${#lclients[@]} -eq ${#HOSTS[@]} ] \
+                || log "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing of their own to lay out (their group's first host lays out the shared read set)"
+            cmd=$(fio_client_cmd "$job" "${lclients[@]}")
+            log "laying out files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "layout failed for $job (partial output in $outfile)"
             if ! check_fio_errors "$outfile" layout; then
-                for host in "${HOSTS[@]}"; do
+                for host in "${lclients[@]}"; do
                     fio_parse_postmortem layout "$host" "$TARGET_DIR/$host/$job" \
                         "$RUN_DIR/parse.${job%.job}.$host.out"
                 done
                 die "layout $job failed -- the files were not created (raw output in $outfile)"
             fi
-            log "layout: complete in $((SECONDS - t0))s across ${#HOSTS[@]} host(s)"
+            log "layout: complete in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
             echo
             continue
         fi
         if [ "$job" = "$UNLINK_JOB" ]; then
             # Cleanup, not measurement: error-checked like a layout job (its
             # stats are open/unlink zeros), timed instead of summarized.
-            log "removing test files ($job) on ${#HOSTS[@]} host(s)..."
+            mapfile -t lclients < <(job_clients "$job")
+            if [ ${#lclients[@]} -eq 0 ]; then
+                log "unlink: nothing to remove ($job)"
+                echo
+                continue
+            fi
+            cmd=$(fio_client_cmd "$job" "${lclients[@]}")
+            log "removing test files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "unlink failed for $job (partial output in $outfile)"
             check_fio_errors "$outfile" layout \
                 || die "unlink $job failed -- test files may remain (raw output in $outfile)"
-            log "unlink: test files removed in $((SECONDS - t0))s across ${#HOSTS[@]} host(s)"
+            log "unlink: test files removed in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
             echo
             continue
         fi
