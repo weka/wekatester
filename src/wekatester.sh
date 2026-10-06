@@ -1339,68 +1339,119 @@ sha256_hex() {
 # Text before the first "{" (fio's own log lines) is skipped. Exit 2: no JSON
 # at all; exit 3: the JSON does not parse (the offset is on stderr).
 json_flat() {   # json_flat <file>
+    # One pass, a line at a time: the tokens of each line are matched off
+    # its front and fed to a parser that keeps its own stack, so no awk ever
+    # holds the file as one string. Over a whole-file buffer the cost was
+    # quadratic on two of the three awks this runs under: macOS awk's
+    # substr() measures the whole string on every call, and mawk copies the
+    # buffer on every appended line -- a 451-client result took ~130 s and
+    # ~9 s to read (gawk: 0.4 s). fio prints one key per line, so every line
+    # is short; a single huge compact line would still be quadratic on those
+    # two, and fio never writes one. A string may run across lines.
     LC_ALL=C awk '
-    { buf = buf $0 "\n" }
-    function ws() { while (i <= n) { c = substr(buf, i, 1); if (c != " " && c != "\t" && c != "\n" && c != "\r") break; i++ } }
-    function fail(what) { printf "json: %s at offset %d\n", what, i > "/dev/stderr"; exit 3 }
-    function str(   out, c, e) {
-        # at the opening quote; returns the unescaped text, i past the closing quote
-        i++; out = ""
-        while (i <= n) {
-            c = substr(buf, i, 1)
-            if (c == "\"") { i++; return out }
-            if (c == "\\") {
-                e = substr(buf, i + 1, 1); i += 2
-                if (e == "n") out = out "\n"; else if (e == "t") out = out "\t"
-                else if (e == "r") out = out "\r"; else if (e == "u") { out = out "?"; i += 4 }
-                else out = out e
-                continue
-            }
-            out = out c; i++
-        }
-        fail("unterminated string")
+    function fail(what) {
+        printf "json: %s at offset %d\n", what, tokoff > "/dev/stderr"; failed = 1; exit 3
     }
-    function value(path,   c, k, idx, v) {
-        ws(); if (i > n) fail("unexpected end")
-        c = substr(buf, i, 1)
-        if (c == "{") {
-            i++; ws()
-            if (substr(buf, i, 1) == "}") { i++; printf "%s\t{}\n", path; return }
-            while (1) {
-                ws(); if (substr(buf, i, 1) != "\"") fail("expected a key")
-                k = str(); ws()
-                if (substr(buf, i, 1) != ":") fail("expected :"); i++
-                value(path == "" ? k : path "." k)
-                ws(); c = substr(buf, i, 1); i++
-                if (c == "}") return
-                if (c != ",") fail("expected , or }")
+    function unesc(s,   out, p, e) {
+        if (!index(s, "\\")) return s
+        out = ""
+        while ((p = index(s, "\\"))) {
+            out = out substr(s, 1, p - 1); e = substr(s, p + 1, 1)
+            if (e == "u") { out = out "?"; s = substr(s, p + 6); continue }
+            if (e == "n") out = out "\n"; else if (e == "t") out = out "\t"
+            else if (e == "r") out = out "\r"; else out = out e
+            s = substr(s, p + 2)
+        }
+        return out s
+    }
+    # after a value: the enclosing container wants a separator, or the
+    # document is complete
+    function done_value() {
+        if (d == 0) { want = "end"; return }
+        want = T[d] == "o" ? "o" : "a"
+    }
+    function push(type, path) { T[++d] = type; CP[d] = path }
+    # one token: tok, and whether it was a quoted string
+    function feed(tok, isstr) {
+        if (want == "v" || want == "V") {
+            if (!isstr && tok == "]" && want == "V") { printf "%s\t[]\n", CP[d]; d--; done_value(); return }
+            if (!isstr && tok == "{") { push("o", vpath); want = "k"; return }
+            if (!isstr && tok == "[") { push("a", vpath); IX[d] = 0; vpath = vpath ".0"; want = "V"; return }
+            if (!isstr && index("{}[]:,", tok)) fail("unexpected character")
+            printf "%s\t%s\n", vpath, isstr ? unesc(tok) : tok
+            done_value(); return
+        }
+        if (want == "k" || want == "K") {
+            if (!isstr && tok == "}" && want == "k") { printf "%s\t{}\n", CP[d]; d--; done_value(); return }
+            if (!isstr) fail("expected a key")
+            tok = unesc(tok); vpath = CP[d] == "" ? tok : CP[d] "." tok; want = ":"; return
+        }
+        if (want == ":") { if (isstr || tok != ":") fail("expected :"); want = "v"; return }
+        if (want == "o") {
+            if (!isstr && tok == ",") { want = "K"; return }
+            if (!isstr && tok == "}") { d--; done_value(); return }
+            fail("expected , or }")
+        }
+        if (want == "a") {
+            if (!isstr && tok == ",") { vpath = CP[d] "." (++IX[d]); want = "v"; return }
+            if (!isstr && tok == "]") { d--; done_value(); return }
+            fail("expected , or ]")
+        }
+    }
+    BEGIN { want = "v"; vpath = ""; d = 0 }
+    {
+        # line: the text being tokenized; lstart: its offset in the file
+        if (carry != "") { line = carry $0; lstart = cstart; carry = "" }
+        else { line = $0; lstart = fpos }
+        fpos += length($0) + 1
+        if (!started) {
+            # fio log text comes first: the document starts at the first {
+            if (!(p = index(line, "{"))) next
+            started = 1; rest = substr(line, p)
+        } else rest = line
+        while (1) {
+            sub(/^[ \t\r]+/, "", rest)
+            if (rest == "") break
+            tokoff = lstart + length(line) - length(rest) + 1
+            c = substr(rest, 1, 1)
+            if (c == "\"") {
+                if (!match(rest, /^"([^"\\]|\\.)*"/)) {
+                    # the string goes on past this line
+                    carry = rest "\n"; cstart = tokoff - 1; break
+                }
+                tl = RLENGTH; feed(substr(rest, 2, tl - 2), 1)
+            } else if (index("{}[]:,", c)) {
+                tl = 1; feed(c, 0)
+            } else {
+                match(rest, /^[^],} \t\r]+/); tl = RLENGTH; feed(substr(rest, 1, tl), 0)
             }
+            if (want == "end") exit 0
+            rest = substr(rest, tl + 1)
         }
-        if (c == "[") {
-            i++; ws(); idx = 0
-            if (substr(buf, i, 1) == "]") { i++; printf "%s\t[]\n", path; return }
-            while (1) {
-                value(path "." idx); idx++
-                ws(); c = substr(buf, i, 1); i++
-                if (c == "]") return
-                if (c != ",") fail("expected , or ]")
-            }
-        }
-        if (c == "\"") { v = str(); printf "%s\t%s\n", path, v; return }
-        v = ""
-        while (i <= n) {
-            c = substr(buf, i, 1)
-            if (c == "," || c == "}" || c == "]" || c == " " || c == "\n" || c == "\t" || c == "\r") break
-            v = v c; i++
-        }
-        if (v == "") fail("unexpected character")
-        printf "%s\t%s\n", path, v
     }
     END {
-        n = length(buf); i = index(buf, "{")
-        if (i == 0) exit 2
-        value("")
+        if (failed) exit 3
+        if (!started) exit 2
+        tokoff = fpos
+        if (carry != "") fail("unterminated string")
+        if (want != "end") fail("unexpected end")
     }' "$1"
+}
+
+# One parse per results file: check_fio_errors loads it fresh, and the
+# reader that follows it (summ_one, cal_values, cal_lat_values) takes the
+# same lines instead of flattening the file a second time.
+JSON_PATH=""; JSON_FLAT=""; JSON_RC=0; JSON_ERR=""
+json_load() {   # json_load <file> -> JSON_FLAT, JSON_RC, JSON_ERR (json_flat's own message)
+    local e="${TMPDIR:-/tmp}/wt.jsonerr.$$"
+    JSON_PATH=$1
+    JSON_FLAT=$(json_flat "$1" 2> "$e"); JSON_RC=$?
+    JSON_ERR=""
+    [ ! -s "$e" ] || IFS= read -r JSON_ERR < "$e"
+    rm -f "$e"
+}
+json_use() {   # json_use <file>: the loaded lines when they are this file's, else load them
+    [ -n "$JSON_PATH" ] && [ "$JSON_PATH" = "$1" ] || json_load "$1"
 }
 
 # Linux strerror for the errno fio reports (the workers are Linux, whatever
@@ -2141,13 +2192,13 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
     case "$2" in (bw) key=bw_bytes ;; (iops) key=iops ;;
         (*) echo "ERROR: cal_values: unknown mode: $2 (bw|iops)" >&2; return 1 ;; esac
     [ -r "$1" ] || { echo "ERROR: cal_values: cannot read $1" >&2; return 1; }
-    local flat rc
-    flat=$(json_flat "$1"); rc=$?
-    case $rc in
+    json_use "$1"
+    case $JSON_RC in
         2) echo "ERROR: cal_values: no JSON in $1" >&2; return 1 ;;
-        3) echo "ERROR: cal_values: cannot parse fio JSON in $1" >&2; return 1 ;;
+        3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
+           echo "ERROR: cal_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v key="$key" -v path="$1" '
+    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v key="$key" -v path="$1" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2 }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
@@ -2166,13 +2217,13 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
 # by their IO count, so a cell without group_reporting still reads right.
 cal_lat_values() {   # cal_lat_values <json> <read|write>
     [ -r "$1" ] || { echo "ERROR: cal_lat_values: cannot read $1" >&2; return 1; }
-    local flat rc
-    flat=$(json_flat "$1"); rc=$?
-    case $rc in
+    json_use "$1"
+    case $JSON_RC in
         2) echo "ERROR: cal_lat_values: no JSON in $1" >&2; return 1 ;;
-        3) echo "ERROR: cal_lat_values: cannot parse fio JSON in $1" >&2; return 1 ;;
+        3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
+           echo "ERROR: cal_lat_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v d="$2" -v path="$1" '
+    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v d="$2" -v path="$1" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
@@ -6114,14 +6165,17 @@ finalize_run_dir() {
 # reports neither signal still cannot slip through the run: the first
 # measured job then finds no files and trips the zero-IO check itself.
 check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
-    local path=$1 mode=$2 flat rc
-    flat=$(json_flat "$path"); rc=$?
-    case $rc in
+    local path=$1 mode=$2
+    # always a fresh parse: the file was just written; the reader after
+    # this check takes the same lines (json_use)
+    json_load "$path"
+    case $JSON_RC in
         2) echo "$path: no JSON in fio output" >&2; return 1 ;;
-        3) echo "$path: cannot parse fio JSON" >&2; return 1 ;;
+        3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
+           echo "$path: cannot parse fio JSON" >&2; return 1 ;;
     esac
     local bad
-    bad=$(printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v mode="$mode" '
+    bad=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v mode="$mode" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
@@ -6510,12 +6564,12 @@ summarize_report() {   # summarize_report <path> <items> <expected>
 # results file. In file mode an error goes to stderr and returns 1; in a
 # bundle it prints as "    (reason)" and the next file still gets reported.
 summ_one() {
-    local f=$1 label=$2 items=$3 expected=$4 mode=$5 flat rc out err="${TMPDIR:-/tmp}/wt.jsonerr.$$"
-    flat=$(json_flat "$f" 2> "$err"); rc=$?
-    case $rc in
+    local f=$1 label=$2 items=$3 expected=$4 mode=$5 out
+    json_use "$f"
+    case $JSON_RC in
         2) out="ERR	$label: no JSON in fio output" ;;
-        3) out="ERR	$label: cannot parse fio JSON: $(sed 's/^json: //' "$err")" ;;
-        *) out=$(printf '%s\n' "$flat" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
+        3) out="ERR	$label: cannot parse fio JSON: ${JSON_ERR#json: }" ;;
+        *) out=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         function key(p,   a, n, k) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
         function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB/s", n / 2^30)
@@ -6599,7 +6653,6 @@ summ_one() {
             for (j = 1; j <= nl; j++) print "    " L[j]
         }') ;;
     esac
-    rm -f "$err"
     case "$out" in
         "ERR	"*)
             if [ "$mode" = bundle ]; then printf '    (%s)\n\n' "${out#ERR	}"; return 0; fi

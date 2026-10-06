@@ -5508,6 +5508,43 @@ t_assert "json_flat: fio one-key-per-line and compact JSON flatten alike; string
      [ "$(json_flat "$d/esc.json")" = "s	a \"q\" b" ] || { printf "%s\n" "$a"; json_flat "$d/esc.json"; exit 1; } >&2
      json_flat "$d/none" > "$d/o"; [ $? -eq 2 ] && [ ! -s "$d/o" ] || exit 1
      json_flat "$d/bad" > "$d/o" 2> "$d/e"; [ $? -eq 3 ] && grep -q "offset" "$d/e")'
+t_assert "json_flat: one pass that grows with the file on every awk here (300 clients well inside 10 s); strings across lines, nested and empty arrays, text after the document" bash -c '
+    d=$(mktemp -d)
+    # 300 clients of 232 keys each, fio one-key-per-line: ~1.7 MB, 70k lines.
+    # The whole-file reader took ~57 s on macOS awk and ~2 s on mawk here.
+    LC_ALL=C awk "BEGIN { print \"fio: log text\"; print \"{\"; print \"  \\\"client_stats\\\" : [\"
+        for (c = 1; c <= 300; c++) {
+            print \"    {\"; print \"      \\\"jobname\\\" : \\\"bw\\\",\"; printf \"      \\\"hostname\\\" : \\\"h%d\\\",\n\", c
+            print \"      \\\"read\\\" : {\"
+            for (k = 1; k <= 230; k++) printf \"        \\\"k%d\\\" : %d%s\n\", k, k, (k < 230 ? \",\" : \"\")
+            print \"      }\"; print (c < 300 ? \"    },\" : \"    }\")
+        }
+        print \"  ]\"; print \"}\" }" > "$d/big.json"
+    printf "{ \"a\": \"multi\nline\", \"n\": [[1, 2], []], \"e\": {} } trailing { junk\n" > "$d/edge.json"
+    want=$(printf "a\tmulti\nline\nn.0.0\t1\nn.0.1\t2\nn.1\t[]\ne\t{}")
+    mkdir "$d/bin"
+    for a in awk mawk gawk; do
+        p=$(command -v "$a") || continue
+        ln -sf "$p" "$d/bin/awk"
+        SECONDS=0
+        n=$(PATH="$d/bin:$PATH"; source ./wekatester; json_flat "$d/big.json" | wc -l)
+        [ "$SECONDS" -lt 10 ] && [ "$n" -eq 69600 ] || { echo "$a: $n lines in ${SECONDS}s" >&2; exit 1; }
+        got=$(PATH="$d/bin:$PATH"; source ./wekatester; json_flat "$d/edge.json")
+        [ "$got" = "$want" ] || { echo "$a: [$got]" >&2; exit 1; }
+    done'
+t_assert "fio JSON: a results file is flattened once -- the error check and the reader after it share the lines" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"; cal_json_fixture "$d/c.json" h1:100:10:200:20
+    (source ./wekatester
+     eval "$(declare -f json_flat | sed "1s/json_flat/json_flat_real/")"
+     json_flat() { echo x >> "$d/n"; json_flat_real "$@"; }
+     check_fio_errors "$d/r.json" measured && summarize "$d/r.json" "" "vega-1 vega-2" > "$d/out" &&
+     [ "$(wc -l < "$d/n")" -eq 1 ] && grep -q "total bandwidth: 7.00 GiB/s" "$d/out" &&
+     check_fio_errors "$d/c.json" measured && [ "$(cal_values "$d/c.json" bw)" = "h1 300" ] &&
+     [ "$(wc -l < "$d/n")" -eq 2 ] &&
+     # a check always parses afresh: the same path may hold a new run
+     check_fio_errors "$d/c.json" measured && [ "$(wc -l < "$d/n")" -eq 3 ]) ||
+        { cat "$d/out" "$d/n" >&2; false; }'
 t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" bash -c '
     for f in json_flat errno_text cal_values cal_lat_values check_fio_errors summarize summarize_report summ_one; do
         body=$(sed -n "/^$f() {/,/^}/p" src/wekatester.sh); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }
