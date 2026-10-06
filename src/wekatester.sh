@@ -124,7 +124,7 @@ AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 
 # --- logging -----------------------------------------------------------------
-log()   { echo "$(date '+%H:%M:%S') $*"; }
+log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
@@ -201,15 +201,27 @@ run_host() {   # run_host <host> <command-string>
 }
 
 # Copy files to the master's staging area. The destination directory is the
-# last argument, exactly as cp and scp both expect it.
+# last argument, exactly as cp expects it. Remotely, one tar stream over the
+# master's connection: scp waits on the network once per file and per
+# directory, and a fleet's jobfiles are a dozen per host. The sources share
+# one parent directory -- every caller copies a directory's entries.
 copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         cp -R "$@"
-    else
-        # ${!#} is the last positional (the destination), ${@:1:$#-1} is
-        # everything before it.
-        scp $SSH_OPTS $(host_ssh_opts "$MASTER") -q -r "${@:1:$#-1}" "$MASTER:${!#}"
+        return
     fi
+    # ${!#} is the last positional (the destination), ${@:1:$#-1} is
+    # everything before it
+    local dst=${!#} parent=${1%/*} names=() s
+    for s in "${@:1:$#-1}"; do
+        [ "${s%/*}" = "$parent" ] || { log "ERROR: copy_to_master: $s is not in $parent" >&2; return 1; }
+        names+=("${s##*/}")
+    done
+    (
+        set -o pipefail
+        tar -C "$parent" -cf - -- "${names[@]}" \
+            | ssh $SSH_OPTS $(host_ssh_opts "$MASTER") "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
+    )
 }
 
 # Copy files to ONE worker's staging area (the master gets everything through
@@ -1450,8 +1462,14 @@ json_flat() {   # json_flat <file>
 # same lines instead of flattening the file a second time.
 JSON_PATH=""; JSON_FLAT=""; JSON_RC=0; JSON_ERR=""
 json_load() {   # json_load <file> -> JSON_FLAT, JSON_RC, JSON_ERR (json_flat's own message)
-    local e="${TMPDIR:-/tmp}/wt.jsonerr.$$"
+    # the parser's message goes through a private file (mktemp) inside the
+    # run's own directory where there is one -- never a guessable /tmp name
+    local e
     JSON_PATH=$1
+    if ! e=$(mktemp "${WORK_DIR:-${TMPDIR:-/tmp}}/wt.jsonerr.XXXXXX"); then
+        JSON_FLAT=""; JSON_RC=3; JSON_ERR="json: cannot create a scratch file for the parser"
+        return 1
+    fi
     JSON_FLAT=$(json_flat "$1" 2> "$e"); JSON_RC=$?
     JSON_ERR=""
     [ ! -s "$e" ] || IFS= read -r JSON_ERR < "$e"
@@ -2472,7 +2490,7 @@ PYEOF
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
     cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
     log "cal: seeding $host's calibration $side${by}..."
-    cmd="'$FIO_BIN' --output-format=json --eta=never"
+    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed must leave its evidence somewhere that survives the
     # workdir cleanup: /dev/shm/wt.* is wiped on exit
@@ -3342,7 +3360,7 @@ verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
     # one name per run, so two runs sharing a destination never read each
     # other's group lines (collect_fs_groups)
-    [ -n "$GROUP_FILE" ] || GROUP_FILE=".wekatester-group.$(date +%s).$$.lst"
+    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
     local host line verdict failed=() mode_fail=0 write_fail=0 local_fail=0 gone_fail=0 hd anc i ft
     local missing=() missing_dirs=() missing_parents=()
     local cached_hosts=() cached_modes=() mode who n
@@ -3610,10 +3628,68 @@ start_fio_servers() {
 # the caller knows the SESSION failed, which is not a firewall. The wait is
 # the remote shell's, over its own children only.
 port_probe_cmd() {   # port_probe_cmd <host>... -> remote snippet
-    local h cmd="pids=''; for h in"
+    local h cmd="${COORD_NPROC:+ulimit -Su $COORD_NPROC; }pids=''; for h in"
     for h in "$@"; do cmd="$cmd '$h'"; done
     cmd="$cmd; do ( timeout 3 bash -c \": </dev/tcp/\$h/$FIO_PORT\" || echo \"FAIL \$h\" ) & pids=\"\$pids \$!\"; done; wait \$pids; echo DONE"
     printf '%s' "$cmd"
+}
+
+# --- the limits a run must fit (Frank, 2026-10-06) -------------------------------
+# Every client runs at once -- that is the test -- so the limits that grow with
+# the fleet are checked before anything starts. A soft limit short of what the
+# run needs is raised for it when the hard limit allows that (no privilege
+# needed, nothing changed on the box); otherwise the run stops, naming the
+# limit and the host.
+limit_short() {   # limit_short <limit|unlimited> <need>: the limit is a number below the need
+    case $1 in (unlimited|''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -lt "$2" ]
+}
+
+# The controller: an ssh master per host for the whole run, and while a phase
+# talks to every host at once a subshell and an ssh client per host -- three
+# per host (measured: 302 processes for 100 hosts with a stub ssh that adds a
+# sleep of its own). Checked before the first connection.
+check_controller_procs() {
+    [ "$LOCAL_MODE" -eq 0 ] || return 0
+    local n=${#HOSTS[@]} soft hard cur need
+    soft=$(ulimit -Su); hard=$(ulimit -Hu)
+    cur=$(ps -u "$(id -u)" -o pid= | wc -l)
+    need=$(( 3 * n + cur + 64 ))
+    limit_short "$soft" "$need" || return 0
+    if limit_short "$hard" "$need"; then
+        die "this controller allows $(id -un) $hard processes (ulimit -Hu), and $n hosts need about $need at once: an ssh master per host, plus a subshell and an ssh client per host while a phase talks to every host ($cur already running) -- raise nproc for $(id -un) (/etc/security/limits.conf), or run from a controller that allows more"
+    fi
+    ulimit -Su "$need" || die "cannot raise this run's process limit to $need (ulimit -Su)"
+    log "note: raised this run's process limit (ulimit -u) from $soft to $need for $n hosts (the hard limit is $hard)"
+}
+
+# The coordinator (the first host), from its probe: fio --client keeps one
+# connection open per client and raises no limit itself (client.c polls
+# them all), and the port check probes every client at once from one shell,
+# three processes each. The raise rides those commands (COORD_NOFILE,
+# COORD_NPROC); the probe ran in the same kind of ssh session they do.
+COORD_NOFILE=""; COORD_NPROC=""
+check_coordinator_limits() {
+    local n=${#HOSTS[@]} tag sn hn su hu need
+    read -r tag sn hn su hu < <(awk '$1 == "limits" {print; exit}' "$WORK_DIR/probe/$MASTER")
+    if [ "$tag" != limits ]; then
+        log "WARNING: $MASTER: its probe reported no limits; the coordinator's open files and processes are unchecked" >&2
+        return 0
+    fi
+    need=$(( n + 64 ))
+    if limit_short "$sn" "$need"; then
+        limit_short "$hn" "$need" \
+            && die "$MASTER: fio's coordinator keeps one connection open per client, so $n clients need about $need open files, and $MASTER allows $hn (ulimit -Hn) -- raise nofile for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
+        COORD_NOFILE=$need
+        log "note: $MASTER: fio's coordinator runs with its open-file limit raised from $sn to $need for $n clients (the hard limit is $hn)"
+    fi
+    need=$(( 3 * n + 64 ))
+    if limit_short "$su" "$need"; then
+        limit_short "$hu" "$need" \
+            && die "$MASTER: the fio port check probes every client at once from one shell, so $n clients need about $need processes there, and $MASTER allows $hu (ulimit -Hu) -- raise nproc for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
+        COORD_NPROC=$need
+        log "note: $MASTER: the port check runs with its process limit raised from $su to $need for $n clients (the hard limit is $hu)"
+    fi
 }
 
 # One ssh session to the master, N probes inside it. One session PER WORKER
@@ -3914,6 +3990,7 @@ probe_remote_cmd() {
     # rule assumed every isolated cpu was self-affinable; measuring costs
     # one fork per cpu, once, and cannot be wrong.
     printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
+        echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
@@ -5455,7 +5532,7 @@ resolve_custom_set() {
             # by that name with -w or -C.
             [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
                 die "cannot create a custom set: ./fio-jobfiles is not writable here"
-            dst="./fio-jobfiles/$(date +%Y%m%d-%H%M%S)"
+            printf -v dst './fio-jobfiles/%(%Y%m%d-%H%M%S)T' -1
             mkdir -p "$dst" || die "cannot create $dst"
             copy_set_into "$src" "$dst"
             created=1; TEMP_SET=1
@@ -5481,7 +5558,7 @@ resolve_custom_set() {
                     src=$(workload_src_dir) || exit 1
                     [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
                         die "cannot create a custom set: ./fio-jobfiles is not writable here"
-                    dst="./fio-jobfiles/$(date +%Y%m%d-%H%M%S)"
+                    printf -v dst './fio-jobfiles/%(%Y%m%d-%H%M%S)T' -1
                     mkdir -p "$dst" || die "cannot create $dst"
                     copy_set_into "$src" "$dst"
                     created=1; TEMP_SET=1
@@ -6393,8 +6470,8 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
     if [ "$label" = end ] && [ -n "$RUN_STAMP" ]; then
         # the sar slice for the run window (same-day file; a run crossing
         # midnight gets the tail from 00:00:00 -- sar cannot span files)
-        sar_s=$(printf '%s' "${RUN_STAMP#*-}" | sed 's/\(..\)\(..\)\(..\)/\1:\2:\3/')
-        sar_e=$(date +%H:%M:%S)
+        sar_s=${RUN_STAMP#*-}; sar_s=${sar_s:0:2}:${sar_s:2:2}:${sar_s:4:2}
+        printf -v sar_e '%(%H:%M:%S)T' -1
         cmd="$cmd
     echo '=== WEKATESTER_SYSINFO sar ==='
     if command -v sar >/dev/null; then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
@@ -6690,7 +6767,10 @@ sweep_layout_grid() {
                      | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
-        ( run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
+        # pipefail: a dead session must fail the sweep, not hand the awk an
+        # empty listing it would total as nothing laid out
+        ( set -o pipefail
+          run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
             > "$WORK_DIR/probe/$host.laidout" ) &
         pids+=($!); hs+=("$host")
     done
@@ -6707,7 +6787,7 @@ sweep_layout_grid() {
 # thread past the poll timeout (seen live: "timeout on cmd SEND_ETA ...
 # client timed out" 15 minutes into a 3.3TB relayout).
 fio_client_cmd() {   # fio_client_cmd <job>
-    local host cmd="'$FIO_BIN' --output-format=json --eta=never"
+    local host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
     for host in "${HOSTS[@]}"; do
         cmd="$cmd --client=$host '$TARGET_DIR/$host/$1'"
     done
@@ -6769,7 +6849,7 @@ run_jobs() {
             # decided per file.
             ensure_layout_dirs "$job"
             log "laying out files ($job) on ${#HOSTS[@]} host(s)..."
-            t0=$(date +%s)
+            t0=$SECONDS
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "layout failed for $job (partial output in $outfile)"
             if ! check_fio_errors "$outfile" layout; then
@@ -6779,8 +6859,7 @@ run_jobs() {
                 done
                 die "layout $job failed -- the files were not created (raw output in $outfile)"
             fi
-            t1=$(date +%s)
-            log "layout: complete in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            log "layout: complete in $((SECONDS - t0))s across ${#HOSTS[@]} host(s)"
             echo
             continue
         fi
@@ -6788,13 +6867,12 @@ run_jobs() {
             # Cleanup, not measurement: error-checked like a layout job (its
             # stats are open/unlink zeros), timed instead of summarized.
             log "removing test files ($job) on ${#HOSTS[@]} host(s)..."
-            t0=$(date +%s)
+            t0=$SECONDS
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "unlink failed for $job (partial output in $outfile)"
             check_fio_errors "$outfile" layout \
                 || die "unlink $job failed -- test files may remain (raw output in $outfile)"
-            t1=$(date +%s)
-            log "unlink: test files removed in $((t1 - t0))s across ${#HOSTS[@]} host(s)"
+            log "unlink: test files removed in $((SECONDS - t0))s across ${#HOSTS[@]} host(s)"
             echo
             continue
         fi
@@ -7044,6 +7122,7 @@ main() {
                 || die "host file resolution failed ($early)"
         fi
     fi
+    check_controller_procs
     [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight
     verify_mount_mode
@@ -7071,6 +7150,7 @@ main() {
         # every run probes: only the probe knows where weka's pinned cores
         # are, and fio never lands on them (Frank, 2026-09-29)
         probe_workers
+        check_coordinator_limits
         if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
             test_engines
             finalize_targets
@@ -7091,7 +7171,7 @@ main() {
     # -o cannot kill the run after the benchmark already burned its minutes.
     mkdir -p -- "$OUTPUT_DIR" || die "cannot create output directory $OUTPUT_DIR"
     [ -w "$OUTPUT_DIR" ] || die "output directory $OUTPUT_DIR is not writable"
-    RUN_STAMP=$(date '+%Y%m%d-%H%M%S')
+    printf -v RUN_STAMP '%(%Y%m%d-%H%M%S)T' -1
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     start_run_log
@@ -7101,6 +7181,7 @@ main() {
     # every run probes and pins: only the probe knows where weka's pinned
     # cores are, and fio never lands on them (Frank, 2026-09-29)
     probe_workers
+    check_coordinator_limits
     if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
         test_engines
         finalize_targets

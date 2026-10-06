@@ -590,13 +590,24 @@ t_assert "run_host remote: the command string stays a single argument" bash -c '
           run_host vega-1 "df -kP /mnt/weka")
     [ "$out" = "SSH[-n][-o][BatchMode=yes][vega-1][df -kP /mnt/weka]" ] ||
         { echo "$out" >&2; false; }'
-t_assert "copy_to_master remote: sources stay separate, last arg is the destination" bash -c '
-    source ./tests/helpers.sh; echo_transport_fixture
-    out=$(source ./wekatester
-          LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
-          copy_to_master /w/jobs/h1 /w/jobs/h2 /w/jobs/h3 /dev/shm/fio-jobfiles/)
-    [ "$out" = "SCP[-o][BatchMode=yes][-q][-r][/w/jobs/h1][/w/jobs/h2][/w/jobs/h3][vega-1:/dev/shm/fio-jobfiles/]" ] ||
-        { echo "$out" >&2; false; }'
+t_assert "copy_to_master remote: one tar stream over one ssh to the master, the sources by name, the destination made and unpacked into" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/w/jobs/h1" "$d/w/jobs/h2" "$d/w/jobs/h3" "$d/got"
+    for h in h1 h2 h3; do echo "$h" > "$d/w/jobs/$h/011-bw.job"; done
+    # the stub records its argv and unpacks what it is sent, as the remote would
+    printf "#!/bin/sh\nprintf SSH >> \"%s/argv\"; printf \"[%%s]\" \"\$@\" >> \"%s/argv\"; printf \"\\\\n\" >> \"%s/argv\"\nexec tar -xf - -C \"%s/got\"\n" "$d" "$d" "$d" "$d" > "$d/bin/ssh"
+    chmod +x "$d/bin/ssh"
+    (export PATH="$d/bin:$PATH"; source ./wekatester
+     LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
+     copy_to_master "$d/w/jobs/h1" "$d/w/jobs/h2" "$d/w/jobs/h3" /dev/shm/fio-jobfiles/) || { cat "$d/argv" >&2; exit 1; }
+    [ "$(cat "$d/argv")" = "SSH[-o][BatchMode=yes][vega-1][mkdir -p '"'"'/dev/shm/fio-jobfiles/'"'"' && tar -xf - -C '"'"'/dev/shm/fio-jobfiles/'"'"']" ] &&
+    [ "$(cat "$d/got/h1/011-bw.job" "$d/got/h3/011-bw.job")" = "h1
+h3" ] || { cat "$d/argv" >&2; ls -R "$d/got" >&2; false; }'
+t_assert "copy_to_master remote: a failed stream fails the copy, and sources from two directories are refused" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/w/a" "$d/x/b"
+    printf "#!/bin/sh\ncat > /dev/null; exit 255\n" > "$d/bin/ssh"; chmod +x "$d/bin/ssh"
+    (export PATH="$d/bin:$PATH"; source ./wekatester; LOCAL_MODE=0; MASTER=m; copy_to_master "$d/w/a" /dst/) && { echo "a dead ssh passed" >&2; exit 1; }
+    err=$( (export PATH="$d/bin:$PATH"; source ./wekatester; LOCAL_MODE=0; MASTER=m; copy_to_master "$d/w/a" "$d/x/b" /dst/) 2>&1 ) && { echo "two dirs passed" >&2; exit 1; }
+    case "$err" in *"copy_to_master: $d/x/b is not in $d/w"*) true;; *) echo "$err" >&2; false;; esac'
 
 # preflight reads 255 as ssh'"'"'s "could not connect" status, which only means that
 # remotely. run_host is stubbed to hand preflight the rc directly: no local
@@ -824,10 +835,11 @@ t_assert "the winning login reaches ssh and scp argv per host" bash -c '
           LOCAL_MODE=0; MASTER=vega-1; SSH_OPTS="-o BatchMode=yes"
           AUTH_DIR=$d; CONTROL_OPTS="-o CtlDummy=1"
           printf "ubuntu\n" > "$d/vega-1.user"
+          mkdir -p "$d/w/jobs/h1"
           run_host vega-1 "df -kP /mnt/weka"
-          copy_to_master /w/jobs/h1 /dev/shm/fio-jobfiles/)
+          copy_to_master "$d/w/jobs/h1" /dev/shm/fio-jobfiles/)
     [ "$out" = "SSH[-n][-o][BatchMode=yes][-o][CtlDummy=1][-o][User=ubuntu][vega-1][df -kP /mnt/weka]
-SCP[-o][BatchMode=yes][-o][CtlDummy=1][-o][User=ubuntu][-q][-r][/w/jobs/h1][vega-1:/dev/shm/fio-jobfiles/]" ] ||
+SSH[-o][BatchMode=yes][-o][CtlDummy=1][-o][User=ubuntu][vega-1][mkdir -p '"'"'/dev/shm/fio-jobfiles/'"'"' && tar -xf - -C '"'"'/dev/shm/fio-jobfiles/'"'"']" ] ||
         { echo "$out" >&2; false; }'
 
 # --- interactive prompt primitive (fd seam; no pty anywhere) ---
@@ -5650,6 +5662,59 @@ t_assert "targets_column: one line per host in the order given; the first row pe
     printf "a\tu1\te1\t-\t/d/a\nb\t-\t-\t-\t-\na\tu2\te2\t-\t/d/a2\n" > "$d/t"
     out=$(source ./wekatester; targets_column 5 "$d/t" b c a | tr "\n" "|")
     [ "$out" = "||/d/a|" ] || { echo "[$out]" >&2; false; }'
+t_assert "json_load: the parser message goes through a private file in the run dir, which is gone after" bash -c '
+    d=$(mktemp -d); printf "{ \"a\": [1, }\n" > "$d/bad.json"
+    (source ./wekatester; WORK_DIR=$d; json_load "$d/bad.json"
+     [ "$JSON_RC" -eq 3 ] && case "$JSON_ERR" in "json: unexpected character at offset"*) true;; *) false;; esac) &&
+    [ -z "$(ls "$d" | grep jsonerr)" ] || { ls "$d" >&2; false; }'
+t_assert "log: the timestamp is formatted by bash, not a date process" bash -c '
+    out=$(source ./wekatester; date() { echo DATE-RAN; }; log hello)
+    [[ $out =~ ^[0-2][0-9]:[0-5][0-9]:[0-6][0-9]\ hello$ ]] || { echo "[$out]" >&2; false; }'
+t_assert "sweep: a dead session fails the sweep instead of reading as nothing laid out" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DIRECTORY=/mnt/weka; DRY_RUN=0
+            mkdir -p "$d/jobs/h1" "$SET_DIR"
+            printf "# wekatester-layout: generated sha256=abc\n[global]\ndirectory=/mnt/weka\n[l1]\nfilename_format=h1.\$filenum/\$jobnum\nfilesize=1G\nnumjobs=2\n" > "$SET_DIR/000-wekatester-layout.job"
+            cp "$SET_DIR/000-wekatester-layout.job" "$d/jobs/h1/"
+            JOBFILES=(000-wekatester-layout.job)
+            run_host() { return 255; }
+            sweep_layout_grid) 2>&1 ) && { echo "a dead session passed: $err" >&2; exit 1; }
+    case "$err" in *"layout grid sweep failed on h1"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "limits: the controller raises its soft process limit for a fleet the hard one allows, and stops before connecting when it does not" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"
+    printf "#!/bin/sh\nseq 1 36\n" > "$d/bin/ps"; chmod +x "$d/bin/ps"
+    run() {   # run <soft> <hard>: 400 hosts need 3 x 400 + 36 + 64 = 1300
+        (export PATH="$d/bin:$PATH"; source ./wekatester
+         LOCAL_MODE=0; HOSTS=(); for i in $(seq 1 400); do HOSTS+=(h$i); done
+         SOFT=$1; HARD=$2
+         ulimit() { case "$1" in (-Su) if [ $# -eq 1 ]; then echo "$SOFT"; else echo "RAISED $2"; fi;; (-Hu) echo "$HARD";; esac; }
+         check_controller_procs) 2>&1; }
+    out=$(run 4096 4096) && [ -z "$out" ] || { echo "enough: [$out]" >&2; exit 1; }
+    out=$(run 1024 8192) && case "$out" in *"RAISED 1300"*"raised this run"*"from 1024 to 1300 for 400 hosts"*) ;; *) echo "raise: [$out]" >&2; exit 1;; esac
+    out=$(run 1024 unlimited) && case "$out" in *"RAISED 1300"*) ;; *) echo "unlimited hard: [$out]" >&2; exit 1;; esac
+    out=$(run 1024 1200) && { echo "short hard passed: [$out]" >&2; exit 1; }
+    case "$out" in *"allows"*"1200 processes (ulimit -Hu), and 400 hosts need about 1300 at once"*"limits.conf"*) true;; *) echo "stop: [$out]" >&2; false;; esac'
+t_assert "limits: the coordinator gets its open files and port-check processes raised when its hard limits allow, the run stops when they do not" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    run() {   # run <limits line>: 1100 hosts need 1164 open files and 3364 processes
+        (source ./wekatester
+         WORK_DIR=$d; MASTER=h1; HOSTS=(); for i in $(seq 1 1100); do HOSTS+=(h$i); done
+         FIO_BIN=/usr/bin/fio; TARGET_DIR=/dev/shm/x; FIO_PORT=8765
+         printf "ncpus 8\n%s\n" "$1" > "$d/probe/h1"
+         check_coordinator_limits || exit 1
+         echo "NOFILE=$COORD_NOFILE NPROC=$COORD_NPROC"
+         c=$(fio_client_cmd 011-bw.job); echo "CMD=${c:0:40}"
+         p=$(port_probe_cmd h1 h2); echo "PORT=${p:0:30}") 2>&1; }
+    out=$(run "limits 65536 65536 8192 8192") && case "$out" in *"NOFILE= NPROC="*"CMD="?"/usr/bin/fio"*"PORT=pids="*) ;; *) echo "enough: [$out]" >&2; exit 1;; esac
+    out=$(run "limits 1024 1048576 4096 4096") && case "$out" in *"open-file limit raised from 1024 to 1164 for 1100 clients"*"NOFILE=1164 NPROC="*"CMD=ulimit -Sn 1164 && "?"/usr/bin/fio"*) ;; *) echo "nofile: [$out]" >&2; exit 1;; esac
+    out=$(run "limits 65536 65536 1024 8192") && case "$out" in *"process limit raised from 1024 to 3364"*"PORT=ulimit -Su 3364; pids="*) ;; *) echo "nproc: [$out]" >&2; exit 1;; esac
+    out=$(run "limits 1024 1100 8192 8192") && { echo "short nofile passed: [$out]" >&2; exit 1; }
+    case "$out" in *"h1: fio"*"coordinator keeps one connection open per client, so 1100 clients need about 1164 open files, and h1 allows 1100 (ulimit -Hn)"*) ;; *) echo "nofile stop: [$out]" >&2; exit 1;; esac
+    out=$(run "limits 65536 65536 1024 2048") && { echo "short nproc passed: [$out]" >&2; exit 1; }
+    case "$out" in *"h1: the fio port check probes every client at once"*"need about 3364 processes there, and h1 allows 2048 (ulimit -Hu)"*) true;; *) echo "nproc stop: [$out]" >&2; false;; esac'
+t_assert "probe: reports the open-file and process limits, soft and hard" bash -c '
+    printf "%s\n" "$(probe_stub)" | grep -qE "^limits [0-9a-z]+ [0-9a-z]+ [0-9a-z]+ [0-9a-z]+$"'
 t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" bash -c '
     for f in json_flat errno_text cal_values cal_lat_values check_fio_errors summarize summarize_report summ_one; do
         body=$(sed -n "/^$f() {/,/^}/p" src/wekatester.sh); [ -n "$body" ] || { echo "no $f" >&2; exit 1; }
