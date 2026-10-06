@@ -44,21 +44,25 @@ attaching is the way to pass a value that starts with a dash.
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
   -a, --auto [safe|max|cal|brutal[:secs]]
-                          derive system-specific fio options from the workers
-                          (default level when omitted: max)
-                          cal: group the clients into hardware shapes and,
-                          solo on one client per shape, search numjobs
-                          (N/2, N, 2N, 4N of N usable physical cores),
-                          iodepth, nrfiles and the ioengine per test type:
-                          bandwidth toward NIC line rate, the most iops,
-                          the lowest latency at N jobs over nrfiles
+                          measure the clients and run what they do best
+                          (default level when omitted: max): clients are
+                          grouped into hardware shapes, one client of each
+                          is measured alone; N = its usable physical cores
+                          safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
+                          max: numjobs N/2, N, 2N at the deepest iodepth and
+                          nrfiles cal has chosen (bandwidth 16 and 4, iops
+                          32 and 2)
+                          cal: walk numjobs to 4N, iodepth and nrfiles --
+                          bandwidth toward NIC line rate, the most iops
                           brutal: the cal search with no early stops --
                           every rung of every ladder is measured. Slow
+                          every level: the ioengine, and latency at N jobs
+                          over nrfiles beside a one-job test
                           :secs sets the measured seconds per cell (default
-                          30); it does not change
-                          how long the measured jobs run -- that is
-                          -x/--duration
-  --line-rate Gb/s        every client's dataplane line rate, for the -a cal
+                          15 for safe and max, 30 for cal and brutal); it
+                          does not change how long the measured jobs run --
+                          that is -x/--duration
+  --line-rate Gb/s        every client's dataplane line rate, for the -a
                           bandwidth target, in place of what ethtool reports:
                           a cloud VF can report 100 Gb/s on a 16 Gb/s
                           instance, and without the weka CLI nothing reports it
@@ -84,8 +88,8 @@ attaching is the way to pass a value that starts with a dash.
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
-                 test listed on its own (under -a cal/brutal the 1MiB test
-                 gets its own calibrated job count)
+                 test listed on its own (under -a the 1MiB test is
+                 calibrated on its own)
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -129,9 +133,9 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout job (so it always matches the exact file grid that was laid out, whatever auto tuning or hand edits did) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
 
-`-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a cal` and `-a brutal` the 1 MiB test gets its own calibrated job count, recorded in its own host-file columns (`latency1mR`, `latency1mW`).
+`-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a` the 1 MiB test is calibrated on its own and recorded in its own host-file columns (`latency1mR`, `latency1mW`).
 
-`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a cal` or `-a brutal`, and takes 0.1 to 100000 Gb/s. `-a brutal` measures every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency values still pin their knobs.
+`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a`, and takes 0.1 to 100000 Gb/s. `-a safe`, `-a max` and `-a brutal` measure every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency values still pin their knobs.
 
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
@@ -182,29 +186,29 @@ A generated layout job carries a `# wekatester-layout: generated sha256=...` mar
 `-a` / `--auto` derives system-specific fio options from the workers instead
 of trusting the jobfiles' static values. Four levels:
 
-- `-a safe` — uniform and conservative: `numjobs` = the smallest usable core
-  count across workers, ioengine fixed only if a worker lacks the one in the
-  jobfile, and fio pinned away from weka's cores (`cpus_allowed`). Hosts stay
-  directly comparable.
-- `-a max` (default when the level is omitted) — each worker is tuned to its
-  own capability: `numjobs` = that host's usable cores (every cpu except the
-  ones weka has pinned — `isolcpus` does not narrow it further, because the
-  widest mask measured fastest and `cpus_allowed_policy=split` keeps each job
-  on its own cpu), deeper iodepth,
-  and iops/latency files shrink to 1G with a small per-job spread (2
-  files per job; the single latency job gets 8) IN PLACE -- the namespace stays the jobfile's own, so `-a` runs and
-  plain runs share one on-disk grid and reuse each other's files. (An earlier release sized this against backend
-  DRAM as a "cache-defeat working set"; the weka source disproved the
-  premise — backends never serve file data from RAM — so the spread is
-  stated directly instead of dressed up as a working-set formula.) Highest numbers; hosts with
-  different hardware run different settings.
-- `-a cal` — calibrates before staging, **per client shape**: the clients are
-  grouped by hardware, one client of each shape is measured alone, and the
-  search finds the parameters that give that shape its best result per test
-  type. What it finds is recorded in `hostlist.csv`, where it pins the next
-  calibration (see What lands in the host file). The answer to "why these
-  numbers" becomes "measured on your clients against this cluster."
+Every level calibrates before staging, **per client shape**: the clients are
+grouped by hardware, one client of each shape is measured alone, and what it
+finds is what every client of that shape runs. N is the shape's usable
+physical cores (fio never shares a core with weka or with core 0's pair).
+The levels differ only in how wide the bandwidth and IOPS searches go:
+
+- `-a safe` — numjobs N/2, N and 2N at iodepth 1 and nrfiles 1, 15 s cells.
+  The quickest measured answer.
+- `-a max` (default when the level is omitted) — the same three job counts at
+  the deepest iodepth and nrfiles any cal or brutal search had chosen across
+  the labs and field runs: bandwidth iodepth 16 with 4 files, IOPS iodepth 32
+  with 2 files (`CAL_MAX_BW_QD`, `CAL_MAX_BW_NR`, `CAL_MAX_IOPS_QD`,
+  `CAL_MAX_IOPS_NR`). 15 s cells.
+- `-a cal` — walks the ladders: numjobs up to 4N, iodepth and nrfiles (see The
+  search). 30 s cells.
 - `-a brutal` — the same search with every early stop disabled (see below).
+
+At every level the ioengine is chosen by measurement, latency runs at N jobs
+over the nrfiles ladder with the one-job test beside it, a setting leads only
+when 3% better (the leader rule), and the answers are recorded in
+`hostlist.csv`, where they pin the next calibration (see What lands in the
+host file). The answer to "why these numbers" becomes "measured on your
+clients against this cluster."
 
 ### What calibration optimizes
 
@@ -225,7 +229,7 @@ what the cluster can do.
   one-job twin below runs beside it, so a single stream and full load
   compare. With `-b` the same again at 1 MiB.
 
-Under `-a cal` and `-a brutal` every latency test also runs as a **one-job
+Under every `-a` level every latency test also runs as a **one-job
 twin** (`021-latencyR-1job.job`, just before its original): numjobs, iodepth
 and nrfiles all 1 on every client, with the same data per job. The run then
 shows one single-threaded stream's latency across the fleet next to every
@@ -307,7 +311,8 @@ by `-e` or by the host file is used as it is; `-g` re-chooses a host-file
 engine.
 
 **Then one search per test type and direction** the set runs, with cells of
-`CAL_RUNTIME` seconds (30 by default; `-a cal:15` shortens them):
+`CAL_RUNTIME` seconds (15 for safe and max, 30 for cal and brutal;
+`-a <level>:<secs>` sets them):
 
 **At or below N there is no queue or file ladder**: every cell runs iodepth 1
 and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
@@ -580,7 +585,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth);
 - `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`), plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, and `sar-end` (the sysstat log slice covering the run window, when the box keeps one). A host missing a tool records `not available` instead of failing the run;
-- `cal/` — on `-a cal` and `-a brutal` runs: `shapes` and `shapes.txt` (the client shapes), per shape `s<n>/` with the engine cells, each search's history of readings, and the tuples it settled, every cell's jobfile and raw JSON, and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
+- `cal/` — on every `-a` run: `shapes` and `shapes.txt` (the client shapes), per shape `s<n>/` with the engine cells, each search's history of readings, and the tuples it settled, every cell's jobfile and raw JSON, and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 

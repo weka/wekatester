@@ -457,21 +457,25 @@ attaching is the way to pass a value that starts with a dash.
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning
   -a, --auto [safe|max|cal|brutal[:secs]]
-                          derive system-specific fio options from the workers
-                          (default level when omitted: max)
-                          cal: group the clients into hardware shapes and,
-                          solo on one client per shape, search numjobs
-                          (N/2, N, 2N, 4N of N usable physical cores),
-                          iodepth, nrfiles and the ioengine per test type:
-                          bandwidth toward NIC line rate, the most iops,
-                          the lowest latency at N jobs over nrfiles
+                          measure the clients and run what they do best
+                          (default level when omitted: max): clients are
+                          grouped into hardware shapes, one client of each
+                          is measured alone; N = its usable physical cores
+                          safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
+                          max: numjobs N/2, N, 2N at the deepest iodepth and
+                          nrfiles cal has chosen (bandwidth 16 and 4, iops
+                          32 and 2)
+                          cal: walk numjobs to 4N, iodepth and nrfiles --
+                          bandwidth toward NIC line rate, the most iops
                           brutal: the cal search with no early stops --
                           every rung of every ladder is measured. Slow
+                          every level: the ioengine, and latency at N jobs
+                          over nrfiles beside a one-job test
                           :secs sets the measured seconds per cell (default
-                          30); it does not change
-                          how long the measured jobs run -- that is
-                          -x/--duration
-  --line-rate Gb/s        every client's dataplane line rate, for the -a cal
+                          15 for safe and max, 30 for cal and brutal); it
+                          does not change how long the measured jobs run --
+                          that is -x/--duration
+  --line-rate Gb/s        every client's dataplane line rate, for the -a
                           bandwidth target, in place of what ethtool reports:
                           a cloud VF can report 100 Gb/s on a 16 Gb/s
                           instance, and without the weka CLI nothing reports it
@@ -497,8 +501,8 @@ attaching is the way to pass a value that starts with a dash.
                           needs a terminal unless -r or -n is given. With no
                           attached value the set may be the next bare token
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
-                 test listed on its own (under -a cal/brutal the 1MiB test
-                 gets its own calibrated job count)
+                 test listed on its own (under -a the 1MiB test is
+                 calibrated on its own)
   -r             fast track: no prompts and no editors -- create whatever is
                  needed and run; a wekafs destination that is not mounted
                  forcedirect is a warning instead of a stop
@@ -1429,16 +1433,15 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
     esac
     if [ "$raw" != "${raw%%:*}" ]; then
         secs=${raw#*:}
-        case "$lvl" in
-            (cal|brutal) ;;
-            (*) usage >&2
-                die "$flag: a cell duration applies only to cal and brutal, not $lvl" ;;
-        esac
         case "$secs" in
             (""|*[!0-9]*|0) usage >&2
                 die "$flag: the rung duration must be whole seconds > 0, got: $secs" ;;
         esac
         CAL_RUNTIME=$secs
+    elif [ -z "$CAL_RUNTIME_FROM_ENV" ]; then
+        # the level's own cell length: safe and max search three job counts
+        # at a fixed geometry, cal and brutal walk the ladders
+        case "$lvl" in (safe|max) CAL_RUNTIME=15 ;; (*) CAL_RUNTIME=30 ;; esac
     fi
     AUTO_LEVEL=$lvl
 }
@@ -1566,7 +1569,8 @@ parse_args() {
             # against calibration's intent (Frank, 2026-10-05): say so
             -l|--load) usage >&2; die "-l/--load was removed: the test runs exactly what calibration measured" ;;
             -a|--auto)
-                AUTO_LEVEL="max"
+                # bare -a is max, with max's cell length
+                set_auto_level max "$1"
                 # The level is a keyword, not a value, so it is matched
                 # case-insensitively too -- and only consumed when it really is
                 # one, otherwise it is the first server name. A ":secs" suffix
@@ -1661,7 +1665,7 @@ parse_args() {
         awk -v v="$LINE_RATE_GBPS" 'BEGIN {v += 0; exit !(v >= 0.1 && v <= 100000)}' \
             || { usage >&2; die "--line-rate must be between 0.1 and 100000 Gb/s: '$LINE_RATE_GBPS'"; }
         # only a calibration's bandwidth search has a target to set
-        cal_mode || { usage >&2; die "--line-rate sets the bandwidth target of a calibration: it needs -a cal or -a brutal"; }
+        cal_mode || { usage >&2; die "--line-rate sets the bandwidth target of a calibration: it needs -a"; }
     fi
 }
 
@@ -1672,7 +1676,12 @@ parse_args() {
 #   brutal  with none: every rung of every ladder is measured, the re-splits
 #           run to their caps, and more top cells are re-measured. When the
 #           stopping rules are the suspect, the exhaustive search settles it
-cal_mode()    { case "$AUTO_LEVEL" in (cal|brutal) return 0 ;; esac; return 1; }
+# Every -a level calibrates (Frank, 2026-10-05): safe and max search numjobs
+# only, at fixed iodepth/nrfiles; cal and brutal walk the ladders.
+cal_mode()    { case "$AUTO_LEVEL" in (safe|max|cal|brutal) return 0 ;; esac; return 1; }
+# the widest job count a level's searches reach, in multiples of N: safe and
+# max stop at 2N, cal and brutal climb to 4N (latency stays at N everywhere)
+cal_wide()    { case "$AUTO_LEVEL" in (safe|max) echo 2 ;; (*) echo 4 ;; esac; }
 brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 
 # Set inspection: which searches does a jobfile set actually need?
@@ -1948,6 +1957,7 @@ CAL_SCRATCH=".wekatester-cal"
 # `-a brutal` is the same search with every early stop disabled: every
 # combination of numjobs, iodepth and nrfiles the ladders define is measured,
 # and more cells are re-measured before a peak is picked.
+CAL_RUNTIME_FROM_ENV=${CAL_RUNTIME:+1}   # an exported CAL_RUNTIME beats the level default
 CAL_RUNTIME=${CAL_RUNTIME:-30}   # seconds per search cell (plus a 2s ramp);
                          # "-a cal:15" sets it per run. It does not change how
                          # long the measured jobs run -- that is -x.
@@ -1982,6 +1992,15 @@ CAL_BW_QD_LADDER=${CAL_BW_QD_LADDER:-"1 2 4 8 16"}   # bandwidth iodepths at
                          # iodepth=1 only (1 is kept at 2N so N x qd1 against
                          # 2N x qd1 isolates what the siblings add)
 CAL_IOPS_QD_LADDER=${CAL_IOPS_QD_LADDER:-"1 2 4 8 16 32 64 128 256 512"}
+# -a max searches numjobs at these (Frank, 2026-10-05): the largest iodepth
+# and nrfiles any cal or brutal search had chosen per type across the labs
+# and field runs by then -- bandwidth qd 16 and 4 files, iops qd 32 and 2
+# files (a 128 iops pick came only from a re-split rule since removed). -a
+# safe searches at 1 and 1.
+CAL_MAX_BW_QD=${CAL_MAX_BW_QD:-16}
+CAL_MAX_BW_NR=${CAL_MAX_BW_NR:-4}
+CAL_MAX_IOPS_QD=${CAL_MAX_IOPS_QD:-32}
+CAL_MAX_IOPS_NR=${CAL_MAX_IOPS_NR:-2}
 CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
 CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # the engine tie band: engines whose reading
                          # is within this percent of the best are tied, and the
@@ -2008,12 +2027,19 @@ BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-5}
 
 # The knobs as the planner takes them, one k=v word each; a ladder is one
 # comma-joined word.
-cal_knobs() {
-    local exh=0 conf=$CAL_CONFIRM
-    if brutal_mode; then
-        exh=1; conf=$BRUTAL_CONFIRM
-    fi
-    printf '%s ' "exh=$exh" "line=$CAL_LINE_PCT" \
+cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this level
+    local exh=0 conf=$CAL_CONFIRM fq=- fn=-
+    case "$AUTO_LEVEL" in
+        (brutal) exh=1; conf=$BRUTAL_CONFIRM ;;
+        # safe and max measure three job counts once each: no confirm pass
+        (safe) conf=0; fq=1; fn=1 ;;
+        (max)  conf=0
+               case "${1:-}" in
+                   (bw)   fq=$CAL_MAX_BW_QD; fn=$CAL_MAX_BW_NR ;;
+                   (iops) fq=$CAL_MAX_IOPS_QD; fn=$CAL_MAX_IOPS_NR ;;
+               esac ;;
+    esac
+    printf '%s ' "lvl=${AUTO_LEVEL:-cal}" "fq=$fq" "fn=$fn" "exh=$exh" "line=$CAL_LINE_PCT" \
         "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
         "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
@@ -2410,6 +2436,7 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
 # the seed beyond the nrfiles ladder).
 cal_shapes() {   # cal_shapes <out> <ladders>
     WEKATESTER_CAL_NRS="$CAL_NR $CAL_NR_LADDER" WEKATESTER_FSMIB=$FILESIZE_MIB \
+    WEKATESTER_CAL_WIDE=$(cal_wide) \
     pyrun "$1" "$2" "$WORK_DIR" "${ENGINE:--}" "$REGEN_LAYOUT" "$CAL_MEM_PCT" \
           "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" <<'PYEOF'
 #@include py/cal_shapes.py
@@ -2543,7 +2570,7 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
     local sdir="$WORK_DIR/cal/s$CAL_SID" hist act phase nj qd nr rt msg n=0 knobs
     hist="$sdir/hist-$type-$dirn"
     : > "$hist"
-    knobs="$(cal_knobs)aio=${CAL_REP_AIO:--} $(cal_pin_knobs "$sdir" "$type" "$dirn")"
+    knobs="$(cal_knobs "$type")aio=${CAL_REP_AIO:--} $(cal_pin_knobs "$sdir" "$type" "$dirn")"
     CAL_PIN_FS=$(cal_pin_fs "$sdir" "$type" "$dirn")
     while :; do
         # shellcheck disable=SC2086 -- the knobs are one k=v word each
@@ -2615,7 +2642,7 @@ SLOTEOF
     budget=0; wcells=0
     while read -r type dirn; do
         [ -n "$type" ] || continue
-        c=$(cal_plan budget "$type" "$dirn" x "$usable" 0 0 /dev/null $(cal_knobs) $(cal_pin_knobs "$sdir" "$type" "$dirn")) \
+        c=$(cal_plan budget "$type" "$dirn" x "$usable" 0 0 /dev/null $(cal_knobs "$type") $(cal_pin_knobs "$sdir" "$type" "$dirn")) \
             || die "cannot size the $type $dirn search"
         budget=$((budget + c))
         [ "$dirn" != write ] || wcells=$((wcells + c))
@@ -2759,6 +2786,7 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "${hs[$i]}: cannot list the calibration dataset or its free space"
     done
+    WEKATESTER_CAL_WIDE=$(cal_wide) \
     pyrun "$WORK_DIR" "$shapes" "$ladders" "${CAL_NS_DIR-unset}" "${CAL_FMT:-\$jobnum.\$filenum}" \
           "${CAL_SEP:-.cal.}" "$FILESIZE_MIB" "$CAL_NR $CAL_NR_LADDER" "${HOSTS[@]}" \
           > "$WORK_DIR/cal/cap/report" <<'PYEOF'

@@ -1,5 +1,8 @@
 import os, sys
 
+# the widest job count the level searches, in multiples of N (cal_wide)
+WIDE = int(os.environ.get("WEKATESTER_CAL_WIDE", "4"))
+
 work, shapes_path, ladders, nsdir, fmt, sep, fsmib, nrs = sys.argv[1:9]
 hosts = sys.argv[9:]
 unified = nsdir == ""
@@ -69,7 +72,7 @@ if unified and "read" in dirs:
         needs = []
         for rep, n in shapes:
             if fs_group[rep][0] == first:
-                needs += ladder_needs(nrs, fsmib, 4 * n)
+                needs += ladder_needs(nrs, fsmib, WIDE * n)
         needs += read_needs(os.path.join(work, "cal", "needs.read." + first))
         lister = first if first in have else next(r for r, _ in shapes if fs_group[r][0] == first)
         need, nj, nr = deficit("shared.", needs, have[lister])
@@ -77,7 +80,7 @@ if unified and "read" in dirs:
 for rep, n in shapes:
     if unified and "write" not in dirs:
         continue
-    needs = ladder_needs(nrs, fsmib, 4 * n) + read_needs(os.path.join(work, "cal", "needs.write." + rep))
+    needs = ladder_needs(nrs, fsmib, WIDE * n) + read_needs(os.path.join(work, "cal", "needs.write." + rep))
     if not unified:
         needs += read_needs(os.path.join(work, "cal", "needs.read." + fs_group[rep][0]))
     need, nj, nr = deficit(names.get(rep, rep) + sep, needs, have[rep])

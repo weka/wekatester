@@ -1007,7 +1007,7 @@ t_assert "tuner: an edited layout is staged at each host's own destination too" 
     grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/000-wekatester-layout.job"'
 # The fleet-shared read set is calibration's: safe and max stage reads on
 # the client's own grid, exactly as a plain run does.
-t_assert "staging: only cal and brutal put reads on the fleet-shared set; safe and max keep the client's own grid" bash -c '
+t_assert "staging: every -a level calibrates, so every level puts reads on the fleet-shared set" bash -c '
     d=$(mktemp -d); mkdir -p "$d/set"
     printf "ncpus 8\nengines libaio psync\n" > "$d/probe.h1"
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=2\nioengine=libaio\n[j]\nrw=read\n" > "$d/set/011-r.job"
@@ -1016,13 +1016,9 @@ t_assert "staging: only cal and brutal put reads on the fleet-shared set; safe a
         (source ./wekatester
          WORK_DIR=$w; DIRECTORY=/mnt/w; HOSTS=(h1); AUTO_LEVEL=$lvl
          stage_variants "$d/set") >/dev/null 2>&1 || { echo "stage_variants failed at -a $lvl" >&2; exit 1; }
-        grep "^filename_format=" "$w/jobs/h1/011-r.job" > "$d/fmt.$lvl"
-    done
-    grep -qx "filename_format=\$filenum/\$jobnum" "$d/fmt.safe" &&
-    grep -qx "filename_format=\$filenum/\$jobnum" "$d/fmt.max" &&
-    grep -qx "filename_format=shared.\$filenum/\$jobnum" "$d/fmt.cal" &&
-    grep -qx "filename_format=shared.\$filenum/\$jobnum" "$d/fmt.brutal" ||
-        { head "$d"/fmt.* >&2; false; }'
+        grep -qx "filename_format=shared.\$filenum/\$jobnum" "$w/jobs/h1/011-r.job" ||
+            { echo "-a $lvl: $(grep "^filename_format=" "$w/jobs/h1/011-r.job")" >&2; exit 1; }
+    done'
 t_assert "tuner capacity: layout job does not double the required total" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
@@ -1350,7 +1346,7 @@ t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" b
         *"unknown auto level: bogus (safe|max|cal|brutal)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal" bash -c '
+t_assert "parse: -a cal and --auto=cal set the level; every level calibrates" bash -c '
     (source ./wekatester; parse_args -a cal h1;    [ "$AUTO_LEVEL" = cal ]) &&
     (source ./wekatester; parse_args -ACAL h1;     [ "$AUTO_LEVEL" = cal ]) &&
     (source ./wekatester; parse_args --auto=cal h1; [ "$AUTO_LEVEL" = cal ]) &&
@@ -1366,8 +1362,8 @@ t_assert "parse: -a cal and --auto=cal set the level; cal_mode true only for cal
     esac &&
     (source ./wekatester; AUTO_LEVEL=cal;    cal_mode) &&
     (source ./wekatester; AUTO_LEVEL=brutal; cal_mode) &&
-    ! (source ./wekatester; AUTO_LEVEL=safe; cal_mode) &&
-    ! (source ./wekatester; AUTO_LEVEL=max;  cal_mode) &&
+    (source ./wekatester; AUTO_LEVEL=safe;   cal_mode) &&
+    (source ./wekatester; AUTO_LEVEL=max;    cal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL="";   cal_mode)'
 
 t_assert "seed_estimate_line: complete dataset, unknown free space, and the share of free space" bash -c '
@@ -1688,8 +1684,6 @@ t_assert "parse: -a brutal sets the level, and :secs sets the cell duration" bas
     (source ./wekatester; parse_args -a brutal:10 h1
      [ "$AUTO_LEVEL" = brutal ] && [ "$CAL_RUNTIME" = 10 ]) &&
     (source ./wekatester; parse_args -a cal:15 h1;    [ "$CAL_RUNTIME" = 15 ]) &&
-    # a duration still belongs only to the measured levels
-    ! (source ./wekatester; parse_args -a max:10 h1) 2>/dev/null &&
     (source ./wekatester; AUTO_LEVEL=brutal; brutal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=cal;  brutal_mode) &&
     ! (source ./wekatester; AUTO_LEVEL=max;  brutal_mode)'
@@ -4295,7 +4289,7 @@ t_assert "calibrate: under -b a latency set also measures the 1MiB test, into it
     [ "$(cut -d" " -f11-14,27-30 "$d/cal.results")" = "1 1 5120M 5 1 1 5120M 5" ] || { cat "$d/cal.results" >&2; false; }'
 
 # --- --line-rate, the libaio aio room, and catch-all cpu lists ---
-t_assert "--line-rate takes 0.1 to 100000 Gb/s, attached or separate, and only with -a cal or brutal" bash -c '
+t_assert "--line-rate takes 0.1 to 100000 Gb/s, attached or separate, and needs -a" bash -c '
     (source ./wekatester; parse_args -a cal --line-rate 16 h1; [ "$LINE_RATE_GBPS" = 16 ]) &&
     (source ./wekatester; parse_args -a brutal --LINE-RATE=12.5 h1; [ "$LINE_RATE_GBPS" = 12.5 ]) &&
     (source ./wekatester; parse_args --line-rate=0.1 -a cal h1; [ "$LINE_RATE_GBPS" = 0.1 ]) || exit 1
@@ -4306,10 +4300,9 @@ t_assert "--line-rate takes 0.1 to 100000 Gb/s, attached or separate, and only w
     # an empty value, as an unset variable in a wrapper gives, is no override
     if err=$( (source ./wekatester; parse_args -a cal --line-rate "" h1) 2>&1 ); then echo "accepted an empty value" >&2; exit 1; fi
     case "$err" in *"ERROR: option --line-rate requires a value"*) ;; *) echo "$err" >&2; exit 1;; esac
-    for a in "-a max" ""; do
-        if err=$( (source ./wekatester; parse_args $a --line-rate 16 h1) 2>&1 ); then echo "accepted without cal: $a" >&2; exit 1; fi
-        case "$err" in *"ERROR: --line-rate sets the bandwidth target of a calibration: it needs -a cal or -a brutal"*) ;; *) echo "$a: $err" >&2; exit 1;; esac
-    done'
+    (source ./wekatester; parse_args -a max --line-rate 16 h1; [ "$LINE_RATE_GBPS" = 16 ]) || exit 1
+    if err=$( (source ./wekatester; parse_args --line-rate 16 h1) 2>&1 ); then echo "accepted without -a" >&2; exit 1; fi
+    case "$err" in *"ERROR: --line-rate sets the bandwidth target of a calibration: it needs -a"*) ;; *) echo "$err" >&2; exit 1;; esac'
 t_assert "cal_shapes: --line-rate replaces ethtool's figure, and gives a host with no weka CLI a target" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8 h3:8
@@ -5245,10 +5238,66 @@ t_assert "-x stamps runtime+time_based on measured variants, never the layout" b
     l="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&
     ! grep -q "^runtime=77$" "$l"'
-t_assert "calibrate: no-op below cal" bash -c '
+# Every -a level calibrates (Frank, 2026-10-05). safe and max search numjobs
+# N/2, N, 2N at a fixed iodepth and nrfiles, in 15 s cells; cal and brutal
+# walk the ladders in 30 s cells; :secs sets any level's cells.
+t_assert "levels: safe and max cells default to 15 s, cal and brutal to 30; :secs sets any level; an exported CAL_RUNTIME wins" bash -c '
+    rt() { (source ./wekatester; parse_args -a "$1" h1; echo "$CAL_RUNTIME"); }
+    [ "$(rt safe)" = 15 ] && [ "$(rt max)" = 15 ] && [ "$(rt cal)" = 30 ] && [ "$(rt brutal)" = 30 ] &&
+    [ "$(rt safe:40)" = 40 ] && [ "$(rt max:7)" = 7 ] && [ "$(rt cal:15)" = 15 ] &&
+    [ "$( (source ./wekatester; parse_args -a h1; echo "$CAL_RUNTIME") )" = 15 ] &&
+    [ "$(CAL_RUNTIME=22 bash -c "source ./wekatester; parse_args -a safe h1; echo \$CAL_RUNTIME")" = 22 ] ||
+        { echo "safe=$(rt safe) max=$(rt max) cal=$(rt cal) brutal=$(rt brutal)" >&2; false; }'
+t_assert "levels: the knobs each level gives the planner -- safe at 1 and 1, max at the deepest cal has chosen, no confirm pass for either" bash -c '
+    k() { (source ./wekatester; AUTO_LEVEL=$1; cal_knobs "$2") | tr " " "\n" | grep -E "^(lvl|fq|fn|confirm|exh)=" | tr "\n" " "; }
+    [ "$(k safe bw)" = "lvl=safe fq=1 fn=1 exh=0 confirm=0 " ] &&
+    [ "$(k max bw)" = "lvl=max fq=16 fn=4 exh=0 confirm=0 " ] &&
+    [ "$(k max iops)" = "lvl=max fq=32 fn=2 exh=0 confirm=0 " ] &&
+    [ "$(k max lat)" = "lvl=max fq=- fn=- exh=0 confirm=0 " ] &&
+    [ "$(k cal bw)" = "lvl=cal fq=- fn=- exh=0 confirm=3 " ] &&
+    [ "$(k brutal iops)" = "lvl=brutal fq=- fn=- exh=1 confirm=5 " ] &&
+    [ "$( (source ./wekatester; AUTO_LEVEL=max; cal_wide) )" = 2 ] &&
+    [ "$( (source ./wekatester; AUTO_LEVEL=cal; cal_wide) )" = 4 ] ||
+        { echo "safe-bw=[$(k safe bw)] max-bw=[$(k max bw)] max-iops=[$(k max iops)] cal-bw=[$(k cal bw)]" >&2; false; }'
+t_assert "calibrate -a max: bandwidth and iops measure N/2, N and 2N at the fixed geometry; latency walks nrfiles at N" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8
+    printf "# report bandwidth\n[global]\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    printf "# report iops\n[global]\nbs=4k\n[a]\nrw=randread\n" > "$d/set/031-i.job"
+    printf "# report latency\n[global]\nbs=4k\n[a]\nrw=randread\n" > "$d/set/021-l.job"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=max; CAL_RUNTIME=15; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio; ENGINE=io_uring
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    # 8 cpus, weka on 7, the OS on 0-1: N=5, so N/2=2 and 2N=10
+    cells() { grep -o "cal-$1-read-io_uring-nj[0-9]*-qd[0-9]*-nr[0-9]*-15s" "$d/simlog" | sed "s/cal-$1-read-io_uring-//; s/-15s//" | sort -u | tr "\n" " "; }
+    [ "$(cells bw)" = "nj10-qd16-nr4 nj2-qd16-nr4 nj5-qd16-nr4 " ] &&
+    [ "$(cells iops)" = "nj10-qd32-nr2 nj2-qd32-nr2 nj5-qd32-nr2 " ] &&
+    [ "$(cells lat)" = "nj5-qd1-nr1 nj5-qd1-nr2 nj5-qd1-nr4 " ] &&
+    case "$out" in *"bw-read: "*"(-a max: numjobs 2, 5, 10 at iodepth 16 nrfiles 4, the leader by 3%"*) true;; *) printf "%s\n" "$out" >&2; false;; esac ||
+        { echo "bw=[$(cells bw)] iops=[$(cells iops)] lat=[$(cells lat)]" >&2; false; }'
+t_assert "calibrate -a safe: the same three job counts at iodepth 1 and nrfiles 1, recorded for every member" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8 h2:8
+    printf "# report iops\n[global]\nbs=4k\n[a]\nrw=randwrite\n" > "$d/set/032-w.job"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=safe; CAL_RUNTIME=15; WORK_DIR=$d; HOSTS=(h1 h2); MASTER=h1; FIO_BIN=fio; ENGINE=io_uring
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(grep -o "cal-iops-write-io_uring-nj[0-9]*-qd[0-9]*-nr[0-9]*" "$d/simlog" | sort -u | sed "s/.*io_uring-//" | tr "\n" " ")" = "nj10-qd1-nr1 nj2-qd1-nr1 nj5-qd1-nr1 " ] &&
+    grep -q "^h1 io_uring " "$d/cal.results" && grep -q "^h2 io_uring " "$d/cal.results" &&
+    [ "$(grep "^h1 " "$d/cal.results" | cut -d" " -f2-)" = "$(grep "^h2 " "$d/cal.results" | cut -d" " -f2-)" ] || { cat "$d/simlog" "$d/cal.results" >&2; false; }'
+
+t_assert "calibrate: no-op without -a" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
-     AUTO_LEVEL=max; WORK_DIR=$d
+     AUTO_LEVEL=""; WORK_DIR=$d
      run_host() { echo "TOUCHED" >> "$d/oplog"; }
      calibrate)
     [ ! -f "$d/oplog" ]'

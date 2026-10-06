@@ -4,6 +4,7 @@ out_path, ladders, work, cli_engine, regen, mem_pct, line_gbps = sys.argv[1:8]
 hosts = sys.argv[8:]
 NRS = sorted(set(int(x) for x in os.environ.get("WEKATESTER_CAL_NRS", "1 1 2 4").split() if x.isdigit()))
 FSMIB = int(os.environ.get("WEKATESTER_FSMIB", "5120"))
+WIDE = int(os.environ.get("WEKATESTER_CAL_WIDE", "4"))   # job-count ceiling, x N (cal_wide)
 line_gbps = "" if line_gbps == "-" else line_gbps
 regen = regen == "1"
 mem_pct = float(mem_pct)
@@ -279,7 +280,7 @@ for s in shapes:
     for slot, (q, n, fs, j) in host_pins(rep):
         typ, d = slot.rsplit("_", 1)
         nrs = [int(n)] if n.isdigit() else NRS
-        nj = int(j) if j.isdigit() else 4 * s["cores"]["n"]
+        nj = int(j) if j.isdigit() else WIDE * s["cores"]["n"]
         try:
             fmib = parse_size(fs) >> 20 if fs else 0
         except ValueError:
