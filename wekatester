@@ -5,8 +5,10 @@
 # Shell rewrite. Orchestration uses the system OpenSSH binary, so agent
 # forwarding, certificates, ProxyJump, and ~/.ssh/config behave exactly as
 # they do for interactive ssh. Connections are multiplexed over ControlMaster
-# sockets: one TCP+auth handshake per host for the whole run. Result parsing
-# is delegated to embedded python3 (stdlib only). No installable dependencies.
+# sockets: one TCP+auth handshake per host for the whole run. fio's results
+# are read with awk; -a's calibration planner and tuner are python3 (stdlib
+# only). No installable dependencies. It runs on a Linux controller with
+# bash 4.4 or later (Frank, 2026-10-06).
 #
 # With no server on the command line the same orchestration runs against the
 # local host with the transport swapped for direct execution (see run_host):
@@ -16,6 +18,16 @@
 # fio pidfiles) lives in tmpfs (/dev/shm), never on disk. The only files
 # written to disk are the results_*.json outputs in the output directory
 # (./results by default, -o/--output to choose another).
+
+# Checked before anything else is read: an older bash would otherwise stop
+# on syntax it does not know, with a message that names neither.
+bash_floor_ok() {   # bash_floor_ok <major> <minor>: 4.4 or later
+    [ "$1" -gt 4 ] || { [ "$1" -eq 4 ] && [ "$2" -ge 4 ]; }
+}
+bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
+    echo "wekatester needs bash 4.4 or later; this is ${BASH_VERSION:-not bash}" >&2
+    exit 1
+}
 
 VERSION="2026-09-09"
 
@@ -77,12 +89,9 @@ TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on 
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
-# local staging: prefer tmpfs; fall back for non-Linux (e.g. macOS) dev boxes
-if [ -d /dev/shm ] && [ -w /dev/shm ]; then
-    STAGE_BASE=/dev/shm
-else
-    STAGE_BASE=${TMPDIR:-/tmp}
-fi
+# local staging: tmpfs, which every Linux controller has (the suite, run on a
+# development Mac, points WEKATESTER_STAGE_BASE elsewhere)
+STAGE_BASE=${WEKATESTER_STAGE_BASE:-/dev/shm}
 
 # BatchMode: fail cleanly instead of hanging on an interactive prompt.
 # ControlMaster opts live in CONTROL_OPTS (set in main once the socket dir
@@ -198,7 +207,7 @@ copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
         cp -R "$@"
     else
         # ${!#} is the last positional (the destination), ${@:1:$#-1} is
-        # everything before it; both are bash 3.2-safe.
+        # everything before it.
         scp $SSH_OPTS $(host_ssh_opts "$MASTER") -q -r "${@:1:$#-1}" "$MASTER:${!#}"
     fi
 }
@@ -220,13 +229,6 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
 # phase below needs a second code path -- only the transport changes.
 resolve_local_mode() {
     [ ${#HOSTS[@]} -eq 0 ] || return 0
-    # Local mode leans on Linux-only plumbing: findmnt for the mount guard,
-    # /dev/shm for staging and the fio pidfile. Say so here rather than letting
-    # it surface two phases later as a confusing findmnt failure. Remote runs
-    # from a non-Linux box stay supported -- that plumbing is on the workers.
-    # Plain `uname`, PATH-resolved on purpose, so the suite can stub it.
-    [ "$(uname -s)" = Linux ] || \
-        die "local mode is Linux-only (findmnt, /dev/shm); name a server instead"
     LOCAL_MODE=1
     HOSTS=(localhost)
     MASTER=localhost
@@ -280,15 +282,14 @@ validate_credentials() {
 # reliable answer to "is a human here". The controlling terminal is: /dev/tty is
 # the same device whether or not stdin/stdout were redirected. One rw fd carries
 # both directions, so the prompt stays visible under a pipe and the run log on
-# stdout is never polluted with UI. Every behavior below was probe-verified on
-# bash 3.2.57: timeouts are whole seconds only; read -s must consume via fd
-# redirection (read -u echoes); partial -n input is DISCARDED on timeout, so the
+# stdout is never polluted with UI. read -s must consume via fd redirection
+# (read -u echoes), and partial -n input is DISCARDED on timeout, so the
 # escape drain reads one byte at a time.
 PROMPT_TTY="${WEKATESTER_PROMPT_TTY:-/dev/tty}"   # test plumbing only, namespaced
 PROMPT_OPENED=0      # 1 = we own fd 3 and must close it
 PROMPT_IN_FD=""      # read side  -- the suite presets these two and then
 PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
-PROMPT_DRAIN_SECS=1  # bash 3.2 read -t takes whole seconds; 1 is the floor
+PROMPT_DRAIN_SECS=0.2  # an escape sequence's bytes arrive together; 0.2 s is ample
 
 require_interactive() {   # require_interactive <what-needs-it> [advice]
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
@@ -554,10 +555,8 @@ opt_val() {   # opt_val <normalized-token> <canonical-option>
     [ -n "$OPT_VAL" ] || { usage >&2; die "option $2 requires a value"; }
 }
 
-# bash 3.2 has no ${var,,}, so lowercasing goes through tr. The letters are
-# spelled out rather than given as A-Z or [:upper:]: both of those are
-# locale-dependent in tr, and a Turkish locale would map I to a dotless i.
-lower() { printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'; }
+# Lowercasing under the C locale: a Turkish one would map I to a dotless i.
+lower() { local LC_ALL=C; printf '%s' "${1,,}"; }
 
 # Case-fold an option token's NAME and nothing else, so the `case` below can
 # stay lowercase-only while -D, --AUTO=MAX and -CMySet all land on the right
@@ -1091,7 +1090,7 @@ pyrun() {   # pyrun <args...> -- python script on stdin, WEKA_PYLIB prepended
 #     one at the end.
 #   - a byte count is printed with %.0f: print and %d round or clip past
 #     2^31 on some awks.
-#   - portable to macOS awk, gawk and mawk alike: a comparison inside a
+#   - portable to gawk and mawk alike: a comparison inside a
 #     print list is parenthesized, a function has at most 50 parameters and
 #     locals, and A[k] = (k in A) ? ... is never written (mawk creates A[k]
 #     before it tests).
@@ -1147,8 +1146,8 @@ function py_int(s) {
     gsub(/_/, "", s)
     return s + 0 + 0
 }
-# str.split(sep) for a one-character sep: macOS awk would split at a
-# newline as well, and a quoted host-file cell may hold one
+# str.split(sep) for a one-character sep: an empty string is one empty
+# field, and a newline in a quoted host-file cell is no separator
 function lsplit(s, A, sep,    n, i) {
     split("", A); n = 0
     while ((i = index(s, sep)) > 0) { A[++n] = substr(s, 1, i - 1); s = substr(s, i + 1) }
@@ -1813,15 +1812,10 @@ function line_rate_slots() { return \"$LINE_RATE_SLOTS\" }
 $1" "${@:2}"
 }
 
-# stdin's sha256, lowercase hex: sha256sum, or shasum where there is none
-# (a macOS controller)
+# stdin's sha256, lowercase hex
 sha256_hex() {
     local out
-    if command -v sha256sum >/dev/null; then
-        out=$(sha256sum) || return 1
-    else
-        out=$(shasum -a 256) || return 1
-    fi
+    out=$(sha256sum) || return 1
     printf '%s' "${out%% *}"
 }
 
@@ -5196,26 +5190,16 @@ cleanup() {
         done
         [ ${#pids[@]} -eq 0 ] || wait "${pids[@]}" || true
         rm -rf "$WORK_DIR"
-        # a socket dir of its own (make_ctrl_dir) lives outside the work dir
-        case "$CTRL_DIR" in ("$WORK_DIR"/*|"") ;; (*) rm -rf "$CTRL_DIR" ;; esac
     fi
 }
 
 # --- connection establishment ----------------------------------------------------
 
-# A unix socket path is capped at 104 bytes on macOS (108 on Linux), and ssh
-# binds a master at its ControlPath plus a temporary suffix of about 17
-# bytes: with %C's 40 that leaves 46 for the directory. $WORK_DIR/c fits on
-# /dev/shm; under macOS's TMPDIR (~50 bytes before wt.XXXXXX) it does not,
-# and every connection failed "unix_listener: path too long" -- so there the
-# sockets go to a short private dir under /tmp, which cleanup removes.
+# The ssh master sockets, in the work dir: /dev/shm/wt.XXXXXX/c plus %C's 40
+# and ssh's ~17-byte temporary suffix stays well inside a unix socket path.
 make_ctrl_dir() {
     CTRL_DIR=$WORK_DIR/c
-    if [ ${#CTRL_DIR} -gt 46 ]; then
-        CTRL_DIR=$(mktemp -d /tmp/wtc.XXXXXX) || die "cannot create an ssh socket dir under /tmp"
-    else
-        mkdir -p "$CTRL_DIR" || die "cannot create $CTRL_DIR"
-    fi
+    mkdir -p "$CTRL_DIR" || die "cannot create $CTRL_DIR"
 }
 # Try every credential against every client, keeping the first success per
 # client. Rounds, in order: pre-existing user-owned masters, plain defaults
@@ -5361,7 +5345,7 @@ establish_connections() {
     # (single-quoted heredoc-style: no expansion here).
     write_askpass_helper "$AUTH_DIR/askpass.sh"
     # setsid detaches the tty for OpenSSH older than 8.4, which lacks
-    # SSH_ASKPASS_REQUIRE; macOS has no setsid and does not need it.
+    # SSH_ASKPASS_REQUIRE.
     SETSID_BIN=$(command -v setsid || true)
     log "connecting to ${#HOSTS[@]} host(s)..."
     REMAINING=("${HOSTS[@]}")
@@ -8240,9 +8224,9 @@ report_directive() {
 # the archive, so nothing needs unpacking to stay inspectable.
 
 # Everything printed from here on is also written to $RUN_DIR/wekatester.log.
-# Two fifos + two tees rather than >(process substitution): bash 3.2 cannot
-# wait on a substituted process, and finalize must drain the log before
-# archiving it. stdout and stderr keep their identities on the console.
+# Two fifos + two tees rather than >(process substitution): bash before 5.1
+# cannot wait on a substituted process, and finalize must drain the log
+# before archiving it. stdout and stderr keep their identities on the console.
 TEE_PIDS=()
 start_run_log() {
     local p="$WORK_DIR/log"
@@ -8912,6 +8896,11 @@ main() {
         exit 0
     fi
 
+    # A Linux controller: /dev/shm staging, findmnt, GNU userland (-s above
+    # reads a bundle anywhere). Plain `uname`, PATH-resolved so the suite can
+    # stub it.
+    [ "$(uname -s)" = Linux ] \
+        || die "wekatester runs on a Linux controller, not $(uname -s); -s summarizes a run bundle anywhere"
     resolve_local_mode
     # -i entries are split and their key paths checked here, before the
     # staging dir exists and long before the first connection: a bad key path
@@ -8930,7 +8919,6 @@ main() {
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     echo
-    [ "$STAGE_BASE" = /dev/shm ] || debug "no /dev/shm here; local staging in $STAGE_BASE"
 
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
     make_ctrl_dir

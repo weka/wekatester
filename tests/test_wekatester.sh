@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # wekatester unit tests: source the script (source-guard prevents main), test pure functions.
 cd "$(dirname "$0")/.."
+# The suite needs what wekatester needs, bash 4.4 or later -- its own shell
+# and the bash first in PATH, which every bash -c test runs. wekatester is
+# Linux-only; the suite also runs on a development Mac with a newer bash
+# first in PATH (Homebrew's: PATH=/opt/homebrew/bin:$PATH), standing in a
+# Linux kernel name and a staging dir for the /dev/shm macOS lacks.
+for b in "$BASH" "$(command -v bash)"; do
+    v=$("$b" -c 'echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))')
+    [ "$v" -ge 404 ] || { echo "the suite needs bash 4.4 or later, and $b is older -- on a Mac: PATH=/opt/homebrew/bin:\$PATH bash tests/test_wekatester.sh" >&2; exit 1; }
+done
+if [ "$(uname -s)" != Linux ]; then
+    WT_LINUX_SHIM=$(mktemp -d)
+    printf '#!/bin/sh\necho Linux\n' > "$WT_LINUX_SHIM/uname"; chmod +x "$WT_LINUX_SHIM/uname"
+    export PATH="$WT_LINUX_SHIM:$PATH"
+fi
+[ -w /dev/shm ] || export WEKATESTER_STAGE_BASE=${TMPDIR:-/tmp}
 source ./tests/helpers.sh
 PASS=0; FAIL=0
 
@@ -517,7 +532,7 @@ t_assert "report directive: bare # report means default-all" \
 # With no server on the command line the run happens here, and the transport
 # wrappers must never reach for ssh/scp (no_ssh_fixture enforces that: the
 # stubs shadow the real binaries and exit 99).
-lm() { (uname_fixture Linux   # local mode is Linux-only; the suite also runs on macOS
+lm() { (uname_fixture Linux
         source ./wekatester; parse_args "$@"; resolve_local_mode >/dev/null
         echo "$LOCAL_MODE|$MASTER|${HOSTS[*]-}"); }
 t_assert "local mode defaults off"          bash -c 'source ./wekatester; [ "$LOCAL_MODE" -eq 0 ]'
@@ -529,23 +544,23 @@ t_assert "no servers: the run is announced" bash -c '
     case "$out" in *"local host"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "servers given: local mode stays off, host list untouched" \
     test "$(lm h1 h2)" = "0|h1|h1 h2"
-# Local mode needs findmnt and /dev/shm. A remote run from the same machine is
-# still fine -- that plumbing lives on the workers -- so the guard must sit
-# inside the no-hosts branch, not at the top of the function.
-t_assert "local mode refuses to run on a non-Linux host" bash -c '
+# wekatester runs on a Linux controller (Frank, 2026-10-06): anywhere else a
+# run stops before it starts anything, local or remote; -s, which only reads
+# a results file, still works.
+t_assert "the controller must be Linux: a run stops on another kernel before anything starts; -s still summarizes anywhere" bash -c '
     source ./tests/helpers.sh; uname_fixture Darwin
-    err=$( (source ./wekatester; parse_args; resolve_local_mode) 2>&1 >/dev/null )
-    rc=$?
-    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
-    case "$err" in
-        *"local mode is Linux-only"*"name a server instead"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-t_assert "a non-Linux host with servers named is unaffected" bash -c '
-    source ./tests/helpers.sh; uname_fixture Darwin
-    out=$(source ./wekatester; parse_args h1 h2; resolve_local_mode
-          echo "$LOCAL_MODE|$MASTER")
-    [ "$out" = "0|h1" ] || { echo "$out" >&2; false; }'
+    for args in "" "h1 h2"; do
+        err=$(./wekatester $args 2>&1 >/dev/null) && { echo "ran on Darwin [$args]" >&2; exit 1; }
+        case "$err" in
+            *"wekatester runs on a Linux controller, not Darwin"*) ;;
+            *) echo "[$args] $err" >&2; exit 1;;
+        esac
+    done
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"
+    ./wekatester -s "$d/r.json" | grep -q "total bandwidth: 7.00 GiB/s"'
+t_assert "bash floor: 4.4 and later pass, 4.3 and 3.2 do not" bash -c '
+    source ./wekatester
+    bash_floor_ok 4 4 && bash_floor_ok 5 0 && bash_floor_ok 5 3 && ! bash_floor_ok 4 3 && ! bash_floor_ok 3 2'
 
 # --- local mode: transport wrappers ---
 t_assert "run_host local: returns the command output" bash -c '
@@ -1563,18 +1578,10 @@ t_assert "askpass: -p answers the password once, a second question fails at once
     if ps -p "$pid" > "$d/ps"; then kill "$pid"; echo "the second question blocked" >&2; exit 1; fi
     wait "$pid" && { echo "the second question was answered: $(cat "$d/second")" >&2; exit 1; }
     [ ! -s "$d/second" ]'
-t_assert "ssh: the master-socket directory stays short enough for a unix socket path under a long TMPDIR, and cleanup removes it" bash -c '
-    base=$(mktemp -d)/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; mkdir -p "$base" || exit 1
-    out=$( (source ./wekatester; WORK_DIR=$(mktemp -d "$base/wt.XXXXXX"); make_ctrl_dir
-            [ -d "$CTRL_DIR" ] || { echo "no dir: $CTRL_DIR"; exit 1; }
-            printf "%s\n" "$CTRL_DIR"; cleanup; [ ! -e "$CTRL_DIR" ] || echo "LEFT $CTRL_DIR") 2>&1 ) || { echo "$out" >&2; exit 1; }
-    case "$out" in (*LEFT*|*"no dir"*) echo "$out" >&2; exit 1;; esac
-    [ "${#out}" -le 46 ] || { echo "too long (${#out}): $out" >&2; exit 1; }
-    # a short work dir keeps its sockets inside it
-    w=$(mktemp -d /tmp/wt.XXXXXX) || exit 1
-    out=$( (source ./wekatester; WORK_DIR=$w; make_ctrl_dir; printf "%s" "$CTRL_DIR") ) || exit 1
-    rm -rf "$w"
-    [ "$out" = "$w/c" ] || { echo "$out" >&2; false; }'
+t_assert "ssh: the master sockets live in the work dir, and cleanup removes them with it" bash -c '
+    w=$(mktemp -d)
+    out=$( (source ./wekatester; WORK_DIR=$w; make_ctrl_dir; printf "%s" "$CTRL_DIR"; cleanup) ) || exit 1
+    [ "$out" = "$w/c" ] && [ ! -e "$w" ] || { echo "[$out]" >&2; false; }'
 t_assert "capacity: hosts on one weka filesystem are checked against it together, not one at a time" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     # 50 GiB free on one weka filesystem; each host alone needs ~40

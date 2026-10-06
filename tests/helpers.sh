@@ -99,8 +99,8 @@ echo_transport_fixture() {
     PATH="$ECHOT:$PATH"
 }
 
-# --- local mode is Linux-only: drive the guard both ways ---
-# resolve_local_mode calls plain `uname` so it resolves through PATH.
+# --- the controller is Linux-only: drive the guard both ways ---
+# main calls plain `uname` so it resolves through PATH.
 uname_fixture() {   # $1 = kernel name to report
     UNAMED=$(mktemp -d)   # leaked on purpose; tests are short-lived
     printf '#!/bin/sh\necho %s\n' "$1" > "$UNAMED/uname"
