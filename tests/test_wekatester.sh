@@ -121,8 +121,12 @@ t_assert "wekafs forcedirect ok"   test "$(c 'wekafs rw,relatime,forcedirect,ino
 t_assert "wekafs writecache fails" test "$(c 'wekafs rw,relatime,writecache,readahead_kb=32768')" = "fail writecache"
 t_assert "wekafs readcache fails"  test "$(c 'wekafs rw,readcache')" = "fail readcache"
 t_assert "wekafs unknown mode"     test "$(c 'wekafs rw,relatime')" = "fail unknown"
-t_assert "nfs skipped"             test "$(c 'nfs4 rw,noatime')" = "skip"
-t_assert "empty line skipped"      test "$(c '')" = "skip"
+t_assert "nfs is a network filesystem" test "$(c 'nfs4 rw,noatime')" = "network"
+t_assert "lustre is a network filesystem" test "$(c 'lustre rw,flock')" = "network"
+t_assert "xfs is local"            test "$(c 'xfs rw,noatime')" = "local xfs"
+t_assert "tmpfs is local"          test "$(c 'tmpfs rw,nosuid')" = "local tmpfs"
+t_assert "an unnamed type is not network" test "$(c '')" = "local "
+t_assert "WEKATESTER_NETWORK_FSTYPES adds a network type" test "$(WEKATESTER_NETWORK_FSTYPES=fuse.myfs c 'fuse.myfs rw')" = "network"
 
 # --- usable cores: an unbindable cpu is not usable, and numjobs is this count ---
 t_assert "usable_cores: cpus the probe measured as unbindable are excluded" bash -c '
@@ -3464,10 +3468,19 @@ t_assert "mount guard: a mode failure skips the probe and keeps the remount advi
         *"must be mounted with forcedirect; remount"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "mount guard: writable non-wekafs -d passes with the probe" bash -c '
+t_assert "mount guard: a -d on a local filesystem is refused before anything is written; on another network filesystem it passes with the probe" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
+            run_host() { case "$2" in (findmnt*) echo "xfs rw,noatime";; (p=*) echo PROBED >&2;; (*) return 0;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ) && { echo "a local -d passed: $err" >&2; exit 1; }
+    case "$err" in *PROBED*) echo "probed a local disk: $err" >&2; exit 1;; esac
+    case "$err" in
+        *"localhost: /mnt/weka is on xfs, not a network filesystem -- wekatester never writes to a local disk"*"writes only to weka or another network filesystem -- nothing was written"*) ;;
+        *) echo "$err" >&2; exit 1;;
+    esac
     (source ./wekatester
      LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/data
-     run_host() { case "$2" in findmnt*) echo "xfs rw,noatime";; *) return 0;; esac; }
+     run_host() { case "$2" in findmnt*) echo "nfs4 rw,noatime";; *) return 0;; esac; }
      verify_mount_mode)'
 
 # -r turns the forcedirect stop into a warning. The write probe still runs
@@ -3559,7 +3572,7 @@ t_assert "mount guard: missing -d under forcedirect wekafs is created unattended
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\n";;
-                (mkdir*)    echo "MKDIR[$1] $2" >&2;;
+                (*"mkdir -p --"*) echo "MKDIR[$1] ${2##*; }" >&2;;
                 (p=*)       echo "PROBE[$1]" >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode && echo rc=0) 2>&1 )
@@ -3582,7 +3595,7 @@ t_assert "mount guard: missing -d without -r needs a terminal and creates nothin
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
-                (mkdir*)    echo MKDIR >&2;;
+                (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode) 2>&1 >/dev/null ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
@@ -3597,7 +3610,7 @@ t_assert "mount guard: the create prompt -- y creates, n quits without touching 
     run_host() { case "$2" in
         (findmnt*)  return 1;;
         ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
-        (mkdir*)    echo MKDIR >&2;;
+        (*"mkdir -p --"*) echo MKDIR >&2;;
         (*)         return 0;; esac; }
     yes_out=$(printf y | { verify_mount_mode; } 2>&1); yes_rc=$?
     no_out=$(printf n | { verify_mount_mode; } 2>&1); no_rc=$?
@@ -3616,21 +3629,27 @@ t_assert "prompts: an untimed question whose yes changes something takes a y -- 
     run_host() { case "$2" in
         (findmnt*)  return 1;;
         ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
-        (mkdir*)    echo MKDIR >&2;;
+        (*"mkdir -p --"*) echo MKDIR >&2;;
         (*)         return 0;; esac; }
     out=$(printf "\n" | { verify_mount_mode; } 2>&1) && { echo "Enter went ahead: $out" >&2; exit 1; }
     case "$out" in *MKDIR*) echo "Enter created: $out" >&2; false;; *) true;; esac'
-t_assert "mount guard: missing -d whose parent is not wekafs is never created, even under -r" bash -c '
-    err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/wkea; FAST_TRACK=1
-            run_host() { case "$2" in
-                (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt\nxfs rw,relatime\n";;
-                (mkdir*)    echo MKDIR >&2;;
-                (*)         return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
-    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
-    case "$err" in *MKDIR*) echo "created under a non-wekafs parent: $err" >&2; false;; *) true;; esac &&
+t_assert "mount guard: missing -d whose parent is not wekafs is never created, even under -r -- a local parent is refused, a network one left to the operator" bash -c '
+    try() { (source ./wekatester
+             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/wkea; FAST_TRACK=1; PARENT=$1
+             run_host() { case "$2" in
+                 (findmnt*)  return 1;;
+                 ("[ ! -e"*) printf "/mnt\n%s rw,relatime\n" "$PARENT";;
+                 (*"mkdir -p --"*) echo MKDIR >&2;;
+                 (*)         return 1;; esac; }
+             verify_mount_mode) 2>&1 >/dev/null; }
+    err=$(try xfs) && { echo "passed under a local parent: $err" >&2; exit 1; }
+    case "$err" in *MKDIR*) echo "created under a local parent: $err" >&2; exit 1;; esac
+    case "$err" in
+        *"/mnt/wkea does not exist, and /mnt is on xfs, not a network filesystem -- wekatester never writes to a local disk"*"nothing was written"*) ;;
+        *) echo "$err" >&2; exit 1;;
+    esac
+    err=$(try nfs4) && { echo "passed under an nfs parent: $err" >&2; exit 1; }
+    case "$err" in *MKDIR*) echo "created under a non-wekafs parent: $err" >&2; exit 1;; esac
     case "$err" in
         *"/mnt/wkea does not exist, and /mnt is not a wekafs mount -- create it yourself"*"-d names the right directory"*) true;;
         *) echo "$err" >&2; false;;
@@ -3641,7 +3660,7 @@ t_assert "mount guard: missing -d under a cached-mode parent stops without -r an
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
-                (mkdir*)    echo MKDIR >&2;;
+                (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode) 2>&1 >/dev/null ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
@@ -3657,7 +3676,7 @@ t_assert "mount guard: -r under a cached-mode parent warns, creates and probes" 
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
-                (mkdir*)    echo MKDIR >&2;;
+                (*"mkdir -p --"*) echo MKDIR >&2;;
                 (p=*)       echo PROBED >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode && echo rc=0) 2>&1 )
@@ -3673,13 +3692,37 @@ t_assert "mount guard: nothing is created while another host fails" bash -c '
                 (h1:findmnt*)  echo "wekafs rw,writecache";;
                 (h2:findmnt*)  return 1;;
                 (h2:"[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
-                (*:mkdir*)     echo MKDIR >&2;;
+                (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)            return 1;; esac; }
             verify_mount_mode) 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *MKDIR*) echo "mutated before a stop: $err" >&2; false;; *) true;; esac &&
     case "$err" in
         *"h2: /mnt/weka/wt does not exist; not created while other checks fail"*"h1: wekafs mounted writecache"*"must be mounted with forcedirect"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "mount guard: the create snippet makes the destination only while its nearest existing parent is on wekafs, checked in the same session" bash -c '
+    tmp=$(mktemp -d); stub=$(mktemp -d)
+    printf "#!/bin/sh\necho \"\$*\" >> \"%s/asked\"\necho xfs\n" "$stub" > "$stub/findmnt"; chmod +x "$stub/findmnt"
+    (source ./wekatester; PATH="$stub:$PATH" bash -c "$(create_dest_cmd "$tmp/a/b")"); rc=$?
+    [ "$rc" -eq 4 ] && [ ! -e "$tmp/a" ] || { echo "rc=$rc under xfs" >&2; exit 1; }
+    grep -qx -- "-T $tmp -n -o FSTYPE" "$stub/asked" || { cat "$stub/asked" >&2; exit 1; }
+    printf "#!/bin/sh\necho wekafs\n" > "$stub/findmnt"
+    (source ./wekatester; PATH="$stub:$PATH" bash -c "$(create_dest_cmd "$tmp/a/b")") && [ -d "$tmp/a/b" ]'
+t_assert "mount guard: a parent that stops being wekafs before the create leaves nothing created, probed or written, and says why" bash -c '
+    err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
+            run_host() { case "$2" in
+                (findmnt*)  return 1;;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                (*"mkdir -p --"*) return 4;;
+                (p=*)       echo PROBED >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode) 2>&1 >/dev/null ) && { echo "passed: $err" >&2; exit 1; }
+    case "$err" in *PROBED*) echo "probed: $err" >&2; exit 1;; esac
+    case "$err" in
+        *"localhost: /mnt/weka/wt was not created -- the nearest directory above it is no longer on a wekafs mount"*"nothing was created on a local disk"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 t_assert "mount guard: a failed mkdir dies with the chmod hint naming the parent" bash -c '
@@ -3689,7 +3732,7 @@ t_assert "mount guard: a failed mkdir dies with the chmod hint naming the parent
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
-                (mkdir*)    return 1;;
+                (*"mkdir -p --"*) return 1;;
                 (*)         echo PROBED >&2;; esac; }
             verify_mount_mode) 2>&1 >/dev/null ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&

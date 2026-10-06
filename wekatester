@@ -4653,21 +4653,45 @@ preflight() {
 # Decide whether a "FSTYPE OPTIONS" line from findmnt satisfies the guard.
 # wekafs must be mounted forcedirect: fio's direct=1 asks for O_DIRECT per
 # file, but only the forcedirect mount mode keeps the wekafs client cache
-# out of the IO path entirely. Non-wekafs targets are not our call.
-classify_mount_line() {   # prints the verdict and leaves it in MOUNT_VERDICT
+# out of the IO path entirely. Any other target must be a network
+# filesystem: wekatester never writes to a local disk (Frank, 2026-10-06) --
+# and an unmounted weka leaves its mount point an empty directory on the
+# root disk, which would otherwise pass for a destination.
+# The filesystem types (findmnt FSTYPE) that count as network filesystems
+# besides wekafs; WEKATESTER_NETWORK_FSTYPES adds any this list lacks.
+NETWORK_FSTYPES="nfs nfs4 cifs smb3 smbfs lustre gpfs beegfs ceph fuse.ceph fuse.ceph-fuse glusterfs fuse.glusterfs panfs pvfs2 orangefs ocfs2 gfs2 afs cvfs quobyte fuse.quobyte fuse.daos fuse.juicefs fuse.mfs ${WEKATESTER_NETWORK_FSTYPES:-}"
+
+# ok, "fail <mode>" (wekafs in another mode), network (another network
+# filesystem: the mount guard is weka's), or "local <type>" (anything else,
+# the type empty when findmnt named none). Printed, and left in MOUNT_VERDICT.
+classify_mount_line() {
     set -- $1
     local fstype=${1:-} opts=${2:-}
-    if [ "$fstype" != "wekafs" ]; then
-        MOUNT_VERDICT=skip
-    else
+    if [ "$fstype" = "wekafs" ]; then
         case ",$opts," in
             *,forcedirect,*) MOUNT_VERDICT=ok ;;
             *,writecache,*)  MOUNT_VERDICT="fail writecache" ;;
             *,readcache,*)   MOUNT_VERDICT="fail readcache" ;;
             *)               MOUNT_VERDICT="fail unknown" ;;
         esac
+    else
+        case " $NETWORK_FSTYPES " in
+            (*" $fstype "*) MOUNT_VERDICT=network ;;
+            (*)             MOUNT_VERDICT="local $fstype" ;;
+        esac
+        [ -n "$fstype" ] || MOUNT_VERDICT="local "
     fi
     echo "$MOUNT_VERDICT"
+}
+
+# Remote snippet that creates a missing destination -- every host runs its
+# own, and mkdir -p makes the shared ones harmless -- but only after the
+# nearest directory that exists is seen on a wekafs mount, in this same
+# session: the mount check that found it there ran earlier, maybe before an
+# untimed prompt, and a weka client that restarts in between leaves its
+# mount point an empty directory on the root disk. Exit 4: not wekafs now.
+create_dest_cmd() {   # create_dest_cmd <dir>
+    printf '%s' "d='$1'; p=\$d; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$(findmnt -T \"\$p\" -n -o FSTYPE)\" = wekafs ] || exit 4; mkdir -p -- '$1'"
 }
 
 # Remote snippet for a destination that does not exist: print its nearest
@@ -4810,7 +4834,7 @@ verify_mount_mode() {
     # one name per run, so two runs sharing a destination never read each
     # other's group lines (collect_fs_groups)
     [ -n "$GROUP_FILE" ] || GROUP_FILE=".wekatester-group.$(date +%s).$$.lst"
-    local host line verdict failed=() mode_fail=0 write_fail=0 hd anc i
+    local host line verdict failed=() mode_fail=0 write_fail=0 local_fail=0 gone_fail=0 hd anc i ft
     local missing=() missing_dirs=() missing_parents=()
     local cached_hosts=() cached_modes=() mode who n
     # Three fan-outs instead of one serial walk. Every host still receives
@@ -4863,11 +4887,22 @@ verify_mount_mode() {
         classify_mount_line "${lines[$i]}" > /dev/null; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ;;
-            skip) if [ -n "$anc" ]; then
+            network)
+                  if [ -n "$anc" ]; then
                       msgs[$i]="$host: $hd does not exist, and $anc is not a wekafs mount -- create it yourself, or check that -d names the right directory"
                       continue
                   fi
-                  debug "$host: $hd is not wekafs; guard skipped" ;;
+                  debug "$host: $hd is on a network filesystem, not wekafs; the weka mount guard does not apply" ;;
+            local*)
+                  # refused before anything is written: a local disk is never a target
+                  local_fail=1
+                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem findmnt did not name"
+                  if [ -n "$anc" ]; then
+                      msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka is mounted on this host and that -d names a directory on it"
+                  else
+                      msgs[$i]="$host: $hd is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka (or another network filesystem) is mounted there on this host"
+                  fi
+                  continue ;;
             fail*) if [ "$FAST_TRACK" -eq 1 ]; then
                        # said once per MODE after the loop: 111 identical
                        # lines is noise, not information (field fleet D, 2026-09-09)
@@ -4934,13 +4969,19 @@ verify_mount_mode() {
             local rc
             pids=()
             for i in "${!missing[@]}"; do
-                ( run_host "${missing[$i]}" "mkdir -p -- '${missing_dirs[$i]}'" || exit 2
+                ( run_host "${missing[$i]}" "$(create_dest_cmd "${missing_dirs[$i]}")"
+                  case $? in (0) ;; (4) exit 4 ;; (*) exit 2 ;; esac
                   probe_writable "${missing[$i]}" "${missing_dirs[$i]}" || exit 3 ) &
                 pids[$i]=$!
             done
             for i in "${!missing[@]}"; do
                 host=${missing[$i]}; hd=${missing_dirs[$i]}
                 wait "${pids[$i]}"; rc=$?
+                if [ "$rc" -eq 4 ]; then
+                    failed+=("$host: $hd was not created -- the nearest directory above it is no longer on a wekafs mount (did the weka client restart?)")
+                    gone_fail=1
+                    continue
+                fi
                 if [ "$rc" -eq 2 ]; then
                     failed+=("$host: cannot create $hd -- $(write_fix_hint "${missing_parents[$i]}")")
                     write_fail=1
@@ -4962,6 +5003,10 @@ verify_mount_mode() {
         # confidently wrong advice pointing away from the real fault.
         [ "$mode_fail" -eq 0 ] || \
             die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+        [ "$local_fail" -eq 0 ] || \
+            die "a destination is on a local filesystem; wekatester writes only to weka or another network filesystem -- nothing was written"
+        [ "$gone_fail" -eq 0 ] || \
+            die "the weka mount above a missing destination went away before it was created; nothing was created on a local disk -- check the weka client and re-run"
         [ "$write_fail" -eq 0 ] || \
             die "$DIRECTORY is not writable on every host; fio cannot lay out its files there"
         die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
