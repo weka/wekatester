@@ -1312,6 +1312,53 @@ function csv_line(s, F,    L, CN, CV, k) {   # one line, as csv.reader([line]) p
     for (k = 1; k <= CN[1]; k++) F[k] = CV[1, k]
     return CN[1]
 }
+# --- the calibration seed ---
+# Seeded file sizes. A job at nrfiles=nr takes FILESIZE_MIB/nr from each of
+# its first nr files, so file f only ever needs the largest share any test
+# takes from it: with nrfiles 1, 2 and 4 that is 5G, 2.5G, 1.25G and 1.25G
+# per job -- 10G, not the 20G of four 5G files. A need is (nj, nr, mib),
+# ND[i, 1..3]: jobs below nj at nrfiles nr read or write mib of each of
+# their first nr files. Every size is fixed before the first seed, from
+# every need there is, so a file is created once at its final size and
+# never has to grow.
+function needs_ladder(ND, n, nrs, fsmib, nj,    A, m, i, k, U, S) {   # the nrfiles ladder <nrs>, appended; the new count
+    m = pysplit(nrs, A); k = 0
+    for (i = 1; i <= m; i++) if (A[i] ~ /^[0-9]+$/ && !((A[i] + 0) in U)) { U[A[i] + 0] = 1; S[++k] = A[i] + 0 }
+    sort_arr(S, k, 1)
+    for (i = 1; i <= k; i++)
+        if (S[i] > 0) { n++; ND[n, 1] = nj; ND[n, 2] = S[i]; ND[n, 3] = int(fsmib / S[i]) > 1 ? int(fsmib / S[i]) : 1 }
+    return n
+}
+function needs_listed(ND, n, path,    L, m, i, F) {   # "<nj> <nr> <mib>" lines (cal_shapes' needs.*), appended
+    m = readlines(path, L)
+    for (i = 1; i <= m; i++)
+        if (pysplit(L[i], F) == 3 && F[1] ~ /^[0-9]+$/ && F[2] ~ /^[0-9]+$/ && F[3] ~ /^[0-9]+$/) {
+            n++; ND[n, 1] = F[1] + 0; ND[n, 2] = F[2] + 0; ND[n, 3] = F[3] + 0
+        }
+    return n
+}
+function seed_size(ND, n, j, f,    i, best) {   # MiB file f of job j is seeded at; 0 when nothing needs it
+    best = 0
+    for (i = 1; i <= n; i++) if (j < ND[i, 1] && f < ND[i, 2] && ND[i, 3] > best) best = ND[i, 3]
+    return best
+}
+function seed_name(prefix, fmt, j, f) { return replace_all(replace_all(prefix fmt, "$jobnum", j), "$filenum", f) }
+# Each host's filesystem group from collect_fs_groups' <work>/groups
+# ("<host> <group>"), over H[1..nh] in order: GF[h] its first member, who
+# lays out and prices the group's fleet-shared read set, and GM[h] every
+# member, space-joined. Without the file every host is one group: one
+# shared directory, as before groups.
+function fs_groups(work, H, nh, GF, GM,    L, n, i, F, G, g, FIRST, ALL) {
+    split("", GF); split("", GM)
+    n = readlines(work "/groups", L)
+    for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2) G[F[1]] = F[2]
+    for (i = 1; i <= nh; i++) {
+        g = (H[i] in G) ? G[H[i]] : "1"
+        if (g in FIRST) ALL[g] = ALL[g] " " H[i]
+        else { FIRST[g] = H[i]; ALL[g] = H[i] }
+    }
+    for (i = 1; i <= nh; i++) { g = (H[i] in G) ? G[H[i]] : "1"; GF[H[i]] = FIRST[g]; GM[H[i]] = ALL[g] }
+}
 # One cal.results line into F: the host, its engine, then (qd nr fs nj) per
 # slot, every slot of the host-file schema in its order; 0 for a blank line.
 # Two parsers read the file (apply_cal_results, the writeback) and they once
@@ -2517,14 +2564,114 @@ SUBDIREOF
         }' "$host" "$eng" "$gf" "$WORK_DIR/cal/hostinfo" "${margs[@]}" >> "$members" \
             || die "$host: cannot list its filesystem group for the shared seed"
     fi
-    want=$(pyrun "$hname" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
-               "$job" "$WORK_DIR/cal" "$WORK_DIR/cal/$host/scratch.list" \
-               "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" "$dense" \
-               "$tlist" "$CAL_NR $CAL_NR_LADDER" "$members" \
-               "$WORK_DIR/cal/needs.read.$(group_first "$host")" "$WORK_DIR/cal/needs.write.$host" <<'PYEOF'
-#@include py/cal_seed_rep.py
-PYEOF
-          ) || die "$host: cannot build the calibration seed"
+    # each member's seed jobfile lands in its own directory under cal/: one
+    # mkdir for the group, whoever ends up with files to write
+    local m mdirs=()
+    while IFS=$'\t' read -r m _; do mdirs+=("$WORK_DIR/cal/$m"); done < "$members"
+    mkdir -p "${mdirs[@]}" || die "$host: cannot create the seed jobfile directories"
+    want=$(awkrun 'BEGIN {
+        SEED_ANY_JOB = 2 ^ 30; SEED_CHUNK = 16
+        host = ARGV[1]; rnj = ARGV[2] + 0; rnr = ARGV[3] + 0; wnj = ARGV[4] + 0; wnr = ARGV[5] + 0
+        fsmib = ARGV[6] + 0; job = ARGV[7]; outdir = ARGV[8]; fmt = ARGV[10]; sep = ARGV[11]
+        unified = ARGV[12] == "1"; sparse = unified && ARGV[13] == "0"; tlist = ARGV[14]
+        if ((n = readlines(ARGV[9], L)) < 0) awk_fail("cannot read " ARGV[9])
+        for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[F[1]] = F[2] + 0
+        # the nrfiles ladder shares, plus any listed need beyond it: what a
+        # host-file value pins past the grid
+        nrd = needs_listed(RN, needs_ladder(RN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[17])
+        nwr = needs_listed(WN, needs_ladder(WN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[18])
+        if (!unified) {
+            # the scratch keeps reads and writes on the same files: one size serves both
+            for (i = 1; i <= nwr; i++) for (k = 1; k <= 3; k++) RN[nrd + i, k] = WN[i, k]
+            nrd += nwr; nwr = nrd
+            for (i = 1; i <= nrd; i++) for (k = 1; k <= 3; k++) WN[i, k] = RN[i, k]
+        }
+        # what is missing: the read side, then the write side; a file both
+        # sides name is seeded once
+        ntodo = 0; nread = 0; nt = 0; tmib = 0
+        for (j = 0; j < rnj; j++)
+            for (f = 0; f < rnr; f++) {
+                name = seed_name(unified ? "shared." : host sep, fmt, j, f)
+                if (!(mib = seed_size(RN, nrd, j, f))) mib = int(fsmib / rnr) > 1 ? int(fsmib / rnr) : 1
+                if ((name in SEEN) || ((name in HAVE) && HAVE[name] >= mib * 1048576)) continue
+                SEEN[name] = 1; nread++
+                TJ[++ntodo] = j; TN[ntodo] = name; TM[ntodo] = mib; tmib += mib
+            }
+        for (j = 0; j < wnj; j++)
+            for (f = 0; f < wnr; f++) {
+                name = seed_name(host sep, fmt, j, f)
+                if (!(mib = seed_size(WN, nwr, j, f))) mib = int(fsmib / wnr) > 1 ? int(fsmib / wnr) : 1
+                if ((name in SEEN) || ((name in HAVE) && HAVE[name] >= mib * 1048576)) continue
+                SEEN[name] = 1
+                if (sparse) { TR[++nt] = name " " mib; continue }
+                TJ[++ntodo] = j; TN[ntodo] = name; TM[ntodo] = mib; tmib += mib
+            }
+        if (nt) writelines(tlist, TR, nt)
+        else { printf "" > tlist; close(tlist) }
+        nm = 0
+        if ((n = readlines(ARGV[16], L)) < 0) awk_fail("cannot read " ARGV[16])
+        for (i = 1; i <= n; i++) {
+            if (strip(L[i]) == "") continue
+            if (lsplit(L[i], F, "\t") != 4) awk_fail("a seed member line needs host, dir, cpus and engine: " L[i])
+            nm++; MH[nm] = F[1]; MD[nm] = F[2]; MC[nm] = F[3]; ME[nm] = F[4]
+        }
+        # the unified read side round robin over the members, by file; the
+        # rest to the rep
+        for (k = 1; k <= ntodo; k++) {
+            m = (unified && k <= nread) ? MH[(k - 1) % nm + 1] : MH[1]
+            SH[m, ++SC[m]] = k
+        }
+        active = ""
+        for (i = 1; i <= nm; i++) {
+            m = MH[i]
+            if (!SC[m]) continue
+            # fallocate=none: see generate_layout -- the incremental skip
+            # trusts size, which is only sound if a partial write leaves a
+            # short file.
+            no = 0; split("", O)
+            O[++no] = "[global]"; O[++no] = "directory=" MD[i]; O[++no] = "unique_filename=0"
+            O[++no] = "ioengine=" ME[i]; O[++no] = "direct=1"; O[++no] = "bs=1Mi"; O[++no] = "rw=write"
+            O[++no] = "fallocate=none"; O[++no] = "create_on_open=1"
+            if (MC[i] != "") { O[++no] = "cpus_allowed=" MC[i]; O[++no] = "cpus_allowed_policy=split" }
+            # One section per file blew straight through fio REAL_MAX_JOBS
+            # (4096) the first time a wide dataset was seeded: 52 jobs x 128
+            # files = 6656 sections, dead at parse two seconds in (field
+            # client B, 2026-08-24). A section seeds up to SEED_CHUNK files
+            # of one size through a colon-joined filename list -- the
+            # incremental skip stays exact (only files that failed the size
+            # test are listed), and the chunk keeps the option line far
+            # below the 4096-byte fio parser buffer.
+            split("", GK); split("", GC); split("", GN); ng = 0
+            for (x = 1; x <= SC[m]; x++) {
+                k = SH[m, x]; g = sprintf("%012d %012d", TJ[k], TM[k])
+                if (!(g in GC)) { GK[++ng] = g; GC[g] = 0 }
+                GN[g, ++GC[g]] = TN[k]
+            }
+            sort_arr(GK, ng, 0)
+            sections = 0
+            for (x = 1; x <= ng; x++) {
+                g = GK[x]; split(g, P, " ")
+                for (c = 0; c < GC[g]; c += SEED_CHUNK) {
+                    s = GN[g, c + 1]
+                    for (y = c + 2; y <= GC[g] && y <= c + SEED_CHUNK; y++) s = s ":" GN[g, y]
+                    sections++
+                    O[++no] = sprintf("[seed-%d-%dM-%d]", P[1], P[2], c / SEED_CHUNK)
+                    O[++no] = "filename=" s; O[++no] = "nrfiles=" (y - c - 1); O[++no] = "filesize=" (P[2] + 0) "M"
+                }
+            }
+            if (sections > 4000)
+                awk_fail(m ": the seed needs " sections " fio sections and fio caps a run at 4096 jobs; shorten CAL_NR_LADDER or mount weka with more cores (a smaller N)")
+            writelines(outdir "/" m "/" job, O, no)
+            active = active (active == "" ? "" : " ") m
+        }
+        printf "%d %.0f %d\n", ntodo, tmib, nt
+        print active
+    }' "$hname" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
+        "$job" "$WORK_DIR/cal" "$WORK_DIR/cal/$host/scratch.list" \
+        "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" "$dense" \
+        "$tlist" "$CAL_NR $CAL_NR_LADDER" "$members" \
+        "$WORK_DIR/cal/needs.read.$(group_first "$host")" "$WORK_DIR/cal/needs.write.$host" \
+        ) || die "$host: cannot build the calibration seed"
     read -r nfiles nmib ntrunc <<<"${want%%$'\n'*}"
     active=""; [ "$want" = "${want#*$'\n'}" ] || active=${want#*$'\n'}
     read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
@@ -3018,17 +3165,103 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "${hs[$i]}: cannot list the calibration dataset or its free space"
     done
-    WEKATESTER_CAL_WIDE=$(cal_wide) \
-    pyrun "$WORK_DIR" "$shapes" "$ladders" "${CAL_NS_DIR-unset}" "${CAL_FMT:-\$jobnum.\$filenum}" \
-          "${CAL_SEP:-.cal.}" "$FILESIZE_MIB" "$CAL_NR $CAL_NR_LADDER" "${HOSTS[@]}" \
-          > "$WORK_DIR/cal/cap/report" <<'PYEOF'
-#@include py/cal_capacity_check.py
-PYEOF
+    awkrun '
+    function deficit(prefix, ND, n, rep,    i, nj, nr, j, f, mib, have, total) {
+        # bytes still to write for every file the needs ask for; DNJ x DNR
+        # the most jobs x files they reach
+        nj = 0; nr = 0; total = 0
+        for (i = 1; i <= n; i++) { if (ND[i, 1] > nj) nj = ND[i, 1]; if (ND[i, 2] > nr) nr = ND[i, 2] }
+        for (j = 0; j < nj; j++)
+            for (f = 0; f < nr; f++) {
+                if (!(mib = seed_size(ND, n, j, f))) continue
+                have = ((rep, seed_name(prefix, fmt, j, f)) in HAVE) ? HAVE[rep, seed_name(prefix, fmt, j, f)] : 0
+                if (mib * 1048576 > have) total += mib * 1048576 - have
+            }
+        DNJ = nj; DNR = nr
+        return total
+    }
+    function gib(b) { return sprintf("%.1f", b / 1073741824) }
+    function charge(rep, need, what,    k) {
+        print "cal: capacity: " what ": ~" gib(need) "GiB to write"
+        if (!(rep in AVAIL) || need == 0) return
+        k = PKEY[rep]
+        if (!(k in PNEED)) { PNEED[k] = 0; PAVAIL[k] = AVAIL[rep]; PO[++np] = k; PHOSTS[k] = ""; P0[k] = K0[rep]; P1[k] = K1[rep] }
+        PNEED[k] += need
+        if (AVAIL[rep] < PAVAIL[k]) PAVAIL[k] = AVAIL[rep]
+        if (!((k, rep) in PH)) { PH[k, rep] = 1; PHOSTS[k] = PHOSTS[k] (PHOSTS[k] == "" ? "" : " ") rep }
+    }
+    BEGIN {
+        work = ARGV[1]; unified = ARGV[4] == ""; fmt = ARGV[5]; sep = ARGV[6]
+        fsmib = ARGV[7] + 0; nrs = ARGV[8]; wide = ARGV[9] + 0   # the widest job count, x N (cal_wide)
+        nh = 0
+        for (a = 10; a < ARGC; a++) { H[++nh] = ARGV[a]; if (!(ARGV[a] in HIDX)) HIDX[ARGV[a]] = nh }
+        n = split(ARGV[3], L, "\n")
+        for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2) DIRS[F[2]] = 1
+        fs_groups(work, H, nh, GF, GM)
+        cap = work "/cal/cap"
+        if ((n = readlines(cap "/names", L)) < 0) awk_fail("cannot read " cap "/names")
+        for (i = 1; i <= n; i++) if (index(L[i], "\t")) { lsplit(L[i], F, "\t"); NAME[F[1]] = F[2] }
+        if ((n = readlines(ARGV[2], L)) < 0) awk_fail("cannot read " ARGV[2])
+        ns = 0
+        for (i = 1; i <= n; i++) if (lsplit(L[i], F, "\t") >= 3) { ns++; SR[ns] = F[2]; SN[ns] = F[3] + 0 }
+        for (s = 1; s <= ns; s++) {
+            rep = SR[s]
+            if ((n = readlines(cap "/" rep, L)) < 0) awk_fail("cannot read " cap "/" rep)
+            for (i = 1; i <= n && L[i] != "WEKATESTER_DF"; i++)
+                if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[rep, F[1]] = F[2] + 0
+            LISTED[rep] = 1
+            # the seed df line: source, size in KiB, free MiB; then the fs
+            # type. Hosts on one weka filesystem share its free space.
+            if (i < n && pysplit(L[i + 1], F) >= 3 && F[3] ~ /^[0-9]+$/) {
+                K0[rep] = "host"; K1[rep] = rep
+                if (i + 2 <= n && strip(L[i + 2]) == "wekafs") { K0[rep] = F[1]; sub(/.*\//, "", K0[rep]); K1[rep] = F[2] }
+                PKEY[rep] = "(\047" K0[rep] "\047, \047" K1[rep] "\047)"
+                AVAIL[rep] = F[3] * 1048576
+            }
+        }
+        if (unified && ("read" in DIRS)) {
+            # one shared read set per filesystem group, for every shape that
+            # reads it, in host order
+            nf = 0
+            for (s = 1; s <= ns; s++)
+                if (!((g = GF[SR[s]]) in FSEEN)) { FSEEN[g] = 1; FL[++nf] = sprintf("%09d %s", HIDX[g], g) }
+            sort_arr(FL, nf, 0)
+            for (x = 1; x <= nf; x++) {
+                first = substr(FL[x], 11); split("", ND); nd = 0
+                for (s = 1; s <= ns; s++) if (GF[SR[s]] == first) nd = needs_ladder(ND, nd, nrs, fsmib, wide * SN[s])
+                nd = needs_listed(ND, nd, work "/cal/needs.read." first)
+                lister = first
+                if (!(first in LISTED)) for (s = 1; s <= ns; s++) if (GF[SR[s]] == first) { lister = SR[s]; break }
+                need = deficit("shared.", ND, nd, lister)
+                charge(lister, need, sprintf("the shared read set of %s\047s filesystem group (up to %d jobs x %d files)", first, DNJ, DNR))
+            }
+        }
+        for (s = 1; s <= ns; s++) {
+            rep = SR[s]
+            if (unified && !("write" in DIRS)) continue
+            split("", ND)
+            nd = needs_listed(ND, needs_ladder(ND, 0, nrs, fsmib, wide * SN[s]), work "/cal/needs.write." rep)
+            if (!unified) nd = needs_listed(ND, nd, work "/cal/needs.read." GF[rep])
+            need = deficit(((rep in NAME) ? NAME[rep] : rep) sep, ND, nd, rep)
+            charge(rep, need, sprintf("%s\047s own %s (up to %d jobs x %d files)", rep, unified ? "write set" : "calibration scratch", DNJ, DNR))
+        }
+        sort_arr(PO, np, 0)
+        over = 0
+        for (x = 1; x <= np; x++) {
+            k = PO[x]
+            if (PNEED[k] <= PAVAIL[k]) continue
+            over = 1
+            printf "ERROR: calibration needs ~%sGiB on %s (%s) but only %sGiB is available\n", gib(PNEED[k]), (P0[k] != "host" ? "weka filesystem " P0[k] : P1[k] "\047s destination"), PHOSTS[k], gib(PAVAIL[k]) > "/dev/stderr"
+        }
+        exit over ? 3 : 0   # not 2: an awk that dies on its own exits 2
+    }' "$WORK_DIR" "$shapes" "$ladders" "${CAL_NS_DIR-unset}" "${CAL_FMT:-\$jobnum.\$filenum}" \
+        "${CAL_SEP:-.cal.}" "$FILESIZE_MIB" "$CAL_NR $CAL_NR_LADDER" "$(cal_wide)" "${HOSTS[@]}" \
+        > "$WORK_DIR/cal/cap/report"
     rc=$?
     while IFS= read -r line; do log "$line"; done < "$WORK_DIR/cal/cap/report"
     case $rc in
         0) return 0 ;;
-        2) ;;
+        3) ;;
         *) die "calibration capacity check failed" ;;
     esac
     [ "$IGNORE_CAPACITY" -eq 1 ] \
