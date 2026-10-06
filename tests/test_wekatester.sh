@@ -2415,8 +2415,8 @@ t_assert "capacity: swept bytes are credited against the requirement" bash -c '
     esac'
 
 # No cluster-wide weka CLI runs on the master under -a: the DRAM ceiling it
-# fed is retired (see the corrected "Working-set sizing (max tier)" spec
-# section), so df is the only master-side fact the tuner needs. The per-host
+# fed is retired (weka backends hold no user data in RAM, so there is no
+# cache to defeat), so df is the only master-side fact the tuner needs. The per-host
 # probe asks each host's OWN agent one thing -- which NICs it uses (weka
 # local ps / weka local resources net), for the calibration shapes.
 t_assert "probe: -a runs no weka CLI on the master, only df; per host only weka local" bash -c '

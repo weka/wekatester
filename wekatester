@@ -29,7 +29,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
     exit 1
 }
 
-VERSION="2026-09-09"
+VERSION="2026-10-06"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -6013,9 +6013,9 @@ probe_workers() {
     fi
 
     # df is the only master-side fact the tuner needs. The backend-RAM query
-    # that used to live here is gone with the DRAM ceiling it fed -- see the
-    # spec's "Working-set sizing (max tier) -- CORRECTED 2026-08-18": weka
-    # backends hold no user data in RAM, so there was never a cache to defeat.
+    # that used to live here is gone with the DRAM ceiling it fed (corrected
+    # 2026-08-18): weka backends hold no user data in RAM, so there was never
+    # a cache to defeat.
     [ -n "$AUTO_LEVEL" ] || return 0   # df matters to the tuner only
     run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
         || die "cannot df $DIRECTORY on $MASTER"
