@@ -566,9 +566,17 @@ That one file is built, not edited: `./build` assembles it from `src/`, and both
 In a `.sh` file `./build` reads two directives; an `.awk` file goes in as it is.
 
 - A line `#@include <path>` becomes that file under `src/`, recursively.
-- `#@awk <name>`, inside an awk program's single quotes, becomes `src/awk/<name>.awk`: its first line takes the marker's place, each later line is indented like the marker's own line (an empty one stays empty), and every `'` becomes `'\''`, so the program stays one bash string. The marker goes right after the opening quote, or alone on the next line at the program's indent.
+- `#@awk <name>`, inside an awk program's single quotes and one to a line, becomes `src/awk/<name>.awk`: its first line takes the marker's place, each later line is indented like the marker's own line (an empty one stays empty), and every `'` becomes `'\''`, so the program stays one bash string. The marker goes right after the opening quote, or alone on the next line at the program's indent.
 
-A file it cannot read, an include cycle, anything else that looks like a directive, a directory as the target, or an assembly `bash -n` rejects stops it, with the problem named and the target left alone; a rejected assembly is kept as `<target>.rejected`.
+`./build` stops, naming the problem and leaving the target alone, on:
+
+- a file it cannot read, or an awk file with no text;
+- an include cycle;
+- a second directive on a line, or anything else that looks like one;
+- a directive left in the assembly (an include not named `.sh` comes in as it is);
+- a program line ending in a backslash: `cal_evidence`'s program sits inside an unquoted heredoc, where bash would join it to the next line;
+- a directory as the target;
+- an assembly `bash -n` rejects, which it keeps as `<target>.rejected`.
 
 The awk has to run the same under gawk, mawk and macOS awk, so every program keeps to a few conventions. Run the suite under all three before calling an awk change done.
 

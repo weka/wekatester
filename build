@@ -21,11 +21,16 @@ function esc(s,    r, k) {
     return r s
 }
 # The file text in place of a marker: its first line where the marker was,
-# each later one under <ind> (an empty one stays empty), then <tail>.
-function splice(file, head, tail, ind,    line, n, k, F) {
-    while ((getline line < file) > 0) F[++n] = esc(line)
+# each later one under <ind> (an empty one stays empty), then <tail>. No
+# line may end in a backslash: inside an unquoted heredoc (cal_evidence)
+# bash would join it to the next.
+function splice(file, head, tail, ind,    line, n, k, F, any) {
+    while ((getline line < file) > 0) {
+        if (line ~ /\\$/) fail(file " line " (n + 1) " ends in a backslash")
+        F[++n] = esc(line); if (line != "") any = 1
+    }
     close(file)
-    if (!n) fail("cannot read " file " (missing, unreadable or empty)")
+    if (!any) fail("cannot read " file " (missing, unreadable or empty)")
     printf "%s%s", head, F[1]
     for (k = 2; k <= n; k++) printf "\n%s", (F[k] == "" ? "" : ind F[k])
     print tail
@@ -42,6 +47,7 @@ function emit(file, top,    line, prev, n, sh, ms, ml, nm) {
         else if (line ~ /^#@include [^ ]+$/) emit(src "/" substr(line, 11), 0)
         else if (match(line, /\047#@awk [A-Za-z0-9_.]+\047/) || (prev ~ /\047$/ && match(line, /^[ \t]*#@awk [A-Za-z0-9_.]+\047/))) {
             ms = RSTART; ml = RLENGTH
+            if (substr(line, ms + ml) ~ /#@(include|awk)/) fail("one directive per line, in " file ": " line)
             nm = substr(line, ms, ml); sub(/^[ \t\047]*#@awk /, "", nm); sub(/\047$/, "", nm)
             match(line, /^[ \t]*/)
             splice(src "/awk/" nm ".awk", substr(line, 1, ms + index(substr(line, ms), "#@awk") - 2), substr(line, ms + ml - 1), substr(line, 1, RLENGTH))
@@ -57,6 +63,11 @@ function emit(file, top,    line, prev, n, sh, ms, ml, nm) {
 }
 BEGIN { emit(src "/wekatester.sh", 1) }
 ' > "$tmp"
+# A directive in a file build passed through as it is (an include not named
+# .sh) would reach the output unexpanded.
+if left=$(grep -n -E '#@(include|awk)' "$tmp"); then
+    echo "build: unexpanded directive(s) in the assembly:" >&2; echo "$left" >&2; exit 1
+fi
 bash -n "$tmp" || {
     mv -f "$tmp" "$out.rejected"
     echo "build: the assembly does not parse (kept as $out.rejected); $out left alone" >&2

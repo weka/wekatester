@@ -5680,8 +5680,9 @@ t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" b
 t_assert "source: no bash function is defined twice" bash -c '
     dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" ./wekatester | sed "s/() *{//" | sort | uniq -d)
     [ -z "$dup" ] || { echo "defined twice: $dup" >&2; false; }'
-t_assert "build: the committed wekatester is what ./build makes of src/" bash -c '
-    d=$(mktemp -d); ./build "$d/wekatester" && cmp ./wekatester "$d/wekatester"'
+t_assert "build: the committed wekatester is what ./build makes of src/, with no directive left in it" bash -c '
+    d=$(mktemp -d); ./build "$d/wekatester" && cmp ./wekatester "$d/wekatester" &&
+    ! grep -n -E "#@(include|awk)" ./wekatester'
 t_assert "build: every file under src/ is built in exactly once" bash -c '
     used=$( { grep -rh "^#@include " src | sed "s/^#@include //"
               grep -rhoE "#@awk [A-Za-z0-9_.]+" src | sed -E "s|^#@awk (.*)|awk/\1.awk|"; } | sort)
@@ -5722,16 +5723,41 @@ t_assert "build: an apostrophe in an awk file reaches awk intact, at either mark
     printf "# it%ss a test\nBEGIN { print \"don%st\" }\n" "$q" "$q" > "$d/src/awk/a.awk"
     printf "BEGIN {\n    print \"it%ss\"\n}\n" "$q" > "$d/src/awk/b.awk"
     "$d/build" && out=$(bash "$d/wekatester") && [ "$out" = "$(printf "don%st\nit%ss" "$q" "$q")" ] || { echo "[$out]" >&2; false; }'
-# A line that opens an awk program and does not close it must hand the
-# program to a marker on the next line: every multi-line program lives in
-# src/awk (Frank, 2026-10-08).
+t_assert "build: a marker it cannot place exactly stops it, target untouched" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/sh" "$d/src/awk"; cp ./build "$d/"; echo keep > "$d/wekatester"; q=$(printf "\\047")
+    printf "BEGIN { }\n" > "$d/src/awk/a.awk"; printf "BEGIN { }\n" > "$d/src/awk/b.awk"
+    no() {   # no <message> <line>...: a wekatester.sh of those lines fails, saying it
+        printf "%s\n" "#!/usr/bin/env bash" "${@:2}" > "$d/src/wekatester.sh"
+        out=$("$d/build" 2>&1) && { echo "built: ${*:2}" >&2; return 1; }
+        [ "$(cat "$d/wekatester")" = keep ] || { echo "target changed" >&2; return 1; }
+        case "$out" in *"$1"*) ;; *) echo "no [$1] in [$out]" >&2; return 1;; esac
+    }
+    no "not a directive build knows" "x=\"" "    #@awk a${q}\"" || exit 1
+    no "not a directive build knows" "# see #@awk a" || exit 1
+    no "one directive per line" "awk ${q}#@awk a${q} | awk ${q}#@awk b${q}" || exit 1
+    printf "awk %s#@awk a%s\n" "$q" "$q" > "$d/src/sh/m.bash"
+    no "unexpanded directive" "#@include sh/m.bash" || exit 1
+    printf "\n" > "$d/src/awk/e.awk"
+    no "cannot read src/awk/e.awk" "awk ${q}#@awk e${q}" || exit 1
+    printf "BEGIN { x = 1 + \\\\\n 2 }\n" > "$d/src/awk/c.awk"
+    no "ends in a backslash" "awk ${q}#@awk c${q}"'
+# Every multi-line awk program lives in src/awk (Frank, 2026-10-08). A line
+# that opens a single-quoted program on an awk, gawk, mawk or awkrun command
+# (backslash continuations joined, a marker's own quotes set aside) and does
+# not close it must hand it to a marker on the next line. Programs in double
+# quotes, in variables or behind -f are not seen.
 t_assert "build: no multi-line awk program is left inline in src/" bash -c '
     prog=$(cat <<"EOF"
-FNR == 1 { open = 0 }
-open { if ($0 !~ /^[ \t]*#@awk [A-Za-z0-9_.]+\047/) print FILENAME ":" FNR - 1; open = 0; next }
-/^[ \t]*#/ { next }
-{ t = " " $0 " " }
-t ~ /[^A-Za-z_]awk(run)? / { if (gsub(/\047/, "", t) % 2) { if ($0 ~ /\047$/) open = 1; else print FILENAME ":" FNR } }
+FNR == 1 { open = 0; cont = "" }
+{ line = cont $0; cont = "" }
+line ~ /\\$/ { cont = substr(line, 1, length(line) - 1) " "; next }
+open {
+    if (line !~ /^[ \t]*#@awk [A-Za-z0-9_.]+\047/) print FILENAME ":" FNR - 1
+    open = 0; sub(/^[ \t]*#@awk [A-Za-z0-9_.]+\047/, "", line)
+}
+line ~ /^[ \t]*#/ { next }
+{ gsub(/\047#@awk [A-Za-z0-9_.]+\047/, "", line); t = " " line " " }
+t ~ /[^A-Za-z_][gm]?awk(run)? / { if (gsub(/\047/, "", t) % 2) { if (line ~ /\047$/) open = 1; else print FILENAME ":" FNR } }
 EOF
 )
     bad=$(find src -name "*.sh" | sort | xargs awk "$prog") && [ -z "$bad" ] || { echo "inline at: $bad" >&2; false; }'
