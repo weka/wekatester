@@ -14,17 +14,41 @@ trap 'rm -f "${tmp:?}"' EXIT
 trap 'exit 1' HUP INT TERM
 LC_ALL=C awk -v src=src '
 function fail(msg) { print "build: " msg > "/dev/stderr"; exit 1 }
+# An apostrophe becomes close-quote, escaped quote, reopen: the text stays
+# one bash single-quoted string.
+function esc(s,    r, k) {
+    while ((k = index(s, "\047")) > 0) { r = r substr(s, 1, k - 1) "\047\\\047\047"; s = substr(s, k + 1) }
+    return r s
+}
+# The file text in place of a marker: its first line where the marker was,
+# each later one under <ind> (an empty one stays empty), then <tail>.
+function splice(file, head, tail, ind,    line, n, k, F) {
+    while ((getline line < file) > 0) F[++n] = esc(line)
+    close(file)
+    if (!n) fail("cannot read " file " (missing, unreadable or empty)")
+    printf "%s%s", head, F[1]
+    for (k = 2; k <= n; k++) printf "\n%s", (F[k] == "" ? "" : ind F[k])
+    print tail
+}
 # In a .sh file a "#@include <path>" line becomes that file under src/,
-# recursively; an .awk file comes in as it is. The banner goes in under the
-# top file shebang.
-function emit(file, top,    line, n, sh) {
+# recursively, and an awk program marker src/awk/<name>.awk; an .awk file
+# comes in as it is. The banner goes in under the top file shebang.
+function emit(file, top,    line, prev, n, sh, ms, ml, nm) {
     if (file in OPEN) fail("include cycle at " file)
     OPEN[file] = 1; sh = (file ~ /\.sh$/)
     while ((getline line < file) > 0) {
         n++
-        if (sh && line ~ /^#@include [^ ]+$/) emit(src "/" substr(line, 11), 0)
-        else if (sh && line ~ /#@include/) fail("not a directive build knows, in " file ": " line)
+        if (!sh) print line
+        else if (line ~ /^#@include [^ ]+$/) emit(src "/" substr(line, 11), 0)
+        else if (match(line, /\047#@awk [A-Za-z0-9_.]+\047/) || (prev ~ /\047$/ && match(line, /^[ \t]*#@awk [A-Za-z0-9_.]+\047/))) {
+            ms = RSTART; ml = RLENGTH
+            nm = substr(line, ms, ml); sub(/^[ \t\047]*#@awk /, "", nm); sub(/\047$/, "", nm)
+            match(line, /^[ \t]*/)
+            splice(src "/awk/" nm ".awk", substr(line, 1, ms + index(substr(line, ms), "#@awk") - 2), substr(line, ms + ml - 1), substr(line, 1, RLENGTH))
+        }
+        else if (line ~ /#@(include|awk)/) fail("not a directive build knows, in " file ": " line)
         else print line
+        prev = line
         if (top && n == 1)
             print "# Built by ./build from src/ (README, Source): edit src/, never this file."
     }

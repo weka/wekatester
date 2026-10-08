@@ -5683,16 +5683,20 @@ t_assert "source: no bash function is defined twice" bash -c '
 t_assert "build: the committed wekatester is what ./build makes of src/" bash -c '
     d=$(mktemp -d); ./build "$d/wekatester" && cmp ./wekatester "$d/wekatester"'
 t_assert "build: every file under src/ is built in exactly once" bash -c '
-    used=$(grep -rh "^#@include " src | sed "s/^#@include //" | sort)
+    used=$( { grep -rh "^#@include " src | sed "s/^#@include //"
+              grep -rhoE "#@awk [A-Za-z0-9_.]+" src | sed -E "s|^#@awk (.*)|awk/\1.awk|"; } | sort)
     have=$(cd src && find . -type f ! -path ./wekatester.sh ! -name ".*" | sed "s|^\./||" | sort)
     [ "$used" = "$have" ] || { diff <(printf "%s\n" "$used") <(printf "%s\n" "$have") >&2; false; }'
-t_assert "build: a missing include stops it by name and leaves the target alone" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/src/sh"; cp ./build "$d/"
+t_assert "build: a missing include or awk file stops it by name and leaves the target alone" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/sh" "$d/src/awk"; cp ./build "$d/"; q=$(printf "\\047")
     printf "#!/usr/bin/env bash\n#@include sh/x.sh\n" > "$d/src/wekatester.sh"
     echo keep > "$d/wekatester"
     out=$("$d/build" 2>&1) && { echo "built anyway" >&2; exit 1; }
     [ "$(cat "$d/wekatester")" = keep ] || { echo "target changed" >&2; exit 1; }
     case "$out" in *"cannot read src/sh/x.sh"*) ;; *) echo "[$out]" >&2; exit 1;; esac
+    printf "x=%s#@awk y%s\n" "$q" "$q" > "$d/src/sh/x.sh"
+    out=$("$d/build" 2>&1) && { echo "built without y.awk" >&2; exit 1; }
+    case "$out" in *"cannot read src/awk/y.awk"*) ;; *) echo "[$out]" >&2; exit 1;; esac
     echo "x=1" > "$d/src/sh/x.sh"
     "$d/build" && [ "$(sed -n 3p "$d/wekatester")" = "x=1" ] && head -2 "$d/wekatester" | grep -q "^# Built by ./build"'
 t_assert "build: an include cycle, an unknown directive or an assembly bash cannot parse stops it, target untouched" bash -c '
@@ -5712,6 +5716,25 @@ t_assert "build: an include cycle, an unknown directive or an assembly bash cann
     try "not a directive build knows" || exit 1
     echo "if then fi" > "$d/src/sh/a.sh"
     try "does not parse" && [ -s "$d/wekatester.rejected" ]'
+t_assert "build: an apostrophe in an awk file reaches awk intact, at either marker position" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/awk"; cp ./build "$d/"; q=$(printf "\\047")
+    printf "#!/usr/bin/env bash\nawk %s#@awk a%s\nawk %s\n    #@awk b%s\n" "$q" "$q" "$q" "$q" > "$d/src/wekatester.sh"
+    printf "# it%ss a test\nBEGIN { print \"don%st\" }\n" "$q" "$q" > "$d/src/awk/a.awk"
+    printf "BEGIN {\n    print \"it%ss\"\n}\n" "$q" > "$d/src/awk/b.awk"
+    "$d/build" && out=$(bash "$d/wekatester") && [ "$out" = "$(printf "don%st\nit%ss" "$q" "$q")" ] || { echo "[$out]" >&2; false; }'
+# A line that opens an awk program and does not close it must hand the
+# program to a marker on the next line: every multi-line program lives in
+# src/awk (Frank, 2026-10-08).
+t_assert "build: no multi-line awk program is left inline in src/" bash -c '
+    prog=$(cat <<"EOF"
+FNR == 1 { open = 0 }
+open { if ($0 !~ /^[ \t]*#@awk [A-Za-z0-9_.]+\047/) print FILENAME ":" FNR - 1; open = 0; next }
+/^[ \t]*#/ { next }
+{ t = " " $0 " " }
+t ~ /[^A-Za-z_]awk(run)? / { if (gsub(/\047/, "", t) % 2) { if ($0 ~ /\047$/) open = 1; else print FILENAME ":" FNR } }
+EOF
+)
+    bad=$(find src -name "*.sh" | sort | xargs awk "$prog") && [ -z "$bad" ] || { echo "inline at: $bad" >&2; false; }'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

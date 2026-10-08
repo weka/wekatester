@@ -6764,8 +6764,7 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
     WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
         FNR == 1 { if (out != "") close(out); out = ""; host = substr(FILENAME, length(ENVIRON["WT_PFX"]) + 1) }
         /^=== WEKATESTER_SYSINFO / { if (out != "") close(out); out = ENVIRON["WT_ROOT"] "/" host "/" $3 ENVIRON["WT_SFX"]; next }
-        out != "" { print > out }
-    ' "${files[@]}"
+        out != "" { print > out }' "${files[@]}"
 }
 
 # PSI and load at start and again at teardown, plus the sar slice covering the
