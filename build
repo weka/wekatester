@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# build -- assemble the one-file wekatester from src/ (README, Source).
+#   ./build          writes ./wekatester
+#   ./build <path>   writes the assembly there instead
+# Anything wrong stops it by name and leaves the target alone; an assembly
+# bash cannot parse is kept beside the target as <target>.rejected.
+set -euo pipefail
+if [ $# -gt 0 ]; then case $1 in /*) out=$1 ;; *) out=$PWD/$1 ;; esac; fi
+cd "$(dirname "$0")"
+out=${out:-$PWD/wekatester}
+[ ! -d "$out" ] || { echo "build: $out is a directory" >&2; exit 1; }
+tmp=$(mktemp "$out.build.XXXXXX")
+trap 'rm -f "${tmp:?}"' EXIT
+trap 'exit 1' HUP INT TERM
+LC_ALL=C awk -v src=src '
+function fail(msg) { print "build: " msg > "/dev/stderr"; exit 1 }
+# In a .sh file a "#@include <path>" line becomes that file under src/,
+# recursively; an .awk file comes in as it is. The banner goes in under the
+# top file shebang.
+function emit(file, top,    line, n, sh) {
+    if (file in OPEN) fail("include cycle at " file)
+    OPEN[file] = 1; sh = (file ~ /\.sh$/)
+    while ((getline line < file) > 0) {
+        n++
+        if (sh && line ~ /^#@include [^ ]+$/) emit(src "/" substr(line, 11), 0)
+        else if (sh && line ~ /#@include/) fail("not a directive build knows, in " file ": " line)
+        else print line
+        if (top && n == 1)
+            print "# Built by ./build from src/ (README, Source): edit src/, never this file."
+    }
+    close(file); delete OPEN[file]
+    if (!n) fail("cannot read " file " (missing, unreadable or empty)")
+}
+BEGIN { emit(src "/wekatester.sh", 1) }
+' > "$tmp"
+bash -n "$tmp" || {
+    mv -f "$tmp" "$out.rejected"
+    echo "build: the assembly does not parse (kept as $out.rejected); $out left alone" >&2
+    exit 1
+}
+chmod 755 "$tmp"
+mv -f "$tmp" "$out"

@@ -11,3 +11,7 @@ results/
 
 # SDD scratch
 .superpowers/
+
+# ./build leftovers: an interrupted assembly, or one bash -n rejected
+/wekatester.build.*
+/wekatester.rejected

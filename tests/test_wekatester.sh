@@ -5676,10 +5676,42 @@ t_assert "fio JSON: the readers run on awk alone -- no python in their bodies" b
         printf "%s\n" "$body" | grep -q "python3\|pyrun\|PYEOF" && { echo "$f still uses python" >&2; exit 1; }
     done; true'
 
-# --- the source: one file ---
+# --- the source: src/ builds the one file ---
 t_assert "source: no bash function is defined twice" bash -c '
     dup=$(grep -o "^[a-zA-Z_][a-zA-Z0-9_]*() *{" ./wekatester | sed "s/() *{//" | sort | uniq -d)
     [ -z "$dup" ] || { echo "defined twice: $dup" >&2; false; }'
+t_assert "build: the committed wekatester is what ./build makes of src/" bash -c '
+    d=$(mktemp -d); ./build "$d/wekatester" && cmp ./wekatester "$d/wekatester"'
+t_assert "build: every file under src/ is built in exactly once" bash -c '
+    used=$(grep -rh "^#@include " src | sed "s/^#@include //" | sort)
+    have=$(cd src && find . -type f ! -path ./wekatester.sh ! -name ".*" | sed "s|^\./||" | sort)
+    [ "$used" = "$have" ] || { diff <(printf "%s\n" "$used") <(printf "%s\n" "$have") >&2; false; }'
+t_assert "build: a missing include stops it by name and leaves the target alone" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/sh"; cp ./build "$d/"
+    printf "#!/usr/bin/env bash\n#@include sh/x.sh\n" > "$d/src/wekatester.sh"
+    echo keep > "$d/wekatester"
+    out=$("$d/build" 2>&1) && { echo "built anyway" >&2; exit 1; }
+    [ "$(cat "$d/wekatester")" = keep ] || { echo "target changed" >&2; exit 1; }
+    case "$out" in *"cannot read src/sh/x.sh"*) ;; *) echo "[$out]" >&2; exit 1;; esac
+    echo "x=1" > "$d/src/sh/x.sh"
+    "$d/build" && [ "$(sed -n 3p "$d/wekatester")" = "x=1" ] && head -2 "$d/wekatester" | grep -q "^# Built by ./build"'
+t_assert "build: an include cycle, an unknown directive or an assembly bash cannot parse stops it, target untouched" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src/sh"; cp ./build "$d/"; echo keep > "$d/wekatester"
+    try() {   # try <message>: the build fails within 20 s, saying it
+        "$d/build" > "$d/out" 2>&1 & local p=$!
+        ( sleep 20; kill "$p" ) & local w=$!
+        if wait "$p"; then kill "$w"; echo "built anyway" >&2; return 1; fi
+        kill "$w"
+        [ "$(cat "$d/wekatester")" = keep ] || { echo "target changed" >&2; return 1; }
+        grep -q "$1" "$d/out" || { echo "no [$1] in [$(cat "$d/out")]" >&2; return 1; }
+    }
+    printf "#!/usr/bin/env bash\n#@include sh/a.sh\n" > "$d/src/wekatester.sh"
+    echo "#@include sh/b.sh" > "$d/src/sh/a.sh"; echo "#@include sh/a.sh" > "$d/src/sh/b.sh"
+    try "include cycle at src/sh/a.sh" || exit 1
+    echo "  #@include sh/b.sh" > "$d/src/sh/a.sh"
+    try "not a directive build knows" || exit 1
+    echo "if then fi" > "$d/src/sh/a.sh"
+    try "does not parse" && [ -s "$d/wekatester.rejected" ]'
 
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
