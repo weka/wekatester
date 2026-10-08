@@ -485,16 +485,10 @@ normalize_opt() {   # normalize_opt <token>
 }
 
 # --- the shared awk layer ----------------------------------------------------
-# Rules more than one program needs, spelled once; awkrun prepends this and
-# the constants below. Every program keeps to:
-#   - BEGIN only, data on ARGV (-v escape-processes values); awk_fail exits.
-#   - LC_ALL=C; files read by readlines (universal newlines), written \n-joined.
-#   - byte counts printed with %.0f: %d clips past 2^31 on mawk.
-#   - gawk, mawk and macOS awk: parenthesize comparisons in a print list, at
-#     most 50 parameters and locals per function, never A[k] = (k in A) ? ...
-#     (mawk creates A[k] before the test).
-# Host-file schema: host, four identity columns, eight nj/fs/nr/qd slots; the
-# 1MiB latency slots last, so older files still line up.
+# Rules more than one program needs, spelled once; awkrun prepends this and the
+# constants below. The conventions every program keeps: README, Source.
+# Host-file schema: host, four identity columns, eight nj/fs/nr/qd slots, the
+# 1MiB latency slots last so older files still line up.
 GEOM_SLOTS="bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w"
 GEOM_NAMES="bandwidthR bandwidthW latencyR latencyW iopsR iopsW latency1mR latency1mW"
 # First line of a latency test's one-job twin (-a): stage_floor_twins writes
@@ -995,9 +989,9 @@ function place_reserve(ORD, nk, SOCK, DPDK, core0, want, RES,    n, i, s, ns, SO
 }
 # The cpus fio may use, in physical cores: ONE rule for staging, calibration,
 # usable_cores and the pinning check (README, Usable cores). DPDK cores go
-# whole, since weka idles the sibling (WEKAPP-550768).
-# R gets n, ncores, dpdk, nres, res, weka_core0, unlisted, unbound, topo and
-# catchall. Three functions: awk caps one at 50 parameters and locals.
+# whole (WEKAPP-550768). R gets n, ncores, dpdk, nres, res, weka_core0,
+# unlisted, unbound, topo, catchall. Three functions: awk caps parameters plus
+# locals at 50.
 function probe_cores(P, np, base_list, R, PHYS, ALL,    U, UB, CORE, THR, ORD, nk, SOCK, DPDK, core0, B, RES, nres, SKIP, S, i, j, k, T, nt, t, inb, use, unlisted, unbound, res) {
     split("", R); split("", PHYS); split("", ALL)
     nk = probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R)
@@ -1315,11 +1309,10 @@ function host_addr(cell, ALIAS,    name) {
     return (name in ALIAS) ? ALIAS[name] : name
 }
 # --- JSON ---
-# A tokenizer, a line at a time with its own stack. json_line fills JP[i] (the
-# dot-joined path), JV[i] (unescaped value), JS[i] (1 for a string), i to JN;
-# an empty container is {} or []. Text before the first <starts> char is
-# skipped. Never hold a file as one string: macOS awk substr and mawk append
-# are quadratic (a 451-client result: 130 s and 9 s, gawk 0.4 s).
+# A tokenizer, one line at a time: json_line fills JP[i] (dot path), JV[i]
+# (unescaped value), JS[i] (1 for a string) up to JN; empty containers are {}
+# or []. Text before the first <starts> char is skipped. Whole-file strings are
+# quadratic in macOS awk and mawk.
 function json_begin(starts) {
     J_WANT = "v"; J_VPATH = ""; J_D = 0; J_STARTED = 0; J_CARRY = ""; J_FPOS = 0
     J_STARTS = starts; J_ROOT = ""; J_ERR = ""; JN = 0
@@ -1734,13 +1727,10 @@ cal_mode()    { case "$AUTO_LEVEL" in (safe|max|cal|brutal) return 0 ;; esac; re
 cal_wide()    { case "$AUTO_LEVEL" in (safe|max) echo 2 ;; (*) echo 4 ;; esac; }
 brutal_mode() { [ "$AUTO_LEVEL" = brutal ]; }
 
-# Which searches a set needs: unique sorted lines from {bw iops lat lat1m} x
-# {read write}, nothing when none; calibration and the dry run read them as is.
-# Type from the report directive: latency wins the file, else bandwidth -> bw
-# and iops -> iops; no directive, nothing. A file naming bandwidth and iops
-# asks both though staging applies bw (over-asking costs cells once).
-# Direction from each section effective rw=; none, no search. lat1m for a 1MiB
-# latency file or, under -b, beside every 4k one.
+# Which searches a set needs: unique sorted "<bw|iops|lat|lat1m> <read|write>"
+# lines, none when nothing calibrates; calibration and the dry run read them
+# verbatim. Type by report directive, direction by rw= (README, Auto mode).
+# lat1m: a 1MiB latency file, or under -b beside every 4k one.
 cal_required() {   # cal_required <setdir> [bulk 0|1]
     local f files=()
     [ -d "$1" ] || { echo "ERROR: cal_required: not a jobfile set directory: $1" >&2; return 1; }
@@ -1917,10 +1907,9 @@ EVIDEOF
 CAL_SCRATCH=".wekatester-cal"
 
 # --- calibration: per client shape, solo, one search per test type -----------
-# README, Auto mode, has the goals, shapes and search. Per shape: the engine
-# first (comparison cells, tallied), then one search per (type, direction);
-# cal_plan holds the rules and names each cell, bash runs it. A tuple is
-# (qd nr fs nj), nj always recorded: bandwidth and latency answer in jobs.
+# Per shape: the engine first, then one search per (type, direction); cal_plan
+# names each cell, bash runs it. A tuple is (qd nr fs nj), nj always recorded.
+# README, Auto mode.
 CAL_RUNTIME_FROM_ENV=${CAL_RUNTIME:+1}   # an exported CAL_RUNTIME beats the level default
 CAL_RUNTIME=${CAL_RUNTIME:-30}   # seconds per search cell (plus a 2s ramp);
                          # "-a cal:15" sets it per run. It does not change how
@@ -1987,12 +1976,11 @@ cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this le
         "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')"
 }
 
-# One calibration cell for ONE host, every input an argument. time_based with
-# a 2s ramp, direct=1, group_reporting=1 (one client_stats entry per host).
-# The cpu list carries split affinity: on isolcpus a range without it parks
-# every job on the cpu it forked on. A cell never creates a file (that
-# measures the extend path); the seed does. iops cells turn latency accounting
-# off, as the staged iops jobs do.
+# One cell for ONE host, every input an argument: time_based, 2s ramp,
+# direct=1, group_reporting=1. Always split affinity (an isolcpus range parks
+# every job on one cpu). Never creates a file: that measures the extend path,
+# so the seed creates. iops cells disable latency accounting, like the staged
+# iops jobs.
 stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime>
     local f=$1 hd=$2 name=$3 cpus=$4 type=$5 dirn=$6 eng=$7 nj=$8 qd=$9 nr=${10} rt=${11} bs rw v
     case "$type" in
@@ -2199,11 +2187,10 @@ seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <ntrunc> <availmib
     }'
 }
 
-# Seed one representative dataset: jobs j < nj with files f < nr, read and
+# Seed one representative dataset, jobs j < nj with files f < nr, read and
 # write sides apart; a file at or above its size is skipped (fallocate=none
-# makes size a sound test). Unified: reads are the shared set, writes the host
-# own, sparse when all sequential (README, Seeding). The estimate prints before
-# a byte is written, and a seed that will not fit stops there.
+# makes that sound). Unified: reads use the shared set (README, Seeding).
+# Prints the estimate first; stops if it cannot fit.
 cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-nr> <dense-write 0|1> <engine> <cpus>
     local host=$1 rnj=$2 rnr=$3 wnj=$4 wnr=$5 dense=$6 eng=$7 cpus=$8
     local hd root unified=0 want nfiles nmib ntrunc src totkb availmib maxf subdirs sd cmd
@@ -2458,13 +2445,10 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
 }
 
-# Group HOSTS into client shapes in command-line order (README, Client shapes);
-# the first host is the representative. <out> gets one TSV line per shape:
-#   id rep usable phys all linerate engines pinned memcap aio pins members
-# usable = N; phys, all the cpu lists; linerate bytes/s (0 unknown); engines in
-# ENGINE_ORDER; pinned "-" for none; memcap bytes (0 no guard); aio the
-# smallest member room ("-" unknown); pins slot=qd/nr/fs/nj words ("-" open).
-# The human form on stdout, warnings on stderr; also cal/hostinfo, cal/needs.*.
+# Client shapes in command-line order, the first host the representative
+# (README, Client shapes). <out> gets one TSV line per shape (columns at the
+# printf below); stdout the human form, stderr warnings. Also writes
+# cal/hostinfo and cal/needs.*.
 cal_shapes() {   # cal_shapes <out> <ladders>
     local caldir=.
     [[ $1 != */* ]] || caldir=${1%/*}
@@ -2707,6 +2691,10 @@ cal_shapes() {   # cal_shapes <out> <ladders>
             memcap = SMEMKB[s] ? int(SMEMKB[s] * 1024 * mem_pct / 100) : 0
             members = SMEM[s, 1]
             for (i = 2; i <= SNM[s]; i++) members = members " " SMEM[s, i]
+            # id rep usable phys all linerate engines pinned memcap aio pins members;
+            # usable = N, linerate bytes/s (0 unknown), pinned "-" for none, memcap
+            # bytes (0 no guard), aio the tightest member room ("-" unknown), pins
+            # slot=qd/nr/fs/nj words ("-" open)
             printf "%d\t%s\t%d\t%s\t%s\t%.0f\t%s\t%s\t%.0f\t%s\t%s\t%s\n", s, rep, SN[s], SPHYS[s], SALL[s], int(SLR[s]), SCANDS[s], (SPIN[s] != "" ? SPIN[s] : "-"), memcap, (SAIO[s] == "" ? "-" : sprintf("%.0f", SAIO[s])), (cached == "" ? "-" : cached), members > out
             nics = SNICS[s]
             if (line_gbps != "")
@@ -2773,18 +2761,12 @@ cal_shapes() {   # cal_shapes <out> <ladders>
        "$CAL_NR $CAL_NR_LADDER" "$FILESIZE_MIB" "$(cal_wide)" "${HOSTS[@]}"
 }
 
-# THE SEARCH RULES (README, The search). Stateless: reads the history of one
-# (type, direction) on one shape and prints the next cell, or the verdict:
+# Search rules (README, The search), stateless: from one history, print the
+# next cell or the verdict:
 #   cell <phase> <numjobs> <iodepth> <nrfiles> <runtime>
 #   done <numjobs> <iodepth> <nrfiles> <message>
-# History lines: "<phase> <engine> <nj> <qd> <nr> <runtime> <value> [aux]",
-# value in bytes/s (bw), IOPS (iops), mean us with aux IOPS (lat, lat1m).
-# "budget" prints the most cells the search can take. A sync engine ladders
-# only qd1. A confirm reading never steers a step before it. The guards
-# (memory, libaio aio room) end a 2N/4N queue ladder early and, under safe and
-# max, stop the job counts the fixed iodepth cannot fit; the qd1 rungs, the
-# latency ladders and the engine cells are unguarded (at most ~16N aio
-# events). The verdict names every cell they refused.
+# History: <phase> <engine> <nj> <qd> <nr> <runtime> <value> [aux]; value in
+# bytes/s, IOPS or mean us (aux IOPS). budget: the most cells possible.
 cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...
     awkrun '
     function knob(k) { if (!(k in K)) awk_fail("cal_plan: no " k "= knob"); return K[k] }
@@ -3793,11 +3775,11 @@ probe_writable() {   # probe_writable <host> <dir>
     run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$HOST_NAME' >> '$2/$GROUP_FILE'}"
 }
 
-# --- filesystem groups (README, Calibration measures what the test will run) ---
-# Each client appends its name to the run group file in its destination;
-# equal sha256 means one directory, one group. Two files cannot hash alike:
-# each ends with a name only its own clients appended. Writes $WORK_DIR/groups,
-# "<host> <group>" in host order.
+# --- filesystem groups ---
+# Each client appends its name to the run group file in its destination; equal
+# sha256 means one directory, one group. Distinct files cannot hash alike: each
+# ends with a name only its own clients appended. Writes $WORK_DIR/groups,
+# "<host> <group>".
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
     local i h hd pids=() sum n=0 line
@@ -3882,11 +3864,10 @@ confirm_create_dirs() {   # confirm_create_dirs <count>
     fi
 }
 
-# All workers: -d must not be a cached-mode wekafs mount and must be writable
-# by the login user (fio client mode reports a worker EACCES so quietly that
-# the run "succeeds" with zero IO). A missing -d under a wekafs mount is
-# created after one question; anywhere else it is a hard stop (README,
-# Caveats).
+# All workers: -d must not be a cached-mode wekafs mount, and must be writable
+# by the login user (fio reports a worker EACCES so quietly the run "succeeds"
+# with zero IO). A missing -d is created only under a wekafs mount, after one
+# question (README, Caveats).
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
     # one name per run, so two runs sharing a destination never read each
@@ -4073,11 +4054,10 @@ FIO_STARTED=0
 # drain matches the full command line, anchored to the fio binary and
 # carrying the pidfile path.
 kill_fio_cmd() {   # kill_fio_cmd [priv]
-    # A server launched under an escalator is root-owned: the kill and the
-    # pidfile removal need the same escalator. The ^ anchor is load-bearing:
-    # the shell running this carries the pattern in its own cmdline (an
-    # unanchored pkill -9 once killed the teardown). taskset execs fio, so argv
-    # still starts with the binary.
+    # An escalated server is root-owned: the kill needs the same escalator. The
+    # ^ anchor is load-bearing: this shell carries the pattern in its own
+    # cmdline (an unanchored pkill -9 once killed the teardown). taskset execs
+    # fio, so argv starts with the binary.
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
     printf '%s' "if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
@@ -4128,11 +4108,10 @@ start_fio_servers() {
     debug "fio servers running on all hosts"
 }
 
-# The master must reach every worker on $FIO_PORT (fio itself would silently
-# benchmark the survivors). One remote shell probes all workers at once. Each
-# probe is a single statement (bash does not exit on a failed exec
-# redirection) printing "FAIL <host>"; DONE last proves the snippet finished,
-# so a failed session is not mistaken for a firewall.
+# The master must reach every worker on $FIO_PORT (fio would silently benchmark
+# the survivors). One remote shell probes all at once; each probe is one
+# statement (bash survives a failed exec redirection) printing "FAIL <host>",
+# and DONE proves the snippet finished.
 port_probe_cmd() {   # port_probe_cmd <host>... -> remote snippet
     local h cmd="${COORD_NPROC:+ulimit -Su $COORD_NPROC; }pids=''; for h in"
     for h in "$@"; do cmd="$cmd '$h'"; done
@@ -4268,15 +4247,11 @@ make_ctrl_dir() {
     CTRL_DIR=$WORK_DIR/c
     mkdir -p "$CTRL_DIR" || die "cannot create $CTRL_DIR"
 }
-# Try every credential against every client, first success per client
-# (README, Authentication). Each round tries only the clients still
-# unconnected, in parallel; nothing dies here, a client no credential reaches
-# fails preflight (which also lets a bare -C candidate become a set name).
-# Passwords: one fifo PER ATTEMPT, written from a subshell holding its own rw
-# fd so the write cannot block, and a helper that reads exactly ONE line.
-# NumberOfPasswordPrompts=1 makes a wrong password a clean failure. The auth
-# overrides go BEFORE $SSH_OPTS: ssh keeps the first value of an option, and
-# SSH_OPTS carries BatchMode=yes, which would disable askpass.
+# Every credential against every client, first success wins (README,
+# Authentication); each round tries the unconnected clients in parallel, and
+# nothing dies here. Passwords: a fifo per attempt, a helper reading ONE line,
+# NumberOfPasswordPrompts=1. Auth overrides go BEFORE $SSH_OPTS: ssh keeps the
+# first value, and BatchMode=yes disables askpass.
 prompt_password_creds() {
     local j login pw
     require_interactive "-p" "use key-based auth (-i) for unattended runs"
@@ -4313,11 +4288,10 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
         pw)
             fifo="$AUTH_DIR/$2.fifo"
             mkfifo -m 600 "$fifo" || return 1
-            # Hold the fifo open read-write for the whole attempt (fd 4 is
-            # private to this backgrounded attempt): a fifo drops its contents
-            # when the last fd closes, and the helper open blocks until a
-            # writer exists. The write cannot block (we are our own reader),
-            # and the helper reads ONE line, never to EOF.
+            # Hold the fifo open read-write for the attempt (fd 4 is private to
+            # it): a fifo drops its contents when the last fd closes, and the
+            # helper open blocks until a writer exists. Our write cannot block;
+            # the helper reads ONE line.
             exec 4<>"$fifo"
             printf '%s\n' "${PW_SECRETS[$4]}" >&4
             WEKATESTER_PW_FIFO="$fifo" SSH_ASKPASS="$AUTH_DIR/askpass.sh" \
@@ -4418,20 +4392,11 @@ establish_connections() {
 # --- phase 2b: probe workers for auto-mode system info -----------------------
 # Dumb by design: raw lines out, all interpretation local.
 probe_remote_cmd() {
-    # weka cores: one wekanode PROCESS per node, its process mask the one core
-    # it owns (the management node has a wide mask). Read per process, never
-    # per task: auxiliary threads are pinned too, and counting them invented
-    # ten phantom cores on a field client. ident: the machine id (product_uuid,
-    # else machine-id), so the writeback never opens its own session per host.
-    # Shape facts last (cal_shapes): cpu_model, memtotal_kb, aio_max_nr and
-    # aio_nr, "topo_<file> <cpu> <value>" lines, one "nic <dev> <speed> <pci>
-    # <driver> <vendor:device>" per bus-backed netdev, and "weka_net
-    # <container> <json>" per container (weka local resources net -J needs
-    # root: the login when root, else the escalator), or "weka_net_err", or
-    # "weka_cli absent". WEKATESTER_SYSROOT prefixes /proc and /sys for the
-    # suite; no worker sets it. The bind facts are MEASURED: taskset -c <cpu>
-    # true per online cpu, plainly and under the escalator, since a cpu can be
-    # online and still refuse a bind.
+    # Raw facts out: weka cores from each wekanode PROCESS mask (per task,
+    # pinned helper threads read as phantom cores); ident (the machine id);
+    # shape facts (cpu_model, memtotal_kb, aio_max_nr, aio_nr, topo_*, nic,
+    # weka_net or weka_net_err or weka_cli absent); measured per-cpu bind
+    # tests. WEKATESTER_SYSROOT is for the suite only.
     printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
@@ -4488,11 +4453,10 @@ probe_remote_cmd() {
         else echo 'weka_cli absent'; fi; true"
 }
 
-# Prove each host engine candidates with a real one-file job on its
-# destination (--enghelp lists what fio was built with). Candidates: -e, every
-# engine the host file names, and under -a the tuner list, filtered by
-# enghelp. Results go to $WORK_DIR/engine.results ("host engine ok|fail"), and
-# each probe "engines" line is rewritten to the engines that passed.
+# Prove engine candidates with a real one-file job on each host destination
+# (--enghelp lists only what fio was built with): -e, host-file engines, and
+# under -a the tuner list. Results to engine.results ("host engine ok|fail");
+# each probe engines line keeps only the engines that passed.
 test_engines() {
     local host results="$WORK_DIR/engine.results" csv_engines="" cand et_pids=() _p
     mkdir -p "$WORK_DIR/et"
@@ -4518,11 +4482,10 @@ test_engines() {
                     *" $c "*) ;;
                     *) echo "$host $c fail" >> "$results"; continue ;;
                 esac
-                # A broken engine hangs as often as it errors, and a direct-IO
-                # write on a sick mount can park fio in D state, where SIGKILL
-                # does not land and timeout(1) waits forever. So: background
-                # the bounded job, poll it, and abandon it if it will not die.
-                # A working engine finishes this 64k write in milliseconds.
+                # A broken engine can hang, and a direct-IO write on a sick
+                # mount parks fio in D state, where SIGKILL and timeout(1) both
+                # stall. So: background the bounded job, poll it, and abandon
+                # it if it will not die. A working engine takes milliseconds.
                 tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
                 if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
                         timeout -k 5 $tmo \
@@ -4640,10 +4603,10 @@ check_cpu_pinning() {
     # local mode never ran establish_connections; the lifecycle still reads
     # the same per-host files
     [ -n "$AUTH_DIR" ] || { AUTH_DIR="$WORK_DIR/auth"; mkdir -p "$AUTH_DIR"; }
-    # One awk for every host (six per host was 20s at 451 hosts). One line per
-    # host with a request, in host order: host, request, the taskset and cpu
-    # count the messages quote, the four cpu sets, the flags (comma-joined),
-    # and the escalator prefix last (it has spaces); "-" for empty.
+    # One awk for every host (six per host took 20s at 451 hosts). Per host
+    # with a request, in host order: host, request, taskset, cpu count, four
+    # cpu sets, comma-joined flags, then the escalator prefix (it has spaces);
+    # "-" for empty.
     awkrun '
     # a cpu list the way this check reads one: blanks around a part
     # dropped, an empty part skipped
@@ -4915,13 +4878,10 @@ probe_workers() {
 }
 
 # --- capacity check (every run) ----------------------------------------------------
-# Per host, the STAGED variants by filename_format namespace (else the
-# jobfile own key); a namespace costs its largest footprint; the need is the
-# larger of the namespace sum and the staged layout per-section total,
-# against the host OWN destination df. Over: die, or with --ignore-capacity
-# ask (untimed); unattended with the flag, warn. preview: a dry run under -a,
-# whose staged sizes are the jobfiles own, reports them labelled and stops
-# nothing (the real run checks again after calibration).
+# Per host, the staged variants per filename_format namespace, each costing its
+# largest footprint (or the staged layout total if larger), against that host
+# own df (README). Over: die, or ask under --ignore-capacity. preview (a dry
+# run under -a): report, labelled, and stop nothing.
 check_capacity() {   # check_capacity [preview]
     local host pids=() i failed=0 preview=${1:-}
     mkdir -p "$WORK_DIR/df"
@@ -5140,13 +5100,10 @@ generate_layout() {   # generate_layout <setdir> <outdir>
 }
 
 # --- host files (-t) --------------------------------------------------------------
-# README, Host files, has the format and folding rules. A host-less line login
-# is ONLY a selector: engine selectors need test results, tests need auth,
-# auth needs logins. Hence two phases: phase1 (pre-auth) logins and initial
-# dirs; phase2 (after the engine tests, "host engine ok|fail") everything.
-# Output, one host per line, tab-separated, "-" unset: host login engine cpus
-# dir, then nj/fs/nr/qd per slot in GEOM_SLOTS order (37 columns). CLI values
-# arrive as arguments and win.
+# Format and folding: README, Host files. Two phases, since engine selectors
+# need test results, tests need auth, auth needs logins: phase1 (pre-auth)
+# logins and dirs, phase2 everything. Output per host, tab-separated, "-"
+# unset: host login engine cpus dir, then nj/fs/nr/qd per GEOM_SLOTS slot.
 write_targets_template() {   # write_targets_template <path>
     local header="host,user_login,ioengine,allowed_cpus,destination_folder" n
     # the column list comes from the shared schema, not a second spelling
@@ -5184,13 +5141,11 @@ custom_set_probe_dir() {
     esac
 }
 
-# Which file -t means: README, Host files.
-# --- host identity: what the host FILE and the data files call a machine -----
-# Internally a host is an ADDRESS (ssh target, fio --client=, a $WORK_DIR path
-# component): no slash, and "localhost" in local mode. The host file and data
-# files want a NAME: host_name() is the address remotely and the short
-# hostname locally; it prefixes every data file and names an auto-written row
-# <name>/<machine-id>. Reading, the id is stripped and the name mapped back.
+# --- host identity -------------------------------------------------------------
+# Internally a host is an ADDRESS (ssh target, fio --client=, a $WORK_DIR
+# path): no slash, localhost in local mode. Host files and data files use
+# host_name(): the address, or the short hostname locally; auto-written rows
+# are <name>/<machine-id>, read back as the address.
 
 # Machine id, cached per host: product_uuid (survives a reinstall, root-only
 # on most kernels), else machine-id. Never required.
@@ -5786,11 +5741,10 @@ resolve_custom_set() {
     log "custom set: $dst"
 }
 
-# The guided flow (README, Customizing workloads); -r and -n skip the
-# interactive parts. -C sets own their host file: the one this run resolved,
-# else the source set copy, else the template. Engine, cpu, dir and geometry
-# edits apply THIS run (phase2 has not run, and main re-verifies mounts);
-# login edits apply from the next run, since connections are already up.
+# The guided flow (README, Customizing workloads); -r and -n skip its prompts.
+# A -C set owns its host file: the one this run resolved, else the source set
+# copy, else the template. Edits apply this run, except logins: connections are
+# already up.
 ensure_set_hostfile() {
     local dst="$SET_DIR_OVERRIDE/hostlist.csv" src=""
     if [ -f "$dst" ]; then
@@ -5999,17 +5953,11 @@ auto_tune() {
     WORK_DIR=$work stage_hosts auto "$src" "$dir" "${WEKATESTER_TIER_LABEL:-$tier}" "$targets" "$@"
 }
 
-# Per-host staging, one awk for the fleet: every jobfile of <src> becomes
-# jobs/<host>/<file> with the host destination and its host-file geometry
-# (pick_slot). Under -a the variants also carry what calibration measured on:
-# the cpus (probe_cores, by job count), the shared read set for read-only
-# jobs, a common proven engine (the host-file engine beats it), the one-job
-# twin at 1/1/1, iops latency accounting off, a header, and usable/<host> for
-# the writeback. Host-file values land after everything derived. A pristine
-# layout is re-derived per host (derive_layouts): every host under -a, else
-# the hosts whose geometry the host file changed; an edited one is kept, with
-# a warning. Writes $WORK_DIR/staged.kinds: "J <file>" per job, "L <file>"
-# per layout, "H <host>" per host, "C <host>" per host the host file changed.
+# Per-host staging, one awk for the fleet: each jobfile becomes
+# jobs/<host>/<file> with the host destination and host-file geometry; under -a
+# also what calibration measured on (README). A pristine layout is re-derived
+# per host (derive_layouts). Writes staged.kinds: "J <file>", "L <layout>", "H
+# <host>", "C <host the host file changed>".
 stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <targets|-> <host>...
     local mode=$1 src=$2 dir=$3 label=$4 targets=$5 f files=() dirs=() h kind name changed=() pristine=1
     shift 5
@@ -6395,10 +6343,9 @@ layout_variant_pristine() {   # layout_variant_pristine <dir>
     return 0   # no layout staged yet: nothing to preserve
 }
 
-# -u: one final job unlinks every file the layout created, derived per host
-# from the STAGED layout (the exact grid, client prefixes included) with
-# unlink=1. Sizes become 4k so a missing file costs 4k, never a full-size
-# write. The layout marker is dropped so it is not pulled to position one.
+# -u: a final job unlinks every file the layout created, derived per host from
+# the STAGED layout with unlink=1. Sizes become 4k so a missing file never
+# costs a full write; the marker is dropped so it does not sort first.
 UNLINK_JOB="999-wekatester-unlink.job"
 stage_unlink_variants() {
     is_layout_file "$SET_DIR/${JOBFILES[0]}" \
@@ -6459,15 +6406,10 @@ override_staged() {   # override_staged <all|measured> <key> <value> [<key> <val
     }' "$WORK_DIR/staged.list" "$@"
 }
 
-# fio client/server prefixes filenames with its own idea of the client, and
-# the rule varies by fio version (3.28 rewrites the format; RHEL8 fio prefixes
-# some sections only). Paths must be predictable (directory grid, capacity,
-# unlink, sweep), so every variant gets unique_filename=0 and a "<name>."
-# prefix on filename_format; a $clientuid format keeps its own scheme, and no
-# format gets fio default grid, prefixed.
-# The same pass stamps cpus_allowed_policy=split: isolcpus cores have no load
-# balancing, so a range parks every job on the cpu it forked on. A host with
-# a pinned list gives it to every variant without cpus_allowed.
+# Predictable paths (README, Workloads): unique_filename=0 and a "<name>."
+# prefix on filename_format; a $clientuid format keeps its own scheme. The same
+# pass stamps cpus_allowed_policy=split on every cpu list, and gives a pinned
+# host list to variants without cpus_allowed.
 stamp_unique_names() {
     local host cpus args=()
     # one awk for the fleet (was one python per host, ~30ms each, serial):
@@ -6883,10 +6825,10 @@ finalize_run_dir() {
     fi
 }
 
-# fio --client exits 0 when jobs fail on the workers, so read success from the
-# results: a nonzero per-job error, or, for measured jobs, a last entry per
-# host with zero bytes and ios. Layout jobs skip the second test (create_only
-# stats are zeros); a silent layout failure still trips the next job.
+# fio --client exits 0 when worker jobs fail, so read success from the results:
+# a nonzero job error, or a measured job whose last entry per host moved
+# nothing. Layout jobs skip the second test; a silent layout failure trips the
+# next job.
 check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
     local path=$1 mode=$2
     # always a fresh parse: the file was just written; the reader after
@@ -7007,11 +6949,11 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
 }
 
 # Per-namespace grid facts from a staged layout, one line each:
-#   <file_bytes>\t<path_glob>\t<maxdepth>\t<expected_total_bytes>
-# The glob is the format with every $var wildcarded; maxdepth bounds find.
-#   layout_grid_spec <staged layout jobfile>          -> the spec on stdout
-#   layout_grid_spec -o <dir> <host> <jobfile>...      -> <dir>/<host>.gridspec
-#     per host, one awk; stdout names each host whose layout lacks fallocate=none
+# "<file_bytes>\t<path_glob>\t<maxdepth>\t<expected_total_bytes>"; maxdepth
+# bounds find.
+#   layout_grid_spec <jobfile>                     -> stdout
+#   layout_grid_spec -o <dir> <host> <jobfile>...  -> <dir>/<host>.gridspec;
+#     stdout names hosts lacking fallocate=none
 layout_grid_spec() {
     awkrun '
     # one layout jobfile: its spec lines into OUT[1..n] (n returned), and
@@ -7055,11 +6997,10 @@ layout_grid_spec() {
     }' "$@"
 }
 
-# Evidence, not markers (README, Workloads): per namespace one find deletes
-# files whose size deviates from the spec and one counts the bytes that match,
-# so create_only writes only what is missing and capacity credits the rest.
-# Size is the whole test, sound only under fallocate=none. A dry run never
-# mutates: it skips the sweep and prices the full grid.
+# Evidence, not markers (README, Workloads): per namespace, delete files whose
+# size deviates from the spec and count the bytes that match, so create_only
+# writes only what is missing. Sound only under fallocate=none. A dry run skips
+# the sweep and prices the full grid.
 sweep_layout_grid() {
     [ "$DRY_RUN" -eq 0 ] || return 0
     local lay=${JOBFILES[0]}

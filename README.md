@@ -373,7 +373,10 @@ start inside the previous one's destage backlog. The first field grids showed
 exactly that without it: every read surface was smooth, while the write
 surfaces carried the previous cell's debt. A cell whose in-flight buffers
 (numjobs × iodepth × bs) would exceed `CAL_MEM_PCT` (25%) of the client's
-MemTotal is not run, and the log says so.
+MemTotal is not run, and the log says so. Under `safe` and `max`, where the
+iodepth is fixed, the memory and aio guards drop the job counts it cannot fit
+instead. A sync engine (psync) keeps one IO in flight per job, so its searches
+run at iodepth 1 only.
 
 ### `-a brutal`
 
@@ -552,6 +555,16 @@ calibration, at the measured sizes.
 # Source
 
 `wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is bash and awk throughout: the rules more than one part needs (the core rule, the host-file schema, the seed sizes, the layout, JSON) live once, in the awk library `awkrun` prepends to every program. Edit `wekatester` itself, then run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's).
+
+The awk has to run the same under gawk, mawk and macOS awk, so every program keeps to a few conventions. Run the suite under all three before calling an awk change done.
+
+- `BEGIN` only, with its data on `ARGV`: `-v` would put a value through awk's escape processing. `awk_fail` exits from anywhere, which only `BEGIN` makes safe.
+- `LC_ALL=C`, for byte order whatever the locale. Files are read whole by `readlines`, with universal newlines, and written back joined by `\n`.
+- Byte counts are printed with `%.0f`: mawk's `%d` clips past 2^31.
+- A comparison or `?:` inside a `print` list is parenthesized (macOS awk reads `>` there as a redirection). No regex interval `{n}` (mawk lacks it). No program variable named after a gawk built-in such as `RT` or `NR`.
+- At most 50 parameters and locals per function, and never `A[k] = (k in A) ? ...` (mawk creates `A[k]` before the test).
+- A line at a time, never a whole file in one string: `substr` and appends on a long string are quadratic in macOS awk and mawk.
+- The awk sits inside bash single quotes, so a comment or string in it never contains an apostrophe: write `\047`.
 
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
