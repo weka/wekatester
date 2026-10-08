@@ -554,7 +554,21 @@ calibration, at the measured sizes.
 
 # Source
 
-`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is bash and awk throughout: the rules more than one part needs (the core rule, the host-file schema, the seed sizes, the layout, JSON) live once, in the awk library `awkrun` prepends to every program. Edit `wekatester` itself, then run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's).
+`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is bash and awk throughout: the rules more than one part needs (the core rule, the host-file schema, the seed sizes, the layout, JSON) live once, in the awk library `awkrun` prepends to every program.
+
+That one file is built, not edited: `./build` assembles it from `src/`, and both are committed. Edit `src/`, run `./build`, then run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's). The suite tests the built `wekatester`, and fails while it differs from what `./build` makes of `src/`.
+
+- `src/wekatester.sh`: the defaults, usage, option parsing and `main`, and where each module goes in.
+- `src/sh/*.sh`: the rest of the bash, one module per part of a run: `base` (logging, the ssh transport, prompts), `awk` (the awk library and `awkrun`), `fiojson` (fio's JSON), `calibrate` (`-a`), `preflight` (reachability, mount mode, filesystem groups), `connect` (fio servers, limits, logins, teardown), `probe` (worker facts, engine tests, cpu pinning), `layout` (the capacity check, layout jobs), `hosts` (host files), `customize` (`-C`, the dry run), `stage`, and `run` (the run, its bundle and summary).
+- `src/awk/lib/*.awk`: the awk library, in the order `awkrun` prepends it.
+- `src/awk/<function>.awk`: every awk program longer than one line, named for the function that runs it (`<function>.<role>.awk` where one runs several).
+
+In a `.sh` file `./build` reads two directives; an `.awk` file goes in as it is.
+
+- A line `#@include <path>` becomes that file under `src/`, recursively.
+- `#@awk <name>`, inside an awk program's single quotes, becomes `src/awk/<name>.awk`: its first line takes the marker's place, each later line is indented like the marker's own line (an empty one stays empty), and every `'` becomes `'\''`, so the program stays one bash string. The marker goes right after the opening quote, or alone on the next line at the program's indent.
+
+A file it cannot read, an include cycle, anything else that looks like a directive, a directory as the target, or an assembly `bash -n` rejects stops it, with the problem named and the target left alone; a rejected assembly is kept as `<target>.rejected`.
 
 The awk has to run the same under gawk, mawk and macOS awk, so every program keeps to a few conventions. Run the suite under all three before calling an awk change done.
 
@@ -564,7 +578,7 @@ The awk has to run the same under gawk, mawk and macOS awk, so every program kee
 - A comparison or `?:` inside a `print` list is parenthesized (macOS awk reads `>` there as a redirection). No regex interval `{n}` (mawk lacks it). No program variable named after a gawk built-in such as `RT` or `NR`.
 - At most 50 parameters and locals per function, and never `A[k] = (k in A) ? ...` (mawk creates `A[k]` before the test).
 - A line at a time, never a whole file in one string: `substr` and appends on a long string are quadratic in macOS awk and mawk.
-- The awk sits inside bash single quotes, so a comment or string in it never contains an apostrophe: write `\047`.
+- Files under `src/awk/` may contain apostrophes. A one-line program written inline in a `.sh` file sits inside bash single quotes, so it never contains one: write `\047`.
 
 # SSH configuration
 Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
