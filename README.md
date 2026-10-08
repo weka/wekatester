@@ -123,7 +123,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
-`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. The engine is **proven with a real one-file job on every worker's destination** before anything runs — `--enghelp` only shows what fio was built with, and engines routinely pass it yet fail on the actual filesystem — and a host failing the test is fatal, naming the host and the evidence file. Values are passed to fio as typed.
+`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. The engine is **proven with a real one-file job on every worker's destination** before anything runs — `--enghelp` only shows what fio was built with, and engines routinely pass it yet fail on the actual filesystem — and a host failing the test is fatal, naming the host and the evidence file. A broken engine hangs as often as it errors, so a test job still running after 15 seconds (`WEKATESTER_ENGINE_TEST_TIMEOUT`) is killed and counts as a failure, and one stuck in uninterruptible IO is abandoned with a warning rather than waited on. Values are passed to fio as typed.
 
 `-t [hostfile]` — per-host settings from one CSV; see **Host files** below.
 
@@ -151,9 +151,10 @@ A workload is a directory of standard fio jobfiles under `fio-jobfiles/`, run in
 Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conventions:
 
 - Jobfile names must start with a digit (`011-bandwidthR.job`, ...) — that numeric prefix is both how files are discovered and what sets the run order.
-- A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything.
+- A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything. `#report` works too; at least one space must follow `report`, so a prose comment such as `# reporting notes` is not a directive, and a bare `# report` names nothing.
 - The `directory=` line is overridden by `-d` when the jobfiles are staged — inserted into `[global]` if missing, and if the jobfile has no `[global]` section at all one is created — so the shipped jobfiles work against any mount point.
 - The measured workload should be the **last** job in the jobfile, and the summary describes that last job.
+- Staging makes every data file's path predictable. fio in client/server mode prefixes generated file names with its own idea of the client, and the rule differs between fio versions, so every staged jobfile gets `unique_filename=0` and a `<host>.` prefix on its `filename_format` instead (a jobfile with no format gets fio's default names, prefixed). A format that uses `$clientuid` keeps its own scheme. Every cpu list is staged with `cpus_allowed_policy=split`: on isolcpus cores there is no load balancing, so without it every job of a range stays on the cpu it forked on.
 
 **File layout is a separate, generated job.** Every run puts a `000-wekatester-layout.job` first: it derives one `create_only` section per file namespace from the set's own jobfiles (taking each namespace's largest `numjobs`/`nrfiles`/`filesize`), so **all files exist on all machines before any measured test starts** — wekatester runs jobfiles serially and fio's coordinator waits for every client, so that first job is a true cross-client barrier. A workload directory that carries its own layout job keeps it (it is never regenerated unless you ask with `-g`); every other set gets one generated on the fly, without touching the source directory. The shipped jobfiles still contain their original `create_only` sections — they are harmless no-ops after the layout job has run, and they keep each file usable standalone with plain fio. The layout job prints a duration instead of a summary.
 
@@ -209,6 +210,14 @@ when 3% better (the leader rule), and the answers are recorded in
 `hostlist.csv`, where they pin the next calibration (see What lands in the
 host file). The answer to "why these numbers" becomes "measured on your
 clients against this cluster."
+
+Each jobfile's `# report` directive decides what it calibrates. `latency`
+anywhere in it makes it a latency test, and nothing else is searched for that
+file. Otherwise `bandwidth` asks for the bandwidth search and `iops` for the
+IOPS search; a file naming both asks for both, stages the bandwidth answer,
+and records the IOPS one in the host file only. A jobfile with no directive is
+not calibrated and runs as written. The direction comes from each job
+section's `rw=` (its own, else `[global]`'s), and a mixed one asks for both.
 
 ### What calibration optimizes
 
@@ -296,6 +305,11 @@ the one-thread-per-core set. The log prints each shape's arithmetic, for
 example `8 physical core(s) - 2 weka DPDK - 2 reserved for the OS (0-1 2-3) =
 N=4`, with a term of its own for any core a host-file cpu list leaves out or
 the host cannot bind.
+
+isolcpus does not narrow the set fio runs on. Measured on a lab client,
+confining the OS to its housekeeping cores cost 4–7% write IOPS at every
+housekeeping-core count tried, and split affinity keeps a cpu set that spans
+both partitions safe.
 
 ### The search
 
@@ -526,6 +540,12 @@ instead of aborted, and run anyway on a yes — unattended runs with the flag
 warn and continue (useful when `df` under-reports, e.g. a filesystem that
 is thin-provisioned or still rebalancing). If `df` returns nothing usable
 for a host, that host goes unchecked, with a warning.
+
+A dry run under `-a` stops before calibration, so the sizes it has staged are
+the jobfiles' own, not the ones the run will use. Its capacity check is a
+preview: it prints those sizes labelled "before calibration", turns a
+shortfall into a note, and stops nothing. The real run checks again after
+calibration, at the measured sizes.
 
 # Source
 
