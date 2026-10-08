@@ -4882,7 +4882,7 @@ run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
 probe_workers() {
     echo
-    log "probing ${#HOSTS[@]} worker(s) for auto tuning..."
+    log "probing ${#HOSTS[@]} worker(s)..."
     mkdir -p "$WORK_DIR/probe"
     local pids=() failed=() host i bad=()
     for host in "${HOSTS[@]}"; do
@@ -4912,11 +4912,6 @@ probe_workers() {
         [ -z "$lack" ] \
             || die "ioengine '$ENGINE' is not available (fio --enghelp) on: $lack"
     fi
-
-    # df is the only master-side fact the tuner needs.
-    [ -n "$AUTO_LEVEL" ] || return 0   # df matters to the tuner only
-    run_host "$MASTER" "df -kP '$DIRECTORY'" > "$WORK_DIR/probe/_df" \
-        || die "cannot df $DIRECTORY on $MASTER"
 }
 
 # --- capacity check (every run) ----------------------------------------------------
@@ -6648,12 +6643,12 @@ check_aio_room() {
             key = KEY[K[i]]
             printf "ERROR: %s: libaio sets up %.0f aio events at once (numjobs x iodepth) on %s, and the kernel has room for %.0f (fs.aio-max-nr less fs.aio-nr, as probed): the jobs past the room would fail io_queue_init with EAGAIN (fio error 11) -- raise fs.aio-max-nr, run another ioengine (-e or the host file), or lower the job\047s numjobs x iodepth\n", JOB[key], EV[key], names[key] (nh[key] > 8 ? sprintf(" (+%d more)", nh[key] - 8) : ""), ROOM[key] > "/dev/stderr"
         }
-        exit (nk ? 2 : 0)
+        exit (nk ? 3 : 0)   # not 2: an awk that dies on its own exits 2
     }' "$WORK_DIR" "$WORK_DIR/staged.list"
     case $? in
         0) ;;
         # stop before anything runs (Frank, 2026-10-02); nothing was written
-        2) die "the kernel's aio room would be exceeded (above); nothing was run and the host file is unchanged" ;;
+        3) die "the kernel's aio room would be exceeded (above); nothing was run and the host file is unchanged" ;;
         *) log "WARNING: could not check the staged libaio jobs against the kernel's aio room" >&2 ;;
     esac
 }
