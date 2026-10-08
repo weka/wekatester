@@ -5347,9 +5347,9 @@ targets_field() {   # targets_field <host> <fieldno> [phasefile]
 }
 
 # -a writeback into the host file, when one is in play (README, What lands in
-# the host file). Fill-missing by default; -g asks to overwrite, except under
-# -r. A superseded line is commented out FIRST, then the new one appended:
-# the other order trips the duplicate-host check on the next parse.
+# the host file). Fill-missing by default; -g overwrites without asking. A
+# superseded line is commented out and its new version written directly below
+# it: two live lines for one host would trip the duplicate-host check.
 writeback_targets() {
     [ -n "$AUTO_LEVEL" ] || return 0
     local wb="$TARGETS_FILE" mode=fill
@@ -6617,8 +6617,8 @@ set_entries() {   # set_entries <dir>
 
 # Once everything is staged, each host libaio jobs are held against its probed
 # aio room: the planner guards its own cells, but a staged job can come from a
-# host-file tuple, -e libaio, or a widened jobfile. A warning, not a stop: the
-# room is a snapshot, and plain runs never probe.
+# host-file tuple, -e libaio, or a widened jobfile. Over the room: stop before
+# the first test (Frank, 2026-10-02).
 check_aio_room() {
     [ -d "$WORK_DIR/probe" ] || return 0
     # one awk for the fleet: per host its probed room, then its staged files
