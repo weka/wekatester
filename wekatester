@@ -5685,8 +5685,12 @@ probe_workers() {
 # shrink the answer). Compared against each host's OWN destination df.
 # Over capacity: die -- or with --ignore-capacity, PROMPT (untimed) and
 # continue on a yes; unattended runs with the flag continue with a warning.
-check_capacity() {
-    local host pids=() i failed=0
+# A dry run under -a calls it as a preview: the staged sizes are then the
+# jobfiles' own, which an -a run never stages (it calibrates first and checks
+# again after), so the preview reports them, labelled, and stops nothing
+# (Frank, 2026-10-07).
+check_capacity() {   # check_capacity [preview]
+    local host pids=() i failed=0 preview=${1:-}
     mkdir -p "$WORK_DIR/df"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
@@ -5742,12 +5746,13 @@ check_capacity() {
         return total
     }
     BEGIN {
-        work = ARGV[1]
+        work = ARGV[1]; preview = ARGV[3] == "preview"
+        before = preview ? " before calibration" : ""
         # load_fs_groups: the first host of each filesystem group prices
         # its fleet-shared read set; without the groups file, one group
         if ((n = readlines(work "/groups", L)) > 0)
             for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2) GID[F[1]] = F[2]
-        for (a = 3; a < ARGC; a++) {
+        for (a = 4; a < ARGC; a++) {
             g = (ARGV[a] in GID) ? GID[ARGV[a]] : "1"
             if (!(g in FIRST)) FIRST[g] = ARGV[a]
         }
@@ -5762,7 +5767,7 @@ check_capacity() {
             else JOB[last, ++NJOB[last]] = F[2]
         }
         over = 0; npool = 0
-        for (a = 3; a < ARGC; a++) {
+        for (a = 4; a < ARGC; a++) {
             h = ARGV[a]
             if (h in NODIR) continue
             split("", NSV); nns = 0; layout = 0
@@ -5802,11 +5807,12 @@ check_capacity() {
                 # filesystems apart
                 if (n >= 3 && strip(L[3]) == "wekafs") { fs = F[1]; sub(/.*\//, "", fs); key = fs SUBSEP F[2] }
             }
-            print "capacity: " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
+            print "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
             # avail 0 = df unavailable, not a full filesystem: nothing to check
             if (avail && req > avail) {
                 over = 1
-                print "ERROR: " h ": workload needs ~" gib(req) "GiB but only " gib(avail) "GiB is available" > "/dev/stderr"
+                if (preview) print "note: " h ": the jobfiles as written need ~" gib(req) "GiB but only " gib(avail) "GiB is available; -a stages the calibrated sizes instead and checks again after calibration"
+                else print "ERROR: " h ": workload needs ~" gib(req) "GiB but only " gib(avail) "GiB is available" > "/dev/stderr"
             }
             if (key != "" && avail) {
                 if (!(key in PN)) { PN[key] = 0; PNEED[key] = 0; PAVAIL[key] = avail; PK[++npool] = key }
@@ -5823,13 +5829,14 @@ check_capacity() {
             over = 1; split(key, KF, SUBSEP); names = ""
             for (j = 1; j <= PN[key] && j <= 8; j++) names = names (j > 1 ? " " : "") PH[key, j]
             if (PN[key] > 8) names = names " (+" (PN[key] - 8) " more)"
-            print "ERROR: weka filesystem " KF[1] ": its " PN[key] " hosts (" names ") need ~" gib(PNEED[key]) "GiB together but only " gib(PAVAIL[key]) "GiB is available" > "/dev/stderr"
+            if (preview) print "note: weka filesystem " KF[1] ": its " PN[key] " hosts (" names ") would need ~" gib(PNEED[key]) "GiB together at the jobfiles\047 sizes, and " gib(PAVAIL[key]) "GiB is available; the run checks again after calibration"
+            else print "ERROR: weka filesystem " KF[1] ": its " PN[key] " hosts (" names ") need ~" gib(PNEED[key]) "GiB together but only " gib(PAVAIL[key]) "GiB is available" > "/dev/stderr"
         }
-        exit (over ? 2 : 0)
-    }' "$WORK_DIR" "$WORK_DIR/staged.list" "${HOSTS[@]}"
+        exit (over && !preview ? 3 : 0)   # not 2: an awk that dies on its own exits 2
+    }' "$WORK_DIR" "$WORK_DIR/staged.list" "$preview" "${HOSTS[@]}"
     case $? in
         0) return 0 ;;
-        2) ;;
+        3) ;;
         *) die "capacity check failed" ;;
     esac
     [ "$IGNORE_CAPACITY" -eq 1 ] \
@@ -8562,7 +8569,9 @@ main() {
         cal_preflight
         stage_jobfiles
         sweep_layout_grid   # self-gated: a dry run never mutates
-        check_capacity
+        # under -a the staged sizes are the jobfiles' own until calibration
+        # runs: a preview, not a verdict
+        if cal_mode; then check_capacity preview; else check_capacity; fi
         dry_run_report
         exit 0
     fi

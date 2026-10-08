@@ -329,6 +329,18 @@ t_assert "staging then check_capacity aborts when the workload does not fit" bas
         *ERROR*"workload needs"*"not enough capacity"*) true;;
         *) echo "unexpected stderr: $err" >&2; false;;
     esac'
+t_assert "capacity: a dry run under -a previews the jobfiles sizes, labelled, and stops nothing -- the run checks again after calibration" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
+    out=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
+            AUTO_LEVEL=cal; IGNORE_CAPACITY=0
+            run_host() { cat "$FIX/probe/_df"; }
+            stage_variants "$FIX/src" >/dev/null && check_capacity preview) 2>&1 ); rc=$?
+    [ "$rc" -eq 0 ] || { echo "preview stopped the run: $rc $out" >&2; exit 1; }
+    case "$out" in *ERROR*) echo "preview said ERROR: $out" >&2; exit 1;; esac
+    case "$out" in *"capacity before calibration: h1 needs"*"note: h1: the jobfiles as written need"*"checks again after calibration"*) true;; *) echo "unexpected: $out" >&2; false;; esac'
 t_assert "auto staging with override stages every host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
