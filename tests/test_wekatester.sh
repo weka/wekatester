@@ -19,18 +19,27 @@ fi
 # A preflight run for real locks this suite's own path, never the host's
 # /dev/shm lock that a real run, or a second suite, may hold.
 export WEKATESTER_LOCK_DIR="$(mktemp -d)/wekatester.lock"
+# What a test sends aside goes to WT_ASIDE, never /dev/null: a buffer emptied
+# before each test, shown when the test fails, and gone after the suite
+# (Frank, 2026-10-09).
+WT_ASIDE=$(mktemp "${TMPDIR:-/tmp}/wt-aside.XXXXXX"); export WT_ASIDE
 source ./tests/helpers.sh
 PASS=0; FAIL=0
 
 t_assert() {   # t_assert <description> <command...>
+    local aside l
+    : > "$WT_ASIDE"
     if "${@:2}"; then PASS=$((PASS+1)); echo "ok - $1"
-    else FAIL=$((FAIL+1)); echo "FAIL - $1"; fi
+    else FAIL=$((FAIL+1)); echo "FAIL - $1"
+         aside=$(<"$WT_ASIDE")
+         [ -z "$aside" ] || while IFS= read -r l; do printf '    | %s\n' "$l"; done <<<"$aside"
+    fi
 }
 
 # --- source-guard: sourcing must not run main (no args → would die) ---
 out=$(source ./wekatester 2>&1)
 t_assert "sourcing produces no output" test -z "$out"
-t_assert "usage function defined after source" bash -c 'source ./wekatester; declare -f usage >/dev/null'
+t_assert "usage function defined after source" bash -c 'source ./wekatester; declare -f usage >>$WT_ASIDE'
 
 # --- parse_args ---
 p() { (source ./wekatester; parse_args "$@"; echo "$AUTO_LEVEL|$DIRECTORY|${HOSTS[*]-}"); }
@@ -68,7 +77,7 @@ t_assert "-VV and -vV both count twice" bash -c '
 t_assert "--version prints the version and exits 0" bash -c '
     out=$(./wekatester --version) || { echo "$out" >&2; exit 1; }
     case "$out" in *"wekatester version "*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "--VERSION works too" bash -c './wekatester --VERSION >/dev/null'
+t_assert "--VERSION works too" bash -c './wekatester --VERSION >>$WT_ASIDE'
 
 # --- parse_args: -r / -n / -g ---
 t_assert "-r/-n/-g default off" bash -c '
@@ -84,7 +93,7 @@ t_assert "-g forces layout regeneration" bash -c '
 # -r used to carry the report-items list for -s. That form has to fail loudly:
 # parsed as the new boolean it would silently demote "latency" to a hostname.
 t_assert "the old -s ... -r items form is refused" bash -c '
-    err=$( (source ./wekatester; parse_args -s /tmp/nope.json -r latency) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -s /tmp/nope.json -r latency) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in *"-r"*"-s"*) true;; *) echo "$err" >&2; false;; esac'
@@ -103,7 +112,7 @@ t_assert "-c is the same option as -C"       test "$(cz -cmyset h1)" = "1|myset|
 t_assert "an attached set name keeps its case" test "$(cz -CMySet h1)" = "1|MySet||h1"
 t_assert "--customize=set names the set"     test "$(cz --customize=MySet h1)" = "1|MySet||h1"
 t_assert "--customize= with no value errors" bash -c '
-    err=$( (source ./wekatester; parse_args --customize= h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args --customize= h1) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in *"--customize requires a value"*) true;; *) echo "$err" >&2; false;; esac'
@@ -116,12 +125,12 @@ t_assert "bare --customize records a candidate too"         test "$(cz --customi
 # following -C is the set name outright -- and only one of them may be.
 t_assert "-C name -- h1 consumes name as the set" test "$(cz -C name -- h1)" = "1|name||h1"
 t_assert "two bare set names before -- is a usage error" bash -c '
-    err=$( (source ./wekatester; parse_args -C a b -- h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -C a b -- h1) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in *"one set name"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "-C with -s is a usage error" bash -c '
-    err=$( (source ./wekatester; parse_args -C -s /tmp/nope.json) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -C -s /tmp/nope.json) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in *"-C"*"-s"*) true;; *) echo "$err" >&2; false;; esac'
@@ -198,26 +207,26 @@ t_assert "probe facts: an absent bindable line means UNTESTED, never none" bash 
 # --- tuner: fabricate probe dir + jobfile, run auto_tune ---
 t_assert "tuner writes per-host variants" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE
     test -f "$FIX/jobs/h1/011-bw.job" && test -f "$FIX/jobs/h2/011-bw.job"'
 t_assert "directory override applied" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE
     grep -q "^directory=/mnt/weka$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "cpus_allowed excludes weka cores" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE
     grep -q "^cpus_allowed=2-4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "wide-only weka_allowed masks are ignored (utility threads)" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
     printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE
     grep -q "^cpus_allowed=2-7$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "core mismatch warns" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "ncpus 16\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
-    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
 # --- tuner: no rules per level (2026-10-05): the host file and calibration decide ---
@@ -227,7 +236,7 @@ t_assert "tuner: no level rule -- where the host file and calibration are silent
     printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
     printf "# report bandwidth iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=128k\nrw=read\niodepth=1\n" > "$FIX/src/012-mixed-bw.job"
     for lvl in safe max cal brutal; do
-        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 - h1 h2) >/dev/null 2>&1 || { echo "-a $lvl: auto_tune failed" >&2; exit 1; }
+        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1 || { echo "-a $lvl: auto_tune failed" >&2; exit 1; }
         for h in h1 h2; do
             b="$FIX/jobs/$h/011-bw.job"; m="$FIX/jobs/$h/012-mixed-bw.job"; i="$FIX/jobs/$h/031-iops.job"; l="$FIX/jobs/$h/021-lat.job"
             if ! { grep -qx "numjobs=4" "$b" && grep -qx "filesize=10G" "$b" && grep -qx "iodepth=1" "$b" &&
@@ -244,12 +253,12 @@ t_assert "tuner: a jobfile engine one host lacks gives way to the best engine ev
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nioengine=io_uring\nnumjobs=2\nfilesize=1G\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
     printf "ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines libaio psync \n" > "$FIX/probe/h2"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "mixed report treats file as latency" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops latency\n[global]\nnumjobs=4\nioengine=libaio\nfilesize=1G\n[j]\nrw=randwrite\niodepth=8\n" > "$FIX/src/022-mixed.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^numjobs=4$" "$FIX/jobs/h1/022-mixed.job"'
 
 # --- capacity check (universal: every run, per host, from staged variants) ---
@@ -259,14 +268,14 @@ cap() {   # cap <tier> <ignore 0|1> <host>... -- stages via auto_tune, then chec
      source ./wekatester
      IGNORE_CAPACITY=$ign; WORK_DIR=$FIX; HOSTS=("$@"); DIRECTORY=/mnt/weka
      run_host() { cat "$FIX/probe/_df"; }
-     auto_tune "$FIX/src" "$FIX" "$tier" /mnt/weka 0 - "$@" >/dev/null 2>&1 || exit 9
+     auto_tune "$FIX/src" "$FIX" "$tier" /mnt/weka 0 - "$@" >>$WT_ASIDE 2>&1 || exit 9
      check_capacity)
 }
 export -f cap
 t_assert "capacity check dies when oversized" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
-    err=$( cap max 0 h1 h2 2>&1 >/dev/null )
+    err=$( cap max 0 h1 h2 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in
@@ -276,7 +285,7 @@ t_assert "capacity check dies when oversized" bash -c '
 t_assert "capacity check overridden by --ignore-capacity flag arg" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 0 20971520 1%% /mnt/weka\n" > "$FIX/probe/_df"
-    err=$( cap max 1 h1 h2 2>&1 >/dev/null )
+    err=$( cap max 1 h1 h2 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc" >&2; false; } &&
     case "$err" in
@@ -285,7 +294,7 @@ t_assert "capacity check overridden by --ignore-capacity flag arg" bash -c '
     esac'
 t_assert "no capacity warning when it fits" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc" >&2; false; } &&
     case "$err" in *WARNING*available*) false;; *) true;; esac'
@@ -325,7 +334,7 @@ t_assert "staging then check_capacity aborts when the workload does not fit" bas
             WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
             AUTO_LEVEL=max; IGNORE_CAPACITY=0
             run_host() { cat "$FIX/probe/_df"; }
-            stage_variants "$FIX/src" && check_capacity) 2>&1 >/dev/null )
+            stage_variants "$FIX/src" && check_capacity) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in
@@ -340,7 +349,7 @@ t_assert "capacity: a dry run under -a previews the jobfiles sizes, labelled, an
             WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
             AUTO_LEVEL=cal; IGNORE_CAPACITY=0
             run_host() { cat "$FIX/probe/_df"; }
-            stage_variants "$FIX/src" >/dev/null && check_capacity preview) 2>&1 ); rc=$?
+            stage_variants "$FIX/src" >>$WT_ASIDE && check_capacity preview) 2>&1 ); rc=$?
     [ "$rc" -eq 0 ] || { echo "preview stopped the run: $rc $out" >&2; exit 1; }
     case "$out" in *ERROR*) echo "preview said ERROR: $out" >&2; exit 1;; esac
     case "$out" in *"capacity before calibration: h1 needs"*"note: h1: the jobfiles as written need"*"checks again after calibration"*) true;; *) echo "unexpected: $out" >&2; false;; esac'
@@ -350,7 +359,7 @@ t_assert "auto staging with override stages every host" bash -c '
     err=$( (source ./wekatester
             WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2)
             AUTO_LEVEL=max; IGNORE_CAPACITY=1
-            stage_variants "$FIX/src") 2>&1 >/dev/null )
+            stage_variants "$FIX/src") 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc ($err)" >&2; false; } &&
     { test -f "$FIX/jobs/h1/011-bw.job" ||
@@ -400,13 +409,13 @@ t_assert "non-auto staging creates [global] when the jobfile has none" bash -c '
 t_assert "auto staging creates [global] when the jobfile has none" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[job1]\nrw=read\nfilesize=1G\n" > "$FIX/src/011-bw.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     v="$FIX/jobs/h1/011-bw.job"
     grep -q "^\[global\]$" "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
     grep -q "^cpus_allowed=2-4$" "$v" && grep -q "^\[job1\]$" "$v"'
 t_assert "an existing [global] is never duplicated" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     [ "$(grep -c "^\[global\]$" "$FIX/jobs/h1/011-bw.job")" -eq 1 ]'
 
 # --- capacity model: namespaces, size= ---
@@ -441,7 +450,7 @@ t_assert "capacity: a percentage size= contributes 0 instead of crashing" bash -
 t_assert "size= is never inserted where the jobfile had none" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[j]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     ! grep -q "^size=" "$FIX/jobs/h1/031-iops.job"'
 
 # --- summarizer ---
@@ -503,7 +512,7 @@ t_assert "summarize: the items argument still narrows the report" bash -c '
 t_assert "summarize: refuses results that are missing a host, by name" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
-    err=$( (source ./wekatester; summarize "$d/r.json" "" "vega-1 vega-2 vega-3") 2>&1 >/dev/null )
+    err=$( (source ./wekatester; summarize "$d/r.json" "" "vega-1 vega-2 vega-3") 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
     case "$err" in
@@ -513,7 +522,7 @@ t_assert "summarize: refuses results that are missing a host, by name" bash -c '
 t_assert "summarize: passes when every expected host reported" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
-    (source ./wekatester; summarize "$d/r.json" "bandwidth" "vega-1 vega-2") >/dev/null'
+    (source ./wekatester; summarize "$d/r.json" "bandwidth" "vega-1 vega-2") >>$WT_ASIDE'
 t_assert "summarize: a single-client run needs no All clients aggregate" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_single_fixture "$d/r.json"
@@ -544,7 +553,7 @@ t_assert "report directive: bare # report means default-all" \
 # wrappers must never reach for ssh/scp (no_ssh_fixture enforces that: the
 # stubs shadow the real binaries and exit 99).
 lm() { (uname_fixture Linux
-        source ./wekatester; parse_args "$@"; resolve_local_mode >/dev/null
+        source ./wekatester; parse_args "$@"; resolve_local_mode >>$WT_ASIDE
         echo "$LOCAL_MODE|$MASTER|${HOSTS[*]-}"); }
 t_assert "local mode defaults off"          bash -c 'source ./wekatester; [ "$LOCAL_MODE" -eq 0 ]'
 t_assert "no servers: local mode on, host and master are localhost" \
@@ -561,7 +570,7 @@ t_assert "servers given: local mode stays off, host list untouched" \
 t_assert "the controller must be Linux: a run stops on another kernel before anything starts; -s still summarizes anywhere" bash -c '
     source ./tests/helpers.sh; uname_fixture Darwin
     for args in "" "h1 h2"; do
-        err=$(./wekatester $args 2>&1 >/dev/null) && { echo "ran on Darwin [$args]" >&2; exit 1; }
+        err=$(./wekatester $args 2>&1 >>$WT_ASIDE) && { echo "ran on Darwin [$args]" >&2; exit 1; }
         case "$err" in
             *"wekatester runs on a Linux controller, not Darwin"*) ;;
             *) echo "[$args] $err" >&2; exit 1;;
@@ -615,7 +624,7 @@ t_assert "copy_to_master remote: one tar stream over one ssh to the master, the 
 h3" ] || { cat "$d/argv" >&2; ls -R "$d/got" >&2; false; }'
 t_assert "copy_to_master remote: a failed stream fails the copy, and sources from two directories are refused" bash -c '
     d=$(mktemp -d); mkdir -p "$d/bin" "$d/w/a" "$d/x/b"
-    printf "#!/bin/sh\ncat > /dev/null; exit 255\n" > "$d/bin/ssh"; chmod +x "$d/bin/ssh"
+    printf "#!/bin/sh\ncat > $d/ssh.stdin; exit 255\n" > "$d/bin/ssh"; chmod +x "$d/bin/ssh"
     (export PATH="$d/bin:$PATH"; source ./wekatester; LOCAL_MODE=0; MASTER=m; copy_to_master "$d/w/a" /dst/) && { echo "a dead ssh passed" >&2; exit 1; }
     err=$( (export PATH="$d/bin:$PATH"; source ./wekatester; LOCAL_MODE=0; MASTER=m; copy_to_master "$d/w/a" "$d/x/b" /dst/) 2>&1 ) && { echo "two dirs passed" >&2; exit 1; }
     case "$err" in *"copy_to_master: $d/x/b is not in $d/w"*) true;; *) echo "$err" >&2; false;; esac'
@@ -627,7 +636,7 @@ t_assert "preflight: rc 255 in local mode is a missing fio, not a dead ssh" bash
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=/usr/bin/fio; WORK_DIR=$(mktemp -d)
             run_host() { return 255; }
-            preflight) 2>&1 >/dev/null )
+            preflight) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"localhost: /usr/bin/fio not found"*) true;;
         *) echo "$err" >&2; false;;
@@ -636,7 +645,7 @@ t_assert "preflight: rc 255 in remote mode is still a dead ssh" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-1); FIO_BIN=/usr/bin/fio; WORK_DIR=$(mktemp -d)
             run_host() { return 255; }
-            preflight) 2>&1 >/dev/null )
+            preflight) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"vega-1: ssh failed"*) true;;
         *) echo "$err" >&2; false;;
@@ -699,7 +708,7 @@ t_assert "mount guard: findmnt failure blames the directory, not the mount mode"
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
             run_host() { return 1; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in *forcedirect*) echo "leaked remount advice: $err" >&2; false;; *) true;; esac &&
     case "$err" in
         *"findmnt failed for /mnt/weka -- does it exist? (wrong -d?)"*"-d names the right directory"*) true;;
@@ -709,7 +718,7 @@ t_assert "mount guard: a genuine cached-mode mount still says remount forcedirec
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
             run_host() { echo "wekafs rw,relatime,writecache"; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"wekafs mounted writecache (need forcedirect)"*"must be mounted with forcedirect; remount"*) true;;
         *) echo "$err" >&2; false;;
@@ -718,7 +727,7 @@ t_assert "mount guard: one real mode failure outweighs a findmnt failure" bash -
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(h1 h2); DIRECTORY=/mnt/weka
             run_host() { [ "$1" = h1 ] && return 1; echo "wekafs rw,readcache"; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"h1: findmnt failed"*"h2: wekafs mounted readcache"*"must be mounted with forcedirect; remount"*) true;;
         *) echo "$err" >&2; false;;
@@ -729,7 +738,7 @@ t_assert "port check: local mode blames loopback resolution, not a firewall" bas
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
             run_host() { echo "FAIL localhost"; echo DONE; }
-            verify_fio_ports) 2>&1 >/dev/null )
+            verify_fio_ports) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"cannot reach localhost:8765 (loopback resolution?"*) true;;
         *) echo "$err" >&2; false;;
@@ -738,7 +747,7 @@ t_assert "port check: remote mode still blames the firewall" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-2); MASTER=vega-1
             run_host() { echo "FAIL vega-2"; echo DONE; }
-            verify_fio_ports) 2>&1 >/dev/null )
+            verify_fio_ports) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"vega-1 cannot reach vega-2:8765 (host firewall?)"*) true;;
         *) echo "$err" >&2; false;;
@@ -752,13 +761,13 @@ t_assert "port check: one ssh session to the master however many workers there a
     (source ./wekatester
      LOCAL_MODE=0; MASTER=h1; HOSTS=(h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12)
      run_host() { echo "$1" >> "$d/sessions"; echo DONE; }
-     verify_fio_ports) >/dev/null &&
+     verify_fio_ports) >>$WT_ASIDE &&
     [ "$(wc -l < "$d/sessions")" -eq 1 ] && [ "$(cat "$d/sessions")" = h1 ]'
 t_assert "port check: a failed ssh session to the master is not a firewall" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-1 vega-2); MASTER=vega-1
             run_host() { echo "mux_client_request_session: session request failed" >&2; return 255; }
-            verify_fio_ports) 2>&1 >/dev/null ); rc=$?
+            verify_fio_ports) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *firewall*|*"cannot reach"*) echo "blamed a firewall for a dead session: $err" >&2; false;; *) true;; esac &&
     case "$err" in
@@ -791,7 +800,7 @@ t_assert "port check: a FAIL line for one worker leaves the others reachable" ba
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-1 vega-2 vega-3); MASTER=vega-1
             run_host() { echo "FAIL vega-2"; echo DONE; }
-            verify_fio_ports) 2>&1 >/dev/null )
+            verify_fio_ports) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"vega-1 cannot reach vega-2:8765"*"failed on 1 of 3 host(s)"*) true;;
         *) echo "$err" >&2; false;;
@@ -812,7 +821,7 @@ t_assert "local staging lands per-host variants under the staging dir" bash -c '
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >/dev/null || exit 1
+     stage_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     test -f "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
     test -f "$d/target/localhost/022-smoke-writeiops.job"'
@@ -843,13 +852,13 @@ t_assert "validate_credentials splits login:key pairs; bare paths get the defaul
 t_assert "validate_credentials refuses missing keys, directories, and whitespace" bash -c '
     d=$(mktemp -d); k="$d/my key"; : > "$k"
     err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=(/no/such/key)
-            validate_credentials) 2>&1 >/dev/null )
+            validate_credentials) 2>&1 >>$WT_ASIDE )
     case "$err" in *"identity file not readable: /no/such/key"*) true;; *) echo "$err" >&2; exit 1;; esac
     err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("ubuntu:$d")
-            validate_credentials) 2>&1 >/dev/null )
+            validate_credentials) 2>&1 >>$WT_ASIDE )
     case "$err" in *"identity file not readable: $d"*) true;; *) echo "$err" >&2; exit 1;; esac
     err=$( (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("ubuntu:$k")
-            validate_credentials) 2>&1 >/dev/null )
+            validate_credentials) 2>&1 >>$WT_ASIDE )
     case "$err" in *"must not contain whitespace"*) true;; *) echo "$err" >&2; exit 1;; esac'
 # Local mode never runs ssh, so the credential flags are accepted and ignored
 # -- including a key path that would be fatal on a remote run.
@@ -928,15 +937,15 @@ t_assert "prompt: arrow key is escseq and leaves no residue" bash -c '
 t_assert "confirm_timed: esc beats a yes default" bash -c '
     source ./tests/helpers.sh
     ! (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-       printf "\033" | { confirm_timed 5 yes "q?" >/dev/null; }) '
+       printf "\033" | { confirm_timed 5 yes "q?" >>$WT_ASIDE; }) '
 t_assert "confirm_timed: timeout yields the stated default" bash -c '
     (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-     confirm_timed 1 yes "q?" < <(sleep 2) >/dev/null)'
+     confirm_timed 1 yes "q?" < <(sleep 2) >>$WT_ASIDE)'
 t_assert "confirm_destructive: enter is NOT yes, y is, EOF dies" bash -c '
     source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-    ! (printf "\n" | { confirm_destructive "sure?" >/dev/null; }) &&
-    (printf "y" | { confirm_destructive "sure?" >/dev/null; }) &&
-    ! ( { confirm_destructive "sure?" >/dev/null; } </dev/null )'
+    ! (printf "\n" | { confirm_destructive "sure?" >>$WT_ASIDE; }) &&
+    (printf "y" | { confirm_destructive "sure?" >>$WT_ASIDE; }) &&
+    ! ( { confirm_destructive "sure?" >>$WT_ASIDE; } </dev/null )'
 t_assert "require_interactive dies without a terminal" bash -c '
     out=$( (source ./wekatester; WEKATESTER_PROMPT_TTY=/dev/null PROMPT_TTY=/dev/null
             require_interactive "-C") 2>&1 ); rc=$?
@@ -946,7 +955,7 @@ t_assert "editor: files edited in run order, VISUAL beats EDITOR" bash -c '
     (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
      VISUAL="$ED/stub-ed"; EDITOR=/nonexistent/editor; resolve_editor
      discover_jobfiles "$SETFIX"
-     for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >/dev/null
+     for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >>$WT_ASIDE
     [ "$(cat "$ED/order")" = "011-bw.job
 031-iops.job" ]'
 t_assert "editor: nonzero exit aborts after exactly one file" bash -c '
@@ -954,13 +963,13 @@ t_assert "editor: nonzero exit aborts after exactly one file" bash -c '
     ! (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
        EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
        discover_jobfiles "$SETFIX"
-       for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >/dev/null 2>&1
+       for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >>$WT_ASIDE 2>&1
     [ "$(wc -l < "$ED/order")" -eq 1 ]'
 
 # --- layout generator ---
 t_assert "generator: one section per namespace with superset geometry" bash -c '
     source ./tests/helpers.sh; set_fixture
-    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE
     f="$SETFIX/000-wekatester-layout.job"
     grep -q "^# wekatester-layout: generated sha256=" "$f" &&
     grep -q "^filename_format=big/\$jobnum$" "$f" &&
@@ -970,14 +979,14 @@ t_assert "generator: one section per namespace with superset geometry" bash -c '
 t_assert "generator: deterministic (regeneration is byte-identical)" bash -c '
     source ./tests/helpers.sh; set_fixture
     (source ./wekatester
-     generate_layout "$SETFIX" "$SETFIX" >/dev/null
+     generate_layout "$SETFIX" "$SETFIX" >>$WT_ASIDE
      cp "$SETFIX/000-wekatester-layout.job" /tmp/gen1.$$
-     generate_layout "$SETFIX" "$SETFIX" >/dev/null)
-    diff -q /tmp/gen1.$$ "$SETFIX/000-wekatester-layout.job" >/dev/null; rc=$?
+     generate_layout "$SETFIX" "$SETFIX" >>$WT_ASIDE)
+    diff -q /tmp/gen1.$$ "$SETFIX/000-wekatester-layout.job" >>$WT_ASIDE; rc=$?
     rm -f /tmp/gen1.$$; [ "$rc" -eq 0 ]'
 t_assert "generator: pristine hash verifies and an edit breaks it" bash -c '
     source ./tests/helpers.sh; set_fixture
-    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE
     f="$SETFIX/000-wekatester-layout.job"
     want=$(sed -n "s/^# wekatester-layout: generated sha256=//p" "$f")
     got=$(grep -v "^# wekatester-layout: generated" "$f" | sed "s/[[:space:]]*$//" |
@@ -997,7 +1006,7 @@ t_assert "staging: layout job is generated and runs first" bash -c '
      WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
      WEKATESTER_TARGET_DIR="$d/target" TARGET_DIR="$d/target"
      DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
-     stage_jobfiles >/dev/null
+     stage_jobfiles >>$WT_ASIDE
      [ "${JOBFILES[0]}" = "000-wekatester-layout.job" ] &&
      [ -f "$WORK_DIR/jobs/localhost/000-wekatester-layout.job" ] &&
      grep -q "^directory=/mnt/x$" "$WORK_DIR/jobs/localhost/000-wekatester-layout.job")'
@@ -1010,18 +1019,18 @@ t_assert "staging: a set with its own layout file is not regenerated" bash -c '
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
      WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
-     stage_jobfiles >/dev/null
+     stage_jobfiles >>$WT_ASIDE
      grep -q "sha256=0000" "$WORK_DIR/set/000-wekatester-layout.job")'
 t_assert "tuner: a pristine layout is re-derived per host at every level, covering what each host runs" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     # h1 measured 3 bandwidth jobs and 3 iops jobs of two 1G files; h2 has no row
     row=(h1); for i in $(seq 1 36); do row+=(-); done
     row[5]=3; row[21]=3; row[22]=1G; row[23]=2; row[24]=8
     (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
     for lvl in safe max cal brutal; do
-        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+        (source ./wekatester; auto_tune "$FIX/src" "$FIX" $lvl /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
         v1="$FIX/jobs/h1/000-wekatester-layout.job"; v2="$FIX/jobs/h2/000-wekatester-layout.job"
         grep -q "re-derived by wekatester auto\[$lvl\]" "$v1" && grep -q "re-derived by wekatester auto\[$lvl\]" "$v2" &&
         grep -qx "numjobs=3" "$v1" && ! grep -qx "numjobs=4" "$v1" && grep -qx "nrfiles=2" "$v1" && grep -qx "filesize=1G" "$v1" &&
@@ -1031,9 +1040,9 @@ t_assert "tuner: a pristine layout is re-derived per host at every level, coveri
     done'
 t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
-    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     v="$FIX/jobs/h1/000-wekatester-layout.job"
     grep -q "# operator note" "$v" && ! grep -q "re-derived" "$v" &&
     case "$err" in *"user-edited layout staged as-is"*) true;; *) echo "$err" >&2; false;; esac'
@@ -1041,9 +1050,9 @@ t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
 # that host's destination for the layout too, never the global -d.
 t_assert "tuner: the re-derived layout is marked and lays out at each host's own destination" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     { printf "h1\t-\t-\t-\t/mnt/pin"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     l1="$FIX/jobs/h1/000-wekatester-layout.job"; l2="$FIX/jobs/h2/000-wekatester-layout.job"
     head -1 "$l1" | grep -q "^# wekatester-layout: generated (re-derived by wekatester auto\[max\]" &&
     (source ./wekatester; is_layout_file "$l1") &&
@@ -1052,10 +1061,10 @@ t_assert "tuner: the re-derived layout is marked and lays out at each host's own
     [ "$(cat "$FIX/usable/h1")" = "2-4" ] || { cat "$l1" >&2; false; }'
 t_assert "tuner: an edited layout is staged at each host's own destination too" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
     { printf "h1\t-\t-\t-\t/mnt/pin"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^directory=/mnt/pin$" "$FIX/jobs/h1/000-wekatester-layout.job" &&
     grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/000-wekatester-layout.job"'
 # The fleet-shared read set is calibration's: safe and max stage reads on
@@ -1068,13 +1077,13 @@ t_assert "staging: every -a level calibrates, so every level puts reads on the f
         w=$(mktemp -d); mkdir -p "$w/jobs" "$w/probe"; cp "$d/probe.h1" "$w/probe/h1"
         (source ./wekatester
          WORK_DIR=$w; DIRECTORY=/mnt/w; HOSTS=(h1); AUTO_LEVEL=$lvl
-         stage_variants "$d/set") >/dev/null 2>&1 || { echo "stage_variants failed at -a $lvl" >&2; exit 1; }
+         stage_variants "$d/set") >>$WT_ASIDE 2>&1 || { echo "stage_variants failed at -a $lvl" >&2; exit 1; }
         grep -qx "filename_format=shared.\$filenum/\$jobnum" "$w/jobs/h1/011-r.job" ||
             { echo "-a $lvl: $(grep "^filename_format=" "$w/jobs/h1/011-r.job")" >&2; exit 1; }
     done'
 t_assert "tuner capacity: layout job does not double the required total" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     out=$( cap safe 0 h1 h2 2>&1 )
     case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 
@@ -1086,7 +1095,7 @@ t_assert "resolve: bare name creates under ./fio-jobfiles and copies" bash -c '
     printf "# report bandwidth\n[global]\nfilesize=1G\n[j]\nrw=read\n" > fio-jobfiles/default/011-x.job
     (source "$OLDPWD/wekatester"
      SCRIPT_DIR=$tmp; WORKLOAD=default; CUSTOM_SET=mynew
-     resolve_custom_set >/dev/null
+     resolve_custom_set >>$WT_ASIDE
      [ "$SET_DIR_OVERRIDE" = "./fio-jobfiles/mynew" ] && [ -f ./fio-jobfiles/mynew/011-x.job ])'
 t_assert "resolve: unwritable fio-jobfiles dies for a new bare name" bash -c '
     source ./tests/helpers.sh
@@ -1103,14 +1112,14 @@ t_assert "resolve: existing path is used as-is (no copy)" bash -c '
     source ./tests/helpers.sh; set_fixture
     (source ./wekatester
      WORKLOAD=default; CUSTOM_SET=$SETFIX
-     resolve_custom_set >/dev/null
+     resolve_custom_set >>$WT_ASIDE
      [ "$SET_DIR_OVERRIDE" = "$SETFIX" ] && [ ! -f "$SETFIX/011-bandwidthR.job" ])'
 t_assert "customize -r: layout generated silently, no editor, keep implied" bash -c '
     source ./tests/helpers.sh; set_fixture; editor_fixture
     (source ./wekatester
      FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
      EDITOR="$ED/stub-ed"
-     customize_jobfiles >/dev/null
+     customize_jobfiles >>$WT_ASIDE
      [ -f "$SETFIX/000-wekatester-layout.job" ] && [ "$TEMP_REMOVE" -eq 0 ]) || exit 1
     [ ! -f "$ED/order" ]'
 t_assert "customize -r without -g: existing layout untouched" bash -c '
@@ -1118,14 +1127,14 @@ t_assert "customize -r without -g: existing layout untouched" bash -c '
     printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
     (source ./wekatester
      FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     customize_jobfiles >/dev/null)
+     customize_jobfiles >>$WT_ASIDE)
     grep -q "^mine$" "$SETFIX/000-wekatester-layout.job"'
 t_assert "customize -g: existing layout regenerated even fast-tracked" bash -c '
     source ./tests/helpers.sh; set_fixture
     printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
     (source ./wekatester
      FAST_TRACK=1; REGEN_LAYOUT=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     customize_jobfiles >/dev/null)
+     customize_jobfiles >>$WT_ASIDE)
     ! grep -q "^mine$" "$SETFIX/000-wekatester-layout.job" &&
     grep -q "^create_only=1$" "$SETFIX/000-wekatester-layout.job"'
 t_assert "temp set removed only when marked and only via finish_temp_set" bash -c '
@@ -1133,7 +1142,7 @@ t_assert "temp set removed only when marked and only via finish_temp_set" bash -
     d=$(mktemp -d)
     (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=0; finish_temp_set)
     [ -d "$d" ] || exit 1
-    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=1; finish_temp_set >/dev/null)
+    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=1; finish_temp_set >>$WT_ASIDE)
     [ ! -d "$d" ]'
 t_assert "preflight: unreachable -C candidate becomes the set name (fast track)" bash -c '
     source ./tests/helpers.sh
@@ -1145,7 +1154,7 @@ t_assert "preflight: unreachable -C candidate becomes the set name (fast track)"
      HOSTS=(mysetname); MASTER=mysetname; FIO_BIN=/usr/bin/true; WORK_DIR=$(mktemp -d)
      printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; chmod +x "$stub/pgrep"   # no fio running
      uname() { echo Linux; }
-     preflight >/dev/null 2>&1
+     preflight >>$WT_ASIDE 2>&1
      [ "$CUSTOM_SET" = "mysetname" ] && [ "$LOCAL_MODE" -eq 1 ] && [ "$MASTER" = "localhost" ])'
 
 # --- review fixes: layout union geometry, shipped-set protection, ordering ---
@@ -1155,7 +1164,7 @@ t_assert "generator: divergent geometries yield one section each (union, not gri
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=4\n[a]\nrw=read\n" > "$S/011-a.job"
     printf "# report iops\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\n[b]\nrw=randread\n" > "$S/031-b.job"
     printf "# report iops\n[global]\nfilename_format=x/\$jobnum\nfilesize=15G\nnumjobs=2\nnrfiles=2\n[c]\nrw=randread\n" > "$S/032-c.job"
-    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 3 ] &&
     ! grep -q "^stonewall$" "$f" &&
@@ -1164,7 +1173,7 @@ t_assert "generator: distinct namespaces lay out in parallel (no ordering betwee
     S=$(mktemp -d)
     printf "# report bandwidth\n[global]\nfilename_format=big/\$jobnum\nfilesize=10G\nnumjobs=4\n[a]\nrw=read\n" > "$S/011-a.job"
     printf "# report iops\n[global]\nfilename_format=small.\$jobnum\nfilesize=1G\nnumjobs=8\n[b]\nrw=randread\n" > "$S/031-b.job"
-    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 2 ] &&
     ! grep -q "^stonewall$" "$f" && ! grep -q "^wait_for=" "$f"'
@@ -1172,7 +1181,7 @@ t_assert "generator: a jobname namespace with several contributors gets unique c
     S=$(mktemp -d)
     printf "[global]\nfilesize=1G\nnumjobs=4\n[shared]\nrw=read\n" > "$S/011-a.job"
     printf "[global]\nfilesize=2G\nnumjobs=2\n[shared]\nrw=read\n" > "$S/012-b.job"
-    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "filename_format=shared.\$jobnum.\$filenum" "$f")" -eq 2 ] &&
     [ "$(grep -c "^wait_for=layout-" "$f")" -eq 1 ] &&
@@ -1183,7 +1192,7 @@ t_assert "generator: dominated geometry is pruned to one section" bash -c '
     printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=32\n[a]\nrw=read\n" > "$S/011-a.job"
     printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=64\n[b]\nrw=randread\n" > "$S/031-b.job"
     printf "[global]\nfilename_format=x/\$jobnum\nfilesize=10G\nnumjobs=1\n[c]\nrw=randread\n" > "$S/021-c.job"
-    (source ./wekatester; generate_layout "$S" "$S") >/dev/null
+    (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 1 ] && grep -q "^numjobs=64$" "$f"'
 t_assert "capacity: layout union raises required above per-namespace max" bash -c '
@@ -1191,7 +1200,7 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     rm -f "$FIX/src/011-bw.job"
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[a]\nrw=read\niodepth=1\n" > "$FIX/src/011-a.job"
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\nioengine=libaio\ndirectory=/orig\n[b]\nrw=read\niodepth=1\n" > "$FIX/src/012-b.job"
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     out=$( cap safe 0 h1 h2 2>&1 )
     # a: 4 jobs x 1 file = 4G; b: 2 jobs x 27 files = 54G, the namespace max;
     # the layout lays out both sections, 58G/host, so the union raises the
@@ -1208,7 +1217,7 @@ t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
     before=$(ls fio-jobfiles/smoke | cksum) && [ -n "$before" ] || exit 1
     (source "$OLDPWD/wekatester"
      SCRIPT_DIR=$tmp; CUSTOM_SET=smoke; FAST_TRACK=1; CUSTOMIZE=1
-     customize_jobfiles >/dev/null
+     customize_jobfiles >>$WT_ASIDE
      [ "$TEMP_SET" -eq 1 ] &&
      case "$SET_DIR_OVERRIDE" in ./fio-jobfiles/2*) true;; *) false;; esac &&
      [ -f "$SET_DIR_OVERRIDE/000-wekatester-layout.job" ]) || exit 1
@@ -1216,14 +1225,14 @@ t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
     [ "$before" = "$after" ]'
 t_assert "staging: marker layout with a late-sorting name is forced first" bash -c '
     source ./tests/helpers.sh; set_fixture; no_ssh_fixture
-    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >/dev/null
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE
     mv "$SETFIX/000-wekatester-layout.job" "$SETFIX/090-mylayout.job"
     d=$(mktemp -d)
     (source ./wekatester
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
      WORK_DIR=$(mktemp -d); mkdir -p "$WORK_DIR/jobs"
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
-     stage_jobfiles >/dev/null
+     stage_jobfiles >>$WT_ASIDE
      [ "${JOBFILES[0]}" = "090-mylayout.job" ] && [ "${#JOBFILES[@]}" -eq 3 ])'
 t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
     source ./tests/helpers.sh
@@ -1235,7 +1244,7 @@ t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
     (source "$OLDPWD/wekatester"
      PROMPT_IN_FD=0; PROMPT_OUT_FD=1
      SCRIPT_DIR=$tmp; WORKLOAD=fresh; WORKLOAD_EXPLICIT=1; CUSTOM_SET=./custom
-     printf "y" | { resolve_custom_set >/dev/null; }
+     printf "y" | { resolve_custom_set >>$WT_ASIDE; }
      [ -f ./custom/011-new.job ] && [ ! -f ./custom/011-old.job ] &&
      [ ! -f ./custom/000-wekatester-layout.job ])'
 
@@ -1257,7 +1266,7 @@ t_assert "run_jobs: the results file lands in RUN_DIR, no timestamp infix" bash 
      HOSTS=(vega-1); MASTER=vega-1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
      SET_DIR=$tmp/set; JOBFILES=(011-bw.job); RUN_DIR=$tmp/out
      run_host() { cat "$tmp/fixture.json"; }
-     run_jobs >/dev/null) &&
+     run_jobs >>$WT_ASIDE) &&
     test -f "$tmp/out/results_011-bw.json"'
 
 # --- run bundle: log capture, jobfile snapshot, tgz finalize ---
@@ -1269,7 +1278,7 @@ t_assert "run bundle: stdout and stderr both land in wekatester.log; tgz replace
      start_run_log
      log "hello bundle"
      echo "oops goes to stderr" >&2
-     finalize_run_dir) >/dev/null 2>&1
+     finalize_run_dir) >>$WT_ASIDE 2>&1
     test -f "$d/res/20260101-000000.tgz" &&
     test ! -d "$d/res/20260101-000000" &&
     tar -xzOf "$d/res/20260101-000000.tgz" 20260101-000000/wekatester.log > "$d/log" &&
@@ -1302,7 +1311,7 @@ t_assert "run bundle: cleanup returns while the log tees still run (bare-wait de
         LOCAL_MODE=1; HOSTS=(localhost); FIO_STARTED=1
         TARGET_DIR=$d/scratch; FIO_BIN=/nonexistent-fio; FIO_PIDFILE=$d/absent.pid
         cleanup
-        finalize_run_dir" >/dev/null 2>&1 &&
+        finalize_run_dir" >>$WT_ASIDE 2>&1 &&
     test -f "$d/res/20260101-000002.tgz"'
 t_assert "run bundle: snapshot copies the per-host staged variants" bash -c '
     d=$(mktemp -d)
@@ -1380,7 +1389,7 @@ t_assert "parse: an attached value keeps its case even when the option is folded
 t_assert "parse: attaching is the escape hatch for a dash-leading value" bash -c '
     (source ./wekatester; parse_args -w-odd h1; [ "$WORKLOAD" = -odd ])'
 t_assert "parse: an empty attached value dies instead of naming nothing" bash -c '
-    err=$( (source ./wekatester; parse_args -w= h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -w= h1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"option -w requires a value"*) true;;
         *) echo "$err" >&2; false;;
@@ -1388,7 +1397,7 @@ t_assert "parse: an empty attached value dies instead of naming nothing" bash -c
 t_assert "parse: -asafe and -a=max set the level; a bogus attached level dies" bash -c '
     (source ./wekatester; parse_args -asafe h1; [ "$AUTO_LEVEL" = safe ]) &&
     (source ./wekatester; parse_args -a=MAX h1; [ "$AUTO_LEVEL" = max ]) &&
-    err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -abogus h1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"unknown auto level: bogus (safe|max|cal|brutal)"*) true;;
         *) echo "$err" >&2; false;;
@@ -1397,12 +1406,12 @@ t_assert "parse: -a cal and --auto=cal set the level; every level calibrates" ba
     (source ./wekatester; parse_args -a cal h1;    [ "$AUTO_LEVEL" = cal ]) &&
     (source ./wekatester; parse_args -ACAL h1;     [ "$AUTO_LEVEL" = cal ]) &&
     (source ./wekatester; parse_args --auto=cal h1; [ "$AUTO_LEVEL" = cal ]) &&
-    err=$( (source ./wekatester; parse_args -acalx h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -acalx h1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"unknown auto level: calx (safe|max|cal|brutal)"*) true;;
         *) echo "$err" >&2; false;;
     esac &&
-    err=$( (source ./wekatester; parse_args -ahybrid h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -ahybrid h1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"unknown auto level: hybrid"*) true;;
         *) echo "$err" >&2; false;;
@@ -1618,7 +1627,7 @@ t_assert "capacity: hosts on one weka filesystem are checked against it together
     source ./tests/helpers.sh; tuner_fixture
     # 50 GiB free on one weka filesystem; each host alone needs ~40
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n10.0.1.1,10.0.1.2/default 104857600 0 52428800 1%% /mnt/weka\nwekafs\n" > "$FIX/probe/_df"
-    err=$( cap max 0 h1 h2 2>&1 >/dev/null ) && { echo "passed: $err" >&2; exit 1; }
+    err=$( cap max 0 h1 h2 2>&1 >>$WT_ASIDE ) && { echo "passed: $err" >&2; exit 1; }
     case "$err" in *"ERROR: weka filesystem default: its 2 hosts (h1 h2) need ~80.0GiB together but only 50.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
     # the same df without the wekafs line: local disks, one per host, each fits
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/nvme0n1 104857600 0 52428800 1%% /mnt/weka\n" > "$FIX/probe/_df"
@@ -1808,7 +1817,7 @@ uc_fails() {   # uc_fails <pattern> [probe-file-content]; empty = no probe file
     d=$(mktemp -d) || return 1
     mkdir -p "$d/probe"
     [ -z "${2:-}" ] || printf '%s\n' "$2" > "$d/probe/h1"
-    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 >/dev/null ); rc=$?
+    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 >>$WT_ASIDE ); rc=$?
     rm -rf "$d"
     [ "$rc" -ne 0 ] || { echo "usable_cores unexpectedly succeeded" >&2; return 1; }
     case "$err" in (*$pat*) return 0 ;; esac
@@ -1890,7 +1899,7 @@ cal_g() {   # cal_g <cur> <bw|iops>; prints the lines, newlines as |
 }
 cal_g_fails() {   # cal_g_fails <pattern> <cal_values args>...
     local pat=$1 err rc; shift
-    err=$( (source ./wekatester; cal_values "$@") 2>&1 >/dev/null ); rc=$?
+    err=$( (source ./wekatester; cal_values "$@") 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "cal_values $* unexpectedly succeeded" >&2; return 1; }
     case "$err" in (*$pat*) return 0 ;; esac
     echo "$err" >&2; return 1
@@ -2007,7 +2016,7 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; UNLINK=1
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
      stage_jobfiles
-     [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >/dev/null || exit 1
+     [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >>$WT_ASIDE || exit 1
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
 
@@ -2035,7 +2044,7 @@ t_assert "-e stamps every staged variant, the generated layout included" bash -c
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; ENGINE=xyzeng
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >/dev/null || exit 1
+     stage_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
     grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-layout.job"'
@@ -2046,7 +2055,7 @@ t_assert "-e stamps every staged variant, the generated layout included" bash -c
 t_assert "layout: the generated layout job disables preallocation" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src"
     printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
-    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >>$WT_ASIDE 2>&1
     grep -q "^fallocate=none$" "$d/src/000-wekatester-layout.job"'
 
 # --- engine ranking: a tie goes to io_uring, never to read order ---
@@ -2058,14 +2067,14 @@ t_assert "layout: an engine tie is broken by ENGINE_ORDER, not jobfile read orde
     # libaio sorts first by filename, so read order favours it
     printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
     printf "# report iops\n[global]\nioengine=io_uring\nfilesize=1G\nnumjobs=1\n[b]\nrw=randread\n" > "$d/src/031-b.job"
-    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >>$WT_ASIDE 2>&1
     grep -q "^ioengine=io_uring$" "$d/src/000-wekatester-layout.job"'
 t_assert "layout: a genuine majority still wins over ENGINE_ORDER" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src"
     printf "# report bandwidth\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/src/011-a.job"
     printf "# report iops\n[global]\nioengine=libaio\nfilesize=1G\nnumjobs=1\n[b]\nrw=randread\n" > "$d/src/031-b.job"
     printf "# report latency\n[global]\nioengine=io_uring\nfilesize=1G\nnumjobs=1\n[c]\nrw=randread\n" > "$d/src/021-c.job"
-    (source ./wekatester; generate_layout "$d/src" "$d/src") >/dev/null 2>&1
+    (source ./wekatester; generate_layout "$d/src" "$d/src") >>$WT_ASIDE 2>&1
     grep -q "^ioengine=libaio$" "$d/src/000-wekatester-layout.job"'
 
 # --- deterministic filenames: unique_filename=0 + <host>. prefix ---
@@ -2116,7 +2125,7 @@ t_assert "stamping: staged variants and the generated layout carry it end to end
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >/dev/null || exit 1
+     stage_jobfiles) >>$WT_ASIDE || exit 1
     # the staging path keeps the ADDRESS; the data-file prefix is the NAME
     v="$d/target/localhost/011-smoke-readbw.job"
     r="$d/target/localhost/000-wekatester-layout.job"
@@ -2148,7 +2157,7 @@ t_assert "host_name: a local run fixes the name once in resolve_local_mode" bash
     source ./tests/helpers.sh; uname_fixture Linux
     (source ./wekatester
      hostname() { echo testbox; }
-     HOSTS=(); resolve_local_mode >/dev/null
+     HOSTS=(); resolve_local_mode >>$WT_ASIDE
      [ "$LOCAL_NAME" = testbox ] && [ "${HOSTS[*]}" = localhost ] && [ "$MASTER" = localhost ])'
 t_assert "probe: -e engine missing from a worker refuses early, naming it" bash -c '
     d=$(mktemp -d)
@@ -2160,7 +2169,7 @@ t_assert "probe: -e engine missing from a worker refuses early, naming it" bash 
                                           || echo "engines libaio psync";;
                 (*) echo stubbed;;
             esac; }
-            probe_workers) 2>&1 >/dev/null )
+            probe_workers) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"ioengine '\''io_uring'\'' is not available"*"h2"*) true;;
         *) echo "$err" >&2; false;;
@@ -2185,10 +2194,10 @@ t_assert "prompt_password_creds collects n pairs; empty password dies" bash -c '
     (printf "ubuntu\npw1\nroot\npw2\n" | (source ./wekatester
         PW_COUNT=2; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
         prompt_password_creds
-        [ "${PW_LOGINS[*]}" = "ubuntu root" ] && [ "${PW_SECRETS[*]}" = "pw1 pw2" ]) >/dev/null) &&
+        [ "${PW_LOGINS[*]}" = "ubuntu root" ] && [ "${PW_SECRETS[*]}" = "pw1 pw2" ]) >>$WT_ASIDE) &&
     err=$(printf "ubuntu\n\n" | (source ./wekatester
         PW_COUNT=1; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        prompt_password_creds) 2>&1 >/dev/null )
+        prompt_password_creds) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"empty password"*) true;;
         *) echo "$err" >&2; false;;
@@ -2229,7 +2238,7 @@ EOF
         IDENT_LOGINS=(ubuntu); IDENT_KEYS=("$k1"); PW_COUNT=1
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
         establish_connections
-        [ ${#REMAINING[@]} -eq 1 ] && [ "${REMAINING[0]}" = h5 ]) 2>&1 >/dev/null ) || \
+        [ ${#REMAINING[@]} -eq 1 ] && [ "${REMAINING[0]}" = h5 ]) 2>&1 >>$WT_ASIDE ) || \
         { echo "engine failed: $err" >&2; exit 1; }
     test -f "$d/auth/h4.external" &&
     [ "$(cat "$d/auth/h1.user")" = ubuntu ] &&
@@ -2461,7 +2470,7 @@ t_assert "capacity: swept bytes are credited against the requirement" bash -c '
     out=$( (source ./wekatester
         WORK_DIR=$FIX; HOSTS=(h1); IGNORE_CAPACITY=0
         WEKATESTER_PROMPT_TTY=/dev/null
-        auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 >/dev/null 2>&1
+        auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 >>$WT_ASIDE 2>&1
         run_host() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 209715200 0 209715200 1%% /mnt/weka\n"; }
         check_capacity) 2>&1 )
     case "$out" in
@@ -2486,7 +2495,7 @@ t_assert "probe: -a runs no weka CLI on the master, only df; per host only weka 
                 (*"weka "*) echo "WEKA_CALLED: $2" >&2; return 1;;
                 (*) echo stubbed;;
             esac; }
-            probe_workers) 2>&1 >/dev/null ) || { echo "probe died: $err" >&2; exit 1; }
+            probe_workers) 2>&1 >>$WT_ASIDE ) || { echo "probe died: $err" >&2; exit 1; }
     test ! -e "$d/probe/_weka_ram.json" && test ! -e "$d/probe/_weka_ram.err" &&
     [ -s "$d/wekacalls" ] && ! grep -v "^weka local " "$d/wekacalls" &&
     case "$err" in
@@ -2511,7 +2520,7 @@ t_assert "targets: a host line assigns login/engine/cpus/dir to its host only" b
 t_assert "targets: duplicate host lines are fatal, naming both line numbers" bash -c '
     f=$(mktemp)
     printf "h1,ubuntu,,,,,,\nh1,root,,,,,,\n" > "$f"
-    err=$( (rt phase1 "$f" - - - h1) 2>&1 >/dev/null ); rc=$?
+    err=$( (rt phase1 "$f" - - - h1) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
         *"duplicate definition for host '\''h1'\''"*"line 1"*) true;;
@@ -2535,7 +2544,7 @@ t_assert "targets: equal specificity warns naming both lines; first wins; run co
     f=$(mktemp)
     printf ",,,0-3,,,,\n,,,4-7,,,,\n" > "$f"
     out=$(rt phase1 "$f" - - - h1 2>&1)
-    err=$( (rt phase1 "$f" - - - h1) 2>&1 >/dev/null )
+    err=$( (rt phase1 "$f" - - - h1) 2>&1 >>$WT_ASIDE )
     echo "$out" | grep -q "^h1	-	-	0-3" &&
     case "$err" in
         *"WARNING"*"line 2"*"line 1"*) true;;
@@ -2614,7 +2623,7 @@ t_assert "targets file: explicit missing path prompts; no creates nothing and qu
     err=$(printf "n" | (source ./wekatester
         TARGETS=1; TARGETS_PATH=$d/no.csv
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        resolve_targets_file) 2>&1 >/dev/null )
+        resolve_targets_file) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"host file $d/no.csv does not exist"*) true;;
         *) echo "$err" >&2; exit 1;;
@@ -2626,14 +2635,14 @@ t_assert "targets file: yes creates the template and uses it" bash -c '
         TARGETS=1; TARGETS_PATH=$d/new.csv
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
         resolve_targets_file
-        [ "$TARGETS_FILE" = "$d/new.csv" ]) >/dev/null
+        [ "$TARGETS_FILE" = "$d/new.csv" ]) >>$WT_ASIDE
     head -1 "$d/new.csv" | grep -q "^host,user_login"'
 t_assert "targets file: under -r a missing path is created after the 5s default" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
         TARGETS=1; TARGETS_PATH=$d/r.csv; FAST_TRACK=1
         PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-        printf "\n" | resolve_targets_file) >/dev/null 2>&1
+        printf "\n" | resolve_targets_file) >>$WT_ASIDE 2>&1
     test -f "$d/r.csv"'
 t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist.csv" bash -c '
     d=$(mktemp -d); cd "$d"
@@ -2643,10 +2652,10 @@ t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist
     printf "host,user_login\nh1,root\n" > hostlist.csv
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=myset; resolve_targets_file
-     [ "$TARGETS_FILE" = "$d/fio-jobfiles/myset/hostlist.csv" ]) >/dev/null &&
+     [ "$TARGETS_FILE" = "$d/fio-jobfiles/myset/hostlist.csv" ]) >>$WT_ASIDE &&
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
-     [ "$TARGETS_FILE" = "./hostlist.csv" ]) >/dev/null'
+     [ "$TARGETS_FILE" = "./hostlist.csv" ]) >>$WT_ASIDE'
 t_assert "bare -t: an existing -C set folder's hostlist.csv beats ./hostlist.csv" bash -c '
     d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/mine
     printf "host,user_login\n" > hostlist.csv
@@ -2654,7 +2663,7 @@ t_assert "bare -t: an existing -C set folder's hostlist.csv beats ./hostlist.csv
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; CUSTOMIZE=1; CUSTOM_SET=mine; WORKLOAD=default
      resolve_targets_file
-     [ "$TARGETS_FILE" = "$d/fio-jobfiles/mine/hostlist.csv" ]) >/dev/null'
+     [ "$TARGETS_FILE" = "$d/fio-jobfiles/mine/hostlist.csv" ]) >>$WT_ASIDE'
 t_assert "bare -t with -C and no file anywhere defers creation to the set" bash -c '
     d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles
     out=$( (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
@@ -2691,7 +2700,7 @@ t_assert "customize: host file opens first; jobfiles only behind the prompt (def
      EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
      exec 9<<<"nnn"
      PROMPT_IN_FD=9; PROMPT_OUT_FD=2
-     customize_jobfiles) >/dev/null 2>&1
+     customize_jobfiles) >>$WT_ASIDE 2>&1
     head -1 "$ED/order" | grep -q "hostlist.csv" &&
     [ "$(wc -l < "$ED/order")" -eq 1 ]'
 t_assert "customize: answering yes to the prompt edits the jobfiles after the host file" bash -c '
@@ -2701,7 +2710,7 @@ t_assert "customize: answering yes to the prompt edits the jobfiles after the ho
      EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
      exec 9<<<"ynn"
      PROMPT_IN_FD=9; PROMPT_OUT_FD=2
-     customize_jobfiles) >/dev/null 2>&1
+     customize_jobfiles) >>$WT_ASIDE 2>&1
     head -1 "$ED/order" | grep -q "hostlist.csv" &&
     [ "$(wc -l < "$ED/order")" -gt 1 ] &&
     sed -n 2p "$ED/order" | grep -q "011-"
@@ -2713,7 +2722,7 @@ t_assert "auth rounds: the host file pins a host's login when the credential has
      printf "h1\tubuntu\t-\t-\t-\n" > "$d/targets.phase1"
      attempt_host() { echo "$2:$3" >> "$d/log"; return 0; }
      REMAINING=(h1 h2)
-     auth_round "default ssh auth" default "" "" >/dev/null
+     auth_round "default ssh auth" default "" "" >>$WT_ASIDE
      grep -qx "h1:ubuntu" "$d/log" && grep -qx "h2:" "$d/log" &&
      [ "$(cat "$AUTH_DIR/h1.user")" = ubuntu ] && test ! -f "$AUTH_DIR/h2.user")'
 
@@ -2738,7 +2747,7 @@ t_assert "engines: a HANGING test job is killed by the timeout and recorded as f
      DIRECTORY=$d/dest; FIO_BIN=$stub/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
      printf ",,hangeng,,,,,\n" > "$d/t.csv"
      printf "engines hangeng libaio\n" > "$d/probe/localhost"
-     WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) >/dev/null 2>&1
+     WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) >>$WT_ASIDE 2>&1
     took=$(( $(date +%s) - start ))
     grep -qx "localhost hangeng fail" "$d/engine.results" &&
     [ "$took" -lt 60 ]'
@@ -2754,7 +2763,7 @@ t_assert "engines: test_engines returns while unrelated background children live
         DIRECTORY=$d/dest; FIO_BIN=$stub/fio
         printf \"engines libaio\\n\" > \"$d/probe/localhost\"
         sleep 300 & DECOY=\$!
-        test_engines >/dev/null 2>&1
+        test_engines >>$WT_ASIDE 2>&1
         echo TE_RETURNED
         # reap the decoy: an orphaned sleep holds the suite stderr/stdout
         # fds, and a PIPED suite run then waits ~5 minutes for EOF after
@@ -2775,7 +2784,7 @@ t_assert "engines: a pinned -e engine failing its job is fatal, naming the evide
         printf "engines io_uring\n" > "$d/probe/h1"
         printf "engines io_uring\n" > "$d/probe/h2"
         run_host() { case "$1" in (h2) return 1;; (*) return 0;; esac; }
-        test_engines) 2>&1 >/dev/null )
+        test_engines) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"ioengine '\''io_uring'\'' failed its test job on h2"*) true;;
         *) echo "$err" >&2; false;;
@@ -2787,7 +2796,7 @@ t_assert "engines: under -a a host where no engine passes stops the run, quoting
         printf "engines io_uring libaio psync\n" > "$d/probe/h1"
         printf "engines io_uring libaio psync\n" > "$d/probe/h2"
         run_host() { case "$1" in (h2) echo "fio: io_u error: Invalid argument"; return 1;; (*) return 0;; esac; }
-        test_engines) 2>&1 >/dev/null ); rc=$?
+        test_engines) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected a nonzero exit" >&2; exit 1; }
     case "$err" in
         *"h2: ioengine libaio: fio: io_u error: Invalid argument"*"no ioengine passed its test job on h2 (tried: io_uring libaio psync)"*) true;;
@@ -2800,7 +2809,7 @@ t_assert "finalize: a host-line engine that failed its test dies naming host+evi
     printf "h1 weird_eng fail\n" > "$d/engine.results"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); TARGETS=1; TARGETS_FILE=$f
-        finalize_targets) 2>&1 >/dev/null )
+        finalize_targets) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"assigns ioengine '\''weird_eng'\'' to h1 but its test job failed"*) true;;
         *) echo "$err" >&2; false;;
@@ -2811,7 +2820,7 @@ t_assert "pinning: cpus outside the taskset with no escalator dies showing all t
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; mkdir -p "$d/auth"
         printf "taskset 0-3\nweka_allowed 8\nweka_allowed 9\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null )
+        check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"effective cpus_allowed: 4-7 (requested: 4-7)"*"current taskset:        0-3"*"weka dedicated cores:   8,9"*"outside the current taskset"*) true;;
         *) echo "$err" >&2; false;;
@@ -2868,7 +2877,7 @@ bindable_priv 4,5,6,7
 " > "$d/probe/h1"
         printf "h1	-	-	0-7	-
 " > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null ); rc=$?
+        check_cpu_pinning) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in
         *"effective cpus_allowed: 1-7"*"current taskset:        0-3"*"outside the current taskset and no passwordless escalator"*) true;;
@@ -2886,7 +2895,7 @@ bindable_priv -
 " > "$d/probe/h1"
         printf "h1	-	-	4,5	-
 " > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null ); rc=$?
+        check_cpu_pinning) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in
         *"no requested cpu (4,5) is usable"*"or one it refuses to bind (4-5)"*) true;;
@@ -2911,7 +2920,7 @@ t_assert "pinning: full weka overlap dies; partial runs on the remainder, file u
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
         printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null )
+        check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in (*"every requested cpu (8,10) is a weka dedicated core"*) true;; (*) echo "$err" >&2; exit 1;; esac
     out2=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
@@ -2950,7 +2959,7 @@ t_assert "pinning: a list with no real cpu at all still dies" bash -c '
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
         printf "ncpus 64\ntaskset 0-63\n" > "$d/probe/h1"
         printf "h1\t-\t-\t100-128\t-\n" > "$d/targets.final"
-        check_cpu_pinning) 2>&1 >/dev/null )
+        check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"no requested cpu (100-128) is usable"*"(100-128; the host has 64 cpus: 0-63)"*) true;;
         *) echo "$err" >&2; exit 1;;
@@ -3015,7 +3024,7 @@ t_assert "server launch: priv pins via taskset but fio drops to the login user" 
      WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2 h3); FIO_BIN=fio
      WEKATESTER_SETTLE=0
      run_host() { echo "LAUNCH[$1]: $2"; }
-     start_fio_servers) >/dev/null 2>&1
+     start_fio_servers) >>$WT_ASIDE 2>&1
     grep -q "sudo -n runuser -u .* -- true" "$d/launch.h1" &&
     grep -q "sudo -n taskset -c 4-7 runuser -u .* -- '\''fio'\'' --server" "$d/launch.h1" &&
     grep -q "WEKATESTER_FIO_AS=root; sudo -n taskset -c 4-7 '\''fio'\'' --server" "$d/launch.h1" &&
@@ -3028,7 +3037,7 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
     (source ./wekatester
      WORK_DIR=$d; DIRECTORY=/mnt/global; HOSTS=(h1 h2); mkdir -p "$d/jobs" "$d/set"
      printf "# report iops\n[global]\nfilename_format=x/\$jobnum\ndirectory=/orig\nfilesize=10G\nnumjobs=32\nioengine=libaio\n[j]\nrw=randread\niodepth=8\n" > "$d/set/031-i.job"
-     (source ./wekatester; generate_layout "$d/set" "$d/set") >/dev/null
+     (source ./wekatester; generate_layout "$d/set" "$d/set") >>$WT_ASIDE
      { printf "h1\t-\tpsync\t-\t/mnt/one"
        for i in $(seq 6 37); do
           case $i in (22) printf "\t4";; (23) printf "\t1G";; (24) printf "\t2";;
@@ -3049,7 +3058,7 @@ t_assert "tuner: host-file dir/cpus/geometry/engine land per host; a host withou
     { printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9"
       for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     v1="$FIX/jobs/h1/011-bw.job"; v2="$FIX/jobs/h2/011-bw.job"
     grep -q "^directory=/mnt/pin$" "$v1" && grep -q "^directory=/mnt/weka$" "$v2" &&
     # the host file keeps the operator spelling "2,4"; the STAGED job declares
@@ -3068,7 +3077,7 @@ t_assert "tuner: staged cpus_allowed drops cpus the host does not have" bash -c 
     { printf "h1\t-\t-\t2,4,9-12\t-"
       for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "host_dir: targets dir when resolved, global -d otherwise" bash -c '
     d=$(mktemp -d)
@@ -3095,24 +3104,24 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
     printf "host,user_login,ioengine\nh1,,psync,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
     tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,$" &&
-    (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >/dev/null)'
+    (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >>$WT_ASIDE)'
 t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
     printf "h1,ubuntu,libaio,0-3,/mnt/w,,,,,4/1G/8/32,\n" > "$f"
     before=$(cat "$f")
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(cat "$f")" = "$before" ]'
 t_assert "writeback: -g overwrites without a prompt, but never login or allowed_cpus" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
     printf "h1,opc,psync,9-11,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$"'
 # The layout job sorts first, so before it carried the marker its engine,
 # cpu list and directory won the record. It records nothing now; the cpu
@@ -3126,7 +3135,7 @@ t_assert "writeback: the layout records nothing; the cpu list is the tuner's usa
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
      host_machine_id() { :; }   # no ssh to a fixture host
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-5,/mnt/w," || { tail -1 "$f" >&2; false; }'
 
 # A generic (host-less) row is a default, never the host's own setting. The
@@ -3139,7 +3148,7 @@ t_assert "writeback: a generic cpu list stays as written; the host line records 
     printf "host,user_login,ioengine,allowed_cpus\n,,,0-127,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 2p "$f")" = ",,,0-127,,,,,,," ] &&
     ! grep -q "superseded" "$f" &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
@@ -3149,7 +3158,7 @@ t_assert "writeback: generic engine and dir are defaults too; the host line reco
     printf ",,psync,0-127,/mnt/g,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",,psync,0-127,/mnt/g,,,,,," ] &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
         { cat "$f" >&2; false; }'
@@ -3158,7 +3167,7 @@ t_assert "writeback: a host row beside a generic one keeps its own cpu list; the
     printf ",,,0-127,,,,,,,\nh1,opc,,9-11,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",,,0-127,,,,,,," ] &&
     grep -q "^# superseded by -a: h1,opc,,9-11" "$f" &&
     tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$" ||
@@ -3168,7 +3177,7 @@ t_assert "writeback: a cpu list that differs from the generic one is reason enou
     printf ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32," ] &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
         { cat "$f" >&2; false; }'
@@ -3183,11 +3192,11 @@ t_assert "resolve_targets: hostonly sees the host row and nothing generic; phase
      [ "$(col "$p1" h1)" = "0-127 /mnt/g" ] && [ "$(col "$p1" h2)" = "4-15 /mnt/g" ])'
 t_assert "writeback: -C set owns the target when -t was not given" bash -c '
     d=$(wb_fixture); mkdir "$d/set"
-    (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >/dev/null
+    (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >>$WT_ASIDE
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=""; SET_DIR_OVERRIDE=$d/set
      FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
 # A mixed-direction file stages ONE direction's tuple, but both directions
 # were measured; the writeback must record each measured tuple into its own
@@ -3203,7 +3212,7 @@ t_assert "writeback: measured tuples land per direction, numjobs and all; a mixe
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
      host_machine_id() { :; }   # no ssh to a fixture host
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,4/1024M/2/32,2/1024M/2/4,,,,$" ||
         { tail -1 "$f" >&2; false; }'
 t_assert "writeback: with --line-rate a measured bandwidth tuple replaces the host row, even in fill mode; nothing else does" bash -c '
@@ -3218,7 +3227,7 @@ t_assert "writeback: with --line-rate a measured bandwidth tuple replaces the ho
             (source ./wekatester
              WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1; LINE_RATE_GBPS=$1
              host_machine_id() { :; }   # no ssh to a fixture host
-             writeback_targets) >/dev/null; }
+             writeback_targets) >>$WT_ASIDE; }
     run 16 && [ "$(tail -1 "$f")" = "h1,ubuntu,libaio,0-3,/mnt/w,2/5120M/1/1,,,,3/5120M/1/64," ] ||
         { tail -1 "$f" >&2; exit 1; }
     run "" && [ "$(cat "$f")" = "h1,ubuntu,libaio,0-3,/mnt/w,9/5120M/1/1,,,,3/5120M/1/64," ] ||
@@ -3240,7 +3249,7 @@ t_assert "cal.results: one width, both parsers accept what the shared layer defi
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null ||
+     writeback_targets) >>$WT_ASIDE ||
         { echo "writeback rejected: $row" >&2; false; }
     tail -1 "$f" | grep -q "^h1,"'
 
@@ -3248,7 +3257,7 @@ t_assert "tuner: an unbindable cpu never reaches a staged cpus_allowed" bash -c 
     source ./tests/helpers.sh; tuner_fixture
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h1"
     printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h2"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     # weka owns 5-7 and the OS 0-1, so 2-4 was usable; 3 refuses the bind
     grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job" ||
         { grep "^cpus_allowed=" "$FIX/jobs/h1/011-bw.job" >&2; false; }'
@@ -3259,7 +3268,7 @@ t_assert "tuner: a host-file cpu list is narrowed by the measurement too" bash -
     { printf "h1\t-\t-\t2-5\t-"
       for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     # asked for 2-5: 5 is weka'"'"'s, 3 refuses the bind, 2 and 4 are left
     grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job" ||
         { grep "^cpus_allowed=" "$FIX/jobs/h1/011-bw.job" >&2; false; }'
@@ -3270,7 +3279,7 @@ t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" b
     printf "isolated 4-7\n" >> "$FIX/probe/h1"
     printf "isolated 4-7\n" >> "$FIX/probe/h2"
     out=$( (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     grep -q "^cpus_allowed=2-4$" "$FIX/jobs/h1/011-bw.job" &&
     case "$out" in *"span isolated and housekeeping"*) true;; *) echo "$out" >&2; false;; esac'
 # The pin detection is now the ONLY thing keeping fio off weka's cores, so a
@@ -3280,7 +3289,7 @@ t_assert "tuner: weka running with no pinned cores found warns loudly" bash -c '
     printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
     printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     out=$( (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$out" in
         *"wekanode process(es) running but no pinned cores detected"*) true;;
         *) echo "$out" >&2; false;;
@@ -3290,7 +3299,7 @@ t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
     printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
     printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     out=$( (source ./wekatester
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >/dev/null )
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$out" in
         *"no pinned cores detected"*) echo "$out" >&2; false;;
         *) grep -q "^cpus_allowed=2-7$" "$FIX/jobs/h1/011-bw.job";;
@@ -3318,7 +3327,7 @@ t_assert "schema: one spelling of the fields, the slot columns and the direction
     a=$(awkrun "BEGIN { n = split(geom_slots(), S, \" \"); print 4 + 4 * n, field_col(\"bw_r_nj\"), field_col(\"iops_w_nj\"), field_col(\"lat1m_w_qd\"), n, 2 + 4 * n }") &&
     [ "$a" = "36 6 26 37 8 34" ] &&
     [ "$GEOM_SLOTS" = "bw_r bw_w lat_r lat_w iops_r iops_w lat1m_r lat1m_w" ] &&
-    d=$(mktemp -d) && write_targets_template "$d/t.csv" >/dev/null &&
+    d=$(mktemp -d) && write_targets_template "$d/t.csv" >>$WT_ASIDE &&
     head -1 "$d/t.csv" | grep -q "^host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd$" &&
     b=$(awkrun "BEGIN { L[1] = \"[x]\"; L[2] = \"rw=randrw:8\"; file_directions(L, 2, D); print ((\"read\" in D) ? \"read\" : \"-\"), ((\"write\" in D) ? \"write\" : \"-\") }") &&
     [ "$b" = "read write" ]'
@@ -3469,7 +3478,7 @@ t_assert "run_weka_master: weka missing for the user (exit 127) still gets the e
          ("sudo -n weka status") echo escalated;;
          ("weka status") return 127;;
      esac; }
-     run_weka_master "weka status" "$d/out") >/dev/null 2>&1
+     run_weka_master "weka status" "$d/out") >>$WT_ASIDE 2>&1
     grep -q escalated "$d/out"'
 t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash -c '
     d=$(mktemp -d)
@@ -3488,13 +3497,13 @@ t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash
 # In the field `-f -g` quietly made "-g" the fio binary; preflight then hunted
 # a binary named -g on every host with a bewildering message.
 t_assert "parse: an option value that looks like another option is refused" bash -c '
-    err=$( (source ./wekatester; parse_args -f -g h1) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args -f -g h1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"option -f requires an argument, got '\''-g'\'' (looks like another option)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
 t_assert "parse: a trailing valueless option still dies asking for an argument" bash -c '
-    err=$( (source ./wekatester; parse_args h1 -w) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; parse_args h1 -w) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"option -w requires an argument"*) true;;
         *) echo "$err" >&2; false;;
@@ -3507,7 +3516,7 @@ t_assert "mount guard: unwritable -d dies with the chmod hint before anything ru
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
             run_host() { case "$2" in (findmnt*) echo "wekafs rw,forcedirect";; (*) return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"localhost: cannot create files in /mnt/weka"*"chmod 1777"*"/mnt/weka is not writable on every host"*) true;;
         *) echo "$err" >&2; false;;
@@ -3516,7 +3525,7 @@ t_assert "mount guard: a mode failure skips the probe and keeps the remount advi
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
             run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (*) echo probed >&2; return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in *probed*) echo "probe ran after a mode failure: $err" >&2; false;; *) true;; esac &&
     case "$err" in
         *"must be mounted with forcedirect; remount"*) true;;
@@ -3526,7 +3535,7 @@ t_assert "mount guard: a -d on a local filesystem is refused before anything is 
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
             run_host() { case "$2" in (findmnt*) echo "xfs rw,noatime";; (p=*) echo PROBED >&2;; (*) return 0;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ) && { echo "a local -d passed: $err" >&2; exit 1; }
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ) && { echo "a local -d passed: $err" >&2; exit 1; }
     case "$err" in *PROBED*) echo "probed a local disk: $err" >&2; exit 1;; esac
     case "$err" in
         *"localhost: /mnt/weka is on xfs, not a network filesystem -- wekatester never writes to a local disk"*"writes only to weka or another network filesystem -- nothing was written"*) ;;
@@ -3585,7 +3594,7 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka; FAST_TRACK=1
             run_host() { case "$2" in (findmnt*) echo "wekafs rw,readcache";; (*) return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *"must be mounted with forcedirect"*) echo "remount advice under -r: $err" >&2; false;; *) true;; esac &&
     case "$err" in
@@ -3651,7 +3660,7 @@ t_assert "mount guard: missing -d without -r needs a terminal and creates nothin
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
                 (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)         return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *MKDIR*) echo "created without a terminal: $err" >&2; false;; *) true;; esac &&
     case "$err" in
@@ -3675,9 +3684,9 @@ t_assert "mount guard: the create prompt -- y creates, n quits without touching 
 t_assert "prompts: an untimed question whose yes changes something takes a y -- Enter, space or any other key say no" bash -c '
     source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
     for k in "" " " n x; do
-        if printf "%s\n" "$k" | confirm_explicit "go ahead?" > /dev/null; then echo "key [$k] said yes" >&2; exit 1; fi
+        if printf "%s\n" "$k" | confirm_explicit "go ahead?" >>$WT_ASIDE; then echo "key [$k] said yes" >&2; exit 1; fi
     done
-    printf "y" | confirm_explicit "go ahead?" > /dev/null && printf "Y" | confirm_explicit "go ahead?" > /dev/null || exit 1
+    printf "y" | confirm_explicit "go ahead?" >>$WT_ASIDE && printf "Y" | confirm_explicit "go ahead?" >>$WT_ASIDE || exit 1
     # the create prompt for a missing -d: Enter no longer creates it
     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
     run_host() { case "$2" in
@@ -3695,7 +3704,7 @@ t_assert "mount guard: missing -d whose parent is not wekafs is never created, e
                  ("[ ! -e"*) printf "/mnt\n%s rw,relatime\n" "$PARENT";;
                  (*"mkdir -p --"*) echo MKDIR >&2;;
                  (*)         return 1;; esac; }
-             verify_mount_mode) 2>&1 >/dev/null; }
+             verify_mount_mode) 2>&1 >>$WT_ASIDE; }
     err=$(try xfs) && { echo "passed under a local parent: $err" >&2; exit 1; }
     case "$err" in *MKDIR*) echo "created under a local parent: $err" >&2; exit 1;; esac
     case "$err" in
@@ -3716,7 +3725,7 @@ t_assert "mount guard: missing -d under a cached-mode parent stops without -r an
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
                 (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)         return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *MKDIR*) echo "created on a mode failure: $err" >&2; false;; *) true;; esac &&
     case "$err" in
@@ -3773,7 +3782,7 @@ t_assert "mount guard: a parent that stops being wekafs before the create leaves
                 (*"mkdir -p --"*) return 4;;
                 (p=*)       echo PROBED >&2;;
                 (*)         return 1;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ) && { echo "passed: $err" >&2; exit 1; }
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ) && { echo "passed: $err" >&2; exit 1; }
     case "$err" in *PROBED*) echo "probed: $err" >&2; exit 1;; esac
     case "$err" in
         *"localhost: /mnt/weka/wt was not created -- the nearest directory above it is no longer on a wekafs mount"*"nothing was created on a local disk"*) true;;
@@ -3788,7 +3797,7 @@ t_assert "mount guard: a failed mkdir dies with the chmod hint naming the parent
                 ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
                 (*"mkdir -p --"*) return 1;;
                 (*)         echo PROBED >&2;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null ); rc=$?
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *PROBED*) echo "probed a directory that was not created: $err" >&2; false;; *) true;; esac &&
     case "$err" in
@@ -3819,7 +3828,7 @@ t_assert "check_fio_errors: a nonzero per-job error field fails the run, naming 
     { "jobname": "layout-1", "hostname": "vega-1", "error": 13,
       "read": { "total_ios": 0 }, "write": { "total_ios": 0 } } ] }
 JSON
-    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
@@ -3835,7 +3844,7 @@ t_assert "check_fio_errors: a measured job that moved zero bytes and ios fails" 
     { "jobname": "bw", "hostname": "vega-1",
       "read": { "total_ios": 0, "bw_bytes": 0 }, "write": { "total_ios": 0, "bw_bytes": 0 } } ] }
 JSON
-    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" measured) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" measured) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
@@ -3857,7 +3866,7 @@ t_assert "check_fio_errors: a healthy multi-host results file passes measured mo
 t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pass" bash -c '
     tmp=$(mktemp -d)
     printf "{ \"client_stats\": [] }\n" > "$tmp/r.json"
-    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >/dev/null )
+    err=$( (source ./wekatester; check_fio_errors "$tmp/r.json" layout) 2>&1 >>$WT_ASIDE )
     rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
@@ -3908,7 +3917,7 @@ t_assert "stage_cal_cell: unified reads open the shared dataset, writes the host
     grep -qx "filename_format=h1.\$filenum/\$jobnum" "$d/w.job"'
 t_assert "stage_cal_cell: a bad type, direction, engine or number dies" bash -c '
     d=$(mktemp -d)
-    f() { (source ./wekatester; stage_cal_cell "$d/x.job" /mnt/weka h1 "" "$@") >/dev/null 2>&1; }
+    f() { (source ./wekatester; stage_cal_cell "$d/x.job" /mnt/weka h1 "" "$@") >>$WT_ASIDE 2>&1; }
     ! f bogus read io_uring 1 1 2 30 && ! f bw sideways io_uring 1 1 2 30 &&
     ! f bw read io_uring 0 1 2 30 && ! f bw read io_uring 1 qd8 2 30 &&
     ! f bw read "" 1 1 2 30 && f bw read io_uring 1 1 2 30'
@@ -3970,7 +3979,7 @@ t_assert "cal_plan iops: N/2 and N at qd1, then 2N and 4N walk the queue ladder,
         { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan iops: no queue or file ladder at or below N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
-    plan_sim "$d" iops write io_uring 16 0 0 >/dev/null
+    plan_sim "$d" iops write io_uring 16 0 0 >>$WT_ASIDE
     ! awk "\$2 <= 16 && (\$3 != 1 || \$4 != 1)" "$d/asked" | grep -q . ||
         { awk "\$2 <= 16" "$d/asked" >&2; false; }'
 t_assert "cal_plan iops: a file count that wins is recorded" bash -c '
@@ -4012,7 +4021,7 @@ t_assert "cal_plan lat1m: the same nrfiles ladder at 1MiB" bash -c '
 # Hand-built histories pin the decisions that a smooth model never exercises.
 t_assert "cal_plan: a confirm reading never reopens a step that is already decided" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
-    plan_sim "$d" iops read io_uring 16 0 0 >/dev/null
+    plan_sim "$d" iops read io_uring 16 0 0 >>$WT_ASIDE
     # a late, much higher confirm reading for a ladder cell changes the pick,
     # but the planner must not go back and measure more ladder or file cells
     printf "confirm io_uring 32 4 1 30 2000000\n" >> "$d/hist"
@@ -4207,12 +4216,12 @@ t_assert "tuner: a job count at or below N runs one job per physical core; above
     topo_fixture "$FIX/probe/h1" 16 adjacent 12 14; cp "$FIX/probe/h1" "$FIX/probe/h2"
     row() { printf "h1\t-\t-\t-\t-\t%s\t-\t-\t-" "$1"; for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; }
     row 4 > "$FIX/targets.final"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     grep -qx "cpus_allowed=4,6,8,10" "$FIX/jobs/h1/011-bw.job" || { grep cpus_allowed "$FIX/jobs/h1/011-bw.job" >&2; exit 1; }
     # h2 has no host-file row: it keeps the jobfile 4 jobs, N here, one per physical core
     grep -qx "numjobs=4" "$FIX/jobs/h2/011-bw.job" && grep -qx "cpus_allowed=4,6,8,10" "$FIX/jobs/h2/011-bw.job" &&
     row 8 > "$FIX/targets.final" &&
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1 &&
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1 &&
     grep -qx "cpus_allowed=4-11" "$FIX/jobs/h1/011-bw.job"'
 
 t_assert "tuner: a narrower host-file cpu list rescues a client the default rule leaves no cpus; one covering them all does not" bash -c '
@@ -4272,12 +4281,12 @@ t_assert "tuner: a one-job latency twin runs numjobs=iodepth=nrfiles=1 with its 
     source ./tests/helpers.sh; tuner_fixture
     rm -f "$FIX/src/011-bw.job"
     printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
-    (source ./wekatester; stage_floor_twins "$FIX/src") >/dev/null
+    (source ./wekatester; stage_floor_twins "$FIX/src") >>$WT_ASIDE
     # the calibrated lat_r tuple: 3 jobs, 4 files of 1280M, qd 1 (cols 14-17)
     { printf "h1"; for i in $(seq 2 37); do
           case $i in (14) printf "\t3";; (15) printf "\t1280M";; (16) printf "\t4";; (17) printf "\t1";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$FIX/targets.final"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     v="$FIX/jobs/h1/021-lat.job"; f="$FIX/jobs/h1/021-lat-1job.job"
     grep -qx "numjobs=3" "$v" && grep -qx "filesize=1280M" "$v" && grep -qx "nrfiles=4" "$v" &&
     grep -qx "numjobs=1" "$f" && grep -qx "iodepth=1" "$f" && grep -qx "nrfiles=1" "$f" &&
@@ -4312,7 +4321,7 @@ t_assert "writeback: a measured 1MiB latency tuple lands in its own column" bash
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -qx "h1,,,,,,,,,,,6/5120M/1/1" || { tail -1 "$f" >&2; false; }'
 t_assert "calibrate: under -b a latency set also measures the 1MiB test, into its own slot" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -4417,7 +4426,7 @@ t_assert "cal_plan: libaio stops a queue ladder at the kernel's aio room, and sa
     case "$out" in *"the queue ladder stopped short of numjobs=188 iodepth=512: libaio would set up 96256 aio events and the kernel has room for 65536 (raise fs.aio-max-nr and re-measure with -g to search deeper)"*) true;;
         *) echo "$out" >&2; exit 1;; esac
     # io_uring owes the aio limit nothing
-    plan_sim "$d" iops write io_uring 47 0 0 exh=1 aio=65536 iopsqd=256,512 >/dev/null &&
+    plan_sim "$d" iops write io_uring 47 0 0 exh=1 aio=65536 iopsqd=256,512 >>$WT_ASIDE &&
     grep -q "^iodepth 188 512 1$" "$d/asked"'
 t_assert "cal_plan bw: a guard that refuses 2N outright is not reported as 2N losing" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -4506,13 +4515,13 @@ t_assert "tuner: a one-job latency twin prints no numjobs note of its own" bash 
     source ./tests/helpers.sh; tuner_fixture
     rm -f "$FIX/src/011-bw.job"
     printf "# report latency\n[global]\nfilesize=10G\nnumjobs=1\nioengine=libaio\n[lat]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
-    (source ./wekatester; stage_floor_twins "$FIX/src") >/dev/null
+    (source ./wekatester; stage_floor_twins "$FIX/src") >>$WT_ASIDE
     # lat_r (cols 14-17): 6 jobs past the 3 usable threads -- the original
     # gets the note once, its one-job twin none
     { printf "h1"; for i in $(seq 2 37); do
           case $i in (14) printf "\t6";; (15) printf "\t1280M";; (16) printf "\t4";; (17) printf "\t1";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$FIX/targets.final"
-    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) 2>&1 >/dev/null ) || { echo "$err" >&2; exit 1; }
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) 2>&1 >>$WT_ASIDE ) || { echo "$err" >&2; exit 1; }
     [ "$(printf "%s\n" "$err" | grep -c "lat_r_nj=6 runs up to 2 jobs per cpu")" = 1 ] || { echo "$err" >&2; false; }'
 
 # --- engine choice: one per shape, from the type winners ---
@@ -4552,20 +4561,20 @@ t_assert "cal_shapes: a rep's host-file values pin its shape's searches, a parti
           case $i in (6) printf "\t4";; (7) printf "\t5120M";; (8) printf "\t2";; (9) printf "\t1";; (25) printf "\t32";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; AUTH_DIR=""
-     cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") >/dev/null 2>&1
+     cal_shapes "$d/shapes" "$(printf "bw read\niops read\n")") >>$WT_ASIDE 2>&1
     [ "$(cut -f11 "$d/shapes")" = "bw_r=1/2/5120M/4 iops_r=32/-/-/-" ] || { cut -f11 "$d/shapes" >&2; exit 1; }
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=1; AUTH_DIR=""
-     cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
+     cal_shapes "$d/shapes" "bw read") >>$WT_ASIDE 2>&1
     [ "$(cut -f11 "$d/shapes")" = "-" ]'
 t_assert "cal_shapes: an engine pinned by -e or the host file splits nothing but is carried" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "h1\t-\tlibaio\t-\t-\nh2\t-\t-\t-\t-\n" > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); REGEN_LAYOUT=0; AUTH_DIR=""
-     cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
+     cal_shapes "$d/shapes" "bw read") >>$WT_ASIDE 2>&1
     [ "$(cut -f2,8 "$d/shapes" | tr "\t" "|" | tr "\n" " ")" = "h1|libaio h2|- " ] || { cat "$d/shapes" >&2; exit 1; }
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); REGEN_LAYOUT=0; AUTH_DIR=""; ENGINE=psync
-     cal_shapes "$d/shapes" "bw read") >/dev/null 2>&1
+     cal_shapes "$d/shapes" "bw read") >>$WT_ASIDE 2>&1
     [ "$(cut -f8 "$d/shapes")" = "psync" ]'
 t_assert "cal_shapes: no weka CLI, no root, or UDP mode means no line rate, and a warning says why" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -4574,7 +4583,7 @@ t_assert "cal_shapes: no weka CLI, no root, or UDP mode means no line rate, and 
     sed -i.b "/^weka_net /d" "$d/probe/h2"; echo "weka_net_err client needs root, and no passwordless escalator works here" >> "$d/probe/h2"
     sed -i.b "s/^weka_net client .*/weka_net client []/" "$d/probe/h3"
     err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3); REGEN_LAYOUT=0; AUTH_DIR=""
-            cal_shapes "$d/shapes" "bw read") 2>&1 >/dev/null )
+            cal_shapes "$d/shapes" "bw read") 2>&1 >>$WT_ASIDE )
     [ "$(cut -f6 "$d/shapes" | tr "\n" " ")" = "0 0 0 " ] &&
     case "$err" in
         *"shape 1 (h1): no weka CLI on the host -- the bandwidth search has no line-rate target"*"shape 2 (h2): weka local resources could not be read (client: needs root"*"shape 3 (h3): weka uses no dedicated NIC here (UDP mode)"*) true;;
@@ -4622,7 +4631,7 @@ t_assert "probe: no weka CLI says so; no root and no escalator is a named error,
     chmod +x "$b"/*
     cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
     out=$(PATH="$b:$PATH" bash -c "$cmd" 2>&1)
-    if command -v weka >/dev/null; then echo "a weka CLI on this box: skipping the absent case" >&2
+    if command -v weka >>$WT_ASIDE; then echo "a weka CLI on this box: skipping the absent case" >&2
     else printf "%s\n" "$out" | grep -qx "weka_cli absent" || { printf "%s\n" "$out" >&2; exit 1; }; fi
     printf "#!/bin/sh\necho 1000\n" > "$b/id"
     cat > "$b/weka" <<"WEKA"
@@ -4753,7 +4762,7 @@ t_assert "calibrate: a 4k-random write search forces the dense write seed" bash 
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
-     calibrate) >/dev/null 2>&1
+     calibrate) >>$WT_ASIDE 2>&1
     # a section per job and size: 5G for file 0, 2.5G for file 1, 1.25G for files 2-3
     f=$d/cal/h1/cal-seed-write.job
     grep -A2 -x "filename=h1.0/0" "$f" | grep -qx "filesize=5120M" &&
@@ -4772,7 +4781,7 @@ t_assert "calibrate: every write cell settles, read cells never do" bash -c '
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; echo "RUN $2" >> "$d/order"; }
      sleep() { echo "SLEEP $1" >> "$d/order"; }
-     calibrate) >/dev/null 2>&1
+     calibrate) >>$WT_ASIDE 2>&1
     # after every lat-write cell a settle; never after a lat-read cell
     awk "prev ~ /^RUN.*cal-lat-write-/ { if (\$0 == \"SLEEP 7\") ok++; else bad++ } prev ~ /^RUN.*cal-lat-read-/ { if (\$0 ~ /^SLEEP/) bad++ } { prev = \$0 } END { exit !(ok > 0 && !bad) }" "$d/order" ||
         { cat "$d/order" >&2; false; }'
@@ -4787,7 +4796,7 @@ t_assert "calibrate: a cell failure files its evidence and dies pointing at the 
             copy_to_master() { :; }
             run_host() { case "$2" in (*cal-bw-*) echo "fio: client: h1 connection failed"; return 1;; esac; cal_sim_host "$@"; }
             cal_evidence() { echo "EVIDENCE[$1|$3|$4|$5]" >&2; }
-            calibrate) 2>&1 >/dev/null ); rc=$?
+            calibrate) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] &&
     case "$err" in
         *"EVIDENCE[cell bw-read libaio numjobs=1 iodepth=1 nrfiles=1|cal-bw-read-libaio-nj1-qd1-nr1-30s.job|say|h1]"*"calibration cell bw-read libaio numjobs=1 iodepth=1 nrfiles=1 failed on h1 ("*"in the run bundle under cal/)"*) true;;
@@ -4874,7 +4883,7 @@ t_assert "calibrate: a local-mode rep names its data files for the box, not loca
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
-     calibrate) >/dev/null 2>&1
+     calibrate) >>$WT_ASIDE 2>&1
     f=$(ls "$d/cal/localhost/"cal-bw-write-*.job | head -1) &&
     grep -qx "filename_format=testbox.cal.\$jobnum.\$filenum" "$f" &&
     ! grep -q "localhost\." "$f" "$d/cal/localhost/cal-seed-write.job"'
@@ -4915,7 +4924,7 @@ t_assert "cal_seed_rep: sufficiency is the only test -- a complete file is never
      run_host() { case "$2" in (*WEKATESTER_DF*)
          printf "h1.cal.0.0 5368709120\nh1.cal.0.1 99\nh1.cal.1.0 6000000000\nWEKATESTER_DF\nwekafs 1 99999999\n"; return 0;; esac
          cal_sim_host "$@"; }
-     cal_seed_rep h1 2 2 0 0 1 libaio "") >/dev/null 2>&1
+     cal_seed_rep h1 2 2 0 0 1 libaio "") >>$WT_ASIDE 2>&1
     f=$d/cal/h1/cal-seed-read.job
     [ "$(grep "^filename=" "$f" | tr "\n" " ")" = "filename=h1.cal.0.1 filename=h1.cal.1.1 " ] &&
     grep -q "^\[seed-1-2560M-0\]$" "$f" || { cat "$f" >&2; false; }'
@@ -4951,7 +4960,7 @@ t_assert "fs groups: one directory under two mount paths is one group; a sibling
      run_host() { bash -c "$2"; }
      for h in "${HOSTS[@]}"; do probe_writable "$h" "$(host_dir "$h")" || exit 1; done
      [ "$(cat "$d/fs1/test/.g.lst" | tr "\n" " ")" = "h1 h2 " ] || exit 1
-     collect_fs_groups >/dev/null 2>&1) || exit 1
+     collect_fs_groups >>$WT_ASIDE 2>&1) || exit 1
     [ "$(tr "\n" " " < "$w/groups")" = "h1 1 h2 1 h3 2 h4 3 " ] &&
     [ ! -e "$d/fs1/test/.g.lst" ] && [ ! -e "$d/fs2/test/.g.lst" ] && [ ! -e "$d/fs1/other/.g.lst" ] ||
         { cat "$w/groups" >&2; false; }'
@@ -4964,9 +4973,9 @@ t_assert "tuner: each filesystem group lays out its own shared set, on its first
     source ./tests/helpers.sh; tuner_fixture
     cp "$FIX/probe/h1" "$FIX/probe/h3"
     printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=\$filenum/\$jobnum\n[bw]\nrw=read\niodepth=1\n" > "$FIX/src/011-bw.job"
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     printf "h1 1\nh2 2\nh3 1\n" > "$FIX/groups"
-    (source ./wekatester; WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3) >/dev/null 2>&1
+    (source ./wekatester; WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3) >>$WT_ASIDE 2>&1
     grep -q "^filename_format=shared\." "$FIX/jobs/h1/000-wekatester-layout.job" &&
     grep -q "^filename_format=shared\." "$FIX/jobs/h2/000-wekatester-layout.job" &&
     ! grep -q "^filename_format=shared\." "$FIX/jobs/h3/000-wekatester-layout.job"'
@@ -4974,18 +4983,18 @@ t_assert "capacity: each filesystem group's shared set is priced once, and group
     source ./tests/helpers.sh; tuner_fixture
     cp "$FIX/probe/h1" "$FIX/probe/h3"; cp "$FIX/probe/h1" "$FIX/probe/h4"
     printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=\$filenum/\$jobnum\n[bw]\nrw=read\niodepth=1\n" > "$FIX/src/011-bw.job"
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE
     # 50 GiB free on one weka filesystem; one shared set is 4 jobs x 10G
     printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n10.0.1.1/default 104857600 0 52428800 1%% /mnt/weka\nwekafs\n" > "$FIX/probe/_df"
     chk() { (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
         IGNORE_CAPACITY=0; WORK_DIR=$FIX; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka
         run_host() { cat "$FIX/probe/_df"; }
-        WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3 h4 >/dev/null 2>&1 || exit 9
+        WEKATESTER_NS="unified \$filenum/\$jobnum" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2 h3 h4 >>$WT_ASIDE 2>&1 || exit 9
         check_capacity); }
     printf "h1 1\nh2 1\nh3 1\nh4 1\n" > "$FIX/groups"
     out=$(chk 2>&1) || { echo "one group should fit: $out" >&2; exit 1; }
     printf "h1 1\nh2 1\nh3 2\nh4 2\n" > "$FIX/groups"
-    err=$(chk 2>&1 >/dev/null) && { echo "two groups passed: $err" >&2; exit 1; }
+    err=$(chk 2>&1 >>$WT_ASIDE) && { echo "two groups passed: $err" >&2; exit 1; }
     case "$err" in *"weka filesystem default: its 4 hosts (h1 h2 h3 h4) need ~80.0GiB together but only 50.0GiB is available"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "cal_shapes: one representative per shape per filesystem group" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -5018,7 +5027,7 @@ t_assert "cal_seed_rep: a listed need past the ladder makes its files at least t
      TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
-     cal_seed_rep h1 1 4 0 0 1 libaio "") >/dev/null 2>&1 || exit 1
+     cal_seed_rep h1 1 4 0 0 1 libaio "") >>$WT_ASIDE 2>&1 || exit 1
     f=$d/cal/h1/cal-seed-read.job
     grep -A2 -x "filename=h1.cal.0.2" "$f" | grep -qx "filesize=1706M" &&
     grep -A2 -x "filename=h1.cal.0.3" "$f" | grep -qx "filesize=1280M" || { cat "$f" >&2; false; }'
@@ -5042,7 +5051,7 @@ t_assert "calibration capacity: groups and representatives on one weka filesyste
          FREE1=$1; LIST1=${2:-}
          cal_capacity_check "$d/cal/shapes" "bw read
 bw write"); }
-    err=$(chk 30720 2>&1 >/dev/null) && { echo "passed at 30 GiB: $err" >&2; exit 1; }
+    err=$(chk 30720 2>&1 >>$WT_ASIDE) && { echo "passed at 30 GiB: $err" >&2; exit 1; }
     case "$err" in *"calibration needs ~32.0GiB on weka filesystem fs1 (h1 h3) but only 30.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
     case "$err" in *fs2*) echo "fs2 fits: $err" >&2; exit 1;; esac
     # 1 GiB of the first group shared set already laid out: 31 GiB still to write
@@ -5052,7 +5061,7 @@ t_assert "-u: each filesystem group's shared set is removed from that group's fi
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/w; CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.
      run_host() { printf "%s|%s\n" "$1" "$2" >> "$d/cmds"; }
-     cal_remove_dataset) >/dev/null 2>&1
+     cal_remove_dataset) >>$WT_ASIDE 2>&1
     [ "$(grep "/mnt/w/shared\." "$d/cmds" | cut -d"|" -f1 | sort | tr "\n" " ")" = "h1 h2 " ] || { cat "$d/cmds" >&2; false; }'
 
 # --- host-file values pin their knobs (Frank, 2026-10-02) ---
@@ -5066,7 +5075,7 @@ t_assert "cal_plan: a pinned job count is the only one tried; the open knobs are
     case "$out" in "done 40 "*"pinned by the host file: numjobs=40 -- the only value(s) tried"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "cal_plan: a pinned iodepth holds on the qd1 rungs too" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
-    plan_sim "$d" bw read io_uring 8 0 0 pin_qd=4 >/dev/null || exit 1
+    plan_sim "$d" bw read io_uring 8 0 0 pin_qd=4 >>$WT_ASIDE || exit 1
     [ "$(cut -d" " -f3 "$d/asked" | sort -u)" = 4 ] && grep -q "^numjobs 1 4 1$" "$d/asked" || { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan: a fully pinned libaio cell runs as written, past the aio room, never refused by a guard" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -5096,7 +5105,7 @@ t_assert "cal_shapes: pins past the grid become seed needs -- an off-ladder nrfi
           case $i in (8) printf "\t3";; (19) printf "\t8G";; (20) printf "\t2";; (*) printf "\t-";; esac
       done; printf "\n"; } > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); REGEN_LAYOUT=0; ENGINE=""
-     cal_shapes "$d/cal/shapes" "$(printf "bw read\nlat write\n")") >/dev/null 2>&1 || exit 1
+     cal_shapes "$d/cal/shapes" "$(printf "bw read\nlat write\n")") >>$WT_ASIDE 2>&1 || exit 1
     [ "$(cat "$d/cal/needs.read.h1")" = "20 3 1706" ] &&
     [ "$(cat "$d/cal/needs.write.h1" | tr "\n" " ")" = "20 2 8192 1 1 16384 " ] ||
         { head "$d"/cal/needs.* >&2; false; }'
@@ -5106,7 +5115,7 @@ t_assert "cal_shapes: hosts whose host-file values differ calibrate as shapes of
     { for h in h1 h3; do printf "%s" "$h"; for i in $(seq 2 37); do case $i in (6) printf "\t2";; (*) printf "\t-";; esac; done; printf "\n"; done
       printf "h2"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"; } > "$d/targets.final"
     (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2 h3); REGEN_LAYOUT=0; ENGINE=""
-     cal_shapes "$d/cal/shapes" "bw read") >/dev/null 2>&1 || exit 1
+     cal_shapes "$d/cal/shapes" "bw read") >>$WT_ASIDE 2>&1 || exit 1
     [ "$(cut -f2,12 "$d/cal/shapes" | tr "\t\n" ":|")" = "h1:h1 h3|h2:h2|" ] || { cat "$d/cal/shapes" >&2; false; }'
 t_assert "cal_aio_preflight: a pin past the aio room stops calibration before anything runs; a room it fits, or no libaio, passes" bash -c '
     d=$(mktemp -d)
@@ -5126,7 +5135,7 @@ t_assert "writeback: a host line is commented out and its new version written di
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
      host_machine_id() { :; }
-     writeback_targets) >/dev/null
+     writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 3p "$f")" = "# superseded by -a: h1,,psync,,,,," ] &&
     sed -n 4p "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w," &&
     [ "$(sed -n 2p "$f")" = "h2,,,," ] && [ "$(sed -n 5p "$f")" = "h9,,,," ] && [ "$(wc -l < "$f" | tr -d " ")" = 5 ] ||
@@ -5139,7 +5148,7 @@ t_assert "writeback: values are compared by meaning -- 1024M is 1G, so the line 
         (source ./wekatester
          WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1; REGEN_LAYOUT=$g
          host_machine_id() { :; }
-         writeback_targets) >/dev/null
+         writeback_targets) >>$WT_ASIDE
         [ "$(cat "$f")" = "$before" ] || { echo "-g=$g:"; cat "$f"; exit 1; } >&2
     done'
 t_assert "writeback: cpu lists compare as sets -- 2-4 is 2,3,4 but 2,4 is not 2-4" bash -c '
@@ -5180,30 +5189,30 @@ t_assert "cal_preflight: a pin past the aio room stops before anything runs, fro
     [ ! -e "$d/ran" ] || { cat "$d/ran" >&2; exit 1; }
     # no pins: the shapes are worked out and the run goes on
     { printf "h1"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"; } > "$d/targets.final"
-    pre >/dev/null 2>&1 && [ "$(cut -f2 "$d/cal/shapes")" = h1 ]'
+    pre >>$WT_ASIDE 2>&1 && [ "$(cut -f2 "$d/cal/shapes")" = h1 ]'
 
 # --- what the tuner stages from it ---
 t_assert "tuner: under -a cal the iops jobs run with latency accounting off, other jobs do not" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
     printf "# report latency iops\n[global]\nnumjobs=1\nioengine=libaio\n[l]\nbs=4k\nrw=randread\niodepth=1\n" > "$FIX/src/021-lat.job"
-    (source ./wekatester; WEKATESTER_IOPS_NOLAT=1 auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; WEKATESTER_IOPS_NOLAT=1 auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     for k in disable_lat disable_clat disable_slat norandommap; do
         grep -qx "$k=1" "$FIX/jobs/h1/031-iops.job" || { echo "iops lacks $k" >&2; exit 1; }
         ! grep -q "^$k=" "$FIX/jobs/h1/021-lat.job" || { echo "lat has $k" >&2; exit 1; }
         ! grep -q "^$k=" "$FIX/jobs/h1/011-bw.job" || { echo "bw has $k" >&2; exit 1; }
     done
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     ! grep -q "^disable_lat=" "$FIX/jobs/h1/031-iops.job"'
 t_assert "tuner: the shared read set is laid out for the widest reader, on the first host only" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\n[a]\nrw=read\n" > "$FIX/src/011-bw.job"
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null 2>&1
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE 2>&1
     # h2 reads the shared set with 9 jobs, h1 with 3
     { printf "h1"; for i in $(seq 2 37); do case $i in (6) printf "\t3";; (*) printf "\t-";; esac; done; printf "\n"
       printf "h2"; for i in $(seq 2 37); do case $i in (6) printf "\t9";; (*) printf "\t-";; esac; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester; WEKATESTER_NS="unified \$filenum/\$jobnum" \
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     l1=$FIX/jobs/h1/000-wekatester-layout.job; l2=$FIX/jobs/h2/000-wekatester-layout.job
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$l1" && grep -qx "numjobs=9" "$l1" &&
     ! grep -q "shared\." "$l2" || { cat "$l1" "$l2" >&2; exit 1; }
@@ -5221,7 +5230,7 @@ t_assert "tuner: a file with no report directive keeps its own geometry -- no sl
     row=(h1); for i in $(seq 1 36); do row+=(-); done
     row[5]=3; row[13]=4; row[21]=6; row[24]=32
     (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
-    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >/dev/null 2>&1
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1
     v=$FIX/jobs/h1/041-plain.job
     grep -qx "numjobs=5" "$v" && grep -qx "iodepth=7" "$v" && grep -qx "filesize=2G" "$v" &&
     grep -qx "numjobs=3" "$FIX/jobs/h1/011-bw.job" || { cat "$v" >&2; false; }'
@@ -5260,7 +5269,7 @@ t_assert "tuner: unified staging sends read-only jobs to the shared dataset" bas
     printf "# report bandwidth\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nrw=write\n" > "$FIX/src/012-w.job"
     (source ./wekatester
      WEKATESTER_NS="unified \$filenum/\$jobnum" \
-     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "" h1 h2) >/dev/null 2>&1
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "" h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h1/011-r.job" &&
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h2/011-r.job" &&
     grep -q "^filename_format=\$filenum/\$jobnum$" "$FIX/jobs/h1/012-w.job"'
@@ -5305,7 +5314,7 @@ t_assert "-x stamps runtime+time_based on measured variants, never the layout" b
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; DURATION=77
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >/dev/null || exit 1
+     stage_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     l="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&
@@ -5477,7 +5486,7 @@ t_assert "identity: an auto-added local row is named for the machine, not localh
      LOCAL_MODE=1; HOSTS=(localhost); WORK_DIR=$d; AUTO_LEVEL=cal; REGEN_LAYOUT=0
      TARGETS_FILE=$d/hostlist.csv
      write_targets_template "$d/hostlist.csv"
-     writeback_targets) >/dev/null 2>&1
+     writeback_targets) >>$WT_ASIDE 2>&1
     grep -q "^testbox/deadbeefcafe0000deadbeefcafe0000," "$d/hostlist.csv" ||
         { echo "--- host file ---"; grep -av "^#" "$d/hostlist.csv" >&2; false; }'
 # A row a person wrote keeps their spelling; automation only names what it adds.
@@ -5491,7 +5500,7 @@ t_assert "identity: an existing row keeps the operator spelling on update" bash 
      TARGETS_FILE=$d/hostlist.csv
      write_targets_template "$d/hostlist.csv"
      printf "localhost,,,,/mnt/weka,,,\n" >> "$d/hostlist.csv"
-     writeback_targets) >/dev/null 2>&1
+     writeback_targets) >>$WT_ASIDE 2>&1
     grep -q "^localhost," "$d/hostlist.csv" &&
     ! grep -q "^testbox/" "$d/hostlist.csv"'
 # Reading it back: the id is stripped and the name maps to the address in use.
@@ -5515,7 +5524,7 @@ t_assert "identity: two spellings of one machine are a legible duplicate" bash -
     printf "host,user_login,ioengine,allowed_cpus,destination_folder,bandwidth,latency,iops\n" > "$d/hl.csv"
     printf "node1/aaaa,,,,/mnt/weka,,,\nnode1/bbbb,,,,/mnt/weka,,,\n" >> "$d/hl.csv"
     err=$( (source ./wekatester; WORK_DIR=$d
-            resolve_targets phase1 "$d/hl.csv" - - - node1) 2>&1 >/dev/null )
+            resolve_targets phase1 "$d/hl.csv" - - - node1) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"both resolve to"*"node1"*) true;;
         *) echo "$err" >&2; false;;
@@ -5536,7 +5545,7 @@ t_assert "mount guard: the rounds fan out -- every findmnt lands before any writ
      LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka
      run_host() { case "$2" in (findmnt*) echo "F $1" >> "$d/order"; echo "wekafs rw,forcedirect";;
                               (p=*) echo "P $1" >> "$d/order";; (*) return 1;; esac; }
-     verify_mount_mode) >/dev/null 2>&1 || { echo "guard failed" >&2; exit 1; }
+     verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "guard failed" >&2; exit 1; }
     [ "$(wc -l < "$d/order")" -eq 6 ] &&
     [ "$(head -3 "$d/order" | cut -c1 | sort -u)" = F ] &&
     [ "$(tail -3 "$d/order" | cut -c1 | sort -u)" = P ] || { cat "$d/order" >&2; false; }'
@@ -5549,7 +5558,7 @@ t_assert "mount guard: per-host failures still come out one per host, in host or
                 (h2:findmnt*) echo "wekafs rw,readcache";;
                 (h3:*)        return 1;;
                 (*)           return 0;; esac; }
-            verify_mount_mode) 2>&1 >/dev/null )
+            verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"ERROR: h1: cannot create files in /mnt/weka"*"ERROR: h2: wekafs mounted readcache"*"ERROR: h3: findmnt failed for /mnt/weka"*"must be mounted with forcedirect"*) true;;
         *) echo "$err" >&2; false;;
@@ -5599,7 +5608,7 @@ t_assert "staging: a --client list that overflows one shell argument dies before
             FIO_BIN=fio; TARGET_DIR=/dev/shm/fio-jobfiles; JOBFILES=(000-wekatester-layout.job 011-bw.job)
             HOSTS=(); i=0
             while [ $i -lt 1500 ]; do HOSTS+=("client-node-$i.rack.example.internal"); i=$((i + 1)); done
-            check_client_cmdline) 2>&1 >/dev/null ); rc=$?
+            check_client_cmdline) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in
         *"the fio command line for 000-wekatester-layout.job is "*" bytes with 1500 hosts"*"128 KiB"*"two or more host lists"*) true;;
@@ -5851,5 +5860,6 @@ EOF
 )
     bad=$(find src -name "*.sh" | sort | xargs awk "$prog") && [ -z "$bad" ] || { echo "inline at: $bad" >&2; false; }'
 
+rm -f -- "${WT_ASIDE:?}"
 echo; echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
