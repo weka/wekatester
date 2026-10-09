@@ -700,6 +700,27 @@ t_assert "run lock: a wekatester fio that survives every kill still stops the ru
     out=$(lk_run BREAK_LOCK=1)
     case "$out" in *"another wekatester run is here, or one that did not clean up: fio(99999991) unkillable(99999991)"*) ;; *) echo "$out" >&2; exit 1;; esac
     [ ! -e "$LK/lock" ]'
+t_assert "run lock: an -f naming a directory or a non-executable file is no fio, under sh too" bash -c '
+    for sh in bash sh; do
+        source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+        mkdir "$LK/fio.d"; : > "$LK/fio.txt"
+        for f in "$LK/fio.d" "$LK/fio.txt"; do
+            out=$(lk_run "run_host() { $sh -c \"\$2\" </dev/null; }" "FIO_BIN=$f")
+            case "$out" in *"localhost: $f not found, or not an executable file"*) ;; *) echo "$sh, $f: $out" >&2; exit 1;; esac
+            [ ! -e "$LK/lock" ] || { echo "$sh, $f: locked anyway" >&2; exit 1; }
+        done
+    done'
+t_assert "run lock: under --break-lock a fio that turns zombie is gone, and a pid reused after the TERM is never killed, under sh too" bash -c '
+    for sh in bash sh; do
+        for after in "[fio] <defunct>" "/usr/sbin/sshd -D"; do
+            source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+            echo "99999991 $LK/bin/fio --server --daemonize=$LK/fio.pid" > "$LK/procs"
+            echo "99999991 $after" > "$LK/after"
+            out=$(lk_run "run_host() { $sh -c \"\$2\" </dev/null; }" BREAK_LOCK=1)
+            case "$out" in *"NOTE: localhost: --break-lock cleared another run"*"fio(99999991)"*LOCKED-BY-US*RELEASED*) ;; *) echo "$sh, then \"$after\": $out" >&2; exit 1;; esac
+            [ ! -s "$LK/esc" ] || { echo "$sh, then \"$after\": escalated: $(cat "$LK/esc")" >&2; exit 1; }
+        done
+    done'
 
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
 # operator to remount forcedirect then points away from the real fault, which
@@ -3016,6 +3037,36 @@ t_assert "kill_fio_cmd: priv prefixes kill/rm/pkill and the anchor survives" bas
         *"sudo kill "*"sudo rm -f"*"sudo pkill -9 -f"*"'\''^/usr/bin/fio --server"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+t_assert "ere_quote_v: the regex matches its own text exactly, ERE metacharacters and all" bash -c '
+    s="/opt/fio-3.38+git/b.in/[x](y){2}|z^q\$w*v?u\\t"
+    q=$(source ./wekatester; ere_quote_v "$s"; printf "%s" "$ERE_QUOTED")
+    printf "%s\n" "$s" | grep -Eqx "$q" &&
+    ! printf "%s\n" "${s/b.in/bXin}" | grep -Eqx "$q" || { echo "string $s, regex $q" >&2; false; }'
+t_assert "fio server kill: the pidfile pid gets the TERM only while it is our server, and a path with regex characters still drains, under sh and bash" bash -c '
+    d=$(mktemp -d); b="$d/fio+1.2[x]"; mkdir -p "$b"; cp "$(type -P sleep)" "$b/fio"; pf=$d/fio.pid; bad=0
+    cat > "$d/srv" <<"SRV"
+#!/bin/bash
+# srv <args0> <binary> [ignore-term]: <binary> as a process whose args read "<args0> 300"
+[ -z "${3:-}" ] || trap "" TERM
+exec -a "$1" "$2" 300
+SRV
+    chmod +x "$d/srv"
+    cmd=$(source ./wekatester; FIO_BIN=$b/fio; FIO_PIDFILE=$pf; kill_fio_cmd_v; printf "%s" "$KILL_FIO_CMD")
+    # each fake is orphaned at once: init reaps it, and no job notice prints
+    start() { "$d/srv" "$b/fio --server --daemonize=$pf" "$b/fio" "$@" >>"$WT_ASIDE" 2>&1 & echo $!; }
+    alive() { [ -n "$(ps -o pid= -p "$1")" ]; }
+    for sh in sh bash; do
+        p=$(start); q=$(sleep 300 >>"$WT_ASIDE" 2>&1 & echo $!); echo "$p" > "$pf"; sleep 0.3
+        "$sh" -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+        if alive "$p" || [ -e "$pf" ]; then echo "$sh: our server or its pidfile outlived the kill" >&2; bad=1; fi
+        echo "$q" > "$pf"; "$sh" -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+        alive "$q" || { echo "$sh: a stale pidfile got an unrelated process killed" >&2; bad=1; }
+        kill -9 "$p" "$q" >>"$WT_ASIDE" 2>&1
+    done
+    p=$(start ignore); echo "$p" > "$pf"; sleep 0.3
+    sh -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+    if alive "$p"; then echo "a server that ignores TERM outlived the -9" >&2; kill -9 "$p" >>"$WT_ASIDE" 2>&1; bad=1; fi
+    exit "$bad"'
 t_assert "server launch: priv pins via taskset but fio drops to the login user" bash -c '
     d=$(mktemp -d); mkdir -p "$d/auth"
     printf "sudo -n\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
@@ -4645,6 +4696,23 @@ WEKA
     out=$(PATH="$b:$PATH" bash -c "$cmd" 2>&1)
     printf "%s\n" "$out" | grep -qx "weka_net_err client needs root, and no passwordless escalator works here" ||
         { printf "%s\n" "$out" >&2; false; }'
+t_assert "probe: no ethtool, or one that prints no Speed line, leaves a NIC its sysfs speed, under sh and bash" bash -c '
+    d=$(mktemp -d); r=$d/root
+    mkdir -p "$r/sys/class/net/eth0/device" "$r/proc" "$d/none" "$d/nospeed"
+    echo 25000 > "$r/sys/class/net/eth0/speed"
+    for c in cat awk grep sort tr head readlink getconf pgrep id; do
+        p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }
+        ln -s "$p" "$d/none/$c"; ln -s "$p" "$d/nospeed/$c"
+    done
+    printf "#!/bin/sh\necho \"Link detected: yes\"\n" > "$d/nospeed/ethtool"; chmod +x "$d/nospeed/ethtool"
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        for b in "$d/none" "$d/nospeed"; do
+            out=$(WEKATESTER_SYSROOT=$r PATH=$b "$sh" -c "$cmd" 2>&1)
+            printf "%s\n" "$out" | grep -qx "nic eth0 25000 - - -" ||
+                { echo "$sh, PATH ${b##*/}:"; printf "%s\n" "$out"; exit 1; } >&2
+        done
+    done'
 
 # --- calibrate(): the whole flow against the fake client ---
 t_assert "calibrate: each shape is measured solo on its first host, the answer lands for every member" bash -c '

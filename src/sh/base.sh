@@ -91,6 +91,17 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
     fi
 }
 
+# pgrep and pkill take a regex: a path goes in with every ERE metacharacter
+# backslashed, or a binary named fio-3.38+git never matches itself.
+ere_quote_v() {   # ere_quote_v <string> -> ERE_QUOTED
+    local i c q=
+    for ((i = 0; i < ${#1}; i++)); do
+        c=${1:i:1}
+        case $c in '.'|'['|'\'|'('|')'|'*'|'+'|'?'|'{'|'|'|'^'|'$') q+=\\$c ;; *) q+=$c ;; esac
+    done
+    ERE_QUOTED=$q
+}
+
 # No server given: benchmark this host over loopback; only the transport
 # changes.
 resolve_local_mode() {

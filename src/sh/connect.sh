@@ -19,9 +19,11 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # ^ anchor is load-bearing: this shell carries the pattern in its own
     # cmdline (an unanchored pkill -9 once killed the teardown). taskset execs
     # fio, so argv starts with the binary.
-    local priv=${1:+$1 }
-    local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
-    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" pat
+    ere_quote_v "$srv"; pat="^$ERE_QUOTED"
+    # The pidfile's pid gets the TERM only while its args still read as our
+    # server: one that died uncleanly leaves a pid the kernel may reuse.
+    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); case \"\$(ps -o args= -p \"\$_p\" 2>&1)\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
         if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
 }

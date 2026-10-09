@@ -10,28 +10,33 @@ lock_token() {   # lock_token -> LOCK_TOKEN
     LOCK_TOKEN=${LOCK_TOKEN//\'/}
 }
 
-# preflight's remote command: no fio exits 1. Another run's traces (its lock,
-# staging, or any fio of wekatester's) print "held ..." and exit 75; fio
-# wekatester did not start prints "alien ..." and exits 76, and is never
+# preflight's remote command: no executable fio exits 1. Another run's traces
+# (its lock, staging, or any fio of wekatester's) print "held ..." and exit 75;
+# fio wekatester did not start prints "alien ..." and exits 76, and is never
 # touched. --break-lock clears the traces first and prints "healed ...".
 lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
-    local fb=${FIO_BIN##*/} pg="pgrep -x fio"
+    local fb=${FIO_BIN##*/} pg="pgrep -x fio" mine
     fb=${fb:0:15}   # pgrep -x matches the 15-byte process name
-    [ "$fb" = fio ] || pg="$pg; pgrep -x '$fb'"
-    LOCK_CMD="_o=\$(command -v '$FIO_BIN') || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    ere_quote_v "$fb"
+    [ "$fb" = fio ] || pg="$pg; pgrep -x '$ERE_QUOTED'"
+    # wekatester's fio, by its args: its server, the runs that read its
+    # staging, its engine tests
+    mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
+    LOCK_CMD="_o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
-    # wekatester's fio: its server, the runs that read its staging, its engine tests
     LOCK_CMD+="; for p in \$($pg); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
-    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; '$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
+    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
     LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
-        # probe's order): a root fio needs one
+        # probe's order): a root fio needs one. still() keeps the pids alive
+        # and still ours: a zombie is gone, and a reused pid is not ours.
+        LOCK_CMD+="; still() { l2=; for p in \$left; do a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
-        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; done"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
     else
@@ -82,7 +87,7 @@ preflight() {
         elif [ "$rc" -eq 77 ]; then
             failed+=("$host: cannot create the run lock $LOCK_DIR")
         else
-            failed+=("$host: $FIO_BIN not found")
+            failed+=("$host: $FIO_BIN not found, or not an executable file")
         fi
     done
     # A bare -C candidate that failed ssh is probably the set name: confirm

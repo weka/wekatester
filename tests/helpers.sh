@@ -386,12 +386,14 @@ cores_facts() {   # cores_facts <probe> [cpu-list]: "n ncores dpdk catchall unli
 }
 export -f cores_line cores_facts
 
-# --- run lock: stub pgrep/ps/fio and the escalators, driven by $LK/procs
-# ("<pid> <args>") and $LK/alive (pids a kill leaves standing). The pids are
-# past any pid_max, so no real process is ever signalled. ---
+# --- run lock: stub pgrep/ps/fio and the escalators. The scan's first look
+# at a pid sees $LK/procs ("<pid> <args>"); later looks see it only while in
+# $LK/alive (pids a kill leaves standing), else as $LK/after has it (a zombie,
+# a reused pid). Escalator calls land in $LK/esc. The pids are past any
+# pid_max, so no real process is ever signalled. ---
 lock_fixture() {
     LK=$(mktemp -d)   # leaked on purpose; tests are short-lived
-    mkdir -p "$LK/bin" "$LK/w"; : > "$LK/procs"; : > "$LK/alive"
+    mkdir -p "$LK/bin" "$LK/w"; : > "$LK/procs"; : > "$LK/alive"; : > "$LK/after"
     printf '#!/bin/sh\nexit 0\n' > "$LK/bin/fio"
     cat > "$LK/bin/pgrep" <<EOF
 #!/bin/sh
@@ -400,13 +402,18 @@ awk '{print \$1; n++} END {exit !n}' "$LK/procs"
 EOF
     cat > "$LK/bin/ps" <<EOF
 #!/bin/sh
+row() { awk -v p="\$1" '\$1 == p {sub(/^[^ ]+ /, ""); print; f = 1} END {exit !f}' "\$2"; }
 case "\$1" in
-    -o) awk -v p="\$4" '\$1 == p {sub(/^[^ ]+ /, ""); print; f = 1} END {exit !f}' "$LK/procs" ;;
-    -p) grep -qx "\$2" "$LK/alive" && echo "\$2" ;;
+    -o) [ -e "$LK/seen.\$4" ] || { : > "$LK/seen.\$4"; row "\$4" "$LK/procs"; exit; }
+        if grep -qx "\$4" "$LK/alive"; then row "\$4" "$LK/procs"; else row "\$4" "$LK/after"; fi ;;
+    -p) grep -qx "\$2" "$LK/alive" || awk -v p="\$2" '\$1 == p {f = 1} END {exit !f}' "$LK/after" || exit 1
+        echo "\$2" ;;
 esac
 EOF
     printf '#!/bin/sh\nshift\nexec "$@"\n' > "$LK/bin/timeout"
-    for e in dzdo pbrun sesu pmrun doas ksu sudo; do printf '#!/bin/sh\nexit 1\n' > "$LK/bin/$e"; done
+    for e in dzdo pbrun sesu pmrun doas ksu sudo; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$e" "$LK" > "$LK/bin/$e"
+    done
     chmod +x "$LK/bin"/*
 }
 export -f lock_fixture
