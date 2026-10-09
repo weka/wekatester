@@ -342,6 +342,14 @@ run_jobs() {
                 || die "layout failed for $job (partial output in $outfile)"
             if ! check_fio_errors "$outfile" layout; then
                 for host in "${lclients[@]}"; do
+                    # staging copied the jobfiles to the master only; a
+                    # worker fio can parse only its own copy
+                    if [ "$host" != "$MASTER" ]; then
+                        run_host "$host" "mkdir -p '$TARGET_DIR/$host'" \
+                            && copy_to_host "$host" "$WORK_DIR/jobs/$host/$job" "$TARGET_DIR/$host/" \
+                            || { log "WARNING: $host: cannot stage the layout jobfile for a parse check on that host" >&2
+                                 continue; }
+                    fi
                     fio_parse_postmortem layout "$host" "$TARGET_DIR/$host/$job" \
                         "$RUN_DIR/parse.${job%.job}.$host.out"
                 done

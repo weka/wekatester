@@ -1022,7 +1022,7 @@ t_assert "staging: every -a level calibrates, so every level puts reads on the f
 t_assert "tuner capacity: layout job does not double the required total" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
-    out=$( cap safe 0 h1 h2 2>/dev/null )
+    out=$( cap safe 0 h1 h2 2>&1 )
     case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 
 # --- customize workflow ---
@@ -1138,7 +1138,7 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[a]\nrw=read\niodepth=1\n" > "$FIX/src/011-a.job"
     printf "# report bandwidth\n[global]\nfilename_format=x/\$jobnum\nfilesize=1G\nnumjobs=2\nnrfiles=27\nioengine=libaio\ndirectory=/orig\n[b]\nrw=read\niodepth=1\n" > "$FIX/src/012-b.job"
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >/dev/null
-    out=$( cap safe 0 h1 h2 2>/dev/null )
+    out=$( cap safe 0 h1 h2 2>&1 )
     # a: 4 jobs x 1 file = 4G; b: 2 jobs x 27 files = 54G, the namespace max;
     # the layout lays out both sections, 58G/host, so the union raises the
     # per-host requirement above 54G, proving layout_footprint runs
@@ -2258,6 +2258,44 @@ t_assert "run_jobs: layout is timed create_only -- no markers, no rebuild select
     grep -q "FIO: .*000-wekatester-layout.job" "$d/oplog" &&
     ! grep -q "MARKER_OP" "$d/oplog" &&
     ! grep -q "relayout" "$d/oplog"'
+# fio --client reads the jobfiles on the master, so staging copies them there
+# only. A worker's fio parsed a file it lacked, and the postmortem blamed it
+# for rejecting the layout jobfile. Now a worker gets its own copy first.
+t_assert "run_jobs: a failed layout stages each worker's jobfile before that worker's fio parses it" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1 h2 h3); MASTER=h1; LOCAL_MODE=0
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$SET_DIR" "$RUN_DIR"
+     for h in h1 h2 h3; do
+         mkdir -p "$d/jobs/$h"
+         printf "[global]\n[l]\nfilesize=10G\n" > "$d/jobs/$h/000-wekatester-layout.job"
+     done
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     # the master holds every jobfile, a worker only what was copied to it;
+     # h3 cannot be staged
+     run_host() { echo "RUN[$1] $2" >> "$d/oplog"; case "$2" in
+         (*--client=*) echo "{}";;
+         (*--parse-only*) [ "$1" = h1 ] || grep -q "^COPY\[$1\]" "$d/oplog" ||
+             { echo "fio: unable to open job file"; return 1; };;
+         ("mkdir -p '"'"'/dev/shm/x/h3'"'"'") return 1;;
+     esac; }
+     copy_to_host() { echo "COPY[$1] ${2#"$d/"} -> $3" >> "$d/oplog"; }
+     run_jobs) 2>&1 ) && { echo "a failed layout passed: $out" >&2; exit 1; }
+    case "$out" in
+        *"note: h1: the layout jobfile parses cleanly"*"note: h2: the layout jobfile parses cleanly"*"WARNING: h3: cannot stage the layout jobfile for a parse check on that host"*"layout 000-wekatester-layout.job failed -- the files were not created"*) true;;
+        *) echo "$out" >&2; exit 1;;
+    esac
+    case "$out" in *rejects*) echo "blamed a worker fio: $out" >&2; exit 1;; esac
+    want=$(printf "%s\n" "RUN[h2] mkdir -p '"'"'/dev/shm/x/h2'"'"'" \
+        "COPY[h2] jobs/h2/000-wekatester-layout.job -> /dev/shm/x/h2/" \
+        "RUN[h2] '"'"'fio'"'"' --parse-only '"'"'/dev/shm/x/h2/000-wekatester-layout.job'"'"'")
+    [ "$(grep "\[h2\]" "$d/oplog")" = "$want" ] || { cat "$d/oplog" >&2; exit 1; }
+    ! grep -q -e "^COPY\[h1\]" -e "mkdir -p '"'"'/dev/shm/x/h1'"'"'" "$d/oplog" &&
+    ! grep -q "^RUN\[h3\] .*--parse-only" "$d/oplog" &&
+    [ -e "$d/out/parse.000-wekatester-layout.h2.out" ] &&
+    [ ! -e "$d/out/parse.000-wekatester-layout.h3.out" ]'
 t_assert "sweep: deviants deleted per namespace, matching bytes credited (capped)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -2445,7 +2483,7 @@ t_assert "targets: generic never overrides specific, regardless of order" bash -
 t_assert "targets: equal specificity warns naming both lines; first wins; run continues" bash -c '
     f=$(mktemp)
     printf ",,,0-3,,,,\n,,,4-7,,,,\n" > "$f"
-    out=$(rt phase1 "$f" - - - h1 2>/dev/null)
+    out=$(rt phase1 "$f" - - - h1 2>&1)
     err=$( (rt phase1 "$f" - - - h1) 2>&1 >/dev/null )
     echo "$out" | grep -q "^h1	-	-	0-3" &&
     case "$err" in
@@ -2461,7 +2499,7 @@ t_assert "targets: geometry columns parse with or without the type: prefix" bash
 t_assert "targets: a wrong type: prefix in a geometry column is fatal" bash -c '
     f=$(mktemp)
     printf "h1,,,,,iopsR:4///,,,,,\n" > "$f"
-    ! rt phase1 "$f" - - - h1 2>/dev/null'
+    ! out=$(rt phase1 "$f" - - - h1 2>&1)'
 t_assert "targets: CLI engine and dir beat the file everywhere" bash -c '
     f=$(mktemp)
     printf "h1,,libaio,,/mnt/file,,,\n" > "$f"
@@ -5205,8 +5243,8 @@ t_assert "parse: -x/--duration takes whole seconds, rejects junk" bash -c '
     (source ./wekatester; parse_args -x45 h1;          [ "$DURATION" = 45 ]) &&
     (source ./wekatester; parse_args --duration=90 h1; [ "$DURATION" = 90 ]) &&
     (source ./wekatester; parse_args -X 30 h1;         [ "$DURATION" = 30 ]) &&
-    ! (source ./wekatester; parse_args -x 0 h1)  2>/dev/null;
-    a=$?; ! (source ./wekatester; parse_args -x abc h1) 2>/dev/null; b=$?
+    ! out=$( (source ./wekatester; parse_args -x 0 h1) 2>&1 );
+    a=$?; ! out=$( (source ./wekatester; parse_args -x abc h1) 2>&1 ); b=$?
     [ "$a" -eq 0 ] && [ "$b" -eq 0 ]'
 t_assert "-x stamps runtime+time_based on measured variants, never the layout" bash -c '
     source ./tests/helpers.sh; set_fixture; no_ssh_fixture

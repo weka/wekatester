@@ -100,15 +100,16 @@ test_engines() {
                 # stall. So: background the bounded job, poll it, and abandon
                 # it if it will not die. A working engine takes milliseconds.
                 tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
+                # _o keeps kill's complaints out of the evidence file
                 if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
                         timeout -k 5 $tmo \
                         '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
                         --filesize=64k --filename=\"\$f\" --direct=1 \
                         --output-format=json & p=\$!; i=0; \
-                        while kill -0 \$p 2>/dev/null && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
-                        if kill -0 \$p 2>/dev/null; then \
-                            kill -9 \$p 2>/dev/null; sleep 1; \
-                            kill -0 \$p 2>/dev/null && echo WEKATESTER_ENGINE_STUCK; \
+                        while _o=\$(kill -0 \$p 2>&1) && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
+                        if _o=\$(kill -0 \$p 2>&1); then \
+                            _o=\$(kill -9 \$p 2>&1); sleep 1; \
+                            _o=\$(kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
                             rm -f \"\$f\"; exit 124; \
                         fi; \
                         wait \$p; rc=\$?; rm -f \"\$f\"; exit \$rc" \
