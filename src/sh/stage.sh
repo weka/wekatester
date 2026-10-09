@@ -156,14 +156,9 @@ stage_unlink_variants() {
     JOBFILES+=("$UNLINK_JOB")
 }
 
-# Stamp key=value into a staged variant: replace every line, else insert into
+# Stamp key=value into every staged variant, in one awk for the fleet
+# ("measured": skip layout jobs): replace every line, else insert into
 # [global] (created if missing), as the directory override does.
-override_variant_key() {   # override_variant_key <file> <key> <value>
-    awkrun '#@awk override_variant_key' "$@"
-}
-
-# override_variant_key for the fleet in one awk ("measured": skip layout
-# jobs); per file and key it was minutes at a few hundred hosts.
 override_staged() {   # override_staged <all|measured> <key> <value> [<key> <value>]...
     list_staged "$WORK_DIR/staged.list" || return 1
     awkrun '#@awk override_staged' "$WORK_DIR/staged.list" "$@"

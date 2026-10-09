@@ -16,6 +16,9 @@ if [ "$(uname -s)" != Linux ]; then
     export PATH="$WT_LINUX_SHIM:$PATH"
 fi
 [ -w /dev/shm ] || export WEKATESTER_STAGE_BASE=${TMPDIR:-/tmp}
+# A preflight run for real locks this suite's own path, never the host's
+# /dev/shm lock that a real run, or a second suite, may hold.
+export WEKATESTER_LOCK_DIR="$(mktemp -d)/wekatester.lock"
 source ./tests/helpers.sh
 PASS=0; FAIL=0
 
@@ -622,7 +625,7 @@ t_assert "copy_to_master remote: a failed stream fails the copy, and sources fro
 # command exits 255 for the reason preflight would be classifying.
 t_assert "preflight: rc 255 in local mode is a missing fio, not a dead ssh" bash -c '
     err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=/usr/bin/fio
+            LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=/usr/bin/fio; WORK_DIR=$(mktemp -d)
             run_host() { return 255; }
             preflight) 2>&1 >/dev/null )
     case "$err" in
@@ -631,13 +634,63 @@ t_assert "preflight: rc 255 in local mode is a missing fio, not a dead ssh" bash
     esac'
 t_assert "preflight: rc 255 in remote mode is still a dead ssh" bash -c '
     err=$( (source ./wekatester
-            LOCAL_MODE=0; HOSTS=(vega-1); FIO_BIN=/usr/bin/fio
+            LOCAL_MODE=0; HOSTS=(vega-1); FIO_BIN=/usr/bin/fio; WORK_DIR=$(mktemp -d)
             run_host() { return 255; }
             preflight) 2>&1 >/dev/null )
     case "$err" in
         *"vega-1: ssh failed"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+# --- one run per host: the lock, the evidence of another run, --break-lock ---
+lk_run() {   # lk_run [k=v...]: preflight on the local host in the lock fixture; output on stdout
+    (export PATH="$LK/bin:$PATH" WEKATESTER_TARGET_DIR="$LK/tgt"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=$LK/bin/fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w
+     for kv in "$@"; do eval "$kv"; done
+     preflight 2>&1 && read -r o < "$WEKATESTER_LOCK_DIR/owner" && [ "$o" = "$LOCK_TOKEN" ] && echo LOCKED-BY-US
+     cleanup 2>&1; [ -e "$WEKATESTER_LOCK_DIR" ] || echo RELEASED)
+}
+export -f lk_run
+t_assert "run lock: a clean host is locked in preflight with this run's owner line, and cleanup releases it" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    out=$(lk_run)
+    case "$out" in *LOCKED-BY-US*RELEASED*) ;; *) echo "$out" >&2; exit 1;; esac'
+t_assert "run lock: cleanup leaves a lock another run took meanwhile" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    (export PATH="$LK/bin:$PATH"; source ./wekatester; LOCAL_MODE=1; HOSTS=(localhost); WORK_DIR=$LK/w
+     LOCK_TOKEN="ctl-1 pid 1 user a since x"; mkdir "$LK/lock"; echo "ctl-9 pid 7 user b since y" > "$LK/lock/owner"
+     RUN_LOCKS[localhost]=1; out=$(cleanup 2>&1) || { echo "$out" >&2; exit 1; })
+    grep -qx "ctl-9 pid 7 user b since y" "$LK/lock/owner"'
+t_assert "run lock: another run's lock, staging and fio stop this one, each named, and nothing of theirs is touched" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    mkdir -p "$LK/lock" "$LK/tgt"; echo "ctl-9 pid 77 user x since 2026-10-09 01:00:00" > "$LK/lock/owner"
+    echo "99999991 $LK/bin/fio --server --daemonize=$LK/fio.pid" > "$LK/procs"
+    out=$(lk_run)
+    case "$out" in *"localhost: another wekatester run is here, or one that did not clean up: lock(ctl-9 pid 77 user x since 2026-10-09 01:00:00) staged($LK/tgt) fio(99999991)"*"rerun with --break-lock"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *LOCKED-BY-US*|*RELEASED*) echo "$out" >&2; exit 1;; esac
+    grep -q "pid 77" "$LK/lock/owner" && [ -d "$LK/tgt" ]'
+t_assert "run lock: any fio wekatester did not start stops the run, --break-lock or not, and is never touched" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    printf "99999995 /usr/bin/fio --name=bench --rw=read\n99999996 [fio] <defunct>\n" > "$LK/procs"; echo 99999995 > "$LK/alive"
+    out=$(lk_run BREAK_LOCK=1)
+    # a zombie holds nothing and cannot be killed: not evidence
+    case "$out" in *"localhost: fio that wekatester did not start is running (pid:command 99999995:/usr/bin/fio); stop it first"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *99999996*) echo "$out" >&2; exit 1;; esac
+    case "$out" in *LOCKED-BY-US*|*cleared*) echo "$out" >&2; exit 1;; esac
+    [ ! -e "$LK/lock" ]'
+t_assert "run lock: --break-lock kills wekatester's fio, clears its staging and lock, says so, and locks" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    mkdir -p "$LK/lock" "$LK/tgt.cal"; echo "ctl-9 pid 77 user x since then" > "$LK/lock/owner"
+    echo "99999991 $LK/bin/fio --client=h1 $LK/tgt.cal/h1/cell.job" > "$LK/procs"
+    out=$(lk_run BREAK_LOCK=1)
+    case "$out" in *"NOTE: localhost: --break-lock cleared another run'"'"'s lock(ctl-9 pid 77 user x since then) staged($LK/tgt.cal) fio(99999991)"*LOCKED-BY-US*RELEASED*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ ! -e "$LK/tgt.cal" ]'
+t_assert "run lock: a wekatester fio that survives every kill still stops the run under --break-lock" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    echo "99999991 $LK/bin/fio --server --daemonize=$LK/fio.pid" > "$LK/procs"; echo 99999991 > "$LK/alive"
+    out=$(lk_run BREAK_LOCK=1)
+    case "$out" in *"another wekatester run is here, or one that did not clean up: fio(99999991) unkillable(99999991)"*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ ! -e "$LK/lock" ]'
 
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
 # operator to remount forcedirect then points away from the real fault, which
@@ -1089,7 +1142,8 @@ t_assert "preflight: unreachable -C candidate becomes the set name (fast track)"
     (source ./wekatester
      PATH="$stub:$PATH"
      CUSTOMIZE=1; FAST_TRACK=1; C_CANDIDATE=mysetname
-     HOSTS=(mysetname); MASTER=mysetname; FIO_BIN=/usr/bin/true
+     HOSTS=(mysetname); MASTER=mysetname; FIO_BIN=/usr/bin/true; WORK_DIR=$(mktemp -d)
+     printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; chmod +x "$stub/pgrep"   # no fio running
      uname() { echo Linux; }
      preflight >/dev/null 2>&1
      [ "$CUSTOM_SET" = "mysetname" ] && [ "$LOCAL_MODE" -eq 1 ] && [ "$MASTER" = "localhost" ])'
@@ -1964,18 +2018,15 @@ t_assert "parse: -e in all spellings sets the engine; value case kept; -e= dies"
     (source ./wekatester; parse_args --engine=io_uring h1; [ "$ENGINE" = io_uring ]) &&
     (source ./wekatester; parse_args -EPsync h1;        [ "$ENGINE" = Psync ]) &&
     ! (source ./wekatester; parse_args -e= h1)'
-t_assert "override_variant_key: replaces, inserts into [global], or creates it" bash -c '
-    d=$(mktemp -d)
-    (source ./wekatester
-     printf "[global]\nioengine=libaio\n[j]\nrw=read\n" > "$d/a"
-     printf "[global]\nfilesize=1G\n[j]\nrw=read\n"     > "$d/b"
-     printf "[j]\nrw=read\n"                            > "$d/c"
-     override_variant_key "$d/a" ioengine xyzeng
-     override_variant_key "$d/b" ioengine xyzeng
-     override_variant_key "$d/c" ioengine xyzeng)
-    grep -q "^ioengine=xyzeng$" "$d/a" && ! grep -q libaio "$d/a" &&
-    grep -q "^ioengine=xyzeng$" "$d/b" &&
-    head -2 "$d/c" | grep -q "^\[global\]$" && grep -q "^ioengine=xyzeng$" "$d/c"'
+t_assert "override_staged: replaces, inserts into [global], or creates it" bash -c '
+    d=$(mktemp -d); j=$d/jobs/h1; mkdir -p "$j"
+    printf "[global]\nioengine=libaio\n[j]\nrw=read\n" > "$j/011-a.job"
+    printf "[global]\nfilesize=1G\n[j]\nrw=read\n"     > "$j/012-b.job"
+    printf "[j]\nrw=read\n"                            > "$j/013-c.job"
+    (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); override_staged all ioengine xyzeng) || exit 1
+    grep -q "^ioengine=xyzeng$" "$j/011-a.job" && ! grep -q libaio "$j/011-a.job" &&
+    [ "$(sed -n 2p "$j/012-b.job")" = "ioengine=xyzeng" ] &&
+    [ "$(head -2 "$j/013-c.job" | tr "\n" "|")" = "[global]|ioengine=xyzeng|" ]'
 t_assert "-e stamps every staged variant, the generated layout included" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)

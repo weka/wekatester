@@ -1,26 +1,88 @@
 # --- phase 1: preflight --------------------------------------------------------
+# One run per host (README): a lock directory in each host's tmpfs whose owner
+# line names this run, taken in preflight's own session before anything is
+# written, and released by cleanup.
+declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
+LOCK_TOKEN=""
+lock_token() {   # lock_token -> LOCK_TOKEN
+    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S)T' \
+        "$(local_short_hostname)" "$$" "$(id -un)" -1
+    LOCK_TOKEN=${LOCK_TOKEN//\'/}
+}
+
+# preflight's remote command: no fio exits 1. Another run's traces (its lock,
+# staging, or any fio of wekatester's) print "held ..." and exit 75; fio
+# wekatester did not start prints "alien ..." and exits 76, and is never
+# touched. --break-lock clears the traces first and prints "healed ...".
+lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
+    local fb=${FIO_BIN##*/} pg="pgrep -x fio"
+    fb=${fb:0:15}   # pgrep -x matches the 15-byte process name
+    [ "$fb" = fio ] || pg="$pg; pgrep -x '$fb'"
+    LOCK_CMD="command -v '$FIO_BIN' >/dev/null || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
+    LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
+    # wekatester's fio: its server, the runs that read its staging, its engine tests
+    LOCK_CMD+="; for p in \$($pg); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
+    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; '$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
+    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
+    if [ "$BREAK_LOCK" -eq 1 ]; then
+        # TERM, then -9, then -9 under the first escalator that works (the
+        # probe's order): a root fio needs one
+        LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
+        LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
+    else
+        LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
+    fi
+    # mkdir is the atomic take; a host named twice finds this run's own lock
+    LOCK_CMD+="; if ! mkdir \"\$lk\"; then [ -d \"\$lk\" ] || { echo nolock; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
+    LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
+}
+# cleanup's half: the lock goes only when it is still this run's
+lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
+    LOCK_RELEASE="o=; [ ! -r '$LOCK_DIR/owner' ] || read -r o < '$LOCK_DIR/owner' || :; [ \"\$o\" != '$LOCK_TOKEN' ] || rm -rf '$LOCK_DIR'"
+}
+
 # Every host reachable over ssh with $FIO_BIN, checked in parallel, every
-# failure reported. Each check opens the host ControlMaster for the run.
+# failure reported. Each check opens the host ControlMaster for the run, and
+# takes the run lock.
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
         log "checking $FIO_BIN on the local host..."
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc
-    for host in "${HOSTS[@]}"; do
-        run_host "$host" "command -v '$FIO_BIN' >/dev/null" &
+    local pids=() failed=() host i rc held=0 line
+    [ -n "$LOCK_TOKEN" ] || lock_token
+    lock_take_cmd
+    mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
+    for i in "${!HOSTS[@]}"; do
+        run_host "${HOSTS[$i]}" "$LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
         wait "${pids[$i]}"
         rc=$?
+        line=""; [ ! -s "$WORK_DIR/lock/$i" ] || IFS= read -r line < "$WORK_DIR/lock/$i" || :
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
-            failed+=("${HOSTS[$i]}: ssh failed")
-        elif [ "$rc" -ne 0 ]; then
-            failed+=("${HOSTS[$i]}: $FIO_BIN not found")
+            failed+=("$host: ssh failed")
+        elif [ "$rc" -eq 0 ]; then
+            RUN_LOCKS[$host]=1
+            [ "${line%% *}" != healed ] || log "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
+        elif [ "$rc" -eq 75 ]; then
+            held=1; failed+=("$host: another wekatester run is here, or one that did not clean up:${line#held}")
+        elif [ "$rc" -eq 76 ]; then
+            failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
+        elif [ "$rc" -eq 77 ]; then
+            failed+=("$host: cannot create the run lock $LOCK_DIR")
+        else
+            failed+=("$host: $FIO_BIN not found")
         fi
     done
     # A bare -C candidate that failed ssh is probably the set name: confirm
@@ -65,6 +127,7 @@ preflight() {
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
         done
+        [ "$held" -eq 0 ] || log "a run that is gone: rerun with --break-lock, which kills wekatester's own fio on those hosts and clears its lock and staging" >&2
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
     debug "preflight passed on all hosts"

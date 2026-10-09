@@ -164,13 +164,14 @@ PORTEOF
 }
 
 cleanup() {
-    local host f priv pids=()
+    local host f priv pids=() kcmd
     # the end-of-run pressure/sar capture rides the still-open connections;
     # after this function the control masters are gone
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
         snapshot_pressure end
     fi
+    [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
@@ -180,11 +181,24 @@ cleanup() {
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
             kill_fio_cmd_v "$priv"
-            run_host "$host" "$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
+            # the run lock goes in the same session, last
+            kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
+            [ -z "${RUN_LOCKS[$host]:-}" ] || { kcmd="$kcmd; $LOCK_RELEASE"; unset "RUN_LOCKS[$host]"; }
+            run_host "$host" "$kcmd" &
             pids+=($!)
         done
         # These pids only: a bare wait also waits on the run-log tees, which
         # exit only after cleanup returns. That is a deadlock.
+        wait "${pids[@]}" || true
+    fi
+    # a run that ended before its fio started: the locks on their own
+    if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
+        pids=()
+        for host in "${!RUN_LOCKS[@]}"; do
+            run_host "$host" "$LOCK_RELEASE" &
+            pids+=($!)
+        done
+        RUN_LOCKS=()
         wait "${pids[@]}" || true
     fi
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then

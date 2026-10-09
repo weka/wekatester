@@ -14,8 +14,8 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
         if (index(L[i], layout_marker()) == 1) return 1
     return 0
 }
-# override_variant_key on lines L: replace every key= line, else insert after
-# the first [global], else create [global]. Returns the new line count; in
+# key=value on lines L: replace every key= line, else insert after the first
+# [global], else create [global]. Returns the new line count; in
 # place, so L may keep stale entries past it.
 function override_lines(L, n, key, value,    i, hit, g, kv) {
     kv = key "="; hit = 0; g = 0

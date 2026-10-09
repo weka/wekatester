@@ -63,6 +63,7 @@ SHIPPED_SETS="default mixed 2x400Gb wekawithin smoke"
 # Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
 # TARGET_DIR export must not move it. Test plumbing only.
 TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
+LOCK_DIR="${WEKATESTER_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
@@ -92,6 +93,7 @@ LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
+BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
 
 #@include sh/base.sh
 
@@ -99,7 +101,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s]
+                  [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -146,6 +148,10 @@ attaching is the way to pass a value that starts with a dash.
                           instance, and without the weka CLI nothing reports it
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+  --break-lock            a run that died left its lock, staging or fio on a
+                          host: kill wekatester's own fio there, clear its
+                          files and take the lock (fio it did not start still
+                          stops the run)
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -385,6 +391,7 @@ parse_args() {
                 set_auto_level "$OPT_VAL" -a
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
+            --break-lock) BREAK_LOCK=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;

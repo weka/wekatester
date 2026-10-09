@@ -16,12 +16,13 @@ wekatester uses fio's native client/server mode:
 - ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
 - All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
 - With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
+- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio: a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start, which it never kills. A run that died without cleaning up leaves that evidence behind: `--break-lock` kills wekatester's own fio processes on those hosts (escalating for a root fio), removes its staging and its lock, and takes the lock.
 
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s]
+                  [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -68,6 +69,10 @@ attaching is the way to pass a value that starts with a dash.
                           instance, and without the weka CLI nothing reports it
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+  --break-lock            a run that died left its lock, staging or fio on a
+                          host: kill wekatester's own fio there, clear its
+                          files and take the lock (fio it did not start still
+                          stops the run)
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given

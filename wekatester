@@ -64,6 +64,7 @@ SHIPPED_SETS="default mixed 2x400Gb wekawithin smoke"
 # Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
 # TARGET_DIR export must not move it. Test plumbing only.
 TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
+LOCK_DIR="${WEKATESTER_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
@@ -93,6 +94,7 @@ LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
+BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
 
 # --- logging -----------------------------------------------------------------
 log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
@@ -363,7 +365,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s]
+                  [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -410,6 +412,10 @@ attaching is the way to pass a value that starts with a dash.
                           instance, and without the weka CLI nothing reports it
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+  --break-lock            a run that died left its lock, staging or fio on a
+                          host: kill wekatester's own fio there, clear its
+                          files and take the lock (fio it did not start still
+                          stops the run)
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -682,8 +688,8 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
         if (index(L[i], layout_marker()) == 1) return 1
     return 0
 }
-# override_variant_key on lines L: replace every key= line, else insert after
-# the first [global], else create [global]. Returns the new line count; in
+# key=value on lines L: replace every key= line, else insert after the first
+# [global], else create [global]. Returns the new line count; in
 # place, so L may keep stale entries past it.
 function override_lines(L, n, key, value,    i, hit, g, kv) {
     kv = key "="; hit = 0; g = 0
@@ -1685,6 +1691,7 @@ parse_args() {
                 set_auto_level "$OPT_VAL" -a
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
+            --break-lock) BREAK_LOCK=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
@@ -3746,28 +3753,90 @@ calibrate() {
 }
 
 # --- phase 1: preflight --------------------------------------------------------
+# One run per host (README): a lock directory in each host's tmpfs whose owner
+# line names this run, taken in preflight's own session before anything is
+# written, and released by cleanup.
+declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
+LOCK_TOKEN=""
+lock_token() {   # lock_token -> LOCK_TOKEN
+    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S)T' \
+        "$(local_short_hostname)" "$$" "$(id -un)" -1
+    LOCK_TOKEN=${LOCK_TOKEN//\'/}
+}
+
+# preflight's remote command: no fio exits 1. Another run's traces (its lock,
+# staging, or any fio of wekatester's) print "held ..." and exit 75; fio
+# wekatester did not start prints "alien ..." and exits 76, and is never
+# touched. --break-lock clears the traces first and prints "healed ...".
+lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
+    local fb=${FIO_BIN##*/} pg="pgrep -x fio"
+    fb=${fb:0:15}   # pgrep -x matches the 15-byte process name
+    [ "$fb" = fio ] || pg="$pg; pgrep -x '$fb'"
+    LOCK_CMD="command -v '$FIO_BIN' >/dev/null || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
+    LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
+    # wekatester's fio: its server, the runs that read its staging, its engine tests
+    LOCK_CMD+="; for p in \$($pg); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
+    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; '$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
+    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
+    if [ "$BREAK_LOCK" -eq 1 ]; then
+        # TERM, then -9, then -9 under the first escalator that works (the
+        # probe's order): a root fio needs one
+        LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
+        LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
+    else
+        LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
+    fi
+    # mkdir is the atomic take; a host named twice finds this run's own lock
+    LOCK_CMD+="; if ! mkdir \"\$lk\"; then [ -d \"\$lk\" ] || { echo nolock; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
+    LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
+}
+# cleanup's half: the lock goes only when it is still this run's
+lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
+    LOCK_RELEASE="o=; [ ! -r '$LOCK_DIR/owner' ] || read -r o < '$LOCK_DIR/owner' || :; [ \"\$o\" != '$LOCK_TOKEN' ] || rm -rf '$LOCK_DIR'"
+}
+
 # Every host reachable over ssh with $FIO_BIN, checked in parallel, every
-# failure reported. Each check opens the host ControlMaster for the run.
+# failure reported. Each check opens the host ControlMaster for the run, and
+# takes the run lock.
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
         log "checking $FIO_BIN on the local host..."
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc
-    for host in "${HOSTS[@]}"; do
-        run_host "$host" "command -v '$FIO_BIN' >/dev/null" &
+    local pids=() failed=() host i rc held=0 line
+    [ -n "$LOCK_TOKEN" ] || lock_token
+    lock_take_cmd
+    mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
+    for i in "${!HOSTS[@]}"; do
+        run_host "${HOSTS[$i]}" "$LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
         wait "${pids[$i]}"
         rc=$?
+        line=""; [ ! -s "$WORK_DIR/lock/$i" ] || IFS= read -r line < "$WORK_DIR/lock/$i" || :
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
-            failed+=("${HOSTS[$i]}: ssh failed")
-        elif [ "$rc" -ne 0 ]; then
-            failed+=("${HOSTS[$i]}: $FIO_BIN not found")
+            failed+=("$host: ssh failed")
+        elif [ "$rc" -eq 0 ]; then
+            RUN_LOCKS[$host]=1
+            [ "${line%% *}" != healed ] || log "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
+        elif [ "$rc" -eq 75 ]; then
+            held=1; failed+=("$host: another wekatester run is here, or one that did not clean up:${line#held}")
+        elif [ "$rc" -eq 76 ]; then
+            failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
+        elif [ "$rc" -eq 77 ]; then
+            failed+=("$host: cannot create the run lock $LOCK_DIR")
+        else
+            failed+=("$host: $FIO_BIN not found")
         fi
     done
     # A bare -C candidate that failed ssh is probably the set name: confirm
@@ -3812,6 +3881,7 @@ preflight() {
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
         done
+        [ "$held" -eq 0 ] || log "a run that is gone: rerun with --break-lock, which kills wekatester's own fio on those hosts and clears its lock and staging" >&2
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
     debug "preflight passed on all hosts"
@@ -4312,13 +4382,14 @@ PORTEOF
 }
 
 cleanup() {
-    local host f priv pids=()
+    local host f priv pids=() kcmd
     # the end-of-run pressure/sar capture rides the still-open connections;
     # after this function the control masters are gone
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
         snapshot_pressure end
     fi
+    [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
@@ -4328,11 +4399,24 @@ cleanup() {
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
             kill_fio_cmd_v "$priv"
-            run_host "$host" "$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
+            # the run lock goes in the same session, last
+            kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
+            [ -z "${RUN_LOCKS[$host]:-}" ] || { kcmd="$kcmd; $LOCK_RELEASE"; unset "RUN_LOCKS[$host]"; }
+            run_host "$host" "$kcmd" &
             pids+=($!)
         done
         # These pids only: a bare wait also waits on the run-log tees, which
         # exit only after cleanup returns. That is a deadlock.
+        wait "${pids[@]}" || true
+    fi
+    # a run that ended before its fio started: the locks on their own
+    if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
+        pids=()
+        for host in "${!RUN_LOCKS[@]}"; do
+            run_host "$host" "$LOCK_RELEASE" &
+            pids+=($!)
+        done
+        RUN_LOCKS=()
         wait "${pids[@]}" || true
     fi
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
@@ -6525,18 +6609,9 @@ stage_unlink_variants() {
     JOBFILES+=("$UNLINK_JOB")
 }
 
-# Stamp key=value into a staged variant: replace every line, else insert into
+# Stamp key=value into every staged variant, in one awk for the fleet
+# ("measured": skip layout jobs): replace every line, else insert into
 # [global] (created if missing), as the directory override does.
-override_variant_key() {   # override_variant_key <file> <key> <value>
-    awkrun 'BEGIN {
-        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
-        n = override_lines(L, n, ARGV[2], ARGV[3])
-        writelines(ARGV[1], L, n)
-    }' "$@"
-}
-
-# override_variant_key for the fleet in one awk ("measured": skip layout
-# jobs); per file and key it was minutes at a few hundred hosts.
 override_staged() {   # override_staged <all|measured> <key> <value> [<key> <value>]...
     list_staged "$WORK_DIR/staged.list" || return 1
     awkrun 'BEGIN {

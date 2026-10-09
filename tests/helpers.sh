@@ -385,3 +385,28 @@ cores_facts() {   # cores_facts <probe> [cpu-list]: "n ncores dpdk catchall unli
     }' "$1" "${2:-}")
 }
 export -f cores_line cores_facts
+
+# --- run lock: stub pgrep/ps/fio and the escalators, driven by $LK/procs
+# ("<pid> <args>") and $LK/alive (pids a kill leaves standing). The pids are
+# past any pid_max, so no real process is ever signalled. ---
+lock_fixture() {
+    LK=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    mkdir -p "$LK/bin" "$LK/w"; : > "$LK/procs"; : > "$LK/alive"
+    printf '#!/bin/sh\nexit 0\n' > "$LK/bin/fio"
+    cat > "$LK/bin/pgrep" <<EOF
+#!/bin/sh
+[ "\$1" = -x ] || exit 1
+awk '{print \$1; n++} END {exit !n}' "$LK/procs"
+EOF
+    cat > "$LK/bin/ps" <<EOF
+#!/bin/sh
+case "\$1" in
+    -o) awk -v p="\$4" '\$1 == p {sub(/^[^ ]+ /, ""); print; f = 1} END {exit !f}' "$LK/procs" ;;
+    -p) grep -qx "\$2" "$LK/alive" && echo "\$2" ;;
+esac
+EOF
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$LK/bin/timeout"
+    for e in dzdo pbrun sesu pmrun doas ksu sudo; do printf '#!/bin/sh\nexit 1\n' > "$LK/bin/$e"; done
+    chmod +x "$LK/bin"/*
+}
+export -f lock_fixture
