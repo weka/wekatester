@@ -3,8 +3,12 @@ BEGIN {
     host = ARGV[1]; rnj = ARGV[2] + 0; rnr = ARGV[3] + 0; wnj = ARGV[4] + 0; wnr = ARGV[5] + 0
     fsmib = ARGV[6] + 0; job = ARGV[7]; outdir = ARGV[8]; fmt = ARGV[10]; sep = ARGV[11]
     unified = ARGV[12] == "1"; sparse = unified && ARGV[13] == "0"; tlist = ARGV[14]
-    if ((n = readlines(ARGV[9], L)) < 0) awk_fail("cannot read " ARGV[9])
-    for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[F[1]] = F[2] + 0
+    # streamed, and only shared. and this host own names: a shared
+    # destination lists every member write set too
+    while ((r = (getline line < ARGV[9])) > 0)
+        if ((index(line, "shared.") == 1 || index(line, host sep) == 1) && pysplit(line, F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[F[1]] = F[2] + 0
+    if (r < 0) awk_fail("cannot read " ARGV[9])
+    close(ARGV[9])
     # the nrfiles ladder shares, plus any listed need beyond it: what a
     # host-file value pins past the grid
     nrd = needs_listed(RN, needs_ladder(RN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[17])

@@ -31,24 +31,31 @@ replay_prerun_warnings() {
 
 # stdin is /dev/null on both branches, or a child can eat the script's stdin.
 # host_ssh_opts: our ControlPath and User= per host; nothing for a host on a
-# user-owned master, or when AUTH_DIR is unset.
-host_ssh_opts() {   # host_ssh_opts <host>
+# user-owned master, or when AUTH_DIR is unset. The _v form, without the
+# subshell, is what every remote call uses.
+host_ssh_opts_v() {   # host_ssh_opts_v <host> -> HOST_SSH_OPTS
+    HOST_SSH_OPTS=""
     if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.external" ]; then
         return 0
     fi
-    printf '%s' "$CONTROL_OPTS"
+    HOST_SSH_OPTS=$CONTROL_OPTS
     if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.user" ]; then
         local u=""
         IFS= read -r u < "$AUTH_DIR/$1.user" || :
-        printf ' -o User=%s' "$u"
+        HOST_SSH_OPTS="$HOST_SSH_OPTS -o User=$u"
     fi
+}
+host_ssh_opts() {   # host_ssh_opts <host>
+    host_ssh_opts_v "$1"
+    printf '%s' "$HOST_SSH_OPTS"
 }
 
 run_host() {   # run_host <host> <command-string>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         bash -c "$2" </dev/null
     else
-        ssh -n $SSH_OPTS $(host_ssh_opts "$1") "$1" "$2"
+        host_ssh_opts_v "$1"
+        ssh -n $SSH_OPTS $HOST_SSH_OPTS "$1" "$2"
     fi
 }
 
@@ -66,11 +73,11 @@ copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
         [ "${s%/*}" = "$parent" ] || { log "ERROR: copy_to_master: $s is not in $parent" >&2; return 1; }
         names+=("${s##*/}")
     done
-    (
-        set -o pipefail
-        tar -C "$parent" -cf - -- "${names[@]}" \
-            | ssh $SSH_OPTS $(host_ssh_opts "$MASTER") "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
-    )
+    local -
+    set -o pipefail
+    host_ssh_opts_v "$MASTER"
+    tar -C "$parent" -cf - -- "${names[@]}" \
+        | ssh $SSH_OPTS $HOST_SSH_OPTS "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
 }
 
 # For a worker that needs its own copy (the postmortem's fio --parse-only).
@@ -79,7 +86,8 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         cp -R "$@"
     else
-        scp $SSH_OPTS $(host_ssh_opts "$host") -q -r "${@:1:$#-1}" "$host:${!#}"
+        host_ssh_opts_v "$host"
+        scp $SSH_OPTS $HOST_SSH_OPTS -q -r "${@:1:$#-1}" "$host:${!#}"
     fi
 }
 

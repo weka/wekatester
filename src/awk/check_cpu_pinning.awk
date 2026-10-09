@@ -2,7 +2,7 @@
 # dropped, an empty part skipped
 function expand(s, S,    n, P, i, p, a, b, c) {
     split("", S)
-    n = lsplit(s, P, ",")
+    n = split(s, P, ",")   # not lsplit: a probe's bindable list runs to ~1,500 bytes
     for (i = 1; i <= n; i++) {
         if ((p = strip(P[i])) == "") continue
         if (index(p, "-")) {

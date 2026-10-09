@@ -172,9 +172,7 @@ function probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R,    i, F, S,
         CORE[c] = m
         if (m in THR) THR[m] = THR[m] "," c; else THR[m] = c
     }
-    split("", ORD); nk = 0
-    for (k in THR) ORD[++nk] = k + 0
-    sort_arr(ORD, nk, 1)
+    nk = set_sorted(THR, ORD)
     split("", SOCK); split("", DPDK)
     for (i = 1; i <= nk; i++) SOCK[ORD[i]] = (ORD[i] in TK) ? TS[ORD[i]] : 0
     for (c in weka) if (c in CORE) DPDK[CORE[c]] = 1
@@ -198,11 +196,11 @@ function probe_base(base_list, U, UB, THR, DPDK, core0, B, R,    BU, NEVER, c, k
     return 0
 }
 # probe_cores in one log line; a term only when nonzero, so the sum adds up.
-function cores_summary(R, PHYS, ALL,    more, p, a) {
+function cores_summary(R, PHYS, ALL) { return cores_summary_s(R, fmt_cpulist(PHYS), fmt_cpulist(ALL)) }
+function cores_summary_s(R, p, a,    more) {   # p and a already formatted
     more = ""
     if (R["unlisted"]) more = more sprintf(" - %d outside the host-file cpu list", R["unlisted"])
     if (R["unbound"]) more = more sprintf(" - %d unbindable", R["unbound"])
-    p = fmt_cpulist(PHYS); a = fmt_cpulist(ALL)
     return sprintf("%d physical core(s)%s - %d weka DPDK - %d reserved for the OS (%s)%s = N=%d: N/2 and N jobs on %s, 2N and 4N on %s", R["ncores"], R["topo"] ? "" : " (no topology: one per cpu)", R["dpdk"], R["nres"], R["res"], more, R["n"], p == "" ? "none" : p, a == "" ? "none" : a)
 }
 # Aio events left: fs.aio-max-nr less fs.aio-nr, "" when unknown. Exact

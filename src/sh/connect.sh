@@ -8,15 +8,22 @@ FIO_STARTED=0
 # drain matches the full command line, anchored to the fio binary and
 # carrying the pidfile path.
 kill_fio_cmd() {   # kill_fio_cmd [priv]
+    kill_fio_cmd_v "$1"
+    printf '%s' "$KILL_FIO_CMD"
+}
+# Without the subshell: start and cleanup build it once per host. A loop
+# that ended before its 15th poll saw no server, so only a timed-out one
+# looks again before the -9.
+kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # An escalated server is root-owned: the kill needs the same escalator. The
     # ^ anchor is load-bearing: this shell carries the pattern in its own
     # cmdline (an unanchored pkill -9 once killed the teardown). taskset execs
     # fio, so argv starts with the binary.
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
-    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
+        if [ \"\$i\" -ge 15 ] && pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
 }
 
 start_fio_servers() {
@@ -39,7 +46,8 @@ start_fio_servers() {
         elif [ -n "$priv" ]; then
             launch="$priv $launch"
         fi
-        run_host "$host" "$(kill_fio_cmd "$priv"); $launch" > "$WORK_DIR/launch.$host" &
+        kill_fio_cmd_v "$priv"
+        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
@@ -171,7 +179,8 @@ cleanup() {
             # same escalator or the run leaks a root fio
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
-            run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
+            kill_fio_cmd_v "$priv"
+            run_host "$host" "$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
             pids+=($!)
         done
         # These pids only: a bare wait also waits on the run-log tees, which

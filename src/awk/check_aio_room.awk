@@ -1,3 +1,11 @@
+# A probe's lines up to its aio_nr line (aio_max_nr comes just before it),
+# not the ~1,000 topology lines after
+function aio_head(p, P,    n, line) {
+    split("", P); n = 0
+    while ((getline line < p) > 0) { P[++n] = line; if (index(line, "aio_nr ") == 1) break }
+    close(p)
+    return n
+}
 BEGIN {
     if ((m = readlines(ARGV[2], M)) < 0) awk_fail("cannot read " ARGV[2])
     nk = 0; last = ""
@@ -5,7 +13,7 @@ BEGIN {
         split(M[i], F, "\t")
         if (F[1] != last) {
             last = F[1]
-            if ((np = readlines(ARGV[1] "/probe/" last, P)) < 0) np = 0
+            np = aio_head(ARGV[1] "/probe/" last, P)   # apart: BWK awk passes P untyped otherwise
             room = probe_aio_room(P, np)
         }
         if (room == "" || F[2] == "") continue

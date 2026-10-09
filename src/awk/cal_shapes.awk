@@ -16,10 +16,11 @@ function py_round(x,    r) {   # round(): half to even
     r = int(x)
     return x - r > 0.5 || (x - r == 0.5 && r % 2) ? r + 1 : r
 }
-function field(h, key,    ROW) {   # the host-file value, "" for none
+function field(h, key) {   # the host-file value, "" for none
     if (!(h in ROWS)) return ""
-    lsplit(ROWS[h], ROW, "\t")
-    return row_get(ROW, key)
+    # calls come grouped by host: split each row once per group
+    if (!FLD_SET || h != FLD_H) { lsplit(ROWS[h], FLD_ROW, "\t"); FLD_H = h; FLD_SET = 1 }
+    return row_get(FLD_ROW, key)
 }
 # Host-file values per searched slot (qd nr fs nj, "" for an open knob); -g
 # pins nothing, and --line-rate searches bandwidth again.
@@ -114,6 +115,7 @@ BEGIN {
         ncpus = 0; model = ""; memkb = 0; cli = 1; neng = 0; nn = 0; nw = 0; ne = 0
         split("", WK); split("", ENG); split("", NSPD); split("", NPCI); split("", NDRV); split("", NIDS); split("", NORD)
         for (i = 1; i <= np; i++) {
+            if (substr(P[i], 1, 5) == "topo_") continue   # most of a probe; probe_cores reads them
             if (!(m = pysplit(P[i], F))) continue
             k = F[1]
             if (k == "ncpus" && m > 1 && F[2] ~ /^[0-9]+$/) ncpus = F[2] + 0
@@ -193,7 +195,7 @@ BEGIN {
         if (!(key in SHAPE)) {
             SHAPE[key] = ++ns; s = ns
             SREP[s] = h; SNM[s] = 0; SMODEL[s] = model; SNCPU[s] = ncpus; SMEMKB[s] = memkb; SMEMGIB[s] = memgib
-            SN[s] = CR["n"]; SPHYS[s] = fmt_cpulist(PHYS); SALL[s] = fmt_cpulist(ALL); SSUM[s] = cores_summary(CR, PHYS, ALL)
+            SN[s] = CR["n"]; SPHYS[s] = fmt_cpulist(PHYS); SALL[s] = fmt_cpulist(ALL); SSUM[s] = cores_summary_s(CR, SPHYS[s], SALL[s])
             SLR[s] = linerate; SETH[s] = ethtool; SWHY[s] = why; SCANDS[s] = cands; SPIN[s] = pinned; SAIO[s] = ""
             SNICS[s] = ""
             if (np_) {

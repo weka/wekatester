@@ -139,7 +139,7 @@ function fmt_cpulist(S,    A, n, i, j, out) {   # 0-3,8: runs collapsed
 # A cpu list ("0-3,8") into the set S: 1, or 0 when it is not one
 function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
     split("", S)
-    n = lsplit(s, P, ",")
+    n = split(s, P, ",")   # not lsplit: a probe's bindable list runs to ~1,500 bytes
     for (i = 1; i <= n; i++) {
         if (index(P[i], "-")) {
             if (lsplit(P[i], ab, "-") != 2) return 0

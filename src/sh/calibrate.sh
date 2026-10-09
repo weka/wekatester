@@ -167,6 +167,13 @@ BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-5}
 # comma-joined word.
 cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this level
     local exh=0 conf=$CAL_CONFIRM fq=- fn=-
+    # the comma ladders, joined again only when a ladder changed (~16 calls a shape)
+    if [ "$CAL_LADDERS_SRC" != "$CAL_NR_LADDER|$CAL_BW_QD_LADDER|$CAL_IOPS_QD_LADDER" ]; then
+        CAL_NRC=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')
+        CAL_BWQDC=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')
+        CAL_IOPSQDC=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')
+        CAL_LADDERS_SRC="$CAL_NR_LADDER|$CAL_BW_QD_LADDER|$CAL_IOPS_QD_LADDER"
+    fi
     case "$AUTO_LEVEL" in
         (brutal) exh=1; conf=$BRUTAL_CONFIRM ;;
         # safe and max measure three job counts once each: no confirm pass
@@ -180,9 +187,7 @@ cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this le
     printf '%s ' "lvl=${AUTO_LEVEL:-cal}" "fq=$fq" "fn=$fn" "exh=$exh" "line=$CAL_LINE_PCT" \
         "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
-        "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
-        "bwqd=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')" \
-        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')"
+        "nrc=$CAL_NRC" "bwqd=$CAL_BWQDC" "iopsqd=$CAL_IOPSQDC"
 }
 
 # One cell for ONE host, every input an argument: time_based, 2s ramp,
@@ -208,7 +213,7 @@ stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|la
         esac
     done
     [ -n "$eng" ] || die "stage_cal_cell: no ioengine given"
-    mkdir -p "${f%/*}" || die "cannot create ${f%/*}"
+    [ -d "${f%/*}" ] || mkdir -p "${f%/*}" || die "cannot create ${f%/*}"
     {
         printf '[global]\n'
         printf 'directory=%s%s\n' "$hd" "${CAL_NS_DIR-/$CAL_SCRATCH}"
@@ -263,7 +268,7 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
         3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
            echo "ERROR: cal_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v key="$key" -v path="$1" '
+    json_awk -F'\t' -v key="$key" -v path="$1" '
         #@awk cal_values'
 }
 
@@ -277,7 +282,7 @@ cal_lat_values() {   # cal_lat_values <json> <read|write>
         3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
            echo "ERROR: cal_lat_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v d="$2" -v path="$1" '
+    json_awk -F'\t' -v d="$2" -v path="$1" '
         #@awk cal_lat_values'
 }
 
@@ -290,6 +295,7 @@ apply_cal_results() {
     # values instead of only filling gaps.
     awkrun '#@awk apply_cal_results' "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" "${LINE_RATE_GBPS:--}" \
         || die "cannot apply the calibration results"
+    HOST_DIRS_KEY=""   # a host_dir_v map of the old targets.final is stale
 }
 
 # Only this cell file goes to the master, one copy per push.
@@ -326,16 +332,19 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag.json"
-    hd=$(host_dir "$host")
+    host_dir_v "$host"; hd=$HOST_DIR
     root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
     host_name_v "$host"
-    local hname=$HOST_NAME
+    local hname=$HOST_NAME fmt=${CAL_FMT:-\$jobnum.\$filenum} sep=${CAL_SEP:-.cal.} slashes depth
+    slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     [ "${CAL_NS_DIR-unset}" != "" ] || unified=1
     mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
     rm -f "$WORK_DIR/cal/$host/truncfail"
     # One session for the listing and df. No error suppression on find: without
-    # GNU -printf it must fail loudly, or every run re-seeds everything.
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -type f -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+    # GNU -printf it must fail loudly, or every run re-seeds everything. Only
+    # the names the seed can ask for: a shared destination holds every
+    # member's write set.
+    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
         > "$WORK_DIR/cal/$host/scratch.raw" \
         || die "$host: cannot inspect the calibration dataset or its free space"
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
@@ -346,12 +355,13 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     wantnj=$wnj
     [ "$unified" -eq 1 ] || [ "$rnj" -le "$wantnj" ] || wantnj=$rnj
     subdirs=""
-    if [ "$maxf" -gt 0 ] && [ "$wantnj" -gt 0 ]; then
+    # a name with no / needs no directory: skip the awk launch
+    if [ "$maxf" -gt 0 ] && [ "$wantnj" -gt 0 ] && [[ $hname${CAL_SEP:-.cal.}${CAL_FMT:-\$jobnum.\$filenum} == */* ]]; then
         subdirs=$(cal_scratch_dirs "$hname" "${CAL_SEP:-.cal.}" \
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$wantnj" $((maxf - 1))) \
             || die "$host: cannot derive the calibration namespace directories"
     fi
-    if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ] && [ "$rnr" -gt 0 ]; then
+    if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ] && [ "$rnr" -gt 0 ] && [[ shared.$CAL_FMT == */* ]]; then
         subdirs="$subdirs
 $(cal_scratch_dirs shared "." "$CAL_FMT" "$rnj" $((rnr - 1)))" \
             || die "$host: cannot derive the shared dataset directories"
@@ -413,16 +423,12 @@ SUBDIREOF
         fi
     fi
     if [ "${ntrunc:-0}" -gt 0 ]; then
-        # sparse write canvases by truncate, one pass per size, chunked to keep
-        # the command small
-        for tmib in $(awk '{print $2}' "$tlist" | sort -un); do
-            awk -v s="$tmib" '$2 == s {print $1}' "$tlist" | while IFS= read -r tn || [ -n "$tn" ]; do
-                printf "'%s' " "$tn"
-            done | xargs -n 64 | while IFS= read -r tchunk; do
-                run_host "$host" "cd '$root' && truncate -s ${tmib}M $tchunk" \
-                    || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
-            done
-        done
+        # sparse write canvases by truncate: one session for every size, a
+        # second only past ~100 KB of names (was one per 64 files)
+        while IFS= read -r tchunk; do
+            run_host "$host" "cd '$root' && $tchunk" \
+                || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
+        done < <(awkrun '#@awk cal_seed_rep.truncate' "$tlist")
         [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
             || die "$host: cannot truncate-seed the write set"
         log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
@@ -537,13 +543,15 @@ cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine
     if [ "$type" = lat ] || [ "$type" = lat1m ]; then
         vals=$(cal_lat_values "$json" "$dirn") || die "cannot read the latency of ${json##*/}"
         read -r h v a <<<"$vals"
-        printf '%s %s\n' "$v" "$a" > "$WORK_DIR/cal/reading"
+        CAL_READING="$v $a"
     else
         vals=$(cal_values "$json" "$type") || die "cannot read the throughput of ${json##*/}"
         read -r h v <<<"$vals"
-        printf '%s\n' "$v" > "$WORK_DIR/cal/reading"
+        CAL_READING=$v
     fi
-    debug "cal: shape $CAL_SID $what ${rt}s: $(cat "$WORK_DIR/cal/reading")"
+    # the file is the hand-off; CAL_READING spares the callers a cat per cell
+    printf '%s\n' "$CAL_READING" > "$WORK_DIR/cal/reading"
+    debug "cal: shape $CAL_SID $what ${rt}s: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
 
@@ -567,7 +575,7 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
                 cal_ensure_seed "$rep" "$dirn" "$nj" "$nr"
                 cal_run_cell "$rep" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
                 printf '%s %s %s %s %s %s %s\n' "$phase" "$eng" "$nj" "$qd" "$nr" "$rt" \
-                    "$(cat "$WORK_DIR/cal/reading")" >> "$hist"
+                    "$CAL_READING" >> "$hist"
                 n=$((n + 1)) ;;
             ("done "*)
                 read -r _ nj qd nr msg <<<"$act"
@@ -580,6 +588,12 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
     done
 }
 
+# Whether the newline-separated todo list holds this exact line (was a
+# printf | grep -qx pipeline per test).
+cal_todo_has() {   # cal_todo_has <todo> <line>
+    [[ $'\n'$1$'\n' == *$'\n'"$2"$'\n'* ]]
+}
+
 # One shape, solo: reuse host-file values, seed, pick the engine, search the
 # rest. Leaves cal/s<id>/engine and one tuple file per slot.
 cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
@@ -587,8 +601,8 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
     local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax
     CAL_SID=$sid
-    CAL_REP_DIR=$(host_dir "$rep")
-    CAL_REP_NAME=$(host_name "$rep")
+    host_dir_v "$rep"; CAL_REP_DIR=$HOST_DIR
+    host_name_v "$rep"; CAL_REP_NAME=$HOST_NAME
     CAL_REP_N=$usable
     CAL_REP_PHYS=$phys
     CAL_REP_ALL=$allc
@@ -650,14 +664,14 @@ BUDEOF
         : > "$sdir/engines"
         for etype in bw iops lat; do
             edirn="" ctype=$etype
-            if printf '%s' "$todo" | grep -qx "$etype read"; then edirn=read
-            elif printf '%s' "$todo" | grep -qx "$etype write"; then edirn=write
+            if cal_todo_has "$todo" "$etype read"; then edirn=read
+            elif cal_todo_has "$todo" "$etype write"; then edirn=write
             elif [ "$etype" = lat ]; then
                 # only a 1MiB latency search: its cells stand in, tallied as
                 # latency, or a set like that has no engine cell at all
                 ctype=lat1m
-                if printf '%s' "$todo" | grep -qx "lat1m read"; then edirn=read
-                elif printf '%s' "$todo" | grep -qx "lat1m write"; then edirn=write
+                if cal_todo_has "$todo" "lat1m read"; then edirn=read
+                elif cal_todo_has "$todo" "lat1m write"; then edirn=write
                 fi
             fi
             [ -n "$edirn" ] || continue
@@ -678,7 +692,7 @@ BUDEOF
             CAL_PIN_FS=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
             for e in ${engines//,/ }; do
                 cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
-                printf '%s %s %s\n' "$etype" "$e" "$(cat "$WORK_DIR/cal/reading")" >> "$sdir/engines"
+                printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
             done
             CAL_PIN_FS=""
         done
@@ -689,7 +703,7 @@ BUDEOF
     printf '%s\n' "$eng" > "$sdir/engine"
     for type in bw iops lat lat1m; do
         for dirn in write read; do
-            printf '%s' "$todo" | grep -qx "$type $dirn" || continue
+            cal_todo_has "$todo" "$type $dirn" || continue
             cal_search "$rep" "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap"
         done
     done
@@ -722,14 +736,21 @@ cal_remove_dataset() {
         done
         awkrun '#@awk cal_remove_dataset' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" \
             "${args[@]}" > "$cmds" || die "cannot derive the dataset removal commands"
+        # every shared set first, all at once (one at a time was minutes with
+        # a group per host), so their pruning ends before the members' starts
+        local spids=()
         while IFS=$'\t' read -r kind host ucmd; do
-            if [ "$kind" = S ]; then
-                run_host "$host" "$ucmd" \
-                    || log "WARNING: could not remove the shared dataset" >&2
-            else
-                run_host "$host" "$ucmd" &
-                pids+=($!); hs+=("$host")
-            fi
+            [ "$kind" = S ] || continue
+            run_host "$host" "$ucmd" &
+            spids+=($!)
+        done < "$cmds"
+        for i in "${!spids[@]}"; do
+            wait "${spids[$i]}" || log "WARNING: could not remove the shared dataset" >&2
+        done
+        while IFS=$'\t' read -r kind host ucmd; do
+            [ "$kind" != S ] || continue
+            run_host "$host" "$ucmd" &
+            pids+=($!); hs+=("$host")
         done < "$cmds"
     fi
     for i in "${!pids[@]}"; do
@@ -743,15 +764,17 @@ cal_remove_dataset() {
 # widest cell, less what exists, pooled per weka filesystem. Other members are
 # left to check_capacity. Over: die, or ask under --ignore-capacity.
 cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
-    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line
-    depth=$(( $(printf '%s' "${CAL_FMT:-\$jobnum.\$filenum}" | tr -cd / | wc -c) + 1 ))
+    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line fmt=${CAL_FMT:-\$jobnum.\$filenum} slashes
+    slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     mkdir -p "$WORK_DIR/cal/cap" || die "cannot create $WORK_DIR/cal/cap"
     : > "$WORK_DIR/cal/cap/names"
     while IFS=$'\t' read -r _ rep _; do
-        hd=$(host_dir "$rep")
+        host_dir_v "$rep"; hd=$HOST_DIR
         root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
-        printf '%s\t%s\n' "$rep" "$(host_name "$rep")" >> "$WORK_DIR/cal/cap/names"
-        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
+        host_name_v "$rep"
+        printf '%s\t%s\n' "$rep" "$HOST_NAME" >> "$WORK_DIR/cal/cap/names"
+        # only the names the check prices: shared. and this rep's own
+        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
         pids+=($!); hs+=("$rep")
     done < "$shapes"
     for i in "${!pids[@]}"; do
@@ -859,8 +882,10 @@ calibrate() {
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     local sid rep usable phys allc linerate engines pinned memcap aio cached members
     pids=(); hs=()
+    load_host_dirs   # host_dir_v answers from it for every shape and seed below
     while IFS=$'\t' read -r sid rep rest; do
-        run_host "$rep" "mkdir -p '$(host_dir "$rep")${CAL_NS_DIR-/$CAL_SCRATCH}'" &
+        host_dir_v "$rep"
+        run_host "$rep" "mkdir -p '$HOST_DIR${CAL_NS_DIR-/$CAL_SCRATCH}'" &
         pids+=($!); hs+=("$rep")
     done < "$shapes"
     for i in "${!pids[@]}"; do
@@ -885,7 +910,8 @@ calibrate() {
             dirn=read; [ "${slot##*_}" = r ] || dirn=write
             t="$WORK_DIR/cal/s$sid/tuple-$type-$dirn"
             if [ -s "$t" ]; then
-                line="$line $(cat "$t")"; any=1
+                IFS= read -r m < "$t" || :
+                line="$line $m"; any=1
             else
                 line="$line - - - -"
             fi

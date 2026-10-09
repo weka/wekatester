@@ -137,7 +137,8 @@ BEGIN {
             # identity, credentials and the operator OWN cpu list are
             # never overwritten, -g included
             if ((k == "login" || k == "cpus") && ((h, k) in HAVE)) continue
-            if (((h, k) in HAVE) && norm(k, HAVE[h, k]) == norm(k, D[k])) continue   # the row keeps its own spelling
+            # the row keeps its own spelling; equal text is equal meaning
+            if (((h, k) in HAVE) && ((HAVE[h, k] "") == (D[k] "") || norm(k, HAVE[h, k]) == norm(k, D[k]))) continue
             # the bandwidth tuples --line-rate MEASURED again replace the
             # row; a staged guess for those slots never does
             fresh = line_gbps != "-" && ((h, k) in MEAS) && (substr(k, 1, length(k) - 3) in LINE_RATE)
@@ -148,7 +149,7 @@ BEGIN {
         for (f = 1; f <= nfield; f++) {
             k = FIELD[f]
             if ((h, k) in WANT) any = 1
-            if (((h, k) in WANT) != ((h, k) in HAVE) || ((h, k) in WANT) && norm(k, WANT[h, k]) != norm(k, HAVE[h, k])) same = 0
+            if (((h, k) in WANT) != ((h, k) in HAVE) || ((h, k) in WANT) && (WANT[h, k] "") != (HAVE[h, k] "") && norm(k, WANT[h, k]) != norm(k, HAVE[h, k])) same = 0
         }
         if (any && !same && !(h in WANTED)) { WANTED[h] = 1; nup++ }
     }
@@ -156,11 +157,11 @@ BEGIN {
     # only ever added to: the host own line commented out with its new
     # version below it, or appended; generic rows untouched
     if ((n = readlines(wb, L)) < 0) awk_fail("cannot read " wb)
-    for (i = 1; i <= n; i++)
-        if ((addr = own_line(L[i])) != "" && !(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
     no = 0
     for (i = 1; i <= n; i++) {
         if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
+        # render reads only its own host's first spelling, set here first
+        if (!(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
         O[++no] = "# superseded by -a: " L[i]
         if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
     }

@@ -117,10 +117,11 @@ host_idents() {
             #@awk host_idents' "${files[@]}")
     fi
     for h in "${HOSTS[@]}"; do
-        id=""
-        if [ -s "$WORK_DIR/probe/$h" ]; then id=${ids[$i]:-}; i=$((i + 1)); fi
-        if [ -n "$id" ]; then
-            host_name_v "$h"; out="$out${out:+,}$h=$HOST_NAME/$id"
+        if [ -s "$WORK_DIR/probe/$h" ]; then
+            # every probe carries its ident line: an empty id there is the
+            # answer, with no host_identity round of forks to find it again
+            id=${ids[$i]:-}; i=$((i + 1))
+            host_name_v "$h"; out="$out${out:+,}$h=$HOST_NAME${id:+/$id}"
         else
             out="$out${out:+,}$h=$(host_identity "$h")"
         fi
@@ -237,16 +238,16 @@ targets_column() {   # targets_column <fieldno> <file> <host>...
     awk '#@awk targets_column' "$@"
 }
 
-# host_dir for the fleet in one awk, into HOST_DIRS in HOSTS order. The
-# resolution changes between phases, so each phase that walks the fleet loads
-# it again.
-HOST_DIRS=()
+# host_dir for the fleet in one awk, into HOST_DIRS in HOSTS order and
+# HOST_DIR_OF by host. The resolution changes between phases, so each phase
+# that walks the fleet loads it again.
+HOST_DIRS=(); declare -gA HOST_DIR_OF=(); HOST_DIRS_KEY=""
 load_host_dirs() {
     local f="" d i=0
-    HOST_DIRS=()
     if [ -f "$WORK_DIR/targets.final" ]; then f="$WORK_DIR/targets.final"
     elif [ -f "$WORK_DIR/targets.phase1" ]; then f="$WORK_DIR/targets.phase1"
     fi
+    HOST_DIRS=(); HOST_DIR_OF=(); HOST_DIRS_KEY=$f
     if [ -z "$f" ]; then
         for d in "${HOSTS[@]}"; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
         return 0
@@ -256,6 +257,20 @@ load_host_dirs() {
     done < <(targets_column 5 "$f" "${HOSTS[@]}")
     # a host the awk never answered for still gets -d, as host_dir gives it
     while [ "$i" -lt ${#HOSTS[@]} ]; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
+    for i in "${!HOSTS[@]}"; do
+        [ -n "${HOST_DIR_OF[${HOSTS[$i]}]+set}" ] || HOST_DIR_OF[${HOSTS[$i]}]=${HOST_DIRS[$i]}
+    done
+}
+# host_dir without its subshells and awk: from the last load of targets.final
+# (its writers clear HOST_DIRS_KEY), -d when no file resolves dirs
+host_dir_v() {   # host_dir_v <host> -> HOST_DIR
+    if [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
+        HOST_DIR=${HOST_DIR_OF[$1]}
+    elif [ ! -f "$WORK_DIR/targets.final" ] && [ ! -f "$WORK_DIR/targets.phase1" ]; then
+        HOST_DIR=$DIRECTORY
+    else
+        HOST_DIR=$(host_dir "$1")
+    fi
 }
 
 host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)

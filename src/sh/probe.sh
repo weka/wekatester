@@ -84,7 +84,12 @@ test_engines() {
         host=${HOSTS[$i]}
         (
             hd=${HOST_DIRS[$i]}
-            avail=$(awk '$1 == "engines" {$1 = ""; print}' "$WORK_DIR/probe/$host")
+            # the probe's engines line, near its top: read, not an awk per host
+            avail=""
+            while read -ra _w; do
+                [ "${_w[0]:-}" = engines ] || continue
+                avail=" ${_w[*]:1}"; break
+            done < "$WORK_DIR/probe/$host"
             for c in $cand; do
                 case " $avail " in
                     *" $c "*) ;;
@@ -168,6 +173,7 @@ finalize_targets() {
         "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
+    HOST_DIRS_KEY=""   # a host_dir_v map of an earlier targets.final is stale
     # one awk for the fleet: the first host, in host order, whose host-file
     # engine did not pass its test there
     local bad
@@ -305,9 +311,10 @@ probe_workers() {
     echo
     log "probing ${#HOSTS[@]} worker(s)..."
     mkdir -p "$WORK_DIR/probe"
-    local pids=() failed=() host i bad=()
+    local pids=() failed=() host i bad=() cmd
+    cmd=$(probe_remote_cmd)
     for host in "${HOSTS[@]}"; do
-        run_host "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
+        run_host "$host" "$cmd" > "$WORK_DIR/probe/$host" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do

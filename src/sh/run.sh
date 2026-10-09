@@ -77,8 +77,10 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
     [ ${#files[@]} -gt 0 ] || return 0
     mkdir -p "${dirs[@]}" \
         || { log "WARNING: cannot create the per-host directories under $RUN_DIR/sysinfo" >&2; return 0; }
+    # the raw captures are dead once split: tmpfs is RAM, and a run-window
+    # sar slice per host adds up
     WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
-        #@awk split_sysinfo' "${files[@]}"
+        #@awk split_sysinfo' "${files[@]}" && rm -f -- "${files[@]}"
 }
 
 # PSI and load at start and again at teardown, plus the sar slice covering the
@@ -154,14 +156,14 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
            echo "$path: cannot parse fio JSON" >&2; return 1 ;;
     esac
     local bad
-    bad=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v mode="$mode" '
+    bad=$(json_awk -F'\t' -v mode="$mode" '
         #@awk check_fio_errors')
     [ "$bad" != NONE ] || { echo "$path: fio returned no per-job stats -- the jobs did not run" >&2; return 1; }
     [ -n "$bad" ] || return 0
     local line kind h job e desc
     while IFS=$'\t' read -r kind h job e; do
         case "$kind" in
-            E) desc=$(errno_text "$e"); echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
+            E) errno_text_v "$e"; desc=$ERRNO_TEXT; echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
             Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2 ;;
         esac
     done <<<"$bad"
@@ -210,7 +212,7 @@ sweep_layout_grid() {
     local lay=${JOBFILES[0]}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
-    local host hd spec cmd sz glob depth tot pids hs i args=() nofa
+    local host hd spec cmd sz glob depth tot pids hs i args=() nofa lit dep sl
     pids=(); hs=()
     # one awk derives every host's grid (was one per host plus a grep,
     # serial, ahead of a fan-out whose floor is one round trip)
@@ -234,9 +236,18 @@ sweep_layout_grid() {
             # overcredit of a shared oversize file. The kept calibration
             # scratch is excluded, or a nested glob (*/*) would delete and
             # credit its files.
-            cmd="$cmd find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" ! -size +$((sz - 1))c -delete; \
-                 find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -size +$((sz - 1))c \
-                     | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
+            # Start at the glob's literal directories: from the shared $hd every
+            # host walked every host's grid. One walk prints the files that
+            # count and deletes the deviants.
+            lit=${glob%%[*?[]*}; dep=$depth
+            case $lit in
+                */*) lit=${lit%/*}; sl=${lit//[!\/]/}; dep=$((depth - ${#sl} - 1))
+                     cmd="$cmd if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
+                *)   lit=""; cmd="$cmd { find \"$hd\"" ;;
+            esac
+            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" \\( -size +$((sz - 1))c -print -o -delete \\);"
+            [ -z "$lit" ] && cmd="$cmd }" || cmd="$cmd fi"
+            cmd="$cmd | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
         # pipefail: a dead session must fail the sweep, not hand the awk an
@@ -277,12 +288,14 @@ job_clients() {   # job_clients <job>
 # headroom, so a dry run reports it too (README, Caveats).
 CLIENT_CMD_MAX=122880
 check_client_cmdline() {   # check_client_cmdline [what]
-    local job cmd n longest=0 worst=""
+    local job cmd longest=0 worst="" jl=-1
+    # the name appears once per host, so the longest name makes the longest
+    # command: build that one, not one per job
+    [ ${#JOBFILES[@]} -gt 0 ] || return 0
     for job in "${JOBFILES[@]}"; do
-        cmd=$(fio_client_cmd "$job")
-        n=${#cmd}
-        [ "$n" -le "$longest" ] || { longest=$n; worst=$job; }
+        [ "${#job}" -le "$jl" ] || { jl=${#job}; worst=$job; }
     done
+    cmd=$(fio_client_cmd "$worst"); longest=${#cmd}
     [ "$longest" -gt "$CLIENT_CMD_MAX" ] || return 0
     die "${1:-the fio command line for $worst} is $longest bytes with ${#HOSTS[@]} hosts; the master's shell takes it as one argument, which Linux caps at 128 KiB (MAX_ARG_STRLEN) -- run the fleet as two or more host lists"
 }
@@ -366,8 +379,10 @@ run_jobs() {
         check_fio_errors "$outfile" measured \
             || die "job $job failed on at least one host (raw output in $outfile)"
         # fio keys client_stats by the --client= name, not the worker hostname;
-        # local mode reports as localhost.
-        summarize "$outfile" "$report" "${HOSTS[*]}"
+        # local mode reports as localhost. A results file, never a bundle: no
+        # tar probe (GNU tar reads the whole file looking for a header).
+        summ_one "$outfile" "$outfile" "${report:-bandwidth latency iops}" "${HOSTS[*]}" file \
+            || die "failed to summarize $outfile"
     done
     log "raw fio results: $RUN_DIR/"
     echo
@@ -416,7 +431,7 @@ summ_one() {
     case $JSON_RC in
         2) out="ERR	$label: no JSON in fio output" ;;
         3) out="ERR	$label: cannot parse fio JSON: ${JSON_ERR#json: }" ;;
-        *) out=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
+        *) out=$(json_awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
         #@awk summ_one') ;;
     esac
     case "$out" in

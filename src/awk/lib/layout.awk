@@ -4,14 +4,14 @@
 # (a max-of-everything section creates the cross-product). Order: lay_reset,
 # lay_add and lay_engine per jobfile, lay_sections.
 function lay_reset() {
-    split("", LAY_NS); split("", LAY_TALLY); split("", LAY_EORD); LAY_NNS = 0; LAY_NE = 0
+    split("", LAY_NS); split("", LAY_TALLY); split("", LAY_EORD); split("", LAY_DUP); LAY_NNS = 0; LAY_NE = 0
 }
 function lay_engine(L, n,    eng) {
     if ((eng = first_value(L, n, "ioengine")) == "") return
     if (!(eng in LAY_TALLY)) LAY_EORD[++LAY_NE] = eng
     LAY_TALLY[eng]++
 }
-function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c) {
+function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c, d) {
     # No filename_format: fio names files after the section, so the layout
     # section takes the measured section name.
     if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
@@ -27,7 +27,12 @@ function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k,
     nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
     if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
     if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
-    k = LAY_NS[key]; c = ++LAY_NC[k]
+    k = LAY_NS[key]
+    # a group's members add the same grid again: lay_prune keeps only the
+    # first of equals, and sorting the rest was O(members^2)
+    d = k SUBSEP nj SUBSEP nr SUBSEP sprintf("%.17g", sb)
+    if (d in LAY_DUP) return
+    LAY_DUP[d] = 1; c = ++LAY_NC[k]
     LAY_CNJ[k, c] = nj; LAY_CNR[k, c] = nr; LAY_CSB[k, c] = sb; LAY_CFS[k, c] = fs; LAY_CSZ[k, c] = sz
 }
 # Keep contributors no kept grid covers; widest first, stable, so a dominated

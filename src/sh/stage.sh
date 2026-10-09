@@ -41,8 +41,9 @@ stage_variants() {
     stage_hosts plain "$srcdir" "$DIRECTORY" - - "${HOSTS[@]}" \
         || die "per-host jobfile staging failed"
     # the host-file engine applies per host to every staged file, a re-derived
-    # layout included; the -e post-pass in stage_jobfiles runs after and wins
-    [ -f "$WORK_DIR/targets.final" ] || return 0
+    # layout included; the -e post-pass in stage_jobfiles runs after and wins,
+    # rewriting every ioengine line, so under -e this pass is skipped
+    [ -f "$WORK_DIR/targets.final" ] && [ -z "$ENGINE" ] || return 0
     stage_host_engines
 }
 

@@ -128,7 +128,8 @@ probe_writable() {   # probe_writable <host> <dir>
 # "<host> <group>".
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
-    local i h hd pids=() sum n=0 line
+    local i h pids=() sum n=0 line summary
+    local -A at=()
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
@@ -155,17 +156,20 @@ collect_fs_groups() {
         wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
     done
     awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
-    n=$(awk '{print $2}' "$WORK_DIR/groups" | sort -u | wc -l | tr -d ' ')
+    # the count, then each group's members, from one awk: a pass per group
+    # was groups x hosts when every host has its own directory
+    summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")
+    n=${summary%%$'\n'*}
     if [ "$n" -le 1 ]; then
-        debug "filesystem groups: all ${#HOSTS[@]} host(s) share $(host_dir "${HOSTS[0]}")"
+        debug "filesystem groups: all ${#HOSTS[@]} host(s) share ${HOST_DIRS[0]}"
         return 0
     fi
+    for i in "${!HOSTS[@]}"; do [ -n "${at[${HOSTS[$i]}]+set}" ] || at[${HOSTS[$i]}]=$i; done
     log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
-    for i in $(seq 1 "$n"); do
-        line=$(awk -v g="$i" '$2 == g {printf "%s%s", (c++ ? " " : ""), $1}' "$WORK_DIR/groups")
-        hd=$(host_dir "${line%% *}")
-        log "  group $i: $line (at $hd on ${line%% *})"
-    done
+    while IFS=$'\t' read -r i line; do
+        h=${line%% *}
+        log "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
+    done <<<"${summary#*$'\n'}"
 }
 
 # The first host of <host> group lays out, prices and removes its shared read
@@ -251,8 +255,13 @@ verify_mount_mode() {
     done
     for i in "${!HOSTS[@]}"; do
         [ "${rcs[$i]}" -ne 0 ] || continue
-        if wait "${pids[$i]}" && line=$(cat "$td/$i.anc") \
-                && [ "$line" != "${line#*$'\n'}" ]; then
+        line=""
+        if wait "${pids[$i]}"; then
+            # the file as $(cat) gives it (trailing newlines dropped), no fork
+            IFS= read -r -d '' line < "$td/$i.anc" || :
+            line=${line%"${line##*[!$'\n']}"}
+        fi
+        if [ "$line" != "${line#*$'\n'}" ]; then
             ancs[$i]=${line%%$'\n'*}; lines[$i]=${line#*$'\n'}
         else
             msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"

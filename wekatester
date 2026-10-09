@@ -127,24 +127,31 @@ replay_prerun_warnings() {
 
 # stdin is /dev/null on both branches, or a child can eat the script's stdin.
 # host_ssh_opts: our ControlPath and User= per host; nothing for a host on a
-# user-owned master, or when AUTH_DIR is unset.
-host_ssh_opts() {   # host_ssh_opts <host>
+# user-owned master, or when AUTH_DIR is unset. The _v form, without the
+# subshell, is what every remote call uses.
+host_ssh_opts_v() {   # host_ssh_opts_v <host> -> HOST_SSH_OPTS
+    HOST_SSH_OPTS=""
     if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.external" ]; then
         return 0
     fi
-    printf '%s' "$CONTROL_OPTS"
+    HOST_SSH_OPTS=$CONTROL_OPTS
     if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.user" ]; then
         local u=""
         IFS= read -r u < "$AUTH_DIR/$1.user" || :
-        printf ' -o User=%s' "$u"
+        HOST_SSH_OPTS="$HOST_SSH_OPTS -o User=$u"
     fi
+}
+host_ssh_opts() {   # host_ssh_opts <host>
+    host_ssh_opts_v "$1"
+    printf '%s' "$HOST_SSH_OPTS"
 }
 
 run_host() {   # run_host <host> <command-string>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         bash -c "$2" </dev/null
     else
-        ssh -n $SSH_OPTS $(host_ssh_opts "$1") "$1" "$2"
+        host_ssh_opts_v "$1"
+        ssh -n $SSH_OPTS $HOST_SSH_OPTS "$1" "$2"
     fi
 }
 
@@ -162,11 +169,11 @@ copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
         [ "${s%/*}" = "$parent" ] || { log "ERROR: copy_to_master: $s is not in $parent" >&2; return 1; }
         names+=("${s##*/}")
     done
-    (
-        set -o pipefail
-        tar -C "$parent" -cf - -- "${names[@]}" \
-            | ssh $SSH_OPTS $(host_ssh_opts "$MASTER") "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
-    )
+    local -
+    set -o pipefail
+    host_ssh_opts_v "$MASTER"
+    tar -C "$parent" -cf - -- "${names[@]}" \
+        | ssh $SSH_OPTS $HOST_SSH_OPTS "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
 }
 
 # For a worker that needs its own copy (the postmortem's fio --parse-only).
@@ -175,7 +182,8 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
     if [ "$LOCAL_MODE" -eq 1 ]; then
         cp -R "$@"
     else
-        scp $SSH_OPTS $(host_ssh_opts "$host") -q -r "${@:1:$#-1}" "$host:${!#}"
+        host_ssh_opts_v "$host"
+        scp $SSH_OPTS $HOST_SSH_OPTS -q -r "${@:1:$#-1}" "$host:${!#}"
     fi
 }
 
@@ -644,7 +652,7 @@ function fmt_cpulist(S,    A, n, i, j, out) {   # 0-3,8: runs collapsed
 # A cpu list ("0-3,8") into the set S: 1, or 0 when it is not one
 function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
     split("", S)
-    n = lsplit(s, P, ",")
+    n = split(s, P, ",")   # not lsplit: a probe's bindable list runs to ~1,500 bytes
     for (i = 1; i <= n; i++) {
         if (index(P[i], "-")) {
             if (lsplit(P[i], ab, "-") != 2) return 0
@@ -660,10 +668,11 @@ function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
 
 # --- jobfiles ---
 # The first key=<value> line, its value up to the first blank; "" when none.
-function first_value(L, n, key,    i, v) {
+function first_value(L, n, key,    i, v, kv, o) {
+    kv = key "="; o = length(key) + 2
     for (i = 1; i <= n; i++) {
-        if (index(L[i], key "=") != 1) continue
-        v = substr(L[i], length(key) + 2)
+        if (index(L[i], kv) != 1) continue
+        v = substr(L[i], o)
         if (match(v, /^[^ \t\n\013\014\r\034\035\036\037]+/)) return substr(v, 1, RLENGTH)
     }
     return ""
@@ -674,20 +683,22 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
     return 0
 }
 # override_variant_key on lines L: replace every key= line, else insert after
-# the first [global], else create [global]. Returns the new line count.
-function override_lines(L, n, key, value,    O, i, m, hit, g) {
-    m = 0; hit = 0; g = 0
+# the first [global], else create [global]. Returns the new line count; in
+# place, so L may keep stale entries past it.
+function override_lines(L, n, key, value,    i, hit, g, kv) {
+    kv = key "="; hit = 0; g = 0
     for (i = 1; i <= n; i++)
-        if (index(L[i], key "=") == 1) hit = 1
+        if (index(L[i], kv) == 1) { L[i] = kv value; hit = 1 }
         else if (!g && index(L[i], "[global]") == 1) g = i
-    if (!hit && !g) { O[++m] = "[global]"; O[++m] = key "=" value }
-    for (i = 1; i <= n; i++) {
-        O[++m] = (hit && index(L[i], key "=") == 1) ? key "=" value : L[i]
-        if (!hit && i == g) O[++m] = key "=" value
+    if (hit) return n
+    if (!g) {
+        for (i = n; i >= 1; i--) L[i + 2] = L[i]
+        L[1] = "[global]"; L[2] = kv value
+        return n + 2
     }
-    split("", L)
-    for (i = 1; i <= m; i++) L[i] = O[i]
-    return m
+    for (i = n; i > g; i--) L[i + 1] = L[i]
+    L[g + 1] = kv value
+    return n + 1
 }
 # The sha256 a generated layout job's marker carries, "" for another line.
 # The body it covers is layout_body's.
@@ -820,16 +831,18 @@ function file_directions(L, n, D,    i, name, ns, cur, glob, RW, v) {
 }
 # A resolved host-file row (resolve_targets' tab-separated output, split
 # into ROW): the 1-based column of a FIELDS key, and its value ("" for "-")
-function field_col(key,    S, n, i) {
+function field_col(key,    S, n, i, c) {
     if (key == "login") return 2
     if (key == "engine") return 3
     if (key == "cpus") return 4
     if (key == "dir") return 5
-    n = split(geom_slots(), S, " ")
-    for (i = 1; i <= n; i++)
+    if (key in JF_FCOL) return JF_FCOL[key]   # row_get runs per job and host
+    n = split(geom_slots(), S, " "); c = 0
+    for (i = 1; i <= n && !c; i++)
         if (index(key, S[i] "_") == 1)
-            return 6 + 4 * (i - 1) + (index("nj fs nr qd", substr(key, length(S[i]) + 2)) - 1) / 3
-    return 0
+            c = 6 + 4 * (i - 1) + (index("nj fs nr qd", substr(key, length(S[i]) + 2)) - 1) / 3
+    JF_FCOL[key] = c
+    return c
 }
 function row_get(ROW, key,    c) {
     c = field_col(key)
@@ -1063,9 +1076,7 @@ function probe_core_map(P, np, U, UB, CORE, THR, ORD, SOCK, DPDK, R,    i, F, S,
         CORE[c] = m
         if (m in THR) THR[m] = THR[m] "," c; else THR[m] = c
     }
-    split("", ORD); nk = 0
-    for (k in THR) ORD[++nk] = k + 0
-    sort_arr(ORD, nk, 1)
+    nk = set_sorted(THR, ORD)
     split("", SOCK); split("", DPDK)
     for (i = 1; i <= nk; i++) SOCK[ORD[i]] = (ORD[i] in TK) ? TS[ORD[i]] : 0
     for (c in weka) if (c in CORE) DPDK[CORE[c]] = 1
@@ -1089,11 +1100,11 @@ function probe_base(base_list, U, UB, THR, DPDK, core0, B, R,    BU, NEVER, c, k
     return 0
 }
 # probe_cores in one log line; a term only when nonzero, so the sum adds up.
-function cores_summary(R, PHYS, ALL,    more, p, a) {
+function cores_summary(R, PHYS, ALL) { return cores_summary_s(R, fmt_cpulist(PHYS), fmt_cpulist(ALL)) }
+function cores_summary_s(R, p, a,    more) {   # p and a already formatted
     more = ""
     if (R["unlisted"]) more = more sprintf(" - %d outside the host-file cpu list", R["unlisted"])
     if (R["unbound"]) more = more sprintf(" - %d unbindable", R["unbound"])
-    p = fmt_cpulist(PHYS); a = fmt_cpulist(ALL)
     return sprintf("%d physical core(s)%s - %d weka DPDK - %d reserved for the OS (%s)%s = N=%d: N/2 and N jobs on %s, 2N and 4N on %s", R["ncores"], R["topo"] ? "" : " (no topology: one per cpu)", R["dpdk"], R["nres"], R["res"], more, R["n"], p == "" ? "none" : p, a == "" ? "none" : a)
 }
 # Aio events left: fs.aio-max-nr less fs.aio-nr, "" when unknown. Exact
@@ -1194,14 +1205,14 @@ function fs_groups(work, H, nh, GF, GM,    L, n, i, F, G, g, FIRST, ALL) {
 # (a max-of-everything section creates the cross-product). Order: lay_reset,
 # lay_add and lay_engine per jobfile, lay_sections.
 function lay_reset() {
-    split("", LAY_NS); split("", LAY_TALLY); split("", LAY_EORD); LAY_NNS = 0; LAY_NE = 0
+    split("", LAY_NS); split("", LAY_TALLY); split("", LAY_EORD); split("", LAY_DUP); LAY_NNS = 0; LAY_NE = 0
 }
 function lay_engine(L, n,    eng) {
     if ((eng = first_value(L, n, "ioengine")) == "") return
     if (!(eng in LAY_TALLY)) LAY_EORD[++LAY_NE] = eng
     LAY_TALLY[eng]++
 }
-function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c) {
+function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c, d) {
     # No filename_format: fio names files after the section, so the layout
     # section takes the measured section name.
     if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
@@ -1217,7 +1228,12 @@ function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k,
     nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
     if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
     if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
-    k = LAY_NS[key]; c = ++LAY_NC[k]
+    k = LAY_NS[key]
+    # a group's members add the same grid again: lay_prune keeps only the
+    # first of equals, and sorting the rest was O(members^2)
+    d = k SUBSEP nj SUBSEP nr SUBSEP sprintf("%.17g", sb)
+    if (d in LAY_DUP) return
+    LAY_DUP[d] = 1; c = ++LAY_NC[k]
     LAY_CNJ[k, c] = nj; LAY_CNR[k, c] = nr; LAY_CSB[k, c] = sb; LAY_CFS[k, c] = fs; LAY_CSZ[k, c] = sz
 }
 # Keep contributors no kept grid covers; widest first, stable, so a dominated
@@ -1451,18 +1467,26 @@ json_flat() {   # json_flat <file>
 }
 
 # One parse per results file: check_fio_errors loads it, the next reader reuses
-# it.
-JSON_PATH=""; JSON_FLAT=""; JSON_RC=0; JSON_ERR=""
-json_load() {   # json_load <file> -> JSON_FLAT, JSON_RC, JSON_ERR (json_flat's own message)
+# it. In a run the flat form is a file, one per shell so a subshell's load
+# never rewrites its parent's: a layout result at a few hundred hosts is
+# hundreds of MB.
+JSON_PATH=""; JSON_FLAT=""; JSON_FLAT_FILE=""; JSON_RC=0; JSON_ERR=""
+json_load() {   # json_load <file> -> JSON_FLAT_FILE or JSON_FLAT, JSON_RC, JSON_ERR (json_flat's own message)
     # the parser's message goes through a private file (mktemp) inside the
     # run's own directory where there is one -- never a guessable /tmp name
     local e
     JSON_PATH=$1
     if ! e=$(mktemp "${WORK_DIR:-${TMPDIR:-/tmp}}/wt.jsonerr.XXXXXX"); then
-        JSON_FLAT=""; JSON_RC=3; JSON_ERR="json: cannot create a scratch file for the parser"
+        JSON_FLAT=""; JSON_FLAT_FILE=""; JSON_RC=3; JSON_ERR="json: cannot create a scratch file for the parser"
         return 1
     fi
-    JSON_FLAT=$(json_flat "$1" 2> "$e"); JSON_RC=$?
+    if [ -n "${WORK_DIR:-}" ]; then
+        JSON_FLAT=""; JSON_FLAT_FILE="$WORK_DIR/json.flat.$BASHPID"
+        json_flat "$1" > "$JSON_FLAT_FILE" 2> "$e"; JSON_RC=$?
+    else
+        JSON_FLAT_FILE=""
+        JSON_FLAT=$(json_flat "$1" 2> "$e"); JSON_RC=$?
+    fi
     JSON_ERR=""
     [ ! -s "$e" ] || IFS= read -r JSON_ERR < "$e"
     rm -f "$e"
@@ -1470,30 +1494,42 @@ json_load() {   # json_load <file> -> JSON_FLAT, JSON_RC, JSON_ERR (json_flat's 
 json_use() {   # json_use <file>: the loaded lines when they are this file's, else load them
     [ -n "$JSON_PATH" ] && [ "$JSON_PATH" = "$1" ] || json_load "$1"
 }
+json_awk() {   # json_awk <awk args>: awk (LC_ALL=C) over the loaded lines
+    if [ -n "$JSON_FLAT_FILE" ]; then
+        LC_ALL=C awk "$@" "$JSON_FLAT_FILE"
+    else
+        printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk "$@"
+    fi
+}
 
 # Linux strerror for the errno fio reports (the workers are Linux, whatever
 # the controller is); the bare number when unknown.
 errno_text() {   # errno_text <n>
+    errno_text_v "$1"
+    printf '%s' "$ERRNO_TEXT"
+}
+errno_text_v() {   # errno_text_v <n> -> ERRNO_TEXT, without a subshell per error line
+    ERRNO_TEXT=""
     case "$1" in
-        1) printf 'Operation not permitted' ;;      2) printf 'No such file or directory' ;;
-        4) printf 'Interrupted system call' ;;      5) printf 'Input/output error' ;;
-        9) printf 'Bad file descriptor' ;;          11) printf 'Resource temporarily unavailable' ;;
-        12) printf 'Cannot allocate memory' ;;      13) printf 'Permission denied' ;;
-        16) printf 'Device or resource busy' ;;     17) printf 'File exists' ;;
-        19) printf 'No such device' ;;              20) printf 'Not a directory' ;;
-        21) printf 'Is a directory' ;;              22) printf 'Invalid argument' ;;
-        24) printf 'Too many open files' ;;         27) printf 'File too large' ;;
-        28) printf 'No space left on device' ;;     30) printf 'Read-only file system' ;;
-        110) printf 'Connection timed out' ;;       122) printf 'Disk quota exceeded' ;;
+        1) ERRNO_TEXT='Operation not permitted' ;;      2) ERRNO_TEXT='No such file or directory' ;;
+        4) ERRNO_TEXT='Interrupted system call' ;;      5) ERRNO_TEXT='Input/output error' ;;
+        9) ERRNO_TEXT='Bad file descriptor' ;;          11) ERRNO_TEXT='Resource temporarily unavailable' ;;
+        12) ERRNO_TEXT='Cannot allocate memory' ;;      13) ERRNO_TEXT='Permission denied' ;;
+        16) ERRNO_TEXT='Device or resource busy' ;;     17) ERRNO_TEXT='File exists' ;;
+        19) ERRNO_TEXT='No such device' ;;              20) ERRNO_TEXT='Not a directory' ;;
+        21) ERRNO_TEXT='Is a directory' ;;              22) ERRNO_TEXT='Invalid argument' ;;
+        24) ERRNO_TEXT='Too many open files' ;;         27) ERRNO_TEXT='File too large' ;;
+        28) ERRNO_TEXT='No space left on device' ;;     30) ERRNO_TEXT='Read-only file system' ;;
+        110) ERRNO_TEXT='Connection timed out' ;;       122) ERRNO_TEXT='Disk quota exceeded' ;;
         # the ones a network filesystem adds
-        6) printf 'No such device or address' ;;    23) printf 'Too many open files in system' ;;
-        32) printf 'Broken pipe' ;;                 36) printf 'File name too long' ;;
-        38) printf 'Function not implemented' ;;    39) printf 'Directory not empty' ;;
-        61) printf 'No data available' ;;           95) printf 'Operation not supported' ;;
-        104) printf 'Connection reset by peer' ;;   107) printf 'Transport endpoint is not connected' ;;
-        111) printf 'Connection refused' ;;         112) printf 'Host is down' ;;
-        113) printf 'No route to host' ;;           116) printf 'Stale file handle' ;;
-        125) printf 'Operation canceled' ;;
+        6) ERRNO_TEXT='No such device or address' ;;    23) ERRNO_TEXT='Too many open files in system' ;;
+        32) ERRNO_TEXT='Broken pipe' ;;                 36) ERRNO_TEXT='File name too long' ;;
+        38) ERRNO_TEXT='Function not implemented' ;;    39) ERRNO_TEXT='Directory not empty' ;;
+        61) ERRNO_TEXT='No data available' ;;           95) ERRNO_TEXT='Operation not supported' ;;
+        104) ERRNO_TEXT='Connection reset by peer' ;;   107) ERRNO_TEXT='Transport endpoint is not connected' ;;
+        111) ERRNO_TEXT='Connection refused' ;;         112) ERRNO_TEXT='Host is down' ;;
+        113) ERRNO_TEXT='No route to host' ;;           116) ERRNO_TEXT='Stale file handle' ;;
+        125) ERRNO_TEXT='Operation canceled' ;;
     esac
 }
 
@@ -1959,6 +1995,13 @@ BRUTAL_CONFIRM=${BRUTAL_CONFIRM:-5}
 # comma-joined word.
 cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this level
     local exh=0 conf=$CAL_CONFIRM fq=- fn=-
+    # the comma ladders, joined again only when a ladder changed (~16 calls a shape)
+    if [ "$CAL_LADDERS_SRC" != "$CAL_NR_LADDER|$CAL_BW_QD_LADDER|$CAL_IOPS_QD_LADDER" ]; then
+        CAL_NRC=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')
+        CAL_BWQDC=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')
+        CAL_IOPSQDC=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')
+        CAL_LADDERS_SRC="$CAL_NR_LADDER|$CAL_BW_QD_LADDER|$CAL_IOPS_QD_LADDER"
+    fi
     case "$AUTO_LEVEL" in
         (brutal) exh=1; conf=$BRUTAL_CONFIRM ;;
         # safe and max measure three job counts once each: no confirm pass
@@ -1972,9 +2015,7 @@ cal_knobs() {   # cal_knobs [bw|iops|lat|lat1m]: the planner's knobs for this le
     printf '%s ' "lvl=${AUTO_LEVEL:-cal}" "fq=$fq" "fn=$fn" "exh=$exh" "line=$CAL_LINE_PCT" \
         "thr=$CAL_SHAPE_THR" "stop=$CAL_STOP_BELOW" \
         "confirm=$conf" "rt=$CAL_RUNTIME" "nr=$CAL_NR" \
-        "nrc=$(printf '%s' "$CAL_NR_LADDER" | tr -s ' ' ',')" \
-        "bwqd=$(printf '%s' "$CAL_BW_QD_LADDER" | tr -s ' ' ',')" \
-        "iopsqd=$(printf '%s' "$CAL_IOPS_QD_LADDER" | tr -s ' ' ',')"
+        "nrc=$CAL_NRC" "bwqd=$CAL_BWQDC" "iopsqd=$CAL_IOPSQDC"
 }
 
 # One cell for ONE host, every input an argument: time_based, 2s ramp,
@@ -2000,7 +2041,7 @@ stage_cal_cell() {   # stage_cal_cell <file> <dir> <name> <cpus> <bw|iops|lat|la
         esac
     done
     [ -n "$eng" ] || die "stage_cal_cell: no ioengine given"
-    mkdir -p "${f%/*}" || die "cannot create ${f%/*}"
+    [ -d "${f%/*}" ] || mkdir -p "${f%/*}" || die "cannot create ${f%/*}"
     {
         printf '[global]\n'
         printf 'directory=%s%s\n' "$hd" "${CAL_NS_DIR-/$CAL_SCRATCH}"
@@ -2055,18 +2096,21 @@ cal_values() {   # cal_values <cur.json> <bw|iops>
         3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
            echo "ERROR: cal_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v key="$key" -v path="$1" '
+    json_awk -F'\t' -v key="$key" -v path="$1" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2 }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
-        $1 ~ ("^client_stats\\.[0-9]+\\.(read|write)\\." key "$") { v[idx($1)] += $2 }
+        BEGIN { re = "^client_stats\\.[0-9]+\\.(read|write)\\." key "$" }
+        $1 ~ re { v[idx($1)] += $2 }
         END {
             for (i in job) if (substr(job[i], 1, 4) == "cal-") {
-                h = (i in host) ? host[i] : "?"; tot[h] += v[i]; any = 1 }
+                h = (i in host) ? host[i] : "?"; if (!(h in tot)) nh++; tot[h] += v[i]; any = 1 }
             if (!any) { printf "ERROR: cal_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
             # %.0f, not %d: Ubuntu mawk (1.3.4 20200120) clamps %d at
             # 2^31-1, and a client past ~2.1 GB/s then read 2147483647
-            for (h in tot) printf "%s %.0f\n", h, tot[h] | "LC_ALL=C sort"
+            # a cell runs solo: one host, no sort process
+            if (nh == 1) for (h in tot) printf "%s %.0f\n", h, tot[h]
+            else for (h in tot) printf "%s %.0f\n", h, tot[h] | "LC_ALL=C sort"
         }'
 }
 
@@ -2080,13 +2124,14 @@ cal_lat_values() {   # cal_lat_values <json> <read|write>
         3) [ -z "$JSON_ERR" ] || echo "$JSON_ERR" >&2
            echo "ERROR: cal_lat_values: cannot parse fio JSON in $1" >&2; return 1 ;;
     esac
-    printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v d="$2" -v path="$1" '
+    json_awk -F'\t' -v d="$2" -v path="$1" '
         function idx(p,   a) { split(p, a, "."); return a[2] }
         $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
         $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
-        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.lat_ns\\.mean$") { lat[idx($1)] = $2 }
-        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.total_ios$") { ios[idx($1)] = $2 }
-        $1 ~ ("^client_stats\\.[0-9]+\\." d "\\.iops$") { iops[idx($1)] = $2 }
+        BEGIN { p = "^client_stats\\.[0-9]+\\." d "\\."; rl = p "lat_ns\\.mean$"; ri = p "total_ios$"; rp = p "iops$" }
+        $1 ~ rl { lat[idx($1)] = $2 }
+        $1 ~ ri { ios[idx($1)] = $2 }
+        $1 ~ rp { iops[idx($1)] = $2 }
         END {
             # entries in file order: the first per host seeds, the rest fold in by IO count
             for (k = 1; k <= n; k++) {
@@ -2094,12 +2139,13 @@ cal_lat_values() {   # cal_lat_values <json> <read|write>
                 if (substr(job[i], 1, 4) != "cal-") continue
                 h = (i in host) ? host[i] : "?"
                 us = lat[i] / 1000.0; io = ios[i] + 0; ip = iops[i] + 0
-                if (!(h in seen)) { seen[h] = 1; L[h] = us; I[h] = ip; N[h] = io; continue }
+                if (!(h in seen)) { seen[h] = 1; nh++; L[h] = us; I[h] = ip; N[h] = io; continue }
                 t = N[h] + io
                 if (t > 0) L[h] = (L[h] * N[h] + us * io) / t
                 I[h] += ip; N[h] = t
             }
-            for (h in seen) { any = 1; printf "%s %.3f %.0f\n", h, L[h], I[h] | "LC_ALL=C sort" }
+            # a cell runs solo: one host, no sort process
+            for (h in seen) { any = 1; if (nh == 1) printf "%s %.3f %.0f\n", h, L[h], I[h]; else printf "%s %.3f %.0f\n", h, L[h], I[h] | "LC_ALL=C sort" }
             if (!any) { printf "ERROR: cal_lat_values: %s carries no cal job stats\n", path > "/dev/stderr"; exit 1 }
         }'
 }
@@ -2152,6 +2198,7 @@ apply_cal_results() {
         else { printf "" > final; close(final) }
     }' "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" "${LINE_RATE_GBPS:--}" \
         || die "cannot apply the calibration results"
+    HOST_DIRS_KEY=""   # a host_dir_v map of the old targets.final is stale
 }
 
 # Only this cell file goes to the master, one copy per push.
@@ -2199,16 +2246,19 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag.json"
-    hd=$(host_dir "$host")
+    host_dir_v "$host"; hd=$HOST_DIR
     root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
     host_name_v "$host"
-    local hname=$HOST_NAME
+    local hname=$HOST_NAME fmt=${CAL_FMT:-\$jobnum.\$filenum} sep=${CAL_SEP:-.cal.} slashes depth
+    slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     [ "${CAL_NS_DIR-unset}" != "" ] || unified=1
     mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
     rm -f "$WORK_DIR/cal/$host/truncfail"
     # One session for the listing and df. No error suppression on find: without
-    # GNU -printf it must fail loudly, or every run re-seeds everything.
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -type f -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+    # GNU -printf it must fail loudly, or every run re-seeds everything. Only
+    # the names the seed can ask for: a shared destination holds every
+    # member's write set.
+    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
         > "$WORK_DIR/cal/$host/scratch.raw" \
         || die "$host: cannot inspect the calibration dataset or its free space"
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
@@ -2219,12 +2269,13 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     wantnj=$wnj
     [ "$unified" -eq 1 ] || [ "$rnj" -le "$wantnj" ] || wantnj=$rnj
     subdirs=""
-    if [ "$maxf" -gt 0 ] && [ "$wantnj" -gt 0 ]; then
+    # a name with no / needs no directory: skip the awk launch
+    if [ "$maxf" -gt 0 ] && [ "$wantnj" -gt 0 ] && [[ $hname${CAL_SEP:-.cal.}${CAL_FMT:-\$jobnum.\$filenum} == */* ]]; then
         subdirs=$(cal_scratch_dirs "$hname" "${CAL_SEP:-.cal.}" \
                       "${CAL_FMT:-\$jobnum.\$filenum}" "$wantnj" $((maxf - 1))) \
             || die "$host: cannot derive the calibration namespace directories"
     fi
-    if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ] && [ "$rnr" -gt 0 ]; then
+    if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ] && [ "$rnr" -gt 0 ] && [[ shared.$CAL_FMT == */* ]]; then
         subdirs="$subdirs
 $(cal_scratch_dirs shared "." "$CAL_FMT" "$rnj" $((rnr - 1)))" \
             || die "$host: cannot derive the shared dataset directories"
@@ -2281,8 +2332,12 @@ SUBDIREOF
         host = ARGV[1]; rnj = ARGV[2] + 0; rnr = ARGV[3] + 0; wnj = ARGV[4] + 0; wnr = ARGV[5] + 0
         fsmib = ARGV[6] + 0; job = ARGV[7]; outdir = ARGV[8]; fmt = ARGV[10]; sep = ARGV[11]
         unified = ARGV[12] == "1"; sparse = unified && ARGV[13] == "0"; tlist = ARGV[14]
-        if ((n = readlines(ARGV[9], L)) < 0) awk_fail("cannot read " ARGV[9])
-        for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[F[1]] = F[2] + 0
+        # streamed, and only shared. and this host own names: a shared
+        # destination lists every member write set too
+        while ((r = (getline line < ARGV[9])) > 0)
+            if ((index(line, "shared.") == 1 || index(line, host sep) == 1) && pysplit(line, F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[F[1]] = F[2] + 0
+        if (r < 0) awk_fail("cannot read " ARGV[9])
+        close(ARGV[9])
         # the nrfiles ladder shares, plus any listed need beyond it: what a
         # host-file value pins past the grid
         nrd = needs_listed(RN, needs_ladder(RN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[17])
@@ -2395,16 +2450,28 @@ SUBDIREOF
         fi
     fi
     if [ "${ntrunc:-0}" -gt 0 ]; then
-        # sparse write canvases by truncate, one pass per size, chunked to keep
-        # the command small
-        for tmib in $(awk '{print $2}' "$tlist" | sort -un); do
-            awk -v s="$tmib" '$2 == s {print $1}' "$tlist" | while IFS= read -r tn || [ -n "$tn" ]; do
-                printf "'%s' " "$tn"
-            done | xargs -n 64 | while IFS= read -r tchunk; do
-                run_host "$host" "cd '$root' && truncate -s ${tmib}M $tchunk" \
-                    || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
-            done
-        done
+        # sparse write canvases by truncate: one session for every size, a
+        # second only past ~100 KB of names (was one per 64 files)
+        while IFS= read -r tchunk; do
+            run_host "$host" "cd '$root' && $tchunk" \
+                || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
+        done < <(awkrun '# truncate.list ("<name> <MiB>" lines) as remote commands: a truncate per
+        # size, sizes ascending, names in list order; a new line only past ~100 KB,
+        # under the 128 KiB one sh -c string may hold
+        { if (!($2 in N)) S[++ns] = $2; NM[$2, ++N[$2]] = $1 }
+        END {
+            sort_arr(S, ns, 1); len = 0
+            for (i = 1; i <= ns; i++) {
+                s = S[i]; k = 0
+                while (k < N[s]) {
+                    if (len) { printf " && "; len += 4 }
+                    printf "truncate -s %sM", s; len += 13 + length(s)
+                    while (k < N[s] && len < 100000) { q = " " squote(NM[s, ++k]); printf "%s", q; len += length(q) }
+                    if (len >= 100000) { print ""; len = 0 }
+                }
+            }
+            if (len) print ""
+        }' "$tlist")
         [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
             || die "$host: cannot truncate-seed the write set"
         log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
@@ -2474,10 +2541,11 @@ cal_shapes() {   # cal_shapes <out> <ladders>
         r = int(x)
         return x - r > 0.5 || (x - r == 0.5 && r % 2) ? r + 1 : r
     }
-    function field(h, key,    ROW) {   # the host-file value, "" for none
+    function field(h, key) {   # the host-file value, "" for none
         if (!(h in ROWS)) return ""
-        lsplit(ROWS[h], ROW, "\t")
-        return row_get(ROW, key)
+        # calls come grouped by host: split each row once per group
+        if (!FLD_SET || h != FLD_H) { lsplit(ROWS[h], FLD_ROW, "\t"); FLD_H = h; FLD_SET = 1 }
+        return row_get(FLD_ROW, key)
     }
     # Host-file values per searched slot (qd nr fs nj, "" for an open knob); -g
     # pins nothing, and --line-rate searches bandwidth again.
@@ -2572,6 +2640,7 @@ cal_shapes() {   # cal_shapes <out> <ladders>
             ncpus = 0; model = ""; memkb = 0; cli = 1; neng = 0; nn = 0; nw = 0; ne = 0
             split("", WK); split("", ENG); split("", NSPD); split("", NPCI); split("", NDRV); split("", NIDS); split("", NORD)
             for (i = 1; i <= np; i++) {
+                if (substr(P[i], 1, 5) == "topo_") continue   # most of a probe; probe_cores reads them
                 if (!(m = pysplit(P[i], F))) continue
                 k = F[1]
                 if (k == "ncpus" && m > 1 && F[2] ~ /^[0-9]+$/) ncpus = F[2] + 0
@@ -2651,7 +2720,7 @@ cal_shapes() {   # cal_shapes <out> <ladders>
             if (!(key in SHAPE)) {
                 SHAPE[key] = ++ns; s = ns
                 SREP[s] = h; SNM[s] = 0; SMODEL[s] = model; SNCPU[s] = ncpus; SMEMKB[s] = memkb; SMEMGIB[s] = memgib
-                SN[s] = CR["n"]; SPHYS[s] = fmt_cpulist(PHYS); SALL[s] = fmt_cpulist(ALL); SSUM[s] = cores_summary(CR, PHYS, ALL)
+                SN[s] = CR["n"]; SPHYS[s] = fmt_cpulist(PHYS); SALL[s] = fmt_cpulist(ALL); SSUM[s] = cores_summary_s(CR, SPHYS[s], SALL[s])
                 SLR[s] = linerate; SETH[s] = ethtool; SWHY[s] = why; SCANDS[s] = cands; SPIN[s] = pinned; SAIO[s] = ""
                 SNICS[s] = ""
                 if (np_) {
@@ -3144,13 +3213,15 @@ cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine
     if [ "$type" = lat ] || [ "$type" = lat1m ]; then
         vals=$(cal_lat_values "$json" "$dirn") || die "cannot read the latency of ${json##*/}"
         read -r h v a <<<"$vals"
-        printf '%s %s\n' "$v" "$a" > "$WORK_DIR/cal/reading"
+        CAL_READING="$v $a"
     else
         vals=$(cal_values "$json" "$type") || die "cannot read the throughput of ${json##*/}"
         read -r h v <<<"$vals"
-        printf '%s\n' "$v" > "$WORK_DIR/cal/reading"
+        CAL_READING=$v
     fi
-    debug "cal: shape $CAL_SID $what ${rt}s: $(cat "$WORK_DIR/cal/reading")"
+    # the file is the hand-off; CAL_READING spares the callers a cat per cell
+    printf '%s\n' "$CAL_READING" > "$WORK_DIR/cal/reading"
+    debug "cal: shape $CAL_SID $what ${rt}s: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
 
@@ -3174,7 +3245,7 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
                 cal_ensure_seed "$rep" "$dirn" "$nj" "$nr"
                 cal_run_cell "$rep" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
                 printf '%s %s %s %s %s %s %s\n' "$phase" "$eng" "$nj" "$qd" "$nr" "$rt" \
-                    "$(cat "$WORK_DIR/cal/reading")" >> "$hist"
+                    "$CAL_READING" >> "$hist"
                 n=$((n + 1)) ;;
             ("done "*)
                 read -r _ nj qd nr msg <<<"$act"
@@ -3187,6 +3258,12 @@ cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N
     done
 }
 
+# Whether the newline-separated todo list holds this exact line (was a
+# printf | grep -qx pipeline per test).
+cal_todo_has() {   # cal_todo_has <todo> <line>
+    [[ $'\n'$1$'\n' == *$'\n'"$2"$'\n'* ]]
+}
+
 # One shape, solo: reuse host-file values, seed, pick the engine, search the
 # rest. Leaves cal/s<id>/engine and one tuple file per slot.
 cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
@@ -3194,8 +3271,8 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
     local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax
     CAL_SID=$sid
-    CAL_REP_DIR=$(host_dir "$rep")
-    CAL_REP_NAME=$(host_name "$rep")
+    host_dir_v "$rep"; CAL_REP_DIR=$HOST_DIR
+    host_name_v "$rep"; CAL_REP_NAME=$HOST_NAME
     CAL_REP_N=$usable
     CAL_REP_PHYS=$phys
     CAL_REP_ALL=$allc
@@ -3257,14 +3334,14 @@ BUDEOF
         : > "$sdir/engines"
         for etype in bw iops lat; do
             edirn="" ctype=$etype
-            if printf '%s' "$todo" | grep -qx "$etype read"; then edirn=read
-            elif printf '%s' "$todo" | grep -qx "$etype write"; then edirn=write
+            if cal_todo_has "$todo" "$etype read"; then edirn=read
+            elif cal_todo_has "$todo" "$etype write"; then edirn=write
             elif [ "$etype" = lat ]; then
                 # only a 1MiB latency search: its cells stand in, tallied as
                 # latency, or a set like that has no engine cell at all
                 ctype=lat1m
-                if printf '%s' "$todo" | grep -qx "lat1m read"; then edirn=read
-                elif printf '%s' "$todo" | grep -qx "lat1m write"; then edirn=write
+                if cal_todo_has "$todo" "lat1m read"; then edirn=read
+                elif cal_todo_has "$todo" "lat1m write"; then edirn=write
                 fi
             fi
             [ -n "$edirn" ] || continue
@@ -3285,7 +3362,7 @@ BUDEOF
             CAL_PIN_FS=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
             for e in ${engines//,/ }; do
                 cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
-                printf '%s %s %s\n' "$etype" "$e" "$(cat "$WORK_DIR/cal/reading")" >> "$sdir/engines"
+                printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
             done
             CAL_PIN_FS=""
         done
@@ -3296,7 +3373,7 @@ BUDEOF
     printf '%s\n' "$eng" > "$sdir/engine"
     for type in bw iops lat lat1m; do
         for dirn in write read; do
-            printf '%s' "$todo" | grep -qx "$type $dirn" || continue
+            cal_todo_has "$todo" "$type $dirn" || continue
             cal_search "$rep" "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap"
         done
     done
@@ -3342,14 +3419,21 @@ cal_remove_dataset() {
             }
         }' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" \
             "${args[@]}" > "$cmds" || die "cannot derive the dataset removal commands"
+        # every shared set first, all at once (one at a time was minutes with
+        # a group per host), so their pruning ends before the members' starts
+        local spids=()
         while IFS=$'\t' read -r kind host ucmd; do
-            if [ "$kind" = S ]; then
-                run_host "$host" "$ucmd" \
-                    || log "WARNING: could not remove the shared dataset" >&2
-            else
-                run_host "$host" "$ucmd" &
-                pids+=($!); hs+=("$host")
-            fi
+            [ "$kind" = S ] || continue
+            run_host "$host" "$ucmd" &
+            spids+=($!)
+        done < "$cmds"
+        for i in "${!spids[@]}"; do
+            wait "${spids[$i]}" || log "WARNING: could not remove the shared dataset" >&2
+        done
+        while IFS=$'\t' read -r kind host ucmd; do
+            [ "$kind" != S ] || continue
+            run_host "$host" "$ucmd" &
+            pids+=($!); hs+=("$host")
         done < "$cmds"
     fi
     for i in "${!pids[@]}"; do
@@ -3363,15 +3447,17 @@ cal_remove_dataset() {
 # widest cell, less what exists, pooled per weka filesystem. Other members are
 # left to check_capacity. Over: die, or ask under --ignore-capacity.
 cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
-    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line
-    depth=$(( $(printf '%s' "${CAL_FMT:-\$jobnum.\$filenum}" | tr -cd / | wc -c) + 1 ))
+    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line fmt=${CAL_FMT:-\$jobnum.\$filenum} slashes
+    slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     mkdir -p "$WORK_DIR/cal/cap" || die "cannot create $WORK_DIR/cal/cap"
     : > "$WORK_DIR/cal/cap/names"
     while IFS=$'\t' read -r _ rep _; do
-        hd=$(host_dir "$rep")
+        host_dir_v "$rep"; hd=$HOST_DIR
         root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
-        printf '%s\t%s\n' "$rep" "$(host_name "$rep")" >> "$WORK_DIR/cal/cap/names"
-        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
+        host_name_v "$rep"
+        printf '%s\t%s\n' "$rep" "$HOST_NAME" >> "$WORK_DIR/cal/cap/names"
+        # only the names the check prices: shared. and this rep's own
+        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
         pids+=($!); hs+=("$rep")
     done < "$shapes"
     for i in "${!pids[@]}"; do
@@ -3419,8 +3505,11 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
         for (s = 1; s <= ns; s++) {
             rep = SR[s]
             if ((n = readlines(cap "/" rep, L)) < 0) awk_fail("cannot read " cap "/" rep)
+            # deficit asks only for shared. and the rep own files: a shared
+            # destination lists every member write set too
+            pre = ((rep in NAME) ? NAME[rep] : rep) sep
             for (i = 1; i <= n && L[i] != "WEKATESTER_DF"; i++)
-                if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[rep, F[1]] = F[2] + 0
+                if ((index(L[i], "shared.") == 1 || index(L[i], pre) == 1) && pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[rep, F[1]] = F[2] + 0
             LISTED[rep] = 1
             # the seed df line: source, size in KiB, free MiB; then the fs
             # type. Hosts on one weka filesystem share its free space.
@@ -3591,8 +3680,10 @@ calibrate() {
         || die "cannot create $TARGET_DIR.cal on $MASTER"
     local sid rep usable phys allc linerate engines pinned memcap aio cached members
     pids=(); hs=()
+    load_host_dirs   # host_dir_v answers from it for every shape and seed below
     while IFS=$'\t' read -r sid rep rest; do
-        run_host "$rep" "mkdir -p '$(host_dir "$rep")${CAL_NS_DIR-/$CAL_SCRATCH}'" &
+        host_dir_v "$rep"
+        run_host "$rep" "mkdir -p '$HOST_DIR${CAL_NS_DIR-/$CAL_SCRATCH}'" &
         pids+=($!); hs+=("$rep")
     done < "$shapes"
     for i in "${!pids[@]}"; do
@@ -3617,7 +3708,8 @@ calibrate() {
             dirn=read; [ "${slot##*_}" = r ] || dirn=write
             t="$WORK_DIR/cal/s$sid/tuple-$type-$dirn"
             if [ -s "$t" ]; then
-                line="$line $(cat "$t")"; any=1
+                IFS= read -r m < "$t" || :
+                line="$line $m"; any=1
             else
                 line="$line - - - -"
             fi
@@ -3783,7 +3875,8 @@ probe_writable() {   # probe_writable <host> <dir>
 # "<host> <group>".
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
-    local i h hd pids=() sum n=0 line
+    local i h pids=() sum n=0 line summary
+    local -A at=()
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
@@ -3810,17 +3903,20 @@ collect_fs_groups() {
         wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
     done
     awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
-    n=$(awk '{print $2}' "$WORK_DIR/groups" | sort -u | wc -l | tr -d ' ')
+    # the count, then each group's members, from one awk: a pass per group
+    # was groups x hosts when every host has its own directory
+    summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")
+    n=${summary%%$'\n'*}
     if [ "$n" -le 1 ]; then
-        debug "filesystem groups: all ${#HOSTS[@]} host(s) share $(host_dir "${HOSTS[0]}")"
+        debug "filesystem groups: all ${#HOSTS[@]} host(s) share ${HOST_DIRS[0]}"
         return 0
     fi
+    for i in "${!HOSTS[@]}"; do [ -n "${at[${HOSTS[$i]}]+set}" ] || at[${HOSTS[$i]}]=$i; done
     log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
-    for i in $(seq 1 "$n"); do
-        line=$(awk -v g="$i" '$2 == g {printf "%s%s", (c++ ? " " : ""), $1}' "$WORK_DIR/groups")
-        hd=$(host_dir "${line%% *}")
-        log "  group $i: $line (at $hd on ${line%% *})"
-    done
+    while IFS=$'\t' read -r i line; do
+        h=${line%% *}
+        log "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
+    done <<<"${summary#*$'\n'}"
 }
 
 # The first host of <host> group lays out, prices and removes its shared read
@@ -3906,8 +4002,13 @@ verify_mount_mode() {
     done
     for i in "${!HOSTS[@]}"; do
         [ "${rcs[$i]}" -ne 0 ] || continue
-        if wait "${pids[$i]}" && line=$(cat "$td/$i.anc") \
-                && [ "$line" != "${line#*$'\n'}" ]; then
+        line=""
+        if wait "${pids[$i]}"; then
+            # the file as $(cat) gives it (trailing newlines dropped), no fork
+            IFS= read -r -d '' line < "$td/$i.anc" || :
+            line=${line%"${line##*[!$'\n']}"}
+        fi
+        if [ "$line" != "${line#*$'\n'}" ]; then
             ancs[$i]=${line%%$'\n'*}; lines[$i]=${line#*$'\n'}
         else
             msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"
@@ -4055,15 +4156,22 @@ FIO_STARTED=0
 # drain matches the full command line, anchored to the fio binary and
 # carrying the pidfile path.
 kill_fio_cmd() {   # kill_fio_cmd [priv]
+    kill_fio_cmd_v "$1"
+    printf '%s' "$KILL_FIO_CMD"
+}
+# Without the subshell: start and cleanup build it once per host. A loop
+# that ended before its 15th poll saw no server, so only a timed-out one
+# looks again before the -9.
+kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # An escalated server is root-owned: the kill needs the same escalator. The
     # ^ anchor is load-bearing: this shell carries the pattern in its own
     # cmdline (an unanchored pkill -9 once killed the teardown). taskset execs
     # fio, so argv starts with the binary.
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
-    printf '%s' "if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
+        if [ \"\$i\" -ge 15 ] && pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
 }
 
 start_fio_servers() {
@@ -4086,7 +4194,8 @@ start_fio_servers() {
         elif [ -n "$priv" ]; then
             launch="$priv $launch"
         fi
-        run_host "$host" "$(kill_fio_cmd "$priv"); $launch" > "$WORK_DIR/launch.$host" &
+        kill_fio_cmd_v "$priv"
+        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
@@ -4218,7 +4327,8 @@ cleanup() {
             # same escalator or the run leaks a root fio
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
-            run_host "$host" "$(kill_fio_cmd "$priv"); rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
+            kill_fio_cmd_v "$priv"
+            run_host "$host" "$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'" &
             pids+=($!)
         done
         # These pids only: a bare wait also waits on the run-log tees, which
@@ -4477,7 +4587,12 @@ test_engines() {
         host=${HOSTS[$i]}
         (
             hd=${HOST_DIRS[$i]}
-            avail=$(awk '$1 == "engines" {$1 = ""; print}' "$WORK_DIR/probe/$host")
+            # the probe's engines line, near its top: read, not an awk per host
+            avail=""
+            while read -ra _w; do
+                [ "${_w[0]:-}" = engines ] || continue
+                avail=" ${_w[*]:1}"; break
+            done < "$WORK_DIR/probe/$host"
             for c in $cand; do
                 case " $avail " in
                     *" $c "*) ;;
@@ -4530,7 +4645,7 @@ test_engines() {
             for (a = 3; a < ARGC; a++) {
                 h = ARGV[a]; p = ARGV[2] "/" h
                 if ((m = readlines(p, L)) < 0) awk_fail("cannot read " p)
-                for (i = 1; i <= m; i++) if (split(L[i], W, " ") && W[1] == "engines") L[i] = "engines" OK[h]
+                for (i = 1; i <= m; i++) if (substr(L[i], 1, 8) == "engines " || L[i] == "engines") L[i] = "engines" OK[h]
                 writelines(p, L, m)
                 if (OK[h] == "") print h
             }
@@ -4576,6 +4691,7 @@ finalize_targets() {
         "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
+    HOST_DIRS_KEY=""   # a host_dir_v map of an earlier targets.final is stale
     # one awk for the fleet: the first host, in host order, whose host-file
     # engine did not pass its test there
     local bad
@@ -4613,7 +4729,7 @@ check_cpu_pinning() {
     # dropped, an empty part skipped
     function expand(s, S,    n, P, i, p, a, b, c) {
         split("", S)
-        n = lsplit(s, P, ",")
+        n = split(s, P, ",")   # not lsplit: a probe'\''s bindable list runs to ~1,500 bytes
         for (i = 1; i <= n; i++) {
             if ((p = strip(P[i])) == "") continue
             if (index(p, "-")) {
@@ -4848,9 +4964,10 @@ probe_workers() {
     echo
     log "probing ${#HOSTS[@]} worker(s)..."
     mkdir -p "$WORK_DIR/probe"
-    local pids=() failed=() host i bad=()
+    local pids=() failed=() host i bad=() cmd
+    cmd=$(probe_remote_cmd)
     for host in "${HOSTS[@]}"; do
-        run_host "$host" "$(probe_remote_cmd)" > "$WORK_DIR/probe/$host" &
+        run_host "$host" "$cmd" > "$WORK_DIR/probe/$host" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
@@ -4866,10 +4983,14 @@ probe_workers() {
         # (an empty or unreadable probe lacks it too, as the grep said)
         lack=$(awkrun 'BEGIN {
             for (a = 3; a < ARGC; a++) {
-                ok = 0; m = readlines(ARGV[2] "/" ARGV[a], L)
-                for (i = 1; i <= m && !ok; i++)
-                    if ((nw = pysplit(L[i], W)) && W[1] == "engines")
+                ok = 0; p = ARGV[2] "/" ARGV[a]
+                # the probe'\''s one engines line sits near the top
+                while ((getline line < p) > 0)
+                    if ((nw = pysplit(line, W)) && W[1] == "engines") {
                         for (k = 2; k <= nw; k++) if (W[k] == ARGV[1]) ok = 1
+                        break
+                    }
+                close(p)
                 if (!ok) printf "%s%s", (n++ ? " " : ""), ARGV[a]
             }
         }' "$ENGINE" "$WORK_DIR/probe" "${HOSTS[@]}")
@@ -5052,7 +5173,13 @@ LAYOUT_MARKER="# wekatester-layout: generated"
 is_layout_file() {   # is_layout_file <path>
     [ -f "$1" ] || return 1
     case "${1##*/}" in "$LAYOUT_JOB") return 0 ;; esac
-    head -3 "$1" | grep -q "^${LAYOUT_MARKER}" 2>&1
+    local l n=0   # the marker in the first three lines, read without head | grep
+    while [ "$n" -lt 3 ] && { IFS= read -r l || [ -n "$l" ]; }; do
+        n=$((n + 1))
+        case $l in "$LAYOUT_MARKER"*) return 0 ;; esac
+        l=""
+    done < "$1"
+    return 1
 }
 
 # Group a set jobfiles by namespace, one create_only section per contributor.
@@ -5216,15 +5343,22 @@ host_idents() {
     done
     if [ ${#files[@]} -gt 0 ]; then
         while IFS= read -r id; do ids+=("$id"); done < <(awk '
-            FNR == 1 && NR > 1 { print id; id = "" }
-            $1 == "ident" && !got[FILENAME]++ { id = tolower($2) }
-            END { print id }' "${files[@]}")
+            BEGIN {
+                for (a = 1; a < ARGC; a++) {
+                    id = ""
+                    while ((getline line < ARGV[a]) > 0)
+                        if (split(line, W, " ") && W[1] == "ident") { id = tolower(W[2]); break }
+                    close(ARGV[a])
+                    print id
+                }
+            }' "${files[@]}")
     fi
     for h in "${HOSTS[@]}"; do
-        id=""
-        if [ -s "$WORK_DIR/probe/$h" ]; then id=${ids[$i]:-}; i=$((i + 1)); fi
-        if [ -n "$id" ]; then
-            host_name_v "$h"; out="$out${out:+,}$h=$HOST_NAME/$id"
+        if [ -s "$WORK_DIR/probe/$h" ]; then
+            # every probe carries its ident line: an empty id there is the
+            # answer, with no host_identity round of forks to find it again
+            id=${ids[$i]:-}; i=$((i + 1))
+            host_name_v "$h"; out="$out${out:+,}$h=$HOST_NAME${id:+/$id}"
         else
             out="$out${out:+,}$h=$(host_identity "$h")"
         fi
@@ -5460,7 +5594,8 @@ writeback_targets() {
                 # identity, credentials and the operator OWN cpu list are
                 # never overwritten, -g included
                 if ((k == "login" || k == "cpus") && ((h, k) in HAVE)) continue
-                if (((h, k) in HAVE) && norm(k, HAVE[h, k]) == norm(k, D[k])) continue   # the row keeps its own spelling
+                # the row keeps its own spelling; equal text is equal meaning
+                if (((h, k) in HAVE) && ((HAVE[h, k] "") == (D[k] "") || norm(k, HAVE[h, k]) == norm(k, D[k]))) continue
                 # the bandwidth tuples --line-rate MEASURED again replace the
                 # row; a staged guess for those slots never does
                 fresh = line_gbps != "-" && ((h, k) in MEAS) && (substr(k, 1, length(k) - 3) in LINE_RATE)
@@ -5471,7 +5606,7 @@ writeback_targets() {
             for (f = 1; f <= nfield; f++) {
                 k = FIELD[f]
                 if ((h, k) in WANT) any = 1
-                if (((h, k) in WANT) != ((h, k) in HAVE) || ((h, k) in WANT) && norm(k, WANT[h, k]) != norm(k, HAVE[h, k])) same = 0
+                if (((h, k) in WANT) != ((h, k) in HAVE) || ((h, k) in WANT) && (WANT[h, k] "") != (HAVE[h, k] "") && norm(k, WANT[h, k]) != norm(k, HAVE[h, k])) same = 0
             }
             if (any && !same && !(h in WANTED)) { WANTED[h] = 1; nup++ }
         }
@@ -5479,11 +5614,11 @@ writeback_targets() {
         # only ever added to: the host own line commented out with its new
         # version below it, or appended; generic rows untouched
         if ((n = readlines(wb, L)) < 0) awk_fail("cannot read " wb)
-        for (i = 1; i <= n; i++)
-            if ((addr = own_line(L[i])) != "" && !(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
         no = 0
         for (i = 1; i <= n; i++) {
             if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
+            # render reads only its own host'\''s first spelling, set here first
+            if (!(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
             O[++no] = "# superseded by -a: " L[i]
             if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
         }
@@ -5520,16 +5655,16 @@ targets_column() {   # targets_column <fieldno> <file> <host>...
     }' "$@"
 }
 
-# host_dir for the fleet in one awk, into HOST_DIRS in HOSTS order. The
-# resolution changes between phases, so each phase that walks the fleet loads
-# it again.
-HOST_DIRS=()
+# host_dir for the fleet in one awk, into HOST_DIRS in HOSTS order and
+# HOST_DIR_OF by host. The resolution changes between phases, so each phase
+# that walks the fleet loads it again.
+HOST_DIRS=(); declare -gA HOST_DIR_OF=(); HOST_DIRS_KEY=""
 load_host_dirs() {
     local f="" d i=0
-    HOST_DIRS=()
     if [ -f "$WORK_DIR/targets.final" ]; then f="$WORK_DIR/targets.final"
     elif [ -f "$WORK_DIR/targets.phase1" ]; then f="$WORK_DIR/targets.phase1"
     fi
+    HOST_DIRS=(); HOST_DIR_OF=(); HOST_DIRS_KEY=$f
     if [ -z "$f" ]; then
         for d in "${HOSTS[@]}"; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
         return 0
@@ -5539,6 +5674,20 @@ load_host_dirs() {
     done < <(targets_column 5 "$f" "${HOSTS[@]}")
     # a host the awk never answered for still gets -d, as host_dir gives it
     while [ "$i" -lt ${#HOSTS[@]} ]; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
+    for i in "${!HOSTS[@]}"; do
+        [ -n "${HOST_DIR_OF[${HOSTS[$i]}]+set}" ] || HOST_DIR_OF[${HOSTS[$i]}]=${HOST_DIRS[$i]}
+    done
+}
+# host_dir without its subshells and awk: from the last load of targets.final
+# (its writers clear HOST_DIRS_KEY), -d when no file resolves dirs
+host_dir_v() {   # host_dir_v <host> -> HOST_DIR
+    if [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
+        HOST_DIR=${HOST_DIR_OF[$1]}
+    elif [ ! -f "$WORK_DIR/targets.final" ] && [ ! -f "$WORK_DIR/targets.phase1" ]; then
+        HOST_DIR=$DIRECTORY
+    else
+        HOST_DIR=$(host_dir "$1")
+    fi
 }
 
 host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
@@ -5932,8 +6081,9 @@ stage_variants() {
     stage_hosts plain "$srcdir" "$DIRECTORY" - - "${HOSTS[@]}" \
         || die "per-host jobfile staging failed"
     # the host-file engine applies per host to every staged file, a re-derived
-    # layout included; the -e post-pass in stage_jobfiles runs after and wins
-    [ -f "$WORK_DIR/targets.final" ] || return 0
+    # layout included; the -e post-pass in stage_jobfiles runs after and wins,
+    # rewriting every ioengine line, so under -e this pass is skipped
+    [ -f "$WORK_DIR/targets.final" ] && [ -z "$ENGINE" ] || return 0
     stage_host_engines
 }
 
@@ -5990,6 +6140,12 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
             NL[j] = n
             for (k = 1; k <= n; k++) SL[j, k] = L[k]
             LAY[j] = NM[j] == layout_job() || is_layout_marked(L, n)
+            if (LAY[j]) continue
+            # what depends on the job alone, asked once here, not per host
+            KIND[j] = report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
+            file_directions(L, n, D); DR[j] = ("read" in D); DW[j] = ("write" in D)
+            for (k = 1; k <= 3 && k <= n; k++) if (index(L[k], floor_marker()) == 1) FLOORJ[j] = 1
+            FMT0[j] = first_value(L, n, "filename_format")
         }
         nh = 0
         for (a = 8 + nf; a < ARGC; a++) H[++nh] = ARGV[a]
@@ -6014,9 +6170,10 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
         # job by job, host by host: the order the notes come out in
         for (j = 1; j <= nf; j++)
             for (x = 1; x <= nh; x++) {
-                h = H[x]; split("", ROW)
-                if ((hr = (h in ROWS))) lsplit(ROWS[h], ROW, "\t")
+                h = H[x]
                 if (auto && LAY[j] && pristine) continue   # derive_layouts writes it
+                split("", ROW)
+                if ((hr = (h in ROWS))) lsplit(ROWS[h], ROW, "\t")
                 n = NL[j]
                 for (k = 1; k <= n; k++) L[k] = SL[j, k]
                 # directory= replaced, else inserted after [global], else
@@ -6024,8 +6181,8 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                 # cwd
                 n = override_lines(L, n, "directory", HD[h])
                 if (auto) n = auto_job(j, h, ROW, L, n)
-                else if (has_final && hr && !LAY[j] && (kind = job_kind(j)) != "") {
-                    file_directions_of(j, D)
+                else if (has_final && hr && !LAY[j] && (kind = KIND[j]) != "") {
+                    job_directions(j, D)
                     if ((slot = pick_slot(kind, D, ROW)) != "")
                         for (q = 1; q <= 4; q++) {
                             if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
@@ -6040,7 +6197,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
         if (!auto) exit 0
         for (j = 1; j <= nf; j++) {
             if (LAY[j]) continue
-            k = job_kind(j)
+            k = KIND[j]
             print "auto[" label "]: " NM[j] " type=" (k == "" ? "all" : k == "bw" ? "bandwidth" : k == "iops" ? "iops" : "latency")
         }
         for (j = 1; j <= nf; j++) {
@@ -6049,19 +6206,14 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
             print "auto[" label "]: " NM[j] " type=layout"
         }
     }
-    # Job type by report directive, latency > bandwidth > iops: a
+    # KIND[j], job type by report directive, latency > bandwidth > iops: a
     # bandwidth+iops file takes the bandwidth slot and keeps its latency
     # accounting. A 1MiB latency file (a -b twin) is lat1m. "" for no
     # directive: it runs as written.
-    function job_kind(j,    n, k, L) {
-        n = NL[j]
-        for (k = 1; k <= n; k++) L[k] = SL[j, k]
-        return report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
-    }
-    function file_directions_of(j, D,    n, k, L) {
-        n = NL[j]
-        for (k = 1; k <= n; k++) L[k] = SL[j, k]
-        file_directions(L, n, D)
+    function job_directions(j, D) {   # file_directions of job j, from DR/DW
+        split("", D)
+        if (DR[j]) D["read"] = 1
+        if (DW[j]) D["write"] = 1
     }
     # The facts -a staging needs per host: cpus (probe_cores, the host-file
     # list its base), engines and weka cores, with their warnings, in host
@@ -6070,10 +6222,9 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
         for (x = 1; x <= nh; x++) {
             h = H[x]
             if ((np = readlines(work "/probe/" h, P)) < 0) awk_fail("cannot read " work "/probe/" h)
-            PN[h] = np
-            for (i = 1; i <= np; i++) PL[h, i] = P[i]
             NCPU[h] = 0; nodes = 0; split("", WK); ENGS[h] = " "; ISOL[h] = ""
             for (i = 1; i <= np; i++) {
+                if (substr(P[i], 1, 5) == "topo_") continue   # most of a probe; probe_cores reads them
                 if (!(m = pysplit(P[i], F))) continue
                 if (F[1] == "ncpus") { if ((NCPU[h] = py_int(F[2])) == "") awk_fail("probe: " h ": bad ncpus line: " P[i]) }
                 else if (F[1] == "wekanode" && m > 1) nodes = py_int(F[2]) + 0
@@ -6088,8 +6239,17 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                 else if (F[1] == "engines") { ENGS[h] = " "; for (y = 2; y <= m; y++) ENGS[h] = ENGS[h] F[y] " " }
             }
             NWEKA[h] = set_size(WK); WEKAL[h] = fmt_cpulist(WK)
-            probe_cores(P, np, "", R, PHYS, ALL)
-            FN[h] = R["n"]
+            # the operator cpu list is the base when the file gives one, less
+            # missing cpus, weka cores and core 0 pair; otherwise, and for a
+            # catch-all list, probe_cores own rule. A list that is no cpu list
+            # fails below, after every warning, as it always has.
+            base = ""
+            if (h in ROWS) { lsplit(ROWS[h], F, "\t"); base = row_get(F, "cpus") }
+            BASE[h] = base
+            if (base != "" && !parse_cpulist(base, S)) { DEFER[h] = 1; base = "" }
+            probe_cores(P, np, base, R, PHYS, ALL)
+            CN[h] = R["n"]; CATCH[h] = R["catchall"]; CPH[h] = fmt_cpulist(PHYS); CAL[h] = fmt_cpulist(ALL)
+            NALL[h] = set_size(ALL); CSUM[h] = cores_summary_s(R, CPH[h], CAL[h])
             if (R["weka_core0"])
                 warn(h ": weka has pinned a dedicated core on core 0 -- that core and its sibling belong to the OS; fio stays off it regardless")
             # pin detection is all that keeps fio off weka cores: weka running
@@ -6112,25 +6272,17 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
             for (x = 1; x <= nh && ok; x++) if (!index(ENGS[H[x]], " " F[i] " ")) ok = 0
             if (ok) COMMON = F[i]
         }
-        # the operator cpu list is the base when the file gives one, less
-        # missing cpus, weka cores and core 0 pair; otherwise, and for a
-        # catch-all list, probe_cores own rule
         for (x = 1; x <= nh; x++) {
-            h = H[x]; np = PN[h]
-            for (i = 1; i <= np; i++) P[i] = PL[h, i]
-            base = ""
-            if (h in ROWS) { lsplit(ROWS[h], F, "\t"); base = row_get(F, "cpus") }
-            probe_cores(P, np, base, R, PHYS, ALL)
-            if (base == "" && R["n"] < 1)
-                awk_fail(h ": no cpus left for fio -- " cores_summary(R, PHYS, ALL) "; mount weka with fewer cores, use a larger client, or name the cpus in the host file, fewer than fio could use (a narrower list is the operator\047s own reserve)")
-            if (base != "" && R["n"] < 1 && R["catchall"])
-                awk_fail(h ": the host file\047s cpu list (" base ") covers every cpu fio could use, which counts as no list, and the OS reserve then leaves fio no cpus -- " cores_summary(R, PHYS, ALL) "; mount weka with fewer cores, use a larger client, or list fewer cpus (a narrower list is the operator\047s own reserve)")
-            if (base != "" && R["n"] < 1)
+            h = H[x]; base = BASE[h]
+            if (h in DEFER) { np = readlines(work "/probe/" h, P); probe_cores(P, np, base, R, PHYS, ALL) }
+            if (base == "" && CN[h] < 1)
+                awk_fail(h ": no cpus left for fio -- " CSUM[h] "; mount weka with fewer cores, use a larger client, or name the cpus in the host file, fewer than fio could use (a narrower list is the operator\047s own reserve)")
+            if (base != "" && CN[h] < 1 && CATCH[h])
+                awk_fail(h ": the host file\047s cpu list (" base ") covers every cpu fio could use, which counts as no list, and the OS reserve then leaves fio no cpus -- " CSUM[h] "; mount weka with fewer cores, use a larger client, or list fewer cpus (a narrower list is the operator\047s own reserve)")
+            if (base != "" && CN[h] < 1)
                 awk_fail(h ": the host file\047s cpu list (" base ") leaves fio no cpus -- every one is weka\047s, core 0\047s pair, or not on this host")
-            CN[h] = R["n"]; CPH[h] = fmt_cpulist(PHYS); CAL[h] = fmt_cpulist(ALL); NALL[h] = set_size(ALL)
-            CSUM[h] = cores_summary(R, PHYS, ALL)
             if (ISOL[h] != "" && parse_cpulist(ISOL[h], IS) && set_any(IS)) {
-                c = 0; y = 0
+                parse_cpulist(CAL[h], ALL); c = 0; y = 0
                 for (v in ALL) if (v in IS) c = 1; else y = 1
                 if (c && y) print "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" > "/dev/stderr"
             }
@@ -6148,7 +6300,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
     }
     # One job variant for one host under -a, on lines L (directory already
     # set); returns the new line count. Overrides land in the order applied.
-    function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no, S0) {
+    function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no) {
         if (LAY[j]) {
             # an edited layout: staged with corrections only
             return override_lines(L, n, "cpus_allowed", CAL[h])
@@ -6156,18 +6308,15 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
         # the effective set the cells ran on; the host file keeps its list as
         # written
         n = override_lines(L, n, "cpus_allowed", CAL[h])
-        file_directions_of(j, D)
+        job_directions(j, D)
         if (ns_unified && ("read" in D) && !("write" in D)) {
             # a read-only job reads the shared set the read cells calibrated
             # on; stamp_unique_names leaves "shared." formats alone
-            for (i = 1; i <= NL[j]; i++) S0[i] = SL[j, i]
-            fmt = first_value(S0, NL[j], "filename_format")
+            fmt = FMT0[j]
             n = override_lines(L, n, "filename_format", "shared." (fmt != "" ? fmt : "$jobname.$jobnum.$filenum"))
         }
         if (COMMON != "" && MISSING[j]) n = override_lines(L, n, "ioengine", COMMON)
-        kind = job_kind(j)
-        floor = 0
-        for (i = 1; i <= 3 && i <= NL[j]; i++) if (index(SL[j, i], floor_marker()) == 1) floor = 1
+        kind = KIND[j]; floor = FLOORJ[j]
         if (kind != "" && (slot = pick_slot(kind, D, ROW)) != "")
             for (q = 1; q <= 4; q++) {
                 if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
@@ -6425,30 +6574,24 @@ stamp_unique_names() {
     list_staged "$WORK_DIR/staged.list" && awkrun '
     function stamp(path, name, cpus,    L, n, O, m, i, k, s, hasfmt, hascpus, haspol, INS, ni, g) {
         if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
-        hasfmt = 0
-        for (i = 1; i <= n; i++) if (index(strip(L[i]), "filename_format=") == 1) hasfmt = 1
-        m = 0
+        hasfmt = 0; hascpus = 0; haspol = 0; g = 0; m = 0
         for (i = 1; i <= n; i++) {
             s = strip(L[i])
             if (index(s, "filename_format=") == 1) {
+                hasfmt = 1
                 if (!index(substr(s, 17), "$clientuid") && index(substr(s, 17), "shared.") != 1)
                     L[i] = "filename_format=" name "." substr(s, 17)
             } else if (index(s, "unique_filename=") == 1)
                 continue   # replaced by the forced 0 below
             O[++m] = L[i]
-        }
-        hascpus = 0; haspol = 0
-        for (i = 1; i <= m; i++) {
-            s = strip(O[i])
             if (index(s, "cpus_allowed=") == 1) hascpus = 1
             if (index(s, "cpus_allowed_policy=") == 1) haspol = 1
+            if (!g && s == "[global]") g = m
         }
         ni = 0; INS[++ni] = "unique_filename=0"
         if (!hasfmt) INS[++ni] = "filename_format=" name ".$jobname.$jobnum.$filenum"
         if (cpus != "" && !hascpus) { INS[++ni] = "cpus_allowed=" cpus; hascpus = 1 }
         if (hascpus && !haspol) INS[++ni] = "cpus_allowed_policy=split"
-        g = 0
-        for (i = 1; i <= m && !g; i++) if (strip(O[i]) == "[global]") g = i
         split("", L); n = 0
         if (!g) {
             L[++n] = "[global]"
@@ -6560,14 +6703,22 @@ set_entries() {   # set_entries <dir>
 check_aio_room() {
     [ -d "$WORK_DIR/probe" ] || return 0
     # one awk for the fleet: per host its probed room, then its staged files
-    list_staged "$WORK_DIR/staged.list" && awkrun 'BEGIN {
+    list_staged "$WORK_DIR/staged.list" && awkrun '# A probe'\''s lines up to its aio_nr line (aio_max_nr comes just before it),
+    # not the ~1,000 topology lines after
+    function aio_head(p, P,    n, line) {
+        split("", P); n = 0
+        while ((getline line < p) > 0) { P[++n] = line; if (index(line, "aio_nr ") == 1) break }
+        close(p)
+        return n
+    }
+    BEGIN {
         if ((m = readlines(ARGV[2], M)) < 0) awk_fail("cannot read " ARGV[2])
         nk = 0; last = ""
         for (i = 1; i <= m; i++) {
             split(M[i], F, "\t")
             if (F[1] != last) {
                 last = F[1]
-                if ((np = readlines(ARGV[1] "/probe/" last, P)) < 0) np = 0
+                np = aio_head(ARGV[1] "/probe/" last, P)   # apart: BWK awk passes P untyped otherwise
                 room = probe_aio_room(P, np)
             }
             if (room == "" || F[2] == "") continue
@@ -6761,10 +6912,12 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
     [ ${#files[@]} -gt 0 ] || return 0
     mkdir -p "${dirs[@]}" \
         || { log "WARNING: cannot create the per-host directories under $RUN_DIR/sysinfo" >&2; return 0; }
+    # the raw captures are dead once split: tmpfs is RAM, and a run-window
+    # sar slice per host adds up
     WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
         FNR == 1 { if (out != "") close(out); out = ""; host = substr(FILENAME, length(ENVIRON["WT_PFX"]) + 1) }
         /^=== WEKATESTER_SYSINFO / { if (out != "") close(out); out = ENVIRON["WT_ROOT"] "/" host "/" $3 ENVIRON["WT_SFX"]; next }
-        out != "" { print > out }' "${files[@]}"
+        out != "" { print > out }' "${files[@]}" && rm -f -- "${files[@]}"
 }
 
 # PSI and load at start and again at teardown, plus the sar slice covering the
@@ -6840,13 +6993,20 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
            echo "$path: cannot parse fio JSON" >&2; return 1 ;;
     esac
     local bad
-    bad=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v mode="$mode" '
-        function idx(p,   a) { split(p, a, "."); return a[2] }
-        $1 ~ /^client_stats\.[0-9]+\.jobname$/ { job[idx($1)] = $2; order[++n] = idx($1) }
-        $1 ~ /^client_stats\.[0-9]+\.hostname$/ { host[idx($1)] = $2 }
-        $1 ~ /^client_stats\.[0-9]+\.error$/ { err[idx($1)] = $2 }
-        # anything a direction moved -- ios, bytes, or (older fio) only a rate
-        $1 ~ /^client_stats\.[0-9]+\.(read|write|trim)\.(total_ios|io_bytes|bw_bytes)$/ { moved[idx($1)] += $2 }
+    bad=$(json_awk -F'\t' -v mode="$mode" '
+        # client_stats.<i>.<leaf>: the index and leaf cut out once per line, not
+        # four regexes run on each (a layout result is millions of lines)
+        index($1, "client_stats.") != 1 { next }
+        {
+            k = substr($1, 14); p = index(k, ".")
+            if (!p || (i = substr(k, 1, p - 1)) !~ /^[0-9]+$/) next
+            f = substr(k, p + 1)
+            if (f == "jobname") { job[i] = $2; order[++n] = i }
+            else if (f == "hostname") host[i] = $2
+            else if (f == "error") err[i] = $2
+            # anything a direction moved -- ios, bytes, or (older fio) only a rate
+            else if (f ~ /^(read|write|trim)\.(total_ios|io_bytes|bw_bytes)$/) moved[i] += $2
+        }
         END {
             for (k = 1; k <= n; k++) {
                 i = order[k]
@@ -6865,7 +7025,7 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
     local line kind h job e desc
     while IFS=$'\t' read -r kind h job e; do
         case "$kind" in
-            E) desc=$(errno_text "$e"); echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
+            E) errno_text_v "$e"; desc=$ERRNO_TEXT; echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
             Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2 ;;
         esac
     done <<<"$bad"
@@ -6932,10 +7092,12 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
                     if (!((d = path_join(base, C[j])) in seen)) { seen[d] = 1; D[++nd] = d }
             }
             sort_arr(D, nd, 0)
-            out = ""
+            if (!nd) continue
+            # streamed: a string grown per directory is quadratic in mawk and BWK
+            printf "%s\t", host
             for (i = 1; i <= nd; i++)
-                out = out ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p") " " squote(D[i])
-            if (out != "") print host "\t" out
+                printf "%s %s", ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p"), squote(D[i])
+            print ""
         }
     }' "${args[@]}" > "$out" || die "cannot derive the layout directory set"
     while IFS=$'\t' read -r host cmd; do
@@ -7006,7 +7168,7 @@ sweep_layout_grid() {
     local lay=${JOBFILES[0]}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
-    local host hd spec cmd sz glob depth tot pids hs i args=() nofa
+    local host hd spec cmd sz glob depth tot pids hs i args=() nofa lit dep sl
     pids=(); hs=()
     # one awk derives every host's grid (was one per host plus a grep,
     # serial, ahead of a fan-out whose floor is one round trip)
@@ -7030,9 +7192,18 @@ sweep_layout_grid() {
             # overcredit of a shared oversize file. The kept calibration
             # scratch is excluded, or a nested glob (*/*) would delete and
             # credit its files.
-            cmd="$cmd find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" ! -size +$((sz - 1))c -delete; \
-                 find \"$hd\" -maxdepth $depth -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -size +$((sz - 1))c \
-                     | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
+            # Start at the glob's literal directories: from the shared $hd every
+            # host walked every host's grid. One walk prints the files that
+            # count and deletes the deviants.
+            lit=${glob%%[*?[]*}; dep=$depth
+            case $lit in
+                */*) lit=${lit%/*}; sl=${lit//[!\/]/}; dep=$((depth - ${#sl} - 1))
+                     cmd="$cmd if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
+                *)   lit=""; cmd="$cmd { find \"$hd\"" ;;
+            esac
+            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" \\( -size +$((sz - 1))c -print -o -delete \\);"
+            [ -z "$lit" ] && cmd="$cmd }" || cmd="$cmd fi"
+            cmd="$cmd | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
         # pipefail: a dead session must fail the sweep, not hand the awk an
@@ -7079,12 +7250,14 @@ job_clients() {   # job_clients <job>
 # headroom, so a dry run reports it too (README, Caveats).
 CLIENT_CMD_MAX=122880
 check_client_cmdline() {   # check_client_cmdline [what]
-    local job cmd n longest=0 worst=""
+    local job cmd longest=0 worst="" jl=-1
+    # the name appears once per host, so the longest name makes the longest
+    # command: build that one, not one per job
+    [ ${#JOBFILES[@]} -gt 0 ] || return 0
     for job in "${JOBFILES[@]}"; do
-        cmd=$(fio_client_cmd "$job")
-        n=${#cmd}
-        [ "$n" -le "$longest" ] || { longest=$n; worst=$job; }
+        [ "${#job}" -le "$jl" ] || { jl=${#job}; worst=$job; }
     done
+    cmd=$(fio_client_cmd "$worst"); longest=${#cmd}
     [ "$longest" -gt "$CLIENT_CMD_MAX" ] || return 0
     die "${1:-the fio command line for $worst} is $longest bytes with ${#HOSTS[@]} hosts; the master's shell takes it as one argument, which Linux caps at 128 KiB (MAX_ARG_STRLEN) -- run the fleet as two or more host lists"
 }
@@ -7168,8 +7341,10 @@ run_jobs() {
         check_fio_errors "$outfile" measured \
             || die "job $job failed on at least one host (raw output in $outfile)"
         # fio keys client_stats by the --client= name, not the worker hostname;
-        # local mode reports as localhost.
-        summarize "$outfile" "$report" "${HOSTS[*]}"
+        # local mode reports as localhost. A results file, never a bundle: no
+        # tar probe (GNU tar reads the whole file looking for a header).
+        summ_one "$outfile" "$outfile" "${report:-bandwidth latency iops}" "${HOSTS[*]}" file \
+            || die "failed to summarize $outfile"
     done
     log "raw fio results: $RUN_DIR/"
     echo
@@ -7218,9 +7393,7 @@ summ_one() {
     case $JSON_RC in
         2) out="ERR	$label: no JSON in fio output" ;;
         3) out="ERR	$label: cannot parse fio JSON: ${JSON_ERR#json: }" ;;
-        *) out=$(printf '%s\n' "$JSON_FLAT" | LC_ALL=C awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
-        function idx(p,   a) { split(p, a, "."); return a[2] }
-        function key(p,   a, n, k, j) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
+        *) out=$(json_awk -F'\t' -v label="$label" -v items=" $items " -v expected="$expected" '
         function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB/s", n / 2^30)
                          if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
         function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
@@ -7229,7 +7402,7 @@ summ_one() {
         # the FIRST missing value names the error: the direction when absent,
         # else the leaf key
         function val(i, k,   kk, n) {
-            if ((i "." k) in has) return v[i "." k]
+            if ((i "." k) in v) return v[i "." k]
             if (missing == "") { n = split(k, kk, "."); missing = ((i "." kk[1]) in dirhas) ? kk[n] : kk[1] }
             return 0 }
         # per-host min and max of metric m ("bw", "iops", "lat.read", "lat.write"), when they differ
@@ -7250,12 +7423,18 @@ summ_one() {
             if (kind == "iops") return "  (min " fi(lo) " " loh ", max " fi(hi) " " hih ")"
             return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
         }
+        # only the leaves val() reads are kept: an entry has ~240
+        BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios", kk, " "); for (j in kk) READS[kk[j]] = 1 }
         $1 ~ /^client_stats\.[0-9]+\./ {
-            i = idx($1); k = key($1)
+            n = split($1, a, "."); i = a[2]; k = a[3]
+            for (j = 4; j <= n; j++) k = k "." a[j]
             if (i > maxi) maxi = i
             if (k == "jobname") job[i] = $2
             else if (k == "hostname") host[i] = $2
-            else { v[i "." k] = $2 + 0; has[i "." k] = 1; split(k, kk, "."); dirhas[i "." kk[1]] = 1 }
+            else {
+                if (a[3] == "read" || a[3] == "write") dirhas[i "." a[3]] = 1
+                if (k in READS) v[i "." k] = $2 + 0
+            }
             seen[i] = 1
         }
         END {

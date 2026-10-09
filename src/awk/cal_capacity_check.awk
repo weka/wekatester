@@ -39,8 +39,11 @@ BEGIN {
     for (s = 1; s <= ns; s++) {
         rep = SR[s]
         if ((n = readlines(cap "/" rep, L)) < 0) awk_fail("cannot read " cap "/" rep)
+        # deficit asks only for shared. and the rep own files: a shared
+        # destination lists every member write set too
+        pre = ((rep in NAME) ? NAME[rep] : rep) sep
         for (i = 1; i <= n && L[i] != "WEKATESTER_DF"; i++)
-            if (pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[rep, F[1]] = F[2] + 0
+            if ((index(L[i], "shared.") == 1 || index(L[i], pre) == 1) && pysplit(L[i], F) == 2 && F[2] ~ /^[0-9]+$/) HAVE[rep, F[1]] = F[2] + 0
         LISTED[rep] = 1
         # the seed df line: source, size in KiB, free MiB; then the fs
         # type. Hosts on one weka filesystem share its free space.

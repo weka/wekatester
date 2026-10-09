@@ -5,7 +5,7 @@ BEGIN {
     for (a = 3; a < ARGC; a++) {
         h = ARGV[a]; p = ARGV[2] "/" h
         if ((m = readlines(p, L)) < 0) awk_fail("cannot read " p)
-        for (i = 1; i <= m; i++) if (split(L[i], W, " ") && W[1] == "engines") L[i] = "engines" OK[h]
+        for (i = 1; i <= m; i++) if (substr(L[i], 1, 8) == "engines " || L[i] == "engines") L[i] = "engines" OK[h]
         writelines(p, L, m)
         if (OK[h] == "") print h
     }

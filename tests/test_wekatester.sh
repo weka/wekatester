@@ -2280,8 +2280,8 @@ numjobs=2"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo 1073741824; echo 536870912; }
      sweep_layout_grid)
-    grep -qF -- "-maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +1073741823c -delete" "$d/oplog" &&
-    grep -qF -- "-maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +536870911c -delete" "$d/oplog" &&
+    grep -qF -- "{ find \"/mnt/weka\" -maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +1073741823c -print -o -delete \); }" "$d/oplog" &&
+    grep -qF -- "{ find \"/mnt/weka\" -maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +536870911c -print -o -delete \); }" "$d/oplog" &&
     [ "$(cat "$d/probe/h1.laidout")" = "1610612736" ]'
 t_assert "sweep: same-format sections cannot delete each other (exact singleton indices, size floors)" bash -c '
     d=$(mktemp -d)
@@ -2304,9 +2304,9 @@ numjobs=44"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { echo "SWEEP: $2" >> "$d/oplog"; echo 0; echo 0; }
      sweep_layout_grid)
-    grep -qF -- "-path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +10737418239c -delete" "$d/oplog" &&
-    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +10737418239c" "$d/oplog" &&
-    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" ! -size +1073741823c -delete" "$d/oplog"'
+    grep -qF -- "if [ -d \"/mnt/weka/h1.0\" ]; then find \"/mnt/weka/h1.0\" -maxdepth 1 -type f -path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c -print -o -delete \); fi" "$d/oplog" &&
+    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c" "$d/oplog" &&
+    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +1073741823c -print -o -delete \)" "$d/oplog"'
 # An old-format tuple (fs/nr/qd, no nj) is re-measured, and fill mode keeps
 # its fields: a mix nobody measured, which the writeback would make permanent.
 # The file cannot say whether the operator wrote it, so the run warns.

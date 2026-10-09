@@ -1,9 +1,10 @@
 # --- jobfiles ---
 # The first key=<value> line, its value up to the first blank; "" when none.
-function first_value(L, n, key,    i, v) {
+function first_value(L, n, key,    i, v, kv, o) {
+    kv = key "="; o = length(key) + 2
     for (i = 1; i <= n; i++) {
-        if (index(L[i], key "=") != 1) continue
-        v = substr(L[i], length(key) + 2)
+        if (index(L[i], kv) != 1) continue
+        v = substr(L[i], o)
         if (match(v, /^[^ \t\n\013\014\r\034\035\036\037]+/)) return substr(v, 1, RLENGTH)
     }
     return ""
@@ -14,20 +15,22 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
     return 0
 }
 # override_variant_key on lines L: replace every key= line, else insert after
-# the first [global], else create [global]. Returns the new line count.
-function override_lines(L, n, key, value,    O, i, m, hit, g) {
-    m = 0; hit = 0; g = 0
+# the first [global], else create [global]. Returns the new line count; in
+# place, so L may keep stale entries past it.
+function override_lines(L, n, key, value,    i, hit, g, kv) {
+    kv = key "="; hit = 0; g = 0
     for (i = 1; i <= n; i++)
-        if (index(L[i], key "=") == 1) hit = 1
+        if (index(L[i], kv) == 1) { L[i] = kv value; hit = 1 }
         else if (!g && index(L[i], "[global]") == 1) g = i
-    if (!hit && !g) { O[++m] = "[global]"; O[++m] = key "=" value }
-    for (i = 1; i <= n; i++) {
-        O[++m] = (hit && index(L[i], key "=") == 1) ? key "=" value : L[i]
-        if (!hit && i == g) O[++m] = key "=" value
+    if (hit) return n
+    if (!g) {
+        for (i = n; i >= 1; i--) L[i + 2] = L[i]
+        L[1] = "[global]"; L[2] = kv value
+        return n + 2
     }
-    split("", L)
-    for (i = 1; i <= m; i++) L[i] = O[i]
-    return m
+    for (i = n; i > g; i--) L[i + 1] = L[i]
+    L[g + 1] = kv value
+    return n + 1
 }
 # The sha256 a generated layout job's marker carries, "" for another line.
 # The body it covers is layout_body's.
@@ -160,16 +163,18 @@ function file_directions(L, n, D,    i, name, ns, cur, glob, RW, v) {
 }
 # A resolved host-file row (resolve_targets' tab-separated output, split
 # into ROW): the 1-based column of a FIELDS key, and its value ("" for "-")
-function field_col(key,    S, n, i) {
+function field_col(key,    S, n, i, c) {
     if (key == "login") return 2
     if (key == "engine") return 3
     if (key == "cpus") return 4
     if (key == "dir") return 5
-    n = split(geom_slots(), S, " ")
-    for (i = 1; i <= n; i++)
+    if (key in JF_FCOL) return JF_FCOL[key]   # row_get runs per job and host
+    n = split(geom_slots(), S, " "); c = 0
+    for (i = 1; i <= n && !c; i++)
         if (index(key, S[i] "_") == 1)
-            return 6 + 4 * (i - 1) + (index("nj fs nr qd", substr(key, length(S[i]) + 2)) - 1) / 3
-    return 0
+            c = 6 + 4 * (i - 1) + (index("nj fs nr qd", substr(key, length(S[i]) + 2)) - 1) / 3
+    JF_FCOL[key] = c
+    return c
 }
 function row_get(ROW, key,    c) {
     c = field_col(key)

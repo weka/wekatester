@@ -45,7 +45,13 @@ LAYOUT_MARKER="# wekatester-layout: generated"
 is_layout_file() {   # is_layout_file <path>
     [ -f "$1" ] || return 1
     case "${1##*/}" in "$LAYOUT_JOB") return 0 ;; esac
-    head -3 "$1" | grep -q "^${LAYOUT_MARKER}" 2>&1
+    local l n=0   # the marker in the first three lines, read without head | grep
+    while [ "$n" -lt 3 ] && { IFS= read -r l || [ -n "$l" ]; }; do
+        n=$((n + 1))
+        case $l in "$LAYOUT_MARKER"*) return 0 ;; esac
+        l=""
+    done < "$1"
+    return 1
 }
 
 # Group a set jobfiles by namespace, one create_only section per contributor.

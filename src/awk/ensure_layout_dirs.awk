@@ -45,9 +45,11 @@ BEGIN {
                 if (!((d = path_join(base, C[j])) in seen)) { seen[d] = 1; D[++nd] = d }
         }
         sort_arr(D, nd, 0)
-        out = ""
+        if (!nd) continue
+        # streamed: a string grown per directory is quadratic in mawk and BWK
+        printf "%s\t", host
         for (i = 1; i <= nd; i++)
-            out = out ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p") " " squote(D[i])
-        if (out != "") print host "\t" out
+            printf "%s %s", ((i - 1) % 400 ? "" : (i > 1 ? " && " : "") "mkdir -p"), squote(D[i])
+        print ""
     }
 }

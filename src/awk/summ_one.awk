@@ -1,5 +1,3 @@
-function idx(p,   a) { split(p, a, "."); return a[2] }
-function key(p,   a, n, k, j) { n = split(p, a, "."); k = a[3]; for (j = 4; j <= n; j++) k = k "." a[j]; return k }
 function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB/s", n / 2^30)
                  if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
 function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
@@ -8,7 +6,7 @@ function fi(n,   s, r) { s = sprintf("%.0f", n); r = ""; while (length(s) > 3) {
 # the FIRST missing value names the error: the direction when absent,
 # else the leaf key
 function val(i, k,   kk, n) {
-    if ((i "." k) in has) return v[i "." k]
+    if ((i "." k) in v) return v[i "." k]
     if (missing == "") { n = split(k, kk, "."); missing = ((i "." kk[1]) in dirhas) ? kk[n] : kk[1] }
     return 0 }
 # per-host min and max of metric m ("bw", "iops", "lat.read", "lat.write"), when they differ
@@ -29,12 +27,18 @@ function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
     if (kind == "iops") return "  (min " fi(lo) " " loh ", max " fi(hi) " " hih ")"
     return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
 }
+# only the leaves val() reads are kept: an entry has ~240
+BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios", kk, " "); for (j in kk) READS[kk[j]] = 1 }
 $1 ~ /^client_stats\.[0-9]+\./ {
-    i = idx($1); k = key($1)
+    n = split($1, a, "."); i = a[2]; k = a[3]
+    for (j = 4; j <= n; j++) k = k "." a[j]
     if (i > maxi) maxi = i
     if (k == "jobname") job[i] = $2
     else if (k == "hostname") host[i] = $2
-    else { v[i "." k] = $2 + 0; has[i "." k] = 1; split(k, kk, "."); dirhas[i "." kk[1]] = 1 }
+    else {
+        if (a[3] == "read" || a[3] == "write") dirhas[i "." a[3]] = 1
+        if (k in READS) v[i "." k] = $2 + 0
+    }
     seen[i] = 1
 }
 END {
