@@ -351,7 +351,7 @@ resolve_editor() {
     EDITOR_CMD=${VISUAL:-${EDITOR:-vi}}
     set -- $EDITOR_CMD
     [ $# -gt 0 ] || die "\$VISUAL/\$EDITOR is set but empty"
-    command -v "$1" >/dev/null || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
+    [ -n "$(command -v "$1")" ] || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
 }
 
 # All three fds go to the terminal: stdout may be a pipe.
@@ -3772,7 +3772,7 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     local fb=${FIO_BIN##*/} pg="pgrep -x fio"
     fb=${fb:0:15}   # pgrep -x matches the 15-byte process name
     [ "$fb" = fio ] || pg="$pg; pgrep -x '$fb'"
-    LOCK_CMD="command -v '$FIO_BIN' >/dev/null || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="_o=\$(command -v '$FIO_BIN') || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     # wekatester's fio: its server, the runs that read its staging, its engine tests
@@ -3783,9 +3783,9 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order): a root fio needs one
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
-        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; done"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
     else
@@ -3893,9 +3893,8 @@ preflight() {
 # which is also what an unmounted weka mount point is.
 NETWORK_FSTYPES="nfs nfs4 cifs smb3 smbfs lustre gpfs beegfs ceph fuse.ceph fuse.ceph-fuse glusterfs fuse.glusterfs panfs pvfs2 orangefs ocfs2 gfs2 afs cvfs quobyte fuse.quobyte fuse.daos fuse.juicefs fuse.mfs ${WEKATESTER_NETWORK_FSTYPES:-}"
 
-# ok, "fail <mode>", network, or "local <type>"; printed and left in
-# MOUNT_VERDICT.
-classify_mount_line() {
+# ok, "fail <mode>", network, or "local <type>", left in MOUNT_VERDICT.
+classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VERDICT
     set -- $1
     local fstype=${1:-} opts=${2:-}
     if [ "$fstype" = "wekafs" ]; then
@@ -3912,7 +3911,6 @@ classify_mount_line() {
         esac
         [ -n "$fstype" ] || MOUNT_VERDICT="local "
     fi
-    echo "$MOUNT_VERDICT"
 }
 
 # Creates a missing destination only when its nearest existing parent is
@@ -4089,7 +4087,7 @@ verify_mount_mode() {
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
-        classify_mount_line "${lines[$i]}" > /dev/null; verdict=$MOUNT_VERDICT
+        classify_mount_line_v "${lines[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ;;
             network)
@@ -4240,8 +4238,8 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
     KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
-        i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
+        i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
 }
 
 start_fio_servers() {
@@ -4260,7 +4258,7 @@ start_fio_servers() {
         launch=$base
         [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
         if [ -n "$priv" ] && [ -n "$cpus" ]; then
-            launch="u=\$(id -un); if command -v runuser >/dev/null && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
+            launch="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
         elif [ -n "$priv" ]; then
             launch="$priv $launch"
         fi
@@ -4602,8 +4600,8 @@ probe_remote_cmd() {
         echo \"isolated \$([ -f \"\$_sr/sys/devices/system/cpu/isolated\" ] && cat \"\$_sr/sys/devices/system/cpu/isolated\")\"; \
         echo \"online \$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\")\"; \
         echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
-        _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
-        if command -v taskset >/dev/null; then \
+        _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
+        if _o=\$(command -v taskset); then \
             _on=\$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\"); \
             _ids=\$(printf '%s' \"\${_on:-0-\$(( \$(getconf _NPROCESSORS_ONLN) - 1 ))}\" | awk 'BEGIN {RS = \",\"} {n = split(\$0, a, \"-\"); if (n == 2) {for (i = a[1]; i <= a[2]; i++) print i} else if (length(\$0)) print \$0 + 0}'); \
             _bd=; _bp=; for c in \$_ids; do \
@@ -4613,7 +4611,7 @@ probe_remote_cmd() {
             [ -n \"\$_bd\" ] || _bd=,-; [ -n \"\$_bp\" ] || _bp=,-; \
             echo \"bindable \${_bd#,}\"; echo \"bindable_priv \${_bp#,}\"; \
         fi; \
-        _m=; if [ -z \"\$_sr\" ] && command -v lscpu >/dev/null; then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
+        _m=; if [ -z \"\$_sr\" ] && _o=\$(command -v lscpu); then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \
         echo \"cpu_model \${_m:--}\"; \
         echo \"memtotal_kb \$([ -r \"\$_sr/proc/meminfo\" ] && awk '/^MemTotal:/ {print \$2; exit}' \"\$_sr/proc/meminfo\")\"; \
@@ -4623,9 +4621,10 @@ probe_remote_cmd() {
             grep -H . \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/core_id \"\$_sr\"/sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list \
             | awk -F: '{n = split(\$1, p, \"/\"); c = p[n - 2]; sub(/^cpu/, \"\", c); print \"topo_\" p[n], c, \$2}'; \
         fi; \
+        _et=\$(command -v ethtool); \
         for _d in \"\$_sr\"/sys/class/net/*; do \
             [ -e \"\$_d/device\" ] || continue; _n=\${_d##*/}; \
-            _s=; if command -v ethtool >/dev/null; then _s=\$(ethtool \"\$_n\" 2>&1 | awk '\$1 == \"Speed:\" {print \$2; exit}'); fi; \
+            _s=; if [ -n \"\$_et\" ]; then _s=\$(ethtool \"\$_n\" 2>&1 | awk '\$1 == \"Speed:\" {print \$2; exit}'); fi; \
             case \"\$_s\" in [0-9]*) ;; *) _s=; [ ! -r \"\$_d/speed\" ] || _s=\$(cat \"\$_d/speed\" 2>&1) ;; esac; \
             _p=\$(readlink \"\$_d/device\"); _p=\${_p##*/}; _r=-; _i=-; \
             if [ -e \"\$_d/device/driver\" ]; then _r=\$(readlink \"\$_d/device/driver\"); _r=\${_r##*/}; fi; \
@@ -4633,7 +4632,7 @@ probe_remote_cmd() {
             case \"\$_s\" in [0-9]*) ;; *) _s=- ;; esac; \
             echo \"nic \$_n \$_s \${_p:--} \${_r:--} \${_i:--}\"; \
         done; \
-        if command -v weka >/dev/null; then \
+        if _o=\$(command -v weka); then \
             _wx=; [ \"\$(id -u)\" = 0 ] || _wx=\$_pv; \
             if ! _cs=\$(timeout 15 weka local ps --no-header -o name 2>&1); then \
                 if [ -z \"\$_wx\" ] || ! _cs=\$(timeout 15 \$_wx weka local ps --no-header -o name 2>&1); then \
@@ -6954,18 +6953,18 @@ snapshot_sysinfo() {
             (os-release)
                 if [ -r /etc/os-release ]; then cat /etc/os-release; else echo "not available"; fi ;;
             (uname)   uname -a ;;
-            (uptime)  if command -v uptime  >/dev/null; then uptime;            else echo "not available"; fi ;;
-            (df)      if command -v df      >/dev/null; then df -kP;            else echo "not available"; fi ;;
-            (ip)      if command -v ip      >/dev/null; then ip -o addr;        else echo "not available"; fi ;;
-            (numactl) if command -v numactl >/dev/null; then numactl --hardware; else echo "not available"; fi ;;
+            (uptime)  if _o=$(command -v uptime);  then uptime;            else echo "not available"; fi ;;
+            (df)      if _o=$(command -v df);      then df -kP;            else echo "not available"; fi ;;
+            (ip)      if _o=$(command -v ip);      then ip -o addr;        else echo "not available"; fi ;;
+            (numactl) if _o=$(command -v numactl); then numactl --hardware; else echo "not available"; fi ;;
             (*)
-                if command -v "$it" >/dev/null; then "$it"; else echo "$it: not available"; fi ;;
+                if _o=$(command -v "$it"); then "$it"; else echo "$it: not available"; fi ;;
         esac
     done'
     cmd="$cmd; echo '=== WEKATESTER_SYSINFO fio ==='; \
         '$FIO_BIN' --version 2>&1 || echo 'not available'; \
         echo '=== WEKATESTER_SYSINFO weka ==='; \
-        if command -v weka >/dev/null; then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
+        if _o=\$(command -v weka); then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
         pids+=($!); hs+=("$host")
@@ -7015,7 +7014,7 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
         printf -v sar_e '%(%H:%M:%S)T' -1
         cmd="$cmd
     echo '=== WEKATESTER_SYSINFO sar ==='
-    if command -v sar >/dev/null; then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
+    if _o=\$(command -v sar); then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
     fi
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/pressure.$label.$host" ) &

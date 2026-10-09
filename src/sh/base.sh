@@ -253,7 +253,7 @@ resolve_editor() {
     EDITOR_CMD=${VISUAL:-${EDITOR:-vi}}
     set -- $EDITOR_CMD
     [ $# -gt 0 ] || die "\$VISUAL/\$EDITOR is set but empty"
-    command -v "$1" >/dev/null || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
+    [ -n "$(command -v "$1")" ] || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
 }
 
 # All three fds go to the terminal: stdout may be a pipe.

@@ -18,7 +18,7 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     local fb=${FIO_BIN##*/} pg="pgrep -x fio"
     fb=${fb:0:15}   # pgrep -x matches the 15-byte process name
     [ "$fb" = fio ] || pg="$pg; pgrep -x '$fb'"
-    LOCK_CMD="command -v '$FIO_BIN' >/dev/null || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="_o=\$(command -v '$FIO_BIN') || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     # wekatester's fio: its server, the runs that read its staging, its engine tests
@@ -29,9 +29,9 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order): a root fio needs one
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
-        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; done"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; command -v \$1 >/dev/null || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! ps -p \$p -o pid= >/dev/null || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; l2=; for p in \$left; do ! _o=\$(ps -p \$p -o pid=) || l2=\"\$l2 \$p\"; done; left=\$l2; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
     else
@@ -139,9 +139,8 @@ preflight() {
 # which is also what an unmounted weka mount point is.
 NETWORK_FSTYPES="nfs nfs4 cifs smb3 smbfs lustre gpfs beegfs ceph fuse.ceph fuse.ceph-fuse glusterfs fuse.glusterfs panfs pvfs2 orangefs ocfs2 gfs2 afs cvfs quobyte fuse.quobyte fuse.daos fuse.juicefs fuse.mfs ${WEKATESTER_NETWORK_FSTYPES:-}"
 
-# ok, "fail <mode>", network, or "local <type>"; printed and left in
-# MOUNT_VERDICT.
-classify_mount_line() {
+# ok, "fail <mode>", network, or "local <type>", left in MOUNT_VERDICT.
+classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VERDICT
     set -- $1
     local fstype=${1:-} opts=${2:-}
     if [ "$fstype" = "wekafs" ]; then
@@ -158,7 +157,6 @@ classify_mount_line() {
         esac
         [ -n "$fstype" ] || MOUNT_VERDICT="local "
     fi
-    echo "$MOUNT_VERDICT"
 }
 
 # Creates a missing destination only when its nearest existing parent is
@@ -335,7 +333,7 @@ verify_mount_mode() {
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
-        classify_mount_line "${lines[$i]}" > /dev/null; verdict=$MOUNT_VERDICT
+        classify_mount_line_v "${lines[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ;;
             network)

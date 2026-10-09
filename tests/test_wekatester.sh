@@ -143,7 +143,7 @@ t_assert "-w tracked as explicit only when given" bash -c '
       [ "$WORKLOAD_EXPLICIT" -eq 1 ] && [ "$WORKLOAD" = mixed ] )'
 
 # --- mount guard classifier ---
-c() { (source ./wekatester; classify_mount_line "$1"); }
+c() { (source ./wekatester; classify_mount_line_v "$1"; echo "$MOUNT_VERDICT"); }
 t_assert "wekafs forcedirect ok"   test "$(c 'wekafs rw,relatime,forcedirect,inode_bits=auto')" = "ok"
 t_assert "wekafs writecache fails" test "$(c 'wekafs rw,relatime,writecache,readahead_kb=32768')" = "fail writecache"
 t_assert "wekafs readcache fails"  test "$(c 'wekafs rw,readcache')" = "fail readcache"

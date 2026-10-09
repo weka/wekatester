@@ -43,18 +43,18 @@ snapshot_sysinfo() {
             (os-release)
                 if [ -r /etc/os-release ]; then cat /etc/os-release; else echo "not available"; fi ;;
             (uname)   uname -a ;;
-            (uptime)  if command -v uptime  >/dev/null; then uptime;            else echo "not available"; fi ;;
-            (df)      if command -v df      >/dev/null; then df -kP;            else echo "not available"; fi ;;
-            (ip)      if command -v ip      >/dev/null; then ip -o addr;        else echo "not available"; fi ;;
-            (numactl) if command -v numactl >/dev/null; then numactl --hardware; else echo "not available"; fi ;;
+            (uptime)  if _o=$(command -v uptime);  then uptime;            else echo "not available"; fi ;;
+            (df)      if _o=$(command -v df);      then df -kP;            else echo "not available"; fi ;;
+            (ip)      if _o=$(command -v ip);      then ip -o addr;        else echo "not available"; fi ;;
+            (numactl) if _o=$(command -v numactl); then numactl --hardware; else echo "not available"; fi ;;
             (*)
-                if command -v "$it" >/dev/null; then "$it"; else echo "$it: not available"; fi ;;
+                if _o=$(command -v "$it"); then "$it"; else echo "$it: not available"; fi ;;
         esac
     done'
     cmd="$cmd; echo '=== WEKATESTER_SYSINFO fio ==='; \
         '$FIO_BIN' --version 2>&1 || echo 'not available'; \
         echo '=== WEKATESTER_SYSINFO weka ==='; \
-        if command -v weka >/dev/null; then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
+        if _o=\$(command -v weka); then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
         pids+=($!); hs+=("$host")
@@ -102,7 +102,7 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
         printf -v sar_e '%(%H:%M:%S)T' -1
         cmd="$cmd
     echo '=== WEKATESTER_SYSINFO sar ==='
-    if command -v sar >/dev/null; then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
+    if _o=\$(command -v sar); then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
     fi
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/pressure.$label.$host" ) &

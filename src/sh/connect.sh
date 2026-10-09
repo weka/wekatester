@@ -22,8 +22,8 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     local priv=${1:+$1 }
     local pat="^$FIO_BIN --server --daemonize=$FIO_PIDFILE"
     KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _o=\$(${priv}kill \$(cat '$FIO_PIDFILE') 2>&1) || true; ${priv}rm -f '$FIO_PIDFILE'; fi; \
-        i=0; while pgrep -f '$pat' >/dev/null && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && pgrep -f '$pat' >/dev/null; then ${priv}pkill -9 -f '$pat' || true; fi"
+        i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
 }
 
 start_fio_servers() {
@@ -42,7 +42,7 @@ start_fio_servers() {
         launch=$base
         [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
         if [ -n "$priv" ] && [ -n "$cpus" ]; then
-            launch="u=\$(id -un); if command -v runuser >/dev/null && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
+            launch="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
         elif [ -n "$priv" ]; then
             launch="$priv $launch"
         fi
