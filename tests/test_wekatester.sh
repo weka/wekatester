@@ -3081,6 +3081,26 @@ t_assert "server launch: priv pins via taskset but fio drops to the login user" 
     grep -q "WEKATESTER_FIO_AS=root; sudo -n taskset -c 4-7 '\''fio'\'' --server" "$d/launch.h1" &&
     grep -q "LAUNCH\[h2\]" "$d/launch.h2" && ! grep -q taskset "$d/launch.h2" &&
     grep -q "taskset -c 8-9 '\''fio'\''" "$d/launch.h3" && ! grep -q runuser "$d/launch.h3"'
+t_assert "server launch, run under sh and bash: with runuser fio drops to the login user, without it fio runs as root" bash -c '
+    d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/auth"
+    printf "sudo -n\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
+    for c in cat id pgrep ps rm sleep true; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
+    # sudo, taskset and runuser pass straight through to the command; fio says how it was run
+    printf "#!/bin/sh\n[ \"\$1\" != -n ] || shift\nexec \"\$@\"\n" > "$b/sudo"
+    printf "#!/bin/sh\nshift 2\nexec \"\$@\"\n" > "$b/taskset"
+    printf "#!/bin/sh\nshift 3\nexec \"\$@\"\n" > "$b/runuser"
+    printf "#!/bin/sh\necho \"fio ran: \$*\"\n" > "$b/fio"
+    chmod +x "$b/sudo" "$b/taskset" "$b/runuser" "$b/fio"
+    (source ./wekatester; WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1); FIO_BIN=fio; FIO_PIDFILE=$d/fio.pid; WEKATESTER_SETTLE=0
+     run_host() { printf "%s" "$2" > "$d/cmd.$1"; }
+     start_fio_servers) >>"$WT_ASIDE" 2>&1
+    [ -s "$d/cmd.h1" ] || { echo "no launch string captured" >&2; exit 1; }
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        u=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1")" 2>&1)
+        mv "$b/runuser" "$d/runuser.off"; r=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1")" 2>&1); mv "$d/runuser.off" "$b/runuser"
+        case "$u" in *"WEKATESTER_FIO_AS=user"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "$sh, with runuser: $u" >&2; exit 1;; esac
+        case "$r" in *"WEKATESTER_FIO_AS=root"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "$sh, no runuser: $r" >&2; exit 1;; esac
+    done'
 
 # --- host files: per-host application to staging ---
 t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-derived" bash -c '
@@ -5520,6 +5540,22 @@ t_assert "pressure: no run dir means no capture, no error" bash -c '
      run_host() { echo TOUCHED >> "$d/oplog"; }
      snapshot_pressure start)
     [ ! -f "$d/oplog" ]'
+t_assert "sysinfo and pressure, run under sh and bash: a tool on PATH runs, a missing one is not available" bash -c '
+    d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/w" "$d/run"
+    for c in cat uname; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
+    printf "#!/bin/sh\necho up 1 day\n" > "$b/uptime"
+    printf "#!/bin/sh\necho sar \"\$@\"\n" > "$b/sar"
+    chmod +x "$b/uptime" "$b/sar"
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$d/w; RUN_DIR=$d/run; RUN_STAMP=20261009-120000; FIO_BIN=fio
+     run_host() { printf "%s" "$2" > "$d/cmd.$1.$CMDK"; }
+     CMDK=sysinfo snapshot_sysinfo; CMDK=pressure snapshot_pressure end) >>"$WT_ASIDE" 2>&1
+    [ -s "$d/cmd.h1.sysinfo" ] && [ -s "$d/cmd.h1.pressure" ] || { echo "strings not captured" >&2; exit 1; }
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        s=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1.sysinfo")" 2>&1); p=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1.pressure")" 2>&1)
+        printf "%s\n" "$s" | grep -qx "up 1 day" && printf "%s\n" "$s" | grep -qx "lspci: not available" &&
+        printf "%s\n" "$s" | grep -qx "weka: not available" && printf "%s\n" "$p" | grep -q "^sar -A -s 12:00:00 -e " ||
+            { echo "$sh:"; printf "%s\n" "$s" "$p"; exit 1; } >&2
+    done'
 
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,
