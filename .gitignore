@@ -1,5 +1,17 @@
 # OSX trash
 .DS_Store
 
-__pycache__
-__pycache__/*
+# IDE and local-assistant state
+.idea/
+.claude/
+
+# benchmark outputs
+results_*.json
+results/
+
+# SDD scratch
+.superpowers/
+
+# ./build leftovers: an interrupted assembly, or one bash -n rejected
+/wekatester.build.*
+/wekatester.rejected
