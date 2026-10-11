@@ -106,10 +106,11 @@ preflight() {
 # which is also what an unmounted weka mount point is.
 NETWORK_FSTYPES="nfs nfs4 cifs smb3 smbfs lustre gpfs beegfs ceph fuse.ceph fuse.ceph-fuse glusterfs fuse.glusterfs panfs pvfs2 orangefs ocfs2 gfs2 afs cvfs quobyte fuse.quobyte fuse.daos fuse.juicefs fuse.mfs ${WEKATESTER_NETWORK_FSTYPES:-}"
 
-# ok, "fail <mode>", network, or "local <type>", left in MOUNT_VERDICT.
-classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VERDICT
-    set -- $1
-    local fstype=${1:-} opts=${2:-}
+# ok, "fail <mode>", network, or "local <type>", left in MOUNT_VERDICT, from
+# a /proc/mounts line: its 3rd field is the type, its 4th the options.
+classify_mount_line_v() {   # classify_mount_line_v <proc-mounts-line> -> MOUNT_VERDICT
+    local fstype="" opts=""
+    read -r _ _ fstype opts _ <<<"$1"
     if [ "$fstype" = "wekafs" ]; then
         case ",$opts," in
             *,forcedirect,*) MOUNT_VERDICT=ok ;;
@@ -129,7 +130,7 @@ classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VE
 # One line: the /proc/mounts line of the mount holding <dir> (quoted for the
 # remote shell), or an empty one. The last line for its mount point wins, as
 # a stacked mount is the visible one; findmnt -T names the point once per
-# stacked mount.
+# stacked mount. The check classifies this line, records it and rechecks it.
 mount_line_cmd_v() {   # mount_line_cmd_v <quoted-dir> -> MOUNT_LINE_CMD
     local prog='#@awk proc_mount_line'
     MOUNT_LINE_CMD="t=\$(findmnt -T $1 -n -o TARGET) && T=\"\$t\" awk '$prog' /proc/mounts"
@@ -188,17 +189,19 @@ check_mounts_unchanged() {
 
 # Creates a missing destination only when its nearest existing parent is
 # wekafs in this same session: a weka client that restarted since the check
-# leaves a root-disk mount point. Exit 4: not wekafs now.
+# leaves a root-disk mount point. Exit 4: not wekafs now. The type is the 3rd
+# field of the parent's /proc/mounts line, the line the check classified.
 create_dest_cmd() {   # create_dest_cmd <dir>
-    printf '%s' "p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$(findmnt -T \"\$p\" -n -o FSTYPE)\" = wekafs ] || exit 4; mkdir -p -- '$1'"
+    mount_line_cmd_v '"$p"'
+    printf '%s' "p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$($MOUNT_LINE_CMD | awk '{print \$3}')\" = wekafs ] || exit 4; mkdir -p -- '$1'"
 }
 
-# For a missing destination: the nearest existing ancestor, then its findmnt
-# FSTYPE,OPTIONS and its mount's /proc/mounts line. Nonzero when it does
-# exist, or nothing does. dirname handles a trailing slash and stops at /.
+# For a missing destination: the nearest existing ancestor, then its mount's
+# /proc/mounts line. Nonzero when it does exist, or nothing does. dirname
+# handles a trailing slash and stops at /.
 missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
     mount_line_cmd_v '"$p"'
-    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; findmnt -T \"\$p\" -n -o FSTYPE,OPTIONS && $MOUNT_LINE_CMD"
+    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; $MOUNT_LINE_CMD"
 }
 
 # One probe file as the fio user; on a shared filesystem one failing host
@@ -319,22 +322,20 @@ verify_mount_mode() {
     # the messages come back in host order, as a serial walk produced them;
     # only the waiting overlaps. Per-host output goes to files under the work
     # dir, or a temp dir when the suite calls this phase alone.
-    local td pids=() hds=() rcs=() lines=() ancs=() msgs=() probe=()
+    local td pids=() hds=() rcs=() ancs=() msgs=() probe=()
     td=$(mktemp -d "${WORK_DIR:-${TMPDIR:-/tmp}}/mnt.XXXXXX") \
         || die "cannot create a scratch dir for the mount check"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         hds[$i]=${HOST_DIRS[$i]}
         mount_line_cmd_v "'${hds[$i]}'"
-        ( run_host "${HOSTS[$i]}" "findmnt -T '${hds[$i]}' -n -o FSTYPE,OPTIONS && $MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
+        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
         pids[$i]=$!
     done
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}"; rcs[$i]=$?
-        # findmnt's line (one per stacked mount), then the /proc/mounts line
-        mapfile -t pl < "$td/$i.mnt"
-        lines[$i]=${pl[0]:-}; procs[$i]=""
-        [ ${#pl[@]} -lt 2 ] || procs[$i]=${pl[-1]}
+        line=""; IFS= read -r line < "$td/$i.mnt" || :
+        procs[$i]=$line
     done
     # findmnt fails for a path that does not exist: classify the nearest
     # ancestor that does, and remember that the destination is missing
@@ -347,21 +348,27 @@ verify_mount_mode() {
     for i in "${!HOSTS[@]}"; do
         [ "${rcs[$i]}" -ne 0 ] || continue
         pl=()
-        # the ancestor, its findmnt line(s), then its /proc/mounts line
+        # the ancestor, then its mount's /proc/mounts line
         if wait "${pids[$i]}"; then mapfile -t pl < "$td/$i.anc"; fi
         if [ ${#pl[@]} -ge 2 ]; then
-            ancs[$i]=${pl[0]}; lines[$i]=${pl[1]}; procs[$i]=""
-            [ ${#pl[@]} -lt 3 ] || procs[$i]=${pl[-1]}
+            ancs[$i]=${pl[0]}; procs[$i]=${pl[1]}
         else
             msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"
         fi
     done
-    # classification is local; probe[i] marks the hosts that get the write
-    # probe: destination present, mode ok (or -r's warning)
+    # classification is local, of the line the record keeps and fio sees (a
+    # stacked mount's visible one); probe[i] marks the hosts that get the
+    # write probe: destination present, mode ok (or -r's warning)
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
-        classify_mount_line_v "${lines[$i]}"; verdict=$MOUNT_VERDICT
+        # the line check_mounts_unchanged holds the run to
+        if [ -z "${procs[$i]:-}" ]; then
+            msgs[$i]="$host: no /proc/mounts line for the mount holding ${anc:-$hd} (findmnt -T TARGET names a mount point /proc/mounts does not list)"
+            proc_fail=1
+            continue
+        fi
+        classify_mount_line_v "${procs[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ;;
             network)
@@ -390,12 +397,6 @@ verify_mount_mode() {
                        continue
                    fi ;;
         esac
-        # the line check_mounts_unchanged holds the run to
-        if [ -z "${procs[$i]:-}" ]; then
-            msgs[$i]="$host: no /proc/mounts line for the mount holding ${anc:-$hd} (findmnt -T TARGET names a mount point /proc/mounts does not list)"
-            proc_fail=1
-            continue
-        fi
         if [ -n "$anc" ]; then
             missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc")
             continue   # created below, once the operator agrees, then probed
