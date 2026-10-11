@@ -2569,6 +2569,21 @@ t_assert "cleanup: the fio kill comes before the end pressure/sar capture" bash 
     cat "$d/oplog" >>$WT_ASIDE
     awk "/^KILL/ { k++; last = NR } /^PRESSURE/ { p++; if (!first) first = NR }
          END { exit !(k == 2 && p == 2 && last < first) }" "$d/oplog"'
+t_assert "cleanup: the run lock is held through the end capture and released after it, in its own session" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d/work; RUN_DIR=$d/run; mkdir -p "$WORK_DIR" "$RUN_DIR"
+     HOSTS=(h1 h2); FIO_STARTED=1; TARGET_DIR=/dev/shm/x; RUN_EPOCH=1
+     LOCK_DIR=/dev/shm/wt-lock-test; LOCK_TOKEN=tok; RUN_LOCKS=([h1]=1 [h2]=1)
+     run_host() { case "$2" in
+         (*wt-lock-test*) echo "LOCK $1" >> "$d/oplog";;
+         (*WEKATESTER_SYSINFO*) echo "PRESSURE $1" >> "$d/oplog";;
+         (*) echo "KILL $1" >> "$d/oplog";;
+     esac; }
+     cleanup; [ ${#RUN_LOCKS[@]} -eq 0 ]) >>$WT_ASIDE 2>&1 || exit 1
+    cat "$d/oplog" >>$WT_ASIDE
+    awk "/^KILL/ { k++; lk = NR } /^PRESSURE/ { p++; lp = NR; if (!fp) fp = NR } /^LOCK/ { l++; if (!fl) fl = NR }
+         END { exit !(k == 2 && p == 2 && l == 2 && lk < fp && lp < fl) }" "$d/oplog"'
 t_assert "run_jobs: layout is timed create_only -- no markers, no rebuild selection" bash -c '
     d=$(mktemp -d)
     out=$( (source ./wekatester

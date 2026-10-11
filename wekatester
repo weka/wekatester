@@ -4440,9 +4440,8 @@ cleanup() {
             priv=""
             [ -z "$AUTH_DIR" ] || [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
             kill_fio_cmd_v "$priv"
-            # the run lock goes in the same session, last
+            # the run lock stays until after the end capture, below
             kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
-            [ -z "${RUN_LOCKS[$host]:-}" ] || { kcmd="$kcmd; $LOCK_RELEASE"; unset "RUN_LOCKS[$host]"; }
             run_host "$host" "$kcmd" &
             pids+=($!)
         done
@@ -4457,9 +4456,9 @@ cleanup() {
         PRESSURE_END_DONE=1
         snapshot_pressure end
     fi
-    # a run that ended before its fio started: the locks on their own, and
-    # this run's group file when collect_fs_groups has not removed it (every
-    # host holds a lock by then; fio starts after it)
+    # the locks last, held through the capture so no other run lands in its
+    # slice; with this run's group file when collect_fs_groups has not removed
+    # it (every host holds a lock by then; fio starts after it)
     if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
         pids=()
         if [ -n "$GROUP_FILE" ] && [ "$GROUP_FILE_REMOVED" -eq 0 ]; then
