@@ -63,6 +63,56 @@ probe_remote_cmd() {
         else echo 'weka_cli absent'; fi; true"
 }
 
+# Each engine's real one-file job on one host's destination (--enghelp lists
+# only what fio was built with): "host engine ok|fail" lines into
+# engine.results, the fio output in et/. "first" stops at the first pass and
+# expects failures, so it warns only of a stuck one.
+prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>...
+    local host=$1 hd=$2 mode=$3 results="$WORK_DIR/engine.results" avail="" c tmo _w
+    shift 3
+    # the probe's engines line, near its top: read, not an awk per host
+    while read -ra _w; do
+        [ "${_w[0]:-}" = engines ] || continue
+        avail=" ${_w[*]:1}"; break
+    done < "$WORK_DIR/probe/$host"
+    for c in "$@"; do
+        case " $avail " in
+            *" $c "*) ;;
+            *) echo "$c: not in this fio's --enghelp list" > "$WORK_DIR/et/$host.$c.out"
+               echo "$host $c fail" >> "$results"; continue ;;
+        esac
+        # A broken engine can hang, and a direct-IO write on a sick
+        # mount parks fio in D state, where SIGKILL and timeout(1) both
+        # stall. So: background the bounded job, poll it, and abandon
+        # it if it will not die. A working engine takes milliseconds.
+        tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
+        # _o keeps kill's complaints out of the evidence file
+        if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
+                timeout -k 5 $tmo \
+                '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
+                --filesize=64k --filename=\"\$f\" --direct=1 \
+                --output-format=json & p=\$!; i=0; \
+                while _o=\$(kill -0 \$p 2>&1) && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
+                if _o=\$(kill -0 \$p 2>&1); then \
+                    _o=\$(kill -9 \$p 2>&1); sleep 1; \
+                    _o=\$(kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
+                    rm -f \"\$f\"; exit 124; \
+                fi; \
+                wait \$p; rc=\$?; rm -f \"\$f\"; exit \$rc" \
+                > "$WORK_DIR/et/$host.$c.out" 2>&1; then
+            echo "$host $c ok" >> "$results"
+            [ "$mode" = all ] || return 0
+        else
+            echo "$host $c fail" >> "$results"
+            if grep -q WEKATESTER_ENGINE_STUCK "$WORK_DIR/et/$host.$c.out"; then
+                log "WARNING: $host: ioengine $c test is STUCK in uninterruptible IO -- abandoned; direct IO on $hd may be broken on this host" >&2
+            elif [ "$mode" = all ]; then
+                log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
+            fi
+        fi
+    done
+}
+
 # Prove engine candidates with a real one-file job on each host destination
 # (--enghelp lists only what fio was built with): -e, host-file engines, and
 # under -a the tuner list. Results to engine.results ("host engine ok|fail");
@@ -82,50 +132,7 @@ test_engines() {
     load_host_dirs
     local i
     for i in "${!HOSTS[@]}"; do
-        host=${HOSTS[$i]}
-        (
-            hd=${HOST_DIRS[$i]}
-            # the probe's engines line, near its top: read, not an awk per host
-            avail=""
-            while read -ra _w; do
-                [ "${_w[0]:-}" = engines ] || continue
-                avail=" ${_w[*]:1}"; break
-            done < "$WORK_DIR/probe/$host"
-            for c in $cand; do
-                case " $avail " in
-                    *" $c "*) ;;
-                    *) echo "$host $c fail" >> "$results"; continue ;;
-                esac
-                # A broken engine can hang, and a direct-IO write on a sick
-                # mount parks fio in D state, where SIGKILL and timeout(1) both
-                # stall. So: background the bounded job, poll it, and abandon
-                # it if it will not die. A working engine takes milliseconds.
-                tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
-                # _o keeps kill's complaints out of the evidence file
-                if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
-                        timeout -k 5 $tmo \
-                        '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
-                        --filesize=64k --filename=\"\$f\" --direct=1 \
-                        --output-format=json & p=\$!; i=0; \
-                        while _o=\$(kill -0 \$p 2>&1) && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
-                        if _o=\$(kill -0 \$p 2>&1); then \
-                            _o=\$(kill -9 \$p 2>&1); sleep 1; \
-                            _o=\$(kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
-                            rm -f \"\$f\"; exit 124; \
-                        fi; \
-                        wait \$p; rc=\$?; rm -f \"\$f\"; exit \$rc" \
-                        > "$WORK_DIR/et/$host.$c.out" 2>&1; then
-                    echo "$host $c ok" >> "$results"
-                else
-                    echo "$host $c fail" >> "$results"
-                    if grep -q WEKATESTER_ENGINE_STUCK "$WORK_DIR/et/$host.$c.out"; then
-                        log "WARNING: $host: ioengine $c test is STUCK in uninterruptible IO -- abandoned; direct IO on $hd may be broken on this host" >&2
-                    else
-                        log "WARNING: $host: ioengine $c failed its test job (see $WORK_DIR/et/$host.$c.out)" >&2
-                    fi
-                fi
-            done
-        ) &
+        prove_host_engines "${HOSTS[$i]}" "${HOST_DIRS[$i]}" all $cand &
         et_pids+=($!)
     done
     # SCOPED wait: a bare wait also waits on the run-log tees, which exit only
@@ -185,6 +192,63 @@ finalize_targets() {
         [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
         die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
     fi
+}
+
+# Engine precedence: -e, the host file, the jobfile's own ioengine=, then
+# this. Where a source jobfile names none and the host file gives the host
+# none, the first of ENGINE_ORDER that passes its test there goes into
+# engine.discovered ("host engine"); -a picks its own.
+discover_engines() {
+    [ -z "$AUTO_LEVEL" ] && [ -z "$ENGINE" ] || return 0
+    local src f files=() lacking host need=() i c r pick et_pids=() _p none=() results="$WORK_DIR/engine.results"
+    local -A known=() dir_of=()
+    src=${SET_DIR_OVERRIDE:-$(workload_src_dir)} || exit 1
+    for f in "$src"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
+    [ ${#files[@]} -gt 0 ] || return 0
+    lacking=$(awkrun '#@awk discover_engines' "${files[@]}") || die "cannot read the ioengine lines of the jobfiles in $src"
+    [ -n "$lacking" ] || return 0
+    : > "$WORK_DIR/engine.discovered"
+    load_host_dirs
+    # a host the host file gives an engine needs none (targets_column: "" for none)
+    i=0
+    while IFS= read -r c; do
+        [ -n "$c" ] || need+=("${HOSTS[$i]}")
+        dir_of[${HOSTS[$i]}]=${HOST_DIRS[$i]}; i=$((i + 1))
+    done < <(if [ -f "$WORK_DIR/targets.final" ]; then targets_column 3 "$WORK_DIR/targets.final" "${HOSTS[@]}"; else printf '%s\n' "${HOSTS[@]/*/}"; fi)
+    [ ${#need[@]} -gt 0 ] || return 0
+    log "discovering an ioengine on ${#need[@]} host(s): no ioengine in the host file or the jobfiles for$(printf ' %s' $lacking)"
+    mkdir -p "$WORK_DIR/et"; touch "$results"
+    # an engine the host file's selector lines already proved is not run again
+    while read -r host c r; do known[$host $c]=$r; done < "$results"
+    for host in "${need[@]}"; do
+        set --
+        for c in $ENGINE_ORDER; do
+            case ${known[$host $c]:-} in ok) break ;; fail) ;; *) set -- "$@" "$c" ;; esac
+        done
+        [ $# -eq 0 ] && continue
+        prove_host_engines "$host" "${dir_of[$host]}" first "$@" &
+        et_pids+=($!)
+    done
+    # SCOPED wait, as in test_engines: the run-log tees never exit here
+    for _p in ${et_pids[@]+"${et_pids[@]}"}; do wait "$_p"; done
+    known=()
+    while read -r host c r; do [ "$r" != ok ] || known[$host $c]=ok; done < "$results"
+    for host in "${need[@]}"; do
+        pick=""
+        for c in $ENGINE_ORDER; do [ -z "${known[$host $c]:-}" ] || { pick=$c; break; }; done
+        if [ -z "$pick" ]; then none+=("$host"); continue; fi
+        echo "$host $pick" >> "$WORK_DIR/engine.discovered"
+        log "$host: ioengine $pick discovered, the first of $ENGINE_ORDER to pass its test job: no ioengine in the host file or the jobfiles"
+    done
+    [ ${#none[@]} -gt 0 ] || return 0
+    # the workdir dies with the process: quote the evidence now
+    for host in "${none[@]}"; do
+        for c in $ENGINE_ORDER; do
+            [ -s "$WORK_DIR/et/$host.$c.out" ] || continue
+            log "$host: ioengine $c: $(tail -1 "$WORK_DIR/et/$host.$c.out")" >&2
+        done
+    done
+    die "no ioengine passed its test job on ${none[*]} (tried: $ENGINE_ORDER); the host file and the jobfiles name none there -- check direct IO on the destination and the fio build"
 }
 
 # cpus_allowed enforcement: a requested list must already be allowed (taskset

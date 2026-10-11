@@ -43,7 +43,10 @@ attaching is the way to pass a value that starts with a dash.
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
-                          overriding the jobfiles and auto tuning
+                          overriding the jobfiles and auto tuning; without
+                          it: the host file's, the jobfile's own, else
+                          (not under -a) the first of io_uring, libaio,
+                          psync that passes a test job on the host
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
@@ -94,8 +97,9 @@ attaching is the way to pass a value that starts with a dash.
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
-                 no measured job runs, but a missing -d is created and, with
-                 -a/-t/-e, the ioengines are proven with small fio jobs
+                 no measured job runs, but a missing -d is created and the
+                 ioengines are proven with small fio jobs (with -a/-t/-e,
+                 or when a jobfile names none)
   -g             force regeneration of existing layout jobfiles
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
@@ -124,6 +128,8 @@ With no server given, the test runs on the local host -- no ssh required.
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 
 `-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. The engine is **proven with a real one-file job on every worker's destination** before anything runs — `--enghelp` only shows what fio was built with, and engines routinely pass it yet fail on the actual filesystem — and a host failing the test is fatal, naming the host and the evidence file. A broken engine hangs as often as it errors, so a test job still running after 15 seconds (`WEKATESTER_ENGINE_TEST_TIMEOUT`) is killed and counts as a failure, and one stuck in uninterruptible IO is abandoned with a warning rather than waited on. Values are passed to fio as typed.
+
+**Engine precedence**, for every staged jobfile on every host: (1) `-e`; (2) the host file's ioengine for that host (`-t`); (3) the jobfile's own `ioengine=` line, kept as written; (4) otherwise wekatester **discovers** one: it proves io_uring, libaio and psync in that order with the same one-file test job on the host's destination, and the first that works there goes into that host's jobfiles that set no ioengine in any section (an `ioengine=` line in `[global]`). Each host's discovered engine is logged, with the reason; a host where none works stops the run, naming the host and quoting each test's output. The generated layout job, whose engine is otherwise the set's most-used one, is re-derived for those hosts so it runs the discovered engine too. Nothing is tested when every jobfile names an engine (every shipped set does) or the host file gives the host one. Under `-a` the tuner chooses the engines instead (see Auto mode).
 
 `-t [hostfile]` — per-host settings from one CSV; see **Host files** below.
 
@@ -164,7 +170,7 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 The host file and the workload set are prepared before a run: wekatester opens no editors. A few prompts remain, for things a run would otherwise create or risk: a missing host file (`-t`), a missing destination directory, a workload that does not fit, and the `-p` passwords. They read the terminal directly, so they work fine under `... | tee run.log`.
 
 - `-r` — fast track: no prompts; whatever is needed (the layout, a missing destination directory under a wekafs mount) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so. A destination mount that changes before the measured run is still a stop (Caveats).
-- `-n` — dry run: everything is resolved, generated and staged, then every staged jobfile's contents and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and with `-a`, `-t` or `-e` the ioengines are proven with small one-file fio jobs. The pinning check runs too, so a dry run stops where the real run would.
+- `-n` — dry run: everything is resolved, generated and staged, then every staged jobfile's contents and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and the ioengines are proven with small one-file fio jobs: with `-a`, `-t` or `-e`, and when an ioengine is discovered (see `-e`), so the staged variants show the engine the run would use. The pinning check runs too, so a dry run stops where the real run would.
 - `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too).
 
 A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it. A pristine layout job under `-a` is re-derived per host so it lays out what that host will run: its measured job counts and file geometry.
@@ -593,7 +599,7 @@ client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,12/10G//4,1///1,1///1,
 
 A line naming a host assigns to that host (two lines naming the same host is an error, both line numbers named). Host-less lines are **selector** lines: their login and/or ioengine choose the hosts they apply to — a login selects hosts using that login, an ioengine selects hosts that **passed that engine's functional test** — and their remaining fields fold into any host whose more-specific settings left them unset. A host line beats two selectors beats one beats a global `,,...` line; a generic line never overrides a more specific one regardless of file order; equally specific conflicts keep the *first* line and print a warning. A host-less line's login is only ever a selector — logins are assigned by host lines, the CLI, or your ssh defaults. Empty fields mean "default"; geometry sub-fields may be omitted (`12/10G//8` sets numjobs, filesize and iodepth). Geometry is per type AND direction: the R columns shape read jobs, the W columns write jobs, and a mixed-direction jobfile takes the deeper-queued direction's whole tuple. Quote cpu lists (`"22,24"`), and `#` starts a comment.
 
-Without `-t` no host file is used. Bare `-t` looks in the `-w` set's folder first, falling back to `./hostlist.csv`; when both exist, the set folder wins and is the copy later writebacks (`-a`) update. The host file is taken as prepared for the run. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. Precedence overall: **CLI flags > host file > jobfiles/tuner**.
+Without `-t` no host file is used. Bare `-t` looks in the `-w` set's folder first, falling back to `./hostlist.csv`; when both exist, the set folder wins and is the copy later writebacks (`-a`) update. The host file is taken as prepared for the run. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. Precedence overall: **CLI flags > host file > jobfiles/tuner**. For the ioengine in full: `-e`, then the host file's engine for the host, then the jobfile's own `ioengine=`, then (outside `-a`) the first of io_uring, libaio, psync that passes its test job on the host (see `-e`).
 
 **fio never lands on weka's pinned cores.** Every run probes every host, so a host the file gives no cpu list is pinned too: its fio server and jobs run on every cpu except weka's cores (both threads) and core 0's pair, limited to the cpus the login can bind without privilege (under `-a`, on the tuner's set). One note names how many hosts that covers. Only a host whose probe could not be read stays unpinned.
 

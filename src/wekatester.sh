@@ -108,7 +108,10 @@ attaching is the way to pass a value that starts with a dash.
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
-                          overriding the jobfiles and auto tuning
+                          overriding the jobfiles and auto tuning; without
+                          it: the host file's, the jobfile's own, else
+                          (not under -a) the first of io_uring, libaio,
+                          psync that passes a test job on the host
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
@@ -159,8 +162,9 @@ attaching is the way to pass a value that starts with a dash.
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
-                 no measured job runs, but a missing -d is created and, with
-                 -a/-t/-e, the ioengines are proven with small fio jobs
+                 no measured job runs, but a missing -d is created and the
+                 ioengines are proven with small fio jobs (with -a/-t/-e,
+                 or when a jobfile names none)
   -g             force regeneration of existing layout jobfiles
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
@@ -492,6 +496,7 @@ main() {
             test_engines
             finalize_targets
         fi
+        discover_engines
         # what the real run would pin (or die on) -- local set arithmetic
         # on the probe, no remote command
         check_cpu_pinning
@@ -524,6 +529,7 @@ main() {
         test_engines
         finalize_targets
     fi
+    discover_engines
     check_cpu_pinning
     # every check but capacity has passed: who shares a destination
     collect_fs_groups

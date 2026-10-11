@@ -42,9 +42,10 @@ stage_variants() {
         || die "per-host jobfile staging failed"
     # the host-file engine applies per host to every staged file, a re-derived
     # layout included; the -e post-pass in stage_jobfiles runs after and wins,
-    # rewriting every ioengine line, so under -e this pass is skipped
-    [ -f "$WORK_DIR/targets.final" ] && [ -z "$ENGINE" ] || return 0
-    stage_host_engines
+    # rewriting every ioengine line, so under -e these passes are skipped
+    [ -z "$ENGINE" ] || return 0
+    [ ! -f "$WORK_DIR/targets.final" ] || stage_host_engines
+    [ ! -s "$WORK_DIR/engine.discovered" ] || stage_discovered_engines "$srcdir"
 }
 
 # -a staging entry: stage_hosts auto with the old signature.
@@ -112,6 +113,21 @@ derive_layouts() {   # derive_layouts <plain|auto> <label|-> <directory> <host>.
 stage_host_engines() {
     list_staged "$WORK_DIR/staged.list" || die "per-host engine override failed"
     awkrun '#@awk stage_host_engines' "$WORK_DIR/targets.final" "$WORK_DIR/staged.list" || die "per-host engine override failed"
+}
+
+# Each host's discovered engine (engine.discovered) into its staged files
+# that name none, as an ioengine= line in [global]. A pristine layout is then
+# re-derived for those hosts: its engine came from the set, untested there.
+stage_discovered_engines() {   # stage_discovered_engines <set-dir>
+    local hosts=() h
+    list_staged "$WORK_DIR/staged.list" \
+        && awkrun '#@awk stage_discovered_engines' "$WORK_DIR/engine.discovered" "$WORK_DIR/staged.list" \
+            > "$WORK_DIR/discovered.hosts" || die "discovered engine staging failed"
+    while IFS= read -r h; do hosts+=("$h"); done < "$WORK_DIR/discovered.hosts"
+    [ ${#hosts[@]} -gt 0 ] || return 0
+    layout_variant_pristine "$1" || return 0
+    derive_layouts plain - "$DIRECTORY" "${hosts[@]}" \
+        || die "cannot re-derive the layout for the discovered engines"
 }
 
 # "<host><tab><path>" per staged file, hosts in order, files in byte order;

@@ -2593,6 +2593,94 @@ t_assert "finalize: a host-line engine that failed its test dies naming host+evi
         *"assigns ioengine '\''weird_eng'\'' to h1 but its test job failed"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+# --- ioengine discovery: -e > host file > the jobfile's own > discovered ---
+# A jobfile naming no engine used to run fio's default (psync) silently.
+t_assert "discovery: where a jobfile names no engine, each host gets the first of ENGINE_ORDER that passes, logged with the reason" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
+    printf "[global]\nioengine=libaio\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    printf "[global]\nnumjobs=1\n[b]\nrw=read\n" > "$d/set/012-b.job"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1 h2); ENGINE=""; AUTO_LEVEL=""; DIRECTORY=/mnt/x; FIO_BIN=fio
+        SET_DIR_OVERRIDE=$d/set
+        printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+        printf "engines io_uring libaio psync\n" > "$d/probe/h2"
+        run_host() { case "$2" in (*ioengine=*) echo "$1 ${2#*ioengine=}" | cut -d" " -f1,2 >> "$d/ran";; esac
+                     case "$1:$2" in (h1:*ioengine=io_uring*) return 1;; (*) return 0;; esac; }
+        discover_engines) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    [ "$(sort "$d/engine.discovered" | tr "\n" "|")" = "h1 libaio|h2 io_uring|" ] &&
+    # the first that passes ends the search: no psync anywhere, no libaio on h2
+    [ "$(sort "$d/ran" | tr "\n" "|")" = "h1 io_uring|h1 libaio|h2 io_uring|" ] &&
+    case "$out" in
+        *"h1: ioengine libaio discovered"*"no ioengine in the host file or the jobfiles"*) true;;
+        *) echo "$out" >&2; false;;
+    esac &&
+    # an expected miss is no warning: the WARNING text is for engines asked for
+    case "$out" in *WARNING*) echo "$out" >&2; false;; *) true;; esac'
+t_assert "discovery: costs nothing when every jobfile names an engine, under -e, and under -a" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/set" "$d/bare"
+    printf "[global]\nnumjobs=1\n[a]\nioengine=psync\nrw=read\n" > "$d/set/011-a.job"
+    printf "[global]\nnumjobs=1\n[b]\nrw=read\n" > "$d/bare/011-b.job"
+    printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+    for c in "$d/set||" "$d/bare|libaio|" "$d/bare||max"; do
+        IFS="|" read -r set eng lvl <<<"$c"
+        (source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1); ENGINE=$eng; AUTO_LEVEL=$lvl; DIRECTORY=/mnt/x; FIO_BIN=fio
+         SET_DIR_OVERRIDE=$set
+         run_host() { echo "$1" >> "$d/ran"; return 0; }
+         discover_engines) >>$WT_ASIDE 2>&1 || { echo "failed: $c" >&2; exit 1; }
+    done
+    test ! -e "$d/ran" && test ! -e "$d/engine.discovered"'
+t_assert "discovery: a host the host file gives an engine is left alone; one a selector line already proved is not tested again" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
+    printf "[global]\nnumjobs=1\n[b]\nrw=read\n" > "$d/set/012-b.job"
+    printf "h1\t-\tpsync\t-\t-\nh2\t-\t-\t-\t-\n" > "$d/targets.final"
+    printf "h1 io_uring fail\nh2 io_uring fail\n" > "$d/engine.results"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1 h2); ENGINE=""; AUTO_LEVEL=""; DIRECTORY=/mnt/x; FIO_BIN=fio
+     SET_DIR_OVERRIDE=$d/set
+     printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+     printf "engines io_uring libaio psync\n" > "$d/probe/h2"
+     run_host() { echo "$1 ${2#*ioengine=}" | cut -d" " -f1,2 >> "$d/ran"; return 0; }
+     discover_engines) >>$WT_ASIDE 2>&1 || exit 1
+    [ "$(cat "$d/engine.discovered")" = "h2 libaio" ] && [ "$(cat "$d/ran")" = "h2 libaio" ]'
+t_assert "discovery: a host where no engine passes stops the run, naming it and quoting each test" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/set"
+    printf "[global]\nnumjobs=1\n[b]\nrw=read\n" > "$d/set/012-b.job"
+    err=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1 h2); ENGINE=""; AUTO_LEVEL=""; DIRECTORY=/mnt/x; FIO_BIN=fio
+        SET_DIR_OVERRIDE=$d/set
+        printf "engines io_uring libaio psync\n" > "$d/probe/h1"
+        printf "engines libaio psync\n" > "$d/probe/h2"
+        run_host() { case "$1" in (h2) echo "fio: io_u error: Invalid argument"; return 1;; (*) return 0;; esac; }
+        discover_engines) 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected a nonzero exit" >&2; exit 1; }
+    case "$err" in
+        *"h2: ioengine io_uring: io_uring: not in this fio"*"h2: ioengine psync: fio: io_u error: Invalid argument"*"no ioengine passed its test job on h2 (tried: io_uring libaio psync)"*) true;;
+        *) echo "$err" >&2; false;;
+    esac'
+t_assert "discovery: the engine lands only in the host's files naming none; the generated layout follows it" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/global; HOSTS=(h1 h2); ENGINE=""; mkdir -p "$d/jobs" "$d/set"
+     printf "# report bandwidth\n[global]\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$d/set/011-a.job"
+     printf "# report iops\n[global]\nfilesize=1G\nnumjobs=1\n[b]\nrw=randread\n" > "$d/set/031-b.job"
+     printf "# report iops\n[global]\nfilesize=1G\nnumjobs=1\n[c]\nioengine=psync\nrw=randwrite\n" > "$d/set/032-c.job"
+     generate_layout "$d/set" "$d/set" >>$WT_ASIDE || exit 1
+     # psync is the only engine named: the generated layout takes it
+     grep -qx "ioengine=psync" "$d/set/000-wekatester-layout.job" || exit 1
+     printf "h1 libaio\n" > "$d/engine.discovered"
+     stage_variants "$d/set" >>$WT_ASIDE 2>&1) || exit 1
+    j=$d/jobs/h1
+    [ "$(sed -n 3p "$j/011-a.job")" = "ioengine=libaio" ] && grep -qx "ioengine=libaio" "$j/031-b.job" &&
+    [ "$(grep -c "^ioengine=" "$j/032-c.job")" = 1 ] && grep -qx "ioengine=psync" "$j/032-c.job" &&
+    grep -qx "ioengine=libaio" "$j/000-wekatester-layout.job" &&
+    # a host with no discovered engine keeps the set as it is
+    ! grep -q "^ioengine=" "$d/jobs/h2/011-a.job" && grep -qx "ioengine=psync" "$d/jobs/h2/000-wekatester-layout.job"'
+t_assert "discovery: main runs it after the host-file engines and before pinning and staging, dry runs included" bash -c '
+    m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
+    dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")
+    printf "%s\n" "$dry" | awk "/finalize_targets/ {f = NR} /discover_engines/ {e = NR} /check_cpu_pinning/ {p = NR} END {exit !(f && e > f && p > e)}" &&
+    printf "%s\n" "$m" | awk "/exit 0/ {x = NR} x && /finalize_targets/ {f = NR} x && /discover_engines/ {e = NR} x && /stage_jobfiles/ {s = NR} END {exit !(f && e > f && s > e)}"'
 t_assert "pinning: cpus outside the taskset with no escalator dies showing all three" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     err=$( (source ./wekatester
