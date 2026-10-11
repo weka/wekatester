@@ -250,19 +250,14 @@ PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
 PROMPT_DRAIN_SECS=0.2  # an escape sequence's bytes arrive together; 0.2 s is ample
 
 require_interactive() {   # require_interactive <what-needs-it> [advice]
-    if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
-    # exec with only redirections fails without killing the shell; its stderr
-    # names the device.
-    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
-        PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
-        return 0
-    fi
-    die "$1 needs a terminal; ${2:-use -r for unattended runs}"
+    try_interactive || die "$1 needs a terminal; ${2:-use -r for unattended runs}"
 }
 
 # Best effort, for prompts that have a default on unattended runs (-r/-n).
 try_interactive() {
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
+    # exec with only redirections fails without killing the shell; its stderr
+    # names the device.
     if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
         PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
         return 0
@@ -1553,6 +1548,13 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
     AUTO_LEVEL=$lvl
 }
 
+set_duration() {   # set_duration <value> <flag, for the error message>
+    case "$1" in
+        (""|*[!0-9]*|0) usage >&2; die "option $2 needs a duration in whole seconds" ;;
+    esac
+    DURATION=$1
+}
+
 parse_args() {
     HOSTS=()
     local opt arg servers_only=0
@@ -1638,24 +1640,9 @@ parse_args() {
                 [ -n "$TARGETS_PATH" ] || { usage >&2; die "option --targets requires a value"; }
                 shift ;;
             -t?*) TARGETS=1; opt_val "$opt" -t; TARGETS_PATH=$OPT_VAL; shift ;;
-            -x|--duration)
-                DURATION=${2:-}
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
-                esac
-                shift 2 ;;
-            --duration=*)
-                DURATION=${opt#--duration=}
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option --duration needs a duration in whole seconds" ;;
-                esac
-                shift ;;
-            -x?*)
-                opt_val "$opt" -x; DURATION=$OPT_VAL
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
-                esac
-                shift ;;
+            -x|--duration) set_duration "${2:-}" -x; shift 2 ;;
+            --duration=*) set_duration "${opt#--duration=}" --duration; shift ;;
+            -x?*) opt_val "$opt" -x; set_duration "$OPT_VAL" -x; shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
@@ -5162,18 +5149,6 @@ check_cpu_pinning() {
     if [ ${#nolist_hosts[@]} -gt 0 ]; then
         log "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
     fi
-}
-
-# A weka CLI on the master: as the login user first, ONE retry under the
-# escalator on failure, then the caller fallback. No caller at present; kept
-# as the tested way to reach the weka CLI for a future master-side fact.
-run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
-    local mpriv
-    run_host "$MASTER" "$1" > "$2" && return 0
-    mpriv=$(host_priv "$MASTER")
-    [ -n "$mpriv" ] || return 1
-    run_host "$MASTER" "$mpriv $1" > "$2" || return 1
-    log "NOTE: $MASTER: '$1' needed $mpriv (the unprivileged attempt failed)" >&2
 }
 
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.

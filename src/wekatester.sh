@@ -252,6 +252,13 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
     AUTO_LEVEL=$lvl
 }
 
+set_duration() {   # set_duration <value> <flag, for the error message>
+    case "$1" in
+        (""|*[!0-9]*|0) usage >&2; die "option $2 needs a duration in whole seconds" ;;
+    esac
+    DURATION=$1
+}
+
 parse_args() {
     HOSTS=()
     local opt arg servers_only=0
@@ -337,24 +344,9 @@ parse_args() {
                 [ -n "$TARGETS_PATH" ] || { usage >&2; die "option --targets requires a value"; }
                 shift ;;
             -t?*) TARGETS=1; opt_val "$opt" -t; TARGETS_PATH=$OPT_VAL; shift ;;
-            -x|--duration)
-                DURATION=${2:-}
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
-                esac
-                shift 2 ;;
-            --duration=*)
-                DURATION=${opt#--duration=}
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option --duration needs a duration in whole seconds" ;;
-                esac
-                shift ;;
-            -x?*)
-                opt_val "$opt" -x; DURATION=$OPT_VAL
-                case "$DURATION" in
-                    (""|*[!0-9]*|0) usage >&2; die "option -x needs a duration in whole seconds" ;;
-                esac
-                shift ;;
+            -x|--duration) set_duration "${2:-}" -x; shift 2 ;;
+            --duration=*) set_duration "${opt#--duration=}" --duration; shift ;;
+            -x?*) opt_val "$opt" -x; set_duration "$OPT_VAL" -x; shift ;;
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;

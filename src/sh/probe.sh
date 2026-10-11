@@ -375,18 +375,6 @@ check_cpu_pinning() {
     fi
 }
 
-# A weka CLI on the master: as the login user first, ONE retry under the
-# escalator on failure, then the caller fallback. No caller at present; kept
-# as the tested way to reach the weka CLI for a future master-side fact.
-run_weka_master() {   # run_weka_master <weka-cmd> <outfile>
-    local mpriv
-    run_host "$MASTER" "$1" > "$2" && return 0
-    mpriv=$(host_priv "$MASTER")
-    [ -n "$mpriv" ] || return 1
-    run_host "$MASTER" "$mpriv $1" > "$2" || return 1
-    log "NOTE: $MASTER: '$1' needed $mpriv (the unprivileged attempt failed)" >&2
-}
-
 # Gather per-host facts + master-side extras into $WORK_DIR/probe/.
 probe_workers() {
     echo

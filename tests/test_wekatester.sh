@@ -1360,6 +1360,15 @@ t_assert "parse: -o detached, --output=, and attached -o all set the output dir"
 t_assert "parse: CLI_DIR is the trimmed -d directory, or - without -d (resolve_targets' cli-dir)" bash -c '
     (source ./wekatester; parse_args -d /x/ h1; [ "$CLI_DIR" = /x ]) &&
     (source ./wekatester; parse_args h1;        [ "$CLI_DIR" = - ])'
+t_assert "parse: -x, -xN and --duration= set DURATION; a bad value dies naming the spelling used" bash -c '
+    (source ./wekatester; parse_args -x 30 h1;         [ "$DURATION" = 30 ]) &&
+    (source ./wekatester; parse_args -x5 h1;           [ "$DURATION" = 5 ]) &&
+    (source ./wekatester; parse_args --duration=45 h1; [ "$DURATION" = 45 ]) &&
+    for a in "-x 0" "-x abc" "-xabc" "--duration 1.5" "--duration=" "--duration=-3"; do
+        out=$( (source ./wekatester; parse_args $a h1) 2>&1 ) && { echo "accepted: $a" >&2; exit 1; }
+        case $a in (--duration=*) want="option --duration needs" ;; (*) want="option -x needs" ;; esac
+        case $out in (*"$want a duration in whole seconds"*) ;; (*) echo "$a: [$out]" >&2; exit 1 ;; esac
+    done'
 # --- the Python wekatester's long names: aliases of -d, -w and -f ---
 # (code review #7, Frank, 2026-10-11)
 t_assert "parse: --directory, detached or =, sets the -d directory and marks it explicit" bash -c '
@@ -3956,30 +3965,6 @@ t_assert "host_priv: a multi-word escalator prefix survives intact" bash -c '
      WORK_DIR=$d
      printf "ncpus 8\npriv ksu -e\n" > "$d/probe/h1"
      [ "$(host_priv h1)" = "ksu -e" ] && [ -z "$(host_priv h2)" ])'
-t_assert "run_weka_master: user attempt first, one escalated retry, note on success" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    err=$( (source ./wekatester
-     WORK_DIR=$d; MASTER=m1
-     printf "priv pbrun\n" > "$d/probe/m1"
-     run_host() { case "$2" in
-         ("pbrun weka status") echo escalated;;
-         ("weka status") return 1;;
-     esac; }
-     run_weka_master "weka status" "$d/out" || echo RC_FAIL >&2) 2>&1 )
-    grep -q escalated "$d/out" &&
-    case "$err" in *"needed pbrun"*) true;; *) echo "$err" >&2; false;; esac &&
-    case "$err" in *RC_FAIL*) false;; *) true;; esac'
-t_assert "run_weka_master: weka missing for the user (exit 127) still gets the escalated attempt" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    (source ./wekatester
-     WORK_DIR=$d; MASTER=m1
-     printf "priv sudo -n\n" > "$d/probe/m1"
-     run_host() { case "$2" in
-         ("sudo -n weka status") echo escalated;;
-         ("weka status") return 127;;
-     esac; }
-     run_weka_master "weka status" "$d/out") >>$WT_ASIDE 2>&1
-    grep -q escalated "$d/out"'
 t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash -c '
     d=$(mktemp -d)
     printf "#!/bin/sh\nexit 1\n" > "$d/dzdo"

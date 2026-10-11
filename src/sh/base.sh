@@ -164,19 +164,14 @@ PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
 PROMPT_DRAIN_SECS=0.2  # an escape sequence's bytes arrive together; 0.2 s is ample
 
 require_interactive() {   # require_interactive <what-needs-it> [advice]
-    if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
-    # exec with only redirections fails without killing the shell; its stderr
-    # names the device.
-    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
-        PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
-        return 0
-    fi
-    die "$1 needs a terminal; ${2:-use -r for unattended runs}"
+    try_interactive || die "$1 needs a terminal; ${2:-use -r for unattended runs}"
 }
 
 # Best effort, for prompts that have a default on unattended runs (-r/-n).
 try_interactive() {
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
+    # exec with only redirections fails without killing the shell; its stderr
+    # names the device.
     if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
         PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
         return 0
