@@ -3939,7 +3939,7 @@ probe_writable() {   # probe_writable <host> <dir>
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
     local i h pids=() sum n=0 line summary
-    local -A at=()
+    local -A at=() first=()
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
@@ -3956,11 +3956,13 @@ collect_fs_groups() {
             (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
         esac
         printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
+        [ -n "${first[$sum]+set}" ] || first[$sum]=$i
     done
+    # every hash is in: one removal per group, from its first host
     pids=()
-    for i in "${!HOSTS[@]}"; do
+    for i in "${first[@]}"; do
         run_host "${HOSTS[$i]}" "rm -f '${HOST_DIRS[$i]}/$GROUP_FILE'" &
-        pids+=($!)
+        pids[$i]=$!
     done
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2

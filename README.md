@@ -417,7 +417,8 @@ jobs will not reproduce is not the test's ceiling. So:
   (`.wekatester-group.<run>.lst`) in its own destination; once every client
   has passed every other check, each returns that file's sha256, and equal
   hashes are one group. A separate subdirectory, even of the same filesystem,
-  is a group of its own. The file is removed once hashed. Each group has its
+  is a group of its own. Once every hash is in, each group's first host
+  removes the file, one removal per group. Each group has its
   own representative for every shape, so a group's read cells read that
   group's own set.
 - **Writes use per-client sets** (`<host>.<fmt>`), because concurrent

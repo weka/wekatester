@@ -5382,8 +5382,25 @@ t_assert "fs groups: equal group-file hashes are one group, numbered by first ho
         run_host() { case "$2" in (sha256sum*) case "$1" in (h3) echo "bbbb  f";; (*) echo "aaaa  f";; esac;; (rm*) echo "$1" >> "$w/rm";; esac; }
         collect_fs_groups) 2>&1 ) || { echo "$out" >&2; exit 1; }
     [ "$(tr "\n" " " < "$w/groups")" = "h1 1 h2 1 h3 2 h4 1 " ] &&
-    [ "$(sort "$w/rm" | tr "\n" " ")" = "h1 h2 h3 h4 " ] &&
+    [ "$(sort "$w/rm" | tr "\n" " ")" = "h1 h3 " ] &&
     case "$out" in *"filesystem groups: 2"*"group 1: h1 h2 h4 (at /mnt/x on h1)"*"group 2: h3 (at /mnt/x on h3)"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "fs groups: each group removes its file once, from its first host, after every hash is read" bash -c '
+    grp() {   # grp <hosts...>: prints every command sent, then the output; h2 and h4 hash bbbb, the rest aaaa; rm fails on h2
+        local w; w=$(mktemp -d)
+        (source ./wekatester
+         WORK_DIR=$w; HOSTS=("$@"); GROUP_FILE=.g.lst
+         load_host_dirs() { local h; HOST_DIRS=(); for h in "${HOSTS[@]}"; do HOST_DIRS+=("/mnt/$h"); done; }
+         run_host() { echo "$1 $2" >> "$w/log"; case "$1:$2" in
+             (*:sha256sum*) case "$1" in (h2|h4) echo "bbbb  f";; (*) echo "aaaa  f";; esac;;
+             (h2:rm*) return 1;; esac; }
+         collect_fs_groups) >"$w/out" 2>&1 || { cat "$w/out"; return 1; }
+        cat "$w/log" "$w/out"
+    }
+    one=$(grp h1 h3 h5) && two=$(grp h1 h2 h3 h4) || { echo "$one$two" >&2; exit 1; }
+    [ "$(printf "%s\n" "$one" | grep " rm ")" = "h1 rm -f '\''/mnt/h1/.g.lst'\''" ] || { echo "$one" >&2; exit 1; }
+    [ "$(printf "%s\n" "$two" | grep " rm " | sort | tr "\n" "|")" = "h1 rm -f '\''/mnt/h1/.g.lst'\''|h2 rm -f '\''/mnt/h2/.g.lst'\''|" ] &&
+    printf "%s\n" "$two" | awk "/ sha256sum / {s = NR} / rm / && !r {r = NR} END {exit !(s == 4 && r > s)}" &&
+    case "$two" in *"WARNING: h2: could not remove /mnt/h2/.g.lst"*) true;; *) false;; esac || { echo "$two" >&2; false; }'
 t_assert "fs groups: a host whose group file cannot be hashed stops the run, naming it" bash -c '
     err=$( (source ./wekatester
         WORK_DIR=$(mktemp -d); HOSTS=(h1 h2); GROUP_FILE=.g.lst; DIRECTORY=/mnt/x
