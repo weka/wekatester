@@ -2937,7 +2937,9 @@ EOF
         *"localhost: ioengine broken failed its test job"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "engines: a job ignoring TERM is killed at the timeout bound and recorded as fail, its test file gone" bash -c '
+t_assert "engines: a job ignoring TERM is killed at the timeout bound, recorded as fail and said so in its quoted evidence, its test file gone" bash -c '
+    # a silent fio killed by timeout -k once left an empty evidence file,
+    # which the operator-facing quote skips
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
     cat > "$d/bin/fio" <<"EOF"
 #!/bin/bash
@@ -2947,19 +2949,19 @@ EOF
     chmod +x "$d/bin/fio"
     start=$(date +%s)
     out=$( (source ./wekatester
-        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
-        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
-        printf ",,stubborn,,,,,\n" > "$d/t.csv"
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=stubborn; AUTO_LEVEL=""
+        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio
         printf "engines stubborn\n" > "$d/probe/localhost"
         WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) 2>&1 )
     took=$(( $(date +%s) - start ))
     # timeout -k 5: TERM at 1 s, KILL at 6 s
     [ "$took" -ge 5 ] && [ "$took" -lt 15 ] || { echo "took $took s" >&2; exit 1; }
     grep -qx "localhost stubborn fail" "$d/engine.results" &&
+    grep -qx "fio ignored TERM, killed at 6 s" "$d/et/localhost.stubborn.out" &&
     ! grep -q WEKATESTER_ENGINE_STUCK "$d/et/localhost.stubborn.out" &&
     [ -z "$(ls -A "$d/dest")" ] &&
     case "$out" in
-        *"localhost: ioengine stubborn failed its test job"*) true;;
+        *"localhost: ioengine stubborn failed its test job"*"fio ignored TERM, killed at 6 s"*"ioengine '\''stubborn'\'' failed its test job on localhost"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 t_assert "engines: a job alive at the read bound is killed, recorded as fail, its test file gone" bash -c '

@@ -4709,6 +4709,8 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         # read the moment it exits; past the read's bound it is killed, and
         # abandoned if it will not die.
         tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
+        # 137 is timeout's -k KILL: said in the evidence, which a silent
+        # hung fio would otherwise leave empty, and unquoted.
         # bash -c: process substitution and read -t are not POSIX. fio
         # writes to fd 4, the session's stdout: one that will not die holds
         # it until its IO ends, ssh too. -9 goes to timeout's process group,
@@ -4718,7 +4720,9 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
                 --filesize=64k --filename=\"\$f\" --direct=1 \
                 --output-format=json >&4 4>&- & echo \$!; wait \$!; echo \$?); \
                 read -r p <&3; \
-                if read -t $((tmo + 10)) rc <&3; then rm -f \"\$f\"; exit \$rc; fi; \
+                if read -t $((tmo + 10)) rc <&3; then \
+                    [ \$rc -ne 137 ] || echo \"fio ignored TERM, killed at $((tmo + 5)) s\" >&2; \
+                    rm -f \"\$f\"; exit \$rc; fi; \
                 _o=\$(kill -9 -- -\$p \$p 2>&1); sleep 1; \
                 _o=\$(kill -0 -- -\$p 2>&1 || kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
                 rm -f \"\$f\"; exit 124' et '$hd' '$FIO_BIN'" \
