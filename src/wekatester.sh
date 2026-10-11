@@ -101,10 +101,13 @@ give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
-  -d directory   target directory on the workers for test files (default: $DIRECTORY);
-                 created on request when it is missing under a wekafs mount
-  -w workload    workload definition directory, a subdir of fio-jobfiles (default: $WORKLOAD)
-  -f fio_bin     fio binary on the workers (default: $FIO_BIN)
+  -d, --directory dir     target directory on the workers for test files
+                          (default: $DIRECTORY); created on request when it
+                          is missing under a wekafs mount
+  -w, --workload set      workload definition directory, a subdir of
+                          fio-jobfiles (default: $WORKLOAD)
+  -f, --fio-bin path      fio binary on the workers (default: $FIO_BIN);
+                          --local-fio is an older spelling
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
@@ -259,12 +262,17 @@ parse_args() {
         # Arms match $opt (folded), never $1; $1 is only for need_arg messages.
         case "$opt" in
             --) servers_only=1; shift ;;
-            -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; DIRECTORY_EXPLICIT=1; shift 2 ;;
+            # The long names are the Python wekatester's; --local-fio was its
+            # older spelling of --fio-bin.
+            -d|--directory) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; DIRECTORY_EXPLICIT=1; shift 2 ;;
             -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; DIRECTORY_EXPLICIT=1; shift ;;
-            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; shift 2 ;;
+            --directory=*) opt_val "$opt" --directory; DIRECTORY=$OPT_VAL; DIRECTORY_EXPLICIT=1; shift ;;
+            -w|--workload) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; shift 2 ;;
             -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; shift ;;
-            -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
+            --workload=*) opt_val "$opt" --workload; WORKLOAD=$OPT_VAL; shift ;;
+            -f|--fio-bin|--local-fio) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
             -f?*) opt_val "$opt" -f; FIO_BIN=$OPT_VAL; shift ;;
+            --fio-bin=*|--local-fio=*) opt_val "$opt" "${opt%%=*}"; FIO_BIN=$OPT_VAL; shift ;;
             -s) need_arg "$1" $# "${2:-}"; SUMMARIZE_FILE=$2; shift 2 ;;
             -s?*) opt_val "$opt" -s; SUMMARIZE_FILE=$OPT_VAL; shift ;;
             -o|--output)   need_arg "$1" $# "${2:-}"; OUTPUT_DIR=$2; shift 2 ;;

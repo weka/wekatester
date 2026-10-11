@@ -36,10 +36,13 @@ give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
-  -d directory   target directory on the workers for test files (default: /mnt/weka);
-                 created on request when it is missing under a wekafs mount
-  -w workload    workload definition directory, a subdir of fio-jobfiles (default: default)
-  -f fio_bin     fio binary on the workers (default: /usr/bin/fio)
+  -d, --directory dir     target directory on the workers for test files
+                          (default: /mnt/weka); created on request when it
+                          is missing under a wekafs mount
+  -w, --workload set      workload definition directory, a subdir of
+                          fio-jobfiles (default: default)
+  -f, --fio-bin path      fio binary on the workers (default: /usr/bin/fio);
+                          --local-fio is an older spelling
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: results)
   -e, --engine eng        force this fio ioengine on every staged jobfile,
@@ -119,11 +122,11 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `server ...` — the worker hostnames; the first one is the coordinator/master. Name each server once: a name given twice (after `--` too) is a usage error naming every repeated host, since fio would get that `--client=` twice. Same name means the same string, as you typed it — the `<name>/<machine-id>` spelling belongs to host files, not the command line. Optional: give no server at all and wekatester benchmarks the local host instead, using no ssh, no keys, and no sshd (**local mode**). That is the quickest way to sanity-check a single client — `./wekatester -a max` and nothing else. In local mode the data files on the destination are prefixed with the box's short hostname (`hostname -s`, else `$HOSTNAME`), never `localhost` — `localhost.*` identifies nothing on a shared filesystem, and two boxes in local mode against the same mount would otherwise write (and `-u` unlink) each other's files.
 
-`-d directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time. Trailing slashes are dropped, here and in the host file's `destination_folder` (`/mnt/weka/` is `/mnt/weka`; `/` stays `/`).
+`-d directory`, `--directory directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time. Trailing slashes are dropped, here and in the host file's `destination_folder` (`/mnt/weka/` is `/mnt/weka`; `/` stays `/`).
 
-`-w workload` — pick a workload set, a subdirectory of `fio-jobfiles`. See below.
+`-w workload`, `--workload workload` — pick a workload set, a subdirectory of `fio-jobfiles`. See below.
 
-`-f fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`.
+`-f fio_bin`, `--fio-bin fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`. `--local-fio` is an older spelling (the Python wekatester's, like the other long names here).
 
 `-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
 

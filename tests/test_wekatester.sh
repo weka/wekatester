@@ -1356,6 +1356,30 @@ t_assert "parse: -o detached, --output=, and attached -o all set the output dir"
     (source ./wekatester; parse_args -oout3 h1;         [ "$OUTPUT_DIR" = out3 ]) &&
     (source ./wekatester; parse_args -o=out4 h1;        [ "$OUTPUT_DIR" = out4 ]) &&
     (source ./wekatester; parse_args -Oout5 h1;         [ "$OUTPUT_DIR" = out5 ])'
+
+# --- the Python wekatester's long names: aliases of -d, -w and -f ---
+# (code review #7, Frank, 2026-10-11)
+t_assert "parse: --directory, detached or =, sets the -d directory and marks it explicit" bash -c '
+    (source ./wekatester; parse_args --directory /x h1;   [ "$DIRECTORY" = /x ] && [ "$DIRECTORY_EXPLICIT" -eq 1 ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args --directory=/y/ h1;  [ "$DIRECTORY" = /y ] && [ "$DIRECTORY_EXPLICIT" -eq 1 ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args --DIRECTORY=/Z h1;   [ "$DIRECTORY" = /Z ])'
+t_assert "parse: --workload, detached or =, sets the -w workload" bash -c '
+    (source ./wekatester; parse_args --workload smoke h1;  [ "$WORKLOAD" = smoke ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args --workload=Mixed h1;  [ "$WORKLOAD" = Mixed ] && [ "${HOSTS[*]}" = h1 ])'
+t_assert "parse: --fio-bin and --local-fio, detached or =, set the -f fio binary" bash -c '
+    (source ./wekatester; parse_args --fio-bin /opt/fio h1;     [ "$FIO_BIN" = /opt/fio ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args --fio-bin=/opt/fio2 h1;    [ "$FIO_BIN" = /opt/fio2 ]) &&
+    (source ./wekatester; parse_args --local-fio /tmp/fio h1;   [ "$FIO_BIN" = /tmp/fio ] && [ "${HOSTS[*]}" = h1 ]) &&
+    (source ./wekatester; parse_args --LOCAL-FIO=/tmp/fio2 h1;  [ "$FIO_BIN" = /tmp/fio2 ])'
+t_assert "parse: a long alias with no value dies as its short form does" bash -c '
+    for o in --directory --workload --fio-bin --local-fio; do
+        err=$( (source ./wekatester; parse_args h1 "$o") 2>&1 >>$WT_ASIDE ) && { echo "$o: accepted" >&2; exit 1; }
+        case "$err" in *"ERROR: option $o requires an argument"*) ;; *) echo "$o: $err" >&2; exit 1;; esac
+        err=$( (source ./wekatester; parse_args "$o" -g h1) 2>&1 >>$WT_ASIDE ) && { echo "$o -g: accepted" >&2; exit 1; }
+        case "$err" in *"option $o requires an argument, got '\''-g'\'' (looks like another option)"*) ;; *) echo "$o -g: $err" >&2; exit 1;; esac
+        err=$( (source ./wekatester; parse_args "$o=" h1) 2>&1 >>$WT_ASIDE ) && { echo "$o=: accepted" >&2; exit 1; }
+        case "$err" in *"ERROR: option $o requires a value"*) ;; *) echo "$o=: $err" >&2; exit 1;; esac
+    done'
 t_assert "run_jobs: the results file lands in RUN_DIR, no timestamp infix" bash -c '
     source ./tests/helpers.sh
     tmp=$(mktemp -d); mkdir "$tmp/out" "$tmp/set"
