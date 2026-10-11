@@ -1314,6 +1314,48 @@ t_assert "run bundle: snapshot copies the per-host staged variants" bash -c '
     grep -q geometry-h2 "$d/r/fio-jobfiles/h2/011-a.job"'
 t_assert "run bundle: finalize is a no-op when no run dir was created" bash -c '
     (source ./wekatester; RUN_DIR=""; finalize_run_dir)'
+t_assert "run bundle: pigz on PATH compresses the bundle, and -s and tar -xzf read it" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/res/20260101-000003"
+    printf "#!/bin/bash\necho \"pigz \$*\" >> %q\nexec gzip \"\$@\"\n" "$d/calls" > "$d/bin/pigz"
+    chmod +x "$d/bin/pigz"
+    fio_json_single_fixture "$d/res/20260101-000003/results_011-bw.json"
+    (source ./wekatester
+     OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000003; RUN_DIR=$d/res/$RUN_STAMP
+     PATH=$d/bin:$PATH; finalize_run_dir) >>$WT_ASIDE 2>&1
+    test -s "$d/calls" && test ! -d "$d/res/20260101-000003" &&
+    mkdir "$d/x" && tar -xzf "$d/res/20260101-000003.tgz" -C "$d/x" &&
+    test -f "$d/x/20260101-000003/results_011-bw.json" &&
+    out=$(./wekatester -s "$d/res/20260101-000003.tgz") &&
+    case "$out" in
+        *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "run bundle: without pigz, tar compresses through plain gzip" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/res/20260101-000004"
+    gz=$(command -v gzip) && tr=$(command -v tar) && r=$(command -v rm) || exit 1
+    ln -s "$tr" "$d/bin/tar"; ln -s "$r" "$d/bin/rm"
+    printf "#!%s\necho \"gzip \$*\" >> %q\nexec %q \"\$@\"\n" "$BASH" "$d/calls" "$gz" > "$d/bin/gzip"
+    chmod +x "$d/bin/gzip"
+    echo payload > "$d/res/20260101-000004/wekatester.log"
+    (source ./wekatester
+     OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000004; RUN_DIR=$d/res/$RUN_STAMP
+     PATH=$d/bin; finalize_run_dir) >>$WT_ASIDE 2>&1
+    test -s "$d/calls" && test ! -d "$d/res/20260101-000004" &&
+    tar -xzOf "$d/res/20260101-000004.tgz" 20260101-000004/wekatester.log | grep -q payload'
+t_assert "run bundle: a failing pigz keeps the directory and says so; finalize returns" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/res/20260101-000005"
+    printf "#!/bin/bash\ncat >> %q; exit 1\n" "$d/swallowed" > "$d/bin/pigz"
+    chmod +x "$d/bin/pigz"
+    echo payload > "$d/res/20260101-000005/wekatester.log"
+    out=$( (source ./wekatester
+            OUTPUT_DIR=$d/res; RUN_STAMP=20260101-000005; RUN_DIR=$d/res/$RUN_STAMP
+            PATH=$d/bin:$PATH; finalize_run_dir; echo "finalize returned") 2>&1 )
+    test -f "$d/res/20260101-000005/wekatester.log" &&
+    case "$out" in
+        *"ERROR: could not compress $d/res/20260101-000005; leaving it uncompressed"*"finalize returned"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 
 # --- -s reads run bundles straight from the archive (nothing extracted) ---
 t_assert "-s summarizes every job in a bundle, in order, skipping layout results" bash -c '

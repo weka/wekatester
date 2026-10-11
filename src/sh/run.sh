@@ -156,9 +156,12 @@ snapshot_jobfiles() {
 }
 
 # Runs in the EXIT trap after cleanup, so it must never die: a tar failure
-# leaves the directory and says so.
+# leaves the directory and says so. pigz, when installed, writes the same
+# gzip at the same level on every core.
 finalize_run_dir() {
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
+    local zip=-z _o
+    if _o=$(command -v pigz); then zip=--use-compress-program=pigz; fi
     if [ ${#TEE_PIDS[@]} -gt 0 ]; then
         # Restore the console and let the tees drain: their pipes EOF when
         # these redirected fds close, and only a drained log may be archived.
@@ -166,7 +169,7 @@ finalize_run_dir() {
         wait "${TEE_PIDS[@]}"
         TEE_PIDS=()
     fi
-    if tar -czf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
+    if tar "$zip" -cf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
         rm -rf "$RUN_DIR"
         log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz"
     else
