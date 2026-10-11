@@ -100,7 +100,7 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
         # 137 is timeout's -k KILL: said in the evidence, which a silent
         # hung fio would otherwise leave empty, and unquoted.
-        # bash -c: process substitution and read -t are not POSIX. fio
+        # bash -c: process substitution and read -t are bash's. fio
         # writes to fd 4, the session's stdout: one that will not die holds
         # it until its IO ends, ssh too. -9 goes to timeout's process group,
         # fio's too; _o keeps kill's complaints out of the evidence.

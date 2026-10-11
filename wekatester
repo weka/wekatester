@@ -110,8 +110,9 @@ replay_prerun_warnings() {
 
 # --- transport ----------------------------------------------------------------
 # The only two places that know whether a host is remote. A command string
-# must be POSIX sh or wrap itself in bash -c: remotely it runs under the
-# login shell (verify_fio_ports carries its own bash -c for /dev/tcp).
+# is bash: locally it runs under bash -c, remotely under the login shell, so
+# one that needs bash's own features wraps itself in bash -c
+# (verify_fio_ports does, for /dev/tcp).
 
 # stdin is /dev/null on both branches, or a child can eat the script's stdin.
 # host_ssh_opts: our ControlPath and User= per host; nothing for a host on a
@@ -2438,7 +2439,7 @@ SUBDIREOF
                 || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
         done < <(awkrun '# truncate.list ("<name> <MiB>" lines) as remote commands: a truncate per
         # size, sizes ascending, names in list order; a new line only past ~100 KB,
-        # under the 128 KiB one sh -c string may hold
+        # under the 128 KiB one remote command string may hold
         { if (!($2 in N)) S[++ns] = $2; NM[$2, ++N[$2]] = $1 }
         END {
             sort_arr(S, ns, 1); len = 0
@@ -4118,7 +4119,7 @@ verify_mount_mode() {
             local*)
                   # refused before anything is written: a local disk is never a target
                   local_fail=1
-                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem findmnt did not name"
+                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem with no type in its /proc/mounts line"
                   if [ -n "$anc" ]; then
                       msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka is mounted on this host and that -d names a directory on it"
                   else
@@ -4711,7 +4712,7 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
         # 137 is timeout's -k KILL: said in the evidence, which a silent
         # hung fio would otherwise leave empty, and unquoted.
-        # bash -c: process substitution and read -t are not POSIX. fio
+        # bash -c: process substitution and read -t are bash's. fio
         # writes to fd 4, the session's stdout: one that will not die holds
         # it until its IO ends, ssh too. -9 goes to timeout's process group,
         # fio's too; _o keeps kill's complaints out of the evidence.

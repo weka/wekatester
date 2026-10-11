@@ -1,6 +1,6 @@
 # truncate.list ("<name> <MiB>" lines) as remote commands: a truncate per
 # size, sizes ascending, names in list order; a new line only past ~100 KB,
-# under the 128 KiB one sh -c string may hold
+# under the 128 KiB one remote command string may hold
 { if (!($2 in N)) S[++ns] = $2; NM[$2, ++N[$2]] = $1 }
 END {
     sort_arr(S, ns, 1); len = 0

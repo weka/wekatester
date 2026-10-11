@@ -47,11 +47,11 @@ cg_file() {   # cg_file <dir> <path> <content>: a file in the fixture's sysroot
     mkdir -p "$1/root${2%/*}"
     printf '%s\n' "$3" > "$1/root$2"
 }
-cpuset_probe() {   # cpuset_probe <dir> <shell>: the probe's output there
+cpuset_probe() {   # cpuset_probe <dir>: the probe's output there, run by bash
     local cmd
     cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
     : > "$1/calls"
-    WEKATESTER_SYSROOT=$1/root PATH="$1/bin:$PATH" "$2" -c "$cmd" 2>&1
+    WEKATESTER_SYSROOT=$1/root PATH="$1/bin:$PATH" bash -c "$cmd" 2>&1
 }
 export -f cpuset_fixture cg_file cpuset_probe
 

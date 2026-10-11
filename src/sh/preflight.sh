@@ -382,7 +382,7 @@ verify_mount_mode() {
             local*)
                   # refused before anything is written: a local disk is never a target
                   local_fail=1
-                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem findmnt did not name"
+                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem with no type in its /proc/mounts line"
                   if [ -n "$anc" ]; then
                       msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka is mounted on this host and that -d names a directory on it"
                   else

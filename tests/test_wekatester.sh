@@ -159,26 +159,23 @@ t_assert "probe snippet emits engines" bash -c 'probe_stub | grep -q "engines.*i
 # Which cpus can be bound is READ from the cgroup cpuset, never trial-bound
 # per cpu (Frank, 2026-10-11): fio answers an unbindable cpus_allowed with
 # err=22 cpu_set_affinity per job, on the daemonized server, mid-run.
-t_assert "probe: no cpuset to read falls back to the taskset affinity, under sh and bash" bash -c '
+t_assert "probe: no cpuset to read falls back to the taskset affinity" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-5
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        # no /proc/self/cgroup, then one naming a cgroup with no cpuset file
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
-            { echo "$sh, no cgroup file:"; printf "%s\n" "$out"; exit 1; } >&2
-        cg_file "$d" /proc/self/cgroup "0::/user.slice"
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-5" ||
-            { echo "$sh, no cpuset file:"; printf "%s\n" "$out"; exit 1; } >&2
-        rm -f "$d/root/proc/self/cgroup"
-    done
+    # no /proc/self/cgroup, then one naming a cgroup with no cpuset file
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 0-5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+        { echo "no cgroup file:"; printf "%s\n" "$out"; exit 1; } >&2
+    cg_file "$d" /proc/self/cgroup "0::/user.slice"
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 0-5" ||
+        { echo "no cpuset file:"; printf "%s\n" "$out"; exit 1; } >&2
     out=$(probe_stub)
     printf "%s\n" "$out" | grep -qx "bindable 0-7" || { printf "%s\n" "$out" >&2; false; }'
 # fio launches under taskset -c, so a taskset -cp that fails or gives no
 # list is no measurement, whatever the cpuset says: the probe says why and
 # nothing else (Frank, 2026-10-11). Before, both lines were left out, or the
 # cpuset answered alone.
-t_assert "probe: a failing taskset -cp prints bindable_err with taskset's words, cpuset or none, under sh and bash" bash -c '
+t_assert "probe: a failing taskset -cp prints bindable_err with taskset's words, cpuset or none" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     cat > "$d/bin/taskset" <<TS
 #!/bin/sh
@@ -186,27 +183,24 @@ echo "taskset: failed to get pid \$2 affinity: Operation not permitted" >&2
 exit 1
 TS
     want="bindable_err taskset -cp failed: taskset: failed to get pid [0-9]* affinity: Operation not permitted"
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        # no /proc/self/cgroup, one naming a cgroup with no cpuset file, then a readable cpuset
-        for cg in none no-cpuset-file cpuset; do
-            out=$(cpuset_probe "$d" "$sh")
-            printf "%s\n" "$out" | grep -qx "$want" && printf "%s\n" "$out" | grep -qx "taskset " &&
-            ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
-                { echo "$sh, $cg:"; printf "%s\n" "$out"; exit 1; } >&2
-            cg_file "$d" /proc/self/cgroup "0::/user.slice"
-            [ "$cg" = none ] || cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
-        done
-        rm -f "${d:?}/root/proc/self/cgroup" "${d:?}/root/sys/fs/cgroup/user.slice/cpuset.cpus.effective"
+    # no /proc/self/cgroup, one naming a cgroup with no cpuset file, then a readable cpuset
+    for cg in none no-cpuset-file cpuset; do
+        out=$(cpuset_probe "$d")
+        printf "%s\n" "$out" | grep -qx "$want" && printf "%s\n" "$out" | grep -qx "taskset " &&
+        ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
+            { echo "$cg:"; printf "%s\n" "$out"; exit 1; } >&2
+        cg_file "$d" /proc/self/cgroup "0::/user.slice"
+        [ "$cg" = none ] || cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
     done
     # taskset answers, but with no affinity list to read, beside a readable cpuset
     printf "#!/bin/sh\necho \"no affinity here\"\n" > "$d/bin/taskset"
     cg_file "$d" /proc/self/cgroup "0::/user.slice"
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
-    out=$(cpuset_probe "$d" bash)
+    out=$(cpuset_probe "$d")
     printf "%s\n" "$out" | grep -qx "bindable_err taskset -cp gave no affinity list: no affinity here" &&
     ! printf "%s\n" "$out" | grep -q "^bindable " ||
         { echo "no list:"; printf "%s\n" "$out"; false; } >&2'
-t_assert "probe: no taskset on PATH prints bindable_err naming it, even beside a readable cpuset, under sh and bash" bash -c '
+t_assert "probe: no taskset on PATH prints bindable_err naming it, even beside a readable cpuset" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     cg_file "$d" /proc/self/cgroup "0::/user.slice"
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
@@ -215,28 +209,24 @@ t_assert "probe: no taskset on PATH prints bindable_err naming it, even beside a
     for t in awk sort cat tr head grep readlink id; do ln -s "$(type -P "$t")" "$d/nots/$t"; done
     ! PATH="$d/nots" "$(type -P bash)" -c "command -v taskset" || { echo "taskset still on the PATH" >&2; exit 1; }
     cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(WEKATESTER_SYSROOT=$d/root PATH="$d/nots" "$sh" -c "$cmd" 2>&1)
-        printf "%s\n" "$out" | grep -qx "bindable_err taskset -cp failed: .*taskset.*not found" &&
-        printf "%s\n" "$out" | grep -qx "engines  io_uring libaio " &&
-        ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
-            { echo "$sh:"; printf "%s\n" "$out"; exit 1; } >&2
-    done'
-t_assert "probe: cgroup v2 cpuset is read from the nearest cgroup that has one, under sh and bash" bash -c '
+    out=$(WEKATESTER_SYSROOT=$d/root PATH="$d/nots" "$(type -P bash)" -c "$cmd" 2>&1)
+    printf "%s\n" "$out" | grep -qx "bindable_err taskset -cp failed: .*taskset.*not found" &&
+    printf "%s\n" "$out" | grep -qx "engines  io_uring libaio " &&
+    ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
+        { printf "%s\n" "$out"; exit 1; } >&2'
+t_assert "probe: cgroup v2 cpuset is read from the nearest cgroup that has one" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     # c42j as found: no cpuset controller below user.slice
     cg_file "$d" /proc/self/cgroup "0::/user.slice/user-1000.slice/session-1.scope"
     cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-2,5
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-2,5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
-            { echo "$sh, from user.slice:"; printf "%s\n" "$out"; exit 1; } >&2
-    done
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 0-2,5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+        { echo "from user.slice:"; printf "%s\n" "$out"; exit 1; } >&2
     cg_file "$d" /sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cpuset.cpus.effective 1-2
-    out=$(cpuset_probe "$d" sh)
+    out=$(cpuset_probe "$d")
     printf "%s\n" "$out" | grep -qx "bindable 1-2" || { echo "own cgroup:"; printf "%s\n" "$out"; false; } >&2'
-t_assert "probe: cgroup v1 reads the cpuset hierarchy, effective_cpus before cpus, under sh and bash" bash -c '
+t_assert "probe: cgroup v1 reads the cpuset hierarchy, effective_cpus before cpus" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     # hybrid: the cpuset controller is on v1, so the v2 root file is not it
     cg_file "$d" /proc/self/cgroup "$(printf "12:cpuset:/docker/abc\n4:cpu,cpuacct:/docker/abc\n0::/docker/abc")"
@@ -244,13 +234,11 @@ t_assert "probe: cgroup v1 reads the cpuset hierarchy, effective_cpus before cpu
     cg_file "$d" /sys/fs/cgroup/cpuset/cpuset.cpus 0-7
     cg_file "$d" /sys/fs/cgroup/cpuset/docker/abc/cpuset.effective_cpus 2-5
     cg_file "$d" /sys/fs/cgroup/cpuset/docker/abc/cpuset.cpus 1,3-4
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 2-5" ||
-            { echo "$sh, effective_cpus:"; printf "%s\n" "$out"; exit 1; } >&2
-    done
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 2-5" ||
+        { echo "effective_cpus:"; printf "%s\n" "$out"; exit 1; } >&2
     rm -f "$d/root/sys/fs/cgroup/cpuset/docker/abc/cpuset.effective_cpus"
-    out=$(cpuset_probe "$d" sh)
+    out=$(cpuset_probe "$d")
     printf "%s\n" "$out" | grep -qx "bindable 1,3-4" || { echo "cpus:"; printf "%s\n" "$out"; false; } >&2'
 t_assert "probe: an escalated cgroup with a wider cpuset reads as bindable_priv, the difference" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
@@ -266,13 +254,11 @@ SUDO
     cg_file "$d" /proc/self/cgroup "0::/user.slice/user-1000.slice/session-1.scope"
     cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
-            { echo "$sh:"; printf "%s\n" "$out"; exit 1; } >&2
-    done
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
+        { printf "%s\n" "$out"; exit 1; } >&2
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-1,4
-    out=$(cpuset_probe "$d" sh)
+    out=$(cpuset_probe "$d")
     printf "%s\n" "$out" | grep -qx "bindable_priv 2-3,5-7" || { echo "gaps:"; printf "%s\n" "$out"; false; } >&2'
 t_assert "probe: an escalator that cannot read its cgroup leaves bindable_priv unknown (-), never guessed" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
@@ -297,14 +283,12 @@ esac
 TS
     cg_file "$d" /proc/self/cgroup "0::/user.slice"
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
-            { echo "$sh, cat refused:"; printf "%s\n" "$out"; exit 1; } >&2
-    done
+    out=$(cpuset_probe "$d")
+    printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+        { echo "cat refused:"; printf "%s\n" "$out"; exit 1; } >&2
     # cat works but names no cgroup: still unknown
     printf "#!/bin/sh\ncase \"\$*\" in \"-n true\") exit 0 ;; \"-n cat \"*) echo \"sudo: unable to resolve host x\" ;; *) exit 1 ;; esac\n" > "$d/bin/sudo"
-    out=$(cpuset_probe "$d" sh)
+    out=$(cpuset_probe "$d")
     printf "%s\n" "$out" | grep -qx "bindable_priv -" || { echo "junk cgroup:"; printf "%s\n" "$out"; false; } >&2'
 t_assert "probe: one taskset and one escalated cat per host, never a launch per cpu" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
@@ -321,12 +305,10 @@ SUDO
     cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
     want=$(printf "taskset -cp PID\nsudo -n true\nsudo -n cat $d/root/proc/self/cgroup")
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        got=$(sed "s/^taskset -cp [0-9]*\$/taskset -cp PID/" "$d/calls")
-        [ "$got" = "$want" ] && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
-            { echo "$sh: $(wc -l < "$d/calls") launch(es):"; printf "%s\n" "$got" "--- output:" "$out"; exit 1; } >&2
-    done'
+    out=$(cpuset_probe "$d")
+    got=$(sed "s/^taskset -cp [0-9]*\$/taskset -cp PID/" "$d/calls")
+    [ "$got" = "$want" ] && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
+        { echo "$(wc -l < "$d/calls") launch(es):"; printf "%s\n" "$got" "--- output:" "$out"; exit 1; } >&2'
 t_assert "probe facts: an absent bindable line fails, never reads as every cpu bindable" bash -c '
     d=$(mktemp -d)
     printf "ncpus 8\n" > "$d/p"
@@ -838,26 +820,22 @@ t_assert "run lock: a wekatester fio that survives every kill still stops the ru
     out=$(lk_run BREAK_LOCK=1)
     case "$out" in *"another wekatester run is here, or one that did not clean up: fio(99999991) unkillable(99999991)"*) ;; *) echo "$out" >&2; exit 1;; esac
     [ ! -e "$LK/lock" ]'
-t_assert "run lock: an -f naming a directory or a non-executable file is no fio, under sh too" bash -c '
-    for sh in bash sh; do
-        source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
-        mkdir "$LK/fio.d"; : > "$LK/fio.txt"
-        for f in "$LK/fio.d" "$LK/fio.txt"; do
-            out=$(lk_run "run_host() { $sh -c \"\$2\" </dev/null; }" "FIO_BIN=$f")
-            case "$out" in *"localhost: $f not found, or not an executable file"*) ;; *) echo "$sh, $f: $out" >&2; exit 1;; esac
-            [ ! -e "$LK/lock" ] || { echo "$sh, $f: locked anyway" >&2; exit 1; }
-        done
+t_assert "run lock: an -f naming a directory or a non-executable file is no fio" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    mkdir "$LK/fio.d"; : > "$LK/fio.txt"
+    for f in "$LK/fio.d" "$LK/fio.txt"; do
+        out=$(lk_run "FIO_BIN=$f")
+        case "$out" in *"localhost: $f not found, or not an executable file"*) ;; *) echo "$f: $out" >&2; exit 1;; esac
+        [ ! -e "$LK/lock" ] || { echo "$f: locked anyway" >&2; exit 1; }
     done'
-t_assert "run lock: under --break-lock a fio that turns zombie is gone, and a pid reused after the TERM is never killed, under sh too" bash -c '
-    for sh in bash sh; do
-        for after in "[fio] <defunct>" "/usr/sbin/sshd -D"; do
-            source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
-            echo "99999991 $LK/bin/fio --server --daemonize=$LK/fio.pid" > "$LK/procs"
-            echo "99999991 $after" > "$LK/after"
-            out=$(lk_run "run_host() { $sh -c \"\$2\" </dev/null; }" BREAK_LOCK=1)
-            case "$out" in *"NOTE: localhost: --break-lock cleared another run"*"fio(99999991)"*LOCKED-BY-US*RELEASED*) ;; *) echo "$sh, then \"$after\": $out" >&2; exit 1;; esac
-            [ ! -s "$LK/esc" ] || { echo "$sh, then \"$after\": escalated: $(cat "$LK/esc")" >&2; exit 1; }
-        done
+t_assert "run lock: under --break-lock a fio that turns zombie is gone, and a pid reused after the TERM is never killed" bash -c '
+    for after in "[fio] <defunct>" "/usr/sbin/sshd -D"; do
+        source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+        echo "99999991 $LK/bin/fio --server --daemonize=$LK/fio.pid" > "$LK/procs"
+        echo "99999991 $after" > "$LK/after"
+        out=$(lk_run BREAK_LOCK=1)
+        case "$out" in *"NOTE: localhost: --break-lock cleared another run"*"fio(99999991)"*LOCKED-BY-US*RELEASED*) ;; *) echo "then \"$after\": $out" >&2; exit 1;; esac
+        [ ! -s "$LK/esc" ] || { echo "then \"$after\": escalated: $(cat "$LK/esc")" >&2; exit 1; }
     done'
 
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
@@ -3354,7 +3332,7 @@ t_assert "ere_quote_v: the regex matches its own text exactly, ERE metacharacter
     q=$(source ./wekatester; ere_quote_v "$s"; printf "%s" "$ERE_QUOTED")
     printf "%s\n" "$s" | grep -Eqx "$q" &&
     ! printf "%s\n" "${s/b.in/bXin}" | grep -Eqx "$q" || { echo "string $s, regex $q" >&2; false; }'
-t_assert "fio server kill: the pidfile pid gets the TERM only while it is our server, and a path with regex characters still drains, under sh and bash" bash -c '
+t_assert "fio server kill: the pidfile pid gets the TERM only while it is our server, and a path with regex characters still drains" bash -c '
     d=$(mktemp -d); b="$d/fio+1.2[x]"; mkdir -p "$b"; cp "$(type -P sleep)" "$b/fio"; pf=$d/fio.pid; bad=0
     cat > "$d/srv" <<"SRV"
 #!/bin/bash
@@ -3367,16 +3345,14 @@ SRV
     # each fake is orphaned at once: init reaps it, and no job notice prints
     start() { "$d/srv" "$b/fio --server --daemonize=$pf" "$b/fio" "$@" >>"$WT_ASIDE" 2>&1 & echo $!; }
     alive() { [ -n "$(ps -o pid= -p "$1")" ]; }
-    for sh in sh bash; do
-        p=$(start); q=$(sleep 300 >>"$WT_ASIDE" 2>&1 & echo $!); echo "$p" > "$pf"; sleep 0.3
-        "$sh" -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
-        if alive "$p" || [ -e "$pf" ]; then echo "$sh: our server or its pidfile outlived the kill" >&2; bad=1; fi
-        echo "$q" > "$pf"; "$sh" -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
-        alive "$q" || { echo "$sh: a stale pidfile got an unrelated process killed" >&2; bad=1; }
-        kill -9 "$p" "$q" >>"$WT_ASIDE" 2>&1
-    done
+    p=$(start); q=$(sleep 300 >>"$WT_ASIDE" 2>&1 & echo $!); echo "$p" > "$pf"; sleep 0.3
+    bash -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+    if alive "$p" || [ -e "$pf" ]; then echo "our server or its pidfile outlived the kill" >&2; bad=1; fi
+    echo "$q" > "$pf"; bash -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+    alive "$q" || { echo "a stale pidfile got an unrelated process killed" >&2; bad=1; }
+    kill -9 "$p" "$q" >>"$WT_ASIDE" 2>&1
     p=$(start ignore); echo "$p" > "$pf"; sleep 0.3
-    sh -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
+    bash -c "$cmd" >>"$WT_ASIDE" 2>&1; sleep 0.3
     if alive "$p"; then echo "a server that ignores TERM outlived the -9" >&2; kill -9 "$p" >>"$WT_ASIDE" 2>&1; bad=1; fi
     exit "$bad"'
 t_assert "server launch: priv pins via taskset but fio drops to the login user" bash -c '
@@ -3393,7 +3369,7 @@ t_assert "server launch: priv pins via taskset but fio drops to the login user" 
     grep -q "WEKATESTER_FIO_AS=root; sudo -n taskset -c 4-7 '\''fio'\'' --server" "$d/launch.h1" &&
     grep -q "LAUNCH\[h2\]" "$d/launch.h2" && ! grep -q taskset "$d/launch.h2" &&
     grep -q "taskset -c 8-9 '\''fio'\''" "$d/launch.h3" && ! grep -q runuser "$d/launch.h3"'
-t_assert "server launch, run under sh and bash: with runuser fio drops to the login user, without it fio runs as root" bash -c '
+t_assert "server launch, run for real: with runuser fio drops to the login user, without it fio runs as root" bash -c '
     d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/auth"
     printf "sudo -n\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"
     for c in cat id pgrep ps rm sleep true; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
@@ -3407,12 +3383,11 @@ t_assert "server launch, run under sh and bash: with runuser fio drops to the lo
      run_host() { printf "%s" "$2" > "$d/cmd.$1"; }
      start_fio_servers) >>"$WT_ASIDE" 2>&1
     [ -s "$d/cmd.h1" ] || { echo "no launch string captured" >&2; exit 1; }
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        u=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1")" 2>&1)
-        mv "$b/runuser" "$d/runuser.off"; r=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1")" 2>&1); mv "$d/runuser.off" "$b/runuser"
-        case "$u" in *"WEKATESTER_FIO_AS=user"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "$sh, with runuser: $u" >&2; exit 1;; esac
-        case "$r" in *"WEKATESTER_FIO_AS=root"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "$sh, no runuser: $r" >&2; exit 1;; esac
-    done'
+    bash=$(type -P bash)
+    u=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1")" 2>&1)
+    mv "$b/runuser" "$d/runuser.off"; r=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1")" 2>&1); mv "$d/runuser.off" "$b/runuser"
+    case "$u" in *"WEKATESTER_FIO_AS=user"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "with runuser: $u" >&2; exit 1;; esac
+    case "$r" in *"WEKATESTER_FIO_AS=root"*"fio ran: --server --daemonize=$d/fio.pid"*) ;; *) echo "no runuser: $r" >&2; exit 1;; esac'
 
 # --- host files: per-host application to staging ---
 t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-derived" bash -c '
@@ -4093,7 +4068,7 @@ t_assert "mount recheck: under -r a change to only an option, only the source or
                 "the destination mount changed on 5 of 6 host(s) after it was verified; the measured run did not start"; do
         case "$err" in *"$want"*) ;; *) echo "missing [$want] in: $err" >&2; exit 1;; esac
     done'
-# The remote string itself, run for real by sh and bash: findmnt is stubbed
+# The remote string itself, run for real by bash: findmnt is stubbed
 # to name the mount point, and a fixture stands in for /proc/mounts.
 t_assert "mount recheck: the real snippet -- a \\040 mount point matches, a stacked mount gives the last line, \\134 decodes, no match prints nothing" bash -c '
     d=$(mktemp -d); mkdir "$d/bin"
@@ -4104,20 +4079,18 @@ t_assert "mount recheck: the real snippet -- a \\040 mount point matches, a stac
     cmd=$(source ./wekatester; mount_line_cmd_v "\"/x/y\""; printf "%s" "$MOUNT_LINE_CMD")
     case "$cmd" in *" /proc/mounts") ;; *) echo "does not read /proc/mounts last: $cmd" >&2; exit 1;; esac
     cmd="${cmd% /proc/mounts} $d/mounts"
-    for sh in sh bash; do
-        for c in "/mnt/my weka|weka0 /mnt/my\\040weka wekafs rw,forcedirect 0 0" \
-                 "/mnt/stack|weka1 /mnt/stack wekafs rw,forcedirect 0 0" \
-                 "/mnt/a\\b|bs /mnt/a\\134b wekafs rw 0 0" "/mnt/none|"; do
-            printf "%s\n" "${c%%|*}" > "$d/target"
-            out=$(PATH="$d/bin:$PATH" $sh -c "$cmd"); rc=$?
-            [ "$rc" -eq 0 ] && [ "$out" = "${c#*|}" ] || { echo "$sh, target [${c%%|*}]: rc=$rc out [$out]" >&2; exit 1; }
-        done
-        # findmnt -T names a stacked mount point once per mount
-        printf "%s\n" /mnt/stack /mnt/stack > "$d/target"
-        out=$(PATH="$d/bin:$PATH" $sh -c "$cmd"); rc=$?
-        [ "$rc" -eq 0 ] && [ "$out" = "weka1 /mnt/stack wekafs rw,forcedirect 0 0" ] ||
-            { echo "$sh, stacked findmnt: rc=$rc out [$out]" >&2; exit 1; }
+    for c in "/mnt/my weka|weka0 /mnt/my\\040weka wekafs rw,forcedirect 0 0" \
+             "/mnt/stack|weka1 /mnt/stack wekafs rw,forcedirect 0 0" \
+             "/mnt/a\\b|bs /mnt/a\\134b wekafs rw 0 0" "/mnt/none|"; do
+        printf "%s\n" "${c%%|*}" > "$d/target"
+        out=$(PATH="$d/bin:$PATH" bash -c "$cmd"); rc=$?
+        [ "$rc" -eq 0 ] && [ "$out" = "${c#*|}" ] || { echo "target [${c%%|*}]: rc=$rc out [$out]" >&2; exit 1; }
     done
+    # findmnt -T names a stacked mount point once per mount
+    printf "%s\n" /mnt/stack /mnt/stack > "$d/target"
+    out=$(PATH="$d/bin:$PATH" bash -c "$cmd"); rc=$?
+    [ "$rc" -eq 0 ] && [ "$out" = "weka1 /mnt/stack wekafs rw,forcedirect 0 0" ] ||
+        { echo "stacked findmnt: rc=$rc out [$out]" >&2; exit 1; }
     grep -qx -- "-T /x/y -n -o TARGET" "$d/asked" || { cat "$d/asked" >&2; exit 1; }'
 # A stacked mount (Frank, 2026-10-11): findmnt lists the hidden mount first;
 # the check judges the visible /proc/mounts line, the one recorded and written
@@ -5221,7 +5194,7 @@ WEKA
     out=$(PATH="$b:$PATH" bash -c "$cmd" 2>&1)
     printf "%s\n" "$out" | grep -qx "weka_net_err client needs root, and no passwordless escalator works here" ||
         { printf "%s\n" "$out" >&2; false; }'
-t_assert "probe: no ethtool, or one that prints no Speed line, leaves a NIC its sysfs speed, under sh and bash" bash -c '
+t_assert "probe: no ethtool, or one that prints no Speed line, leaves a NIC its sysfs speed" bash -c '
     d=$(mktemp -d); r=$d/root
     mkdir -p "$r/sys/class/net/eth0/device" "$r/proc" "$d/none" "$d/nospeed"
     echo 25000 > "$r/sys/class/net/eth0/speed"
@@ -5231,12 +5204,10 @@ t_assert "probe: no ethtool, or one that prints no Speed line, leaves a NIC its 
     done
     printf "#!/bin/sh\necho \"Link detected: yes\"\n" > "$d/nospeed/ethtool"; chmod +x "$d/nospeed/ethtool"
     cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        for b in "$d/none" "$d/nospeed"; do
-            out=$(WEKATESTER_SYSROOT=$r PATH=$b "$sh" -c "$cmd" 2>&1)
-            printf "%s\n" "$out" | grep -qx "nic eth0 25000 - - -" ||
-                { echo "$sh, PATH ${b##*/}:"; printf "%s\n" "$out"; exit 1; } >&2
-        done
+    for b in "$d/none" "$d/nospeed"; do
+        out=$(WEKATESTER_SYSROOT=$r PATH=$b "$(type -P bash)" -c "$cmd" 2>&1)
+        printf "%s\n" "$out" | grep -qx "nic eth0 25000 - - -" ||
+            { echo "PATH ${b##*/}:"; printf "%s\n" "$out"; exit 1; } >&2
     done'
 
 # --- calibrate(): the whole flow against the fake client ---
@@ -6077,7 +6048,7 @@ t_assert "pressure: no run dir means no capture, no error" bash -c '
      run_host() { echo TOUCHED >> "$d/oplog"; }
      snapshot_pressure start)
     [ ! -f "$d/oplog" ]'
-t_assert "sysinfo and pressure, run under sh and bash: a tool on PATH runs, a missing one is not available" bash -c '
+t_assert "sysinfo and pressure, run for real: a tool on PATH runs, a missing one is not available" bash -c '
     d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/w" "$d/run"
     for c in cat uname; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
     printf "#!/bin/sh\necho up 1 day\n" > "$b/uptime"
@@ -6087,12 +6058,11 @@ t_assert "sysinfo and pressure, run under sh and bash: a tool on PATH runs, a mi
      run_host() { printf "%s" "$2" > "$d/cmd.$1.$CMDK"; }
      CMDK=sysinfo snapshot_sysinfo; CMDK=pressure snapshot_pressure end) >>"$WT_ASIDE" 2>&1
     [ -s "$d/cmd.h1.sysinfo" ] && [ -s "$d/cmd.h1.pressure" ] || { echo "strings not captured" >&2; exit 1; }
-    for sh in "$(type -P sh)" "$(type -P bash)"; do
-        s=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1.sysinfo")" 2>&1); p=$(PATH=$b "$sh" -c "$(cat "$d/cmd.h1.pressure")" 2>&1)
-        printf "%s\n" "$s" | grep -qx "up 1 day" && printf "%s\n" "$s" | grep -qx "lspci: not available" &&
-        printf "%s\n" "$s" | grep -qx "weka: not available" && printf "%s\n" "$p" | grep -q "^sar -A -s 12:00:00 -e " ||
-            { echo "$sh:"; printf "%s\n" "$s" "$p"; exit 1; } >&2
-    done'
+    bash=$(type -P bash)
+    s=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1.sysinfo")" 2>&1); p=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1.pressure")" 2>&1)
+    printf "%s\n" "$s" | grep -qx "up 1 day" && printf "%s\n" "$s" | grep -qx "lspci: not available" &&
+    printf "%s\n" "$s" | grep -qx "weka: not available" && printf "%s\n" "$p" | grep -q "^sar -A -s 12:00:00 -e " ||
+        { printf "%s\n" "$s" "$p"; exit 1; } >&2'
 
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,

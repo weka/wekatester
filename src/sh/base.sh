@@ -26,8 +26,9 @@ replay_prerun_warnings() {
 
 # --- transport ----------------------------------------------------------------
 # The only two places that know whether a host is remote. A command string
-# must be POSIX sh or wrap itself in bash -c: remotely it runs under the
-# login shell (verify_fio_ports carries its own bash -c for /dev/tcp).
+# is bash: locally it runs under bash -c, remotely under the login shell, so
+# one that needs bash's own features wraps itself in bash -c
+# (verify_fio_ports does, for /dev/tcp).
 
 # stdin is /dev/null on both branches, or a child can eat the script's stdin.
 # host_ssh_opts: our ControlPath and User= per host; nothing for a host on a
