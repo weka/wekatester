@@ -668,6 +668,30 @@ t_assert "summarize: a single-client run needs no All clients aggregate" bash -c
         *"total bandwidth: 3.00 GiB/s"*"average latency: 250.0 us (IO-weighted)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+# The Python wekatester wrote {jobname: fio JSON, ...}: -s names that format
+# instead of reporting a missing aggregate (review #24).
+t_assert "summarize: a Python wekatester results file is named as such" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/inner.json"
+    { printf "{ \"011-bw.job\": "; cat "$d/inner.json"; printf "}\n"; } > "$d/py.json"
+    ! out=$(./wekatester -s "$d/py.json" 2>&1) &&
+    case "$out" in
+        *"All clients"*) echo "$out" >&2; false;;
+        *"py.json: a results file from the Python wekatester"*"jq '\''.\"011-bw.job\"'\'' $d/py.json > job.json"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: the Python file's inner object, on its own, still summarizes" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/inner.json"
+    out=$(./wekatester -s "$d/inner.json" 2>&1) || { echo "$out" >&2; exit 1; }
+    case "$out" in *"total bandwidth: 7.00 GiB/s"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "summarize: this version's results are never taken for the Python format" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_fixture "$d/r.json"; fio_json_single_fixture "$d/s.json"
+    for f in r s; do
+        out=$(./wekatester -s "$d/$f.json" 2>&1) || { echo "$f: $out" >&2; exit 1; }
+        case "$out" in *Python*) echo "$f: $out" >&2; exit 1;; esac
+    done'
 
 # --- report directive parsing ---
 # The metric selector needs whitespace after "report", or prose comments get

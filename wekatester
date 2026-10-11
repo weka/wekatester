@@ -7473,9 +7473,15 @@ summ_one() {
                 if (a[3] == "read" || a[3] == "write") dirhas[i "." a[3]] = 1
                 if (k in READS) v[i "." k] = $2 + 0
             }
-            seen[i] = 1
+            seen[i] = 1; ne++
         }
+        # the Python wekatester'\''s results nest client_stats one key down: {job: fio JSON}
+        !ne && (j = index($1, ".client_stats.")) && pyjob == "" { pyjob = substr($1, 1, j - 1) }
         END {
+            if (!ne && pyjob != "") {
+                printf "ERR\t%s: a results file from the Python wekatester (one fio JSON per job, keyed by job name); -s reads this version%ss results, a results .json or a run bundle .tgz. Summarize one job by extracting its object, e.g. jq %s.\"%s\"%s %s > job.json\n", label, "\047", "\047", pyjob, "\047", label
+                exit
+            }
             for (i = 0; i <= maxi; i++) {
                 if (!(i in seen)) continue
                 if (job[i] == "All clients") { alls = i; hasall = 1; continue }

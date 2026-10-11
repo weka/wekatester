@@ -138,7 +138,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-i` / `-p` — the credential pool; see **Authentication** below.
 
-`-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run).
+`-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used (layout jobs are skipped, as during the run). The Python wekatester's results file (one fio JSON per job, keyed by job name) is not read: `-s` names it and shows how to extract one job with `jq`.
 
 `-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout job (so it always matches the exact file grid that was laid out, whatever auto tuning or hand edits did) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
 
