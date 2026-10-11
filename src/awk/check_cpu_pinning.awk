@@ -41,12 +41,8 @@ BEGIN {
         cur_s = fact(P, np, "taskset"); iso_s = fact(P, np, "isolated"); ncpus_s = fact(P, np, "ncpus")
         priv = ""   # host_priv rule: the first "priv " line, the rest of it verbatim
         for (i = 1; i <= np; i++) if (index(P[i], "priv ") == 1) { priv = substr(P[i], 6); break }
-        expand(req_s, REQ); expand(cur_s, CUR); expand(iso_s, ISO)
+        expand(req_s, REQ); expand(iso_s, ISO)
         ncpus = ncpus_s ~ /^[0-9]+$/ ? ncpus_s + 0 : 0
-        # facts the probe READ from the cpuset (empty, untested, when it
-        # could not read them)
-        tested = probe_cpu_fact(P, np, "bindable", BIND)
-        probe_cpu_fact(P, np, "bindable_priv", BINDP)
         probe_universe(P, np, ncpus, U)
         # weka pins each dedicated io thread to exactly one cpu; wide masks
         # are floating utility threads and must be ignored, or everything
@@ -65,13 +61,17 @@ BEGIN {
             if (W[i] in TK) { nt = split(TL[W[i]], T, ","); for (j = 1; j <= nt; j++) WEKA[T[j]] = 1 }
         flags = ""
         if (nolist && !set_any(U)) continue   # a probe that cannot say which cpus exist: nothing to pin to
+        # facts the probe READ from the cpuset; probe_workers stops a host
+        # without them, so none here is a broken probe, never a guess
+        if (!probe_cpu_fact(P, np, "bindable", BIND)) awk_fail("pinning: " host ": the probe has no bindable line, so which cpus it binds is unknown")
+        probe_cpu_fact(P, np, "bindable_priv", BINDP)
         if (nolist) {
             # every cpu this login binds without privilege (an unlisted
             # host never escalates), less weka cores and core 0 pair, as a
             # list naming them all would
             flag("nolist")
             split("", REQ)
-            for (c in U) if (tested ? (c in BIND) : (!set_any(CUR) || (c in CUR))) REQ[c] = 1
+            for (c in U) if (c in BIND) REQ[c] = 1
             if ((req_s = fmt_cpulist(REQ)) == "") req_s = "-"
         }
         # cpus the host does not have: fio rejects them on the daemonized
@@ -83,7 +83,7 @@ BEGIN {
         # cpus the host refuses to bind (outside the cpuset): fio answers err=22
         # cpu_set_affinity per job, after the run has started
         split("", UNBIND)
-        if (tested) for (c in REQ) if (!(c in WEKA) && !(c in PHANTOM) && !(c in BIND) && !(c in BINDP)) UNBIND[c] = 1
+        for (c in REQ) if (!(c in WEKA) && !(c in PHANTOM) && !(c in BIND) && !(c in BINDP)) UNBIND[c] = 1
         if (set_any(UNBIND)) flag("unbindable")
         # core 0 of socket 0 and its sibling always stay with the OS
         # (Frank, 2026-09-25)
@@ -114,14 +114,9 @@ BEGIN {
         if (set_any(ISO)) for (c in REQ) if (c in ISO) iso_in = 1; else iso_out = 1
         if (iso_in && iso_out) flag("mixed")
         # Which cpus need the escalator: those only the escalated cgroup's
-        # cpuset holds. Without a bindable line, isolated cpus are assumed
-        # self-affinable.
+        # cpuset holds
         if (!set_any(EFF)) flag("allweka")
-        else if (tested) {
-            for (c in EFF) if (!(c in BIND)) { flag("outside"); break }
-        } else if (set_any(CUR)) {
-            for (c in EFF) if (!(c in CUR) && !(c in ISO)) { flag("outside"); break }
-        }
+        else for (c in EFF) if (!(c in BIND)) { flag("outside"); break }
         for (c in REQ) if (c in WEKA) { flag("overlap"); break }
         w = join_sorted(WEKA, ",")
         print host, req_s, (cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)

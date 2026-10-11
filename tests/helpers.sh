@@ -63,8 +63,8 @@ tuner_fixture() {   # $1 = extra probe content variant
     # weka takes the last cores); the 0,3-4 line is a wide utility-thread
     # mask and must be ignored. With cpus 0 and 1 the OS reserve, fio gets
     # 2-4 (N=3).
-    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
-    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
     printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 1073741824 0 1073741824 1%% /mnt/weka\n' > "$FIX/probe/_df"
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n' > "$FIX/src/011-bw.job"
 }
@@ -344,6 +344,7 @@ cal_sim_fixture() {   # cal_sim_fixture <dir> <host[:ncpus[:speed]]>...
     for spec in "$@"; do
         IFS=: read -r h n sp <<<"$spec"
         { printf 'ncpus %s\nweka_allowed %s\nengines io_uring libaio psync\n' "${n:-4}" "$(( ${n:-4} - 1 ))"
+          printf 'bindable 0-%s\nbindable_priv -\n' "$(( ${n:-4} - 1 ))"
           printf 'cpu_model Test CPU %s-core\nmemtotal_kb 263921664\n' "${n:-4}"
           printf 'nic ens1 %sMb/s 0000:3b:00.0 mlx5_core 0x15b3:0x101d\n' "${sp:-100000}"
           printf 'weka_net client [{"name": "ens1", "identifier": "0000:3b:00.0"}]\n'

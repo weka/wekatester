@@ -174,6 +174,44 @@ t_assert "probe: no cpuset to read falls back to the taskset affinity, under sh 
     done
     out=$(probe_stub)
     printf "%s\n" "$out" | grep -qx "bindable 0-7" || { printf "%s\n" "$out" >&2; false; }'
+# Neither answering is no measurement, so the probe says why and nothing
+# else (Frank, 2026-10-11): before, both lines were left out and the
+# pinning check guessed.
+t_assert "probe: no cpuset file and a failing taskset -cp print bindable_err with taskset's words, under sh and bash" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    cat > "$d/bin/taskset" <<TS
+#!/bin/sh
+echo "taskset: failed to get pid \$2 affinity: Operation not permitted" >&2
+exit 1
+TS
+    want="bindable_err no cgroup cpuset file was readable, and taskset -cp failed: taskset: failed to get pid [0-9]* affinity: Operation not permitted"
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        # no /proc/self/cgroup, then one naming a cgroup with no cpuset file
+        for cg in none no-cpuset-file; do
+            out=$(cpuset_probe "$d" "$sh")
+            printf "%s\n" "$out" | grep -qx "$want" && printf "%s\n" "$out" | grep -qx "taskset " &&
+            ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
+                { echo "$sh, $cg:"; printf "%s\n" "$out"; exit 1; } >&2
+            cg_file "$d" /proc/self/cgroup "0::/user.slice"
+        done
+        rm -f "$d/root/proc/self/cgroup"
+    done
+    # taskset answers, but with no affinity list to read
+    printf "#!/bin/sh\necho \"no affinity here\"\n" > "$d/bin/taskset"
+    out=$(cpuset_probe "$d" bash)
+    printf "%s\n" "$out" | grep -qx "bindable_err no cgroup cpuset file was readable, and taskset -cp gave no affinity list: no affinity here" ||
+        { echo "no list:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: a failing taskset -cp beside a readable cpuset keeps the cpuset, no bindable_err" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    printf "#!/bin/sh\necho \"taskset: Operation not permitted\" >&2\nexit 1\n" > "$d/bin/taskset"
+    cg_file "$d" /proc/self/cgroup "0::/user.slice"
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv -" &&
+        ! printf "%s\n" "$out" | grep -q "^bindable_err" ||
+            { echo "$sh:"; printf "%s\n" "$out"; exit 1; } >&2
+    done'
 t_assert "probe: cgroup v2 cpuset is read from the nearest cgroup that has one, under sh and bash" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     # c42j as found: no cpuset controller below user.slice
@@ -279,7 +317,7 @@ SUDO
         [ "$got" = "$want" ] && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
             { echo "$sh: $(wc -l < "$d/calls") launch(es):"; printf "%s\n" "$got" "--- output:" "$out"; exit 1; } >&2
     done'
-t_assert "probe facts: an absent bindable line means UNTESTED, never none" bash -c '
+t_assert "probe facts: an absent bindable line fails, never reads as every cpu bindable" bash -c '
     d=$(mktemp -d)
     printf "ncpus 8\n" > "$d/p"
     facts() { (source ./wekatester; awkrun "BEGIN {
@@ -287,9 +325,10 @@ t_assert "probe facts: an absent bindable line means UNTESTED, never none" bash 
         for (c = 0; c < 8; c++) U8[c] = 1
         probe_unbindable(P, np, U8, UB); probe_universe(P, np, 8, U)
         print t \"|\" join_sorted(S, \",\") \"|\" join_sorted(UB, \",\") \"|\" join_sorted(U, \",\")
-    }" "$d/p"); }
-    # untested: no cpus refused -- a guess is not a measurement
-    [ "$(facts)" = "0|||0,1,2,3,4,5,6,7" ] || { echo "untested: $(facts)" >&2; exit 1; }
+    }" "$d/p") 2>&1; }
+    # no line: a broken probe -- a guess is not a measurement
+    out=$(facts) && { echo "no line passed: $out" >&2; exit 1; }
+    case "$out" in (*"no bindable line"*) ;; (*) echo "no line: $out" >&2; exit 1 ;; esac
     printf "bindable -\nonline 0-3\n" >> "$d/p"
     [ "$(facts)" = "1||0,1,2,3,4,5,6,7|0,1,2,3" ] || { echo "tested: $(facts)" >&2; false; }'
 
@@ -308,13 +347,13 @@ t_assert "cpus_allowed excludes weka cores" bash -c '
     grep -q "^cpus_allowed=2-4$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "wide-only weka_allowed masks are ignored (utility threads)" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
-    printf "ncpus 8\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 0,3-4\nweka_allowed 0-7\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE
     grep -q "^cpus_allowed=2-7$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "core mismatch warns" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 16\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
+    printf "ncpus 16\nbindable 0-15\nbindable_priv -\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines io_uring libaio \n" > "$FIX/probe/h2"
     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$err" in *WARNING*"core counts differ"*) true;; *) false;; esac'
 
@@ -341,7 +380,7 @@ t_assert "tuner: no level rule -- where the host file and calibration are silent
 t_assert "tuner: a jobfile engine one host lacks gives way to the best engine every host has" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nioengine=io_uring\nnumjobs=2\nfilesize=1G\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
-    printf "ncpus 8\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines libaio psync \n" > "$FIX/probe/h2"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 0\nweka_allowed 1\nweka_allowed 2\nengines libaio psync \n" > "$FIX/probe/h2"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" safe /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^ioengine=libaio$" "$FIX/jobs/h1/011-bw.job"'
 t_assert "mixed report treats file as latency" bash -c '
@@ -1161,7 +1200,7 @@ t_assert "tuner: an edited layout is staged at each host's own destination too" 
 # the client's own grid, exactly as a plain run does.
 t_assert "staging: every -a level calibrates, so every level puts reads on the fleet-shared set" bash -c '
     d=$(mktemp -d); mkdir -p "$d/set"
-    printf "ncpus 8\nengines libaio psync\n" > "$d/probe.h1"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nengines libaio psync\n" > "$d/probe.h1"
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=2\nioengine=libaio\n[j]\nrw=read\n" > "$d/set/011-r.job"
     for lvl in safe max cal brutal; do
         w=$(mktemp -d); mkdir -p "$w/jobs" "$w/probe"; cp "$d/probe.h1" "$w/probe/h1"
@@ -1858,7 +1897,8 @@ uc() {   # uc <probe-file-content>; prints the count
     local d out rc
     d=$(mktemp -d) || return 1
     mkdir -p "$d/probe"
-    printf '%s\n' "$1" > "$d/probe/h1"
+    # every probe carries a bindable line; this one refuses no cpu
+    printf '%s\nbindable 0-63\nbindable_priv -\n' "$1" > "$d/probe/h1"
     out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) ); rc=$?
     rm -rf "$d"
     [ "$rc" -eq 0 ] || { echo "ERROR: usable_cores exited $rc"; return "$rc"; }
@@ -1906,10 +1946,13 @@ weka_allowed 7')" = 2
 t_assert "usable_cores: an unreadable probe is an error, not a zero" \
     uc_fails usable_cores
 t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
-    uc_fails "leaves fio no cpus" 'engines psync '
+    uc_fails "leaves fio no cpus" 'engines psync
+bindable 0-7'
+t_assert "usable_cores: a probe with no bindable line is an error, never a guess" \
+    uc_fails "no bindable line" 'ncpus 8'
 t_assert "usable_cores: a list naming cpus the host does not have is trimmed; one covering every cpu fio could use counts as none" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\n" > "$d/probe/h1"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\n" > "$d/probe/h1"
     # 3-11 is an operator list with phantoms: trimmed to 3-7, and only core
     # 0 comes out of it (the operator-list exemption)
     out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "3-11") )
@@ -1921,7 +1964,7 @@ t_assert "usable_cores: a list naming cpus the host does not have is trimmed; on
         [ "$out" = "2,3,4,5,6,7" ] || { echo "$l: $out" >&2; exit 1; }
     done'
 t_assert "cores_summary: cores a host-file list leaves out, or the host cannot bind, get terms of their own so the sum adds up" bash -c '
-    d=$(mktemp -d); printf "ncpus 8\n" > "$d/p"
+    d=$(mktemp -d); printf "ncpus 8\nbindable 0-7\nbindable_priv -\n" > "$d/p"
     # lab 3, 2026-09-27: a list written back by a calibration printed
     # "16 physical - 6 weka DPDK - 1 reserved (0-1) = N=7"
     out=$(cores_line "$d/p" 4-11)
@@ -2217,8 +2260,8 @@ t_assert "probe: -e engine missing from a worker refuses early, naming it" bash 
             LOCAL_MODE=1; HOSTS=(h1 h2); MASTER=h1; AUTO_LEVEL=max
             WORK_DIR=$d; DIRECTORY=/mnt/weka; ENGINE=io_uring
             run_host() { case "$2" in
-                (*enghelp*) [ "$1" = h1 ] && echo "engines io_uring libaio psync" \
-                                          || echo "engines libaio psync";;
+                (*enghelp*) [ "$1" = h1 ] && printf "engines io_uring libaio psync\nbindable 0-7\n" \
+                                          || printf "engines libaio psync\nbindable 0-7\n";;
                 (*) echo stubbed;;
             esac; }
             probe_workers) 2>&1 >>$WT_ASIDE )
@@ -2226,6 +2269,26 @@ t_assert "probe: -e engine missing from a worker refuses early, naming it" bash 
         *"ioengine '\''io_uring'\'' is not available"*"h2"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+# fio launches under taskset -c, so a host whose bindable cpus are unknown
+# cannot be pinned: the run stops, naming every such host and why, before
+# any engine test (Frank, 2026-10-11).
+t_assert "probe: hosts with no bindable cpus stop the run, each named with its reason" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(h1 h2 h3); MASTER=h1; AUTO_LEVEL=""
+            WORK_DIR=$d; DIRECTORY=/mnt/weka; ENGINE=""
+            run_host() { case "$1" in
+                (h1) printf "ncpus 8\ntaskset 0-7\nbindable 0-7\nbindable_priv -\n";;
+                (h2) printf "ncpus 8\ntaskset \nbindable_err no cgroup cpuset file was readable, and taskset -cp failed: taskset: Operation not permitted\n";;
+                (h3) printf "ncpus 8\n";;
+            esac; }
+            probe_workers) 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "probe_workers passed: $err" >&2; exit 1; }
+    case "$err" in
+        *"h2: cannot tell which cpus fio may bind: no cgroup cpuset file was readable, and taskset -cp failed: taskset: Operation not permitted"*"h3: cannot tell which cpus fio may bind: its probe printed no bindable line"*"no cpu list fio can bind on: h2 h3 --"*"taskset -c"*) ;;
+        *) echo "$err" >&2; exit 1 ;;
+    esac
+    case "$err" in *"h1:"*|*"h1 "*) echo "named h1: $err" >&2; false ;; esac'
 
 # --- -p/--password: a count of prompted login/password pairs ---
 t_assert "parse: -p count is optional and never eats a hostname" bash -c '
@@ -2602,7 +2665,7 @@ t_assert "probe: -a runs no weka CLI on the master, only df; per host only weka 
             # "weka " with the space matches a CLI invocation only
             run_host() { case "$2" in
                 (*cpu_model*) printf "%s" "$2" | grep -o "weka [a-z]* [a-z]*" | sort -u > "$d/wekacalls"
-                              echo stubbed;;
+                              printf "stubbed\nbindable 0-7\n";;
                 (*"weka "*) echo "WEKA_CALLED: $2" >&2; return 1;;
                 (*) echo stubbed;;
             esac; }
@@ -2944,7 +3007,8 @@ t_assert "pinning: cpus outside the taskset with no escalator dies showing all t
     d=$(mktemp -d); mkdir -p "$d/probe"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; mkdir -p "$d/auth"
-        printf "taskset 0-3\nweka_allowed 8\nweka_allowed 9\nweka_allowed 0-15\n" > "$d/probe/h1"
+        # 4-7 bind only in another cgroup, and no escalator reaches it
+        printf "taskset 0-3\nbindable 0-3\nbindable_priv 4-15\nweka_allowed 8\nweka_allowed 9\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in
@@ -3027,7 +3091,9 @@ bindable_priv -
         *"no requested cpu (4,5) is usable"*"or one it refuses to bind (4-5)"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "pinning: without the measurement the old isolated-is-self-affinable rule still stands" bash -c '
+# Without the measurement nothing is assumed (Frank, 2026-10-11): the old
+# rule called isolated cpus self-affinable and pinned 1-7 here.
+t_assert "pinning: without a bindable line the check fails naming the host, never assumes isolated cpus bind" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     out=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
@@ -3037,20 +3103,20 @@ isolated 2-7
 " > "$d/probe/h1"
         printf "h1	-	-	0-7	-
 " > "$d/targets.final"
-        check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
-    case "$out" in *"refuses to bind"*) echo "invented a measurement: $out" >&2; false;; *) true;; esac &&
-    [ "$(cat "$d/auth/h1.cpus")" = "1-7" ] && [ ! -f "$d/auth/h1.priv" ]'
+        check_cpu_pinning) 2>&1 ) && { echo "pinned without a measurement: $out" >&2; exit 1; }
+    case "$out" in *"h1: the probe has no bindable line"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ ! -f "$d/auth/h1.cpus" ] && [ ! -f "$d/auth/h1.priv" ]'
 t_assert "pinning: full weka overlap dies; partial runs on the remainder, file untouched" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\nweka_allowed 0-15\n" > "$d/probe/h1"
+        printf "taskset 0-15\nbindable 0-15\nbindable_priv -\nweka_allowed 8\nweka_allowed 10\nweka_allowed 0-15\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in (*"every requested cpu (8,10) is a weka dedicated core"*) true;; (*) echo "$err" >&2; exit 1;; esac
     out2=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "taskset 0-15\nweka_allowed 8\nweka_allowed 10\npriv sudo\n" > "$d/probe/h1"
+        printf "taskset 0-15\nbindable 0-15\nbindable_priv -\nweka_allowed 8\nweka_allowed 10\npriv sudo\n" > "$d/probe/h1"
         printf "h1\t-\t-\t8,10,12\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 )
     case "$out2" in (*"note"*"overlap weka'\''s dedicated cores (8,10)"*"executing on the remainder (12)"*) true;; (*) echo "$out2" >&2; exit 1;; esac
@@ -3059,7 +3125,7 @@ t_assert "pinning: an in-mask request with no escalator records cpus and proceed
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-     printf "taskset 0-15\nweka_allowed 20\nweka_allowed 0-15\n" > "$d/probe/h1"
+     printf "taskset 0-15\nbindable 0-15\nbindable_priv -\nweka_allowed 20\nweka_allowed 0-15\n" > "$d/probe/h1"
      printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-7" ] && test ! -s "$d/auth/h1.priv"'
@@ -3072,7 +3138,7 @@ t_assert "pinning: cpus the host does not have are trimmed with a note, file unt
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     out=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "ncpus 64\ntaskset 0-63\nweka_allowed 52\nweka_allowed 53\n" > "$d/probe/h1"
+        printf "ncpus 64\ntaskset 0-63\nbindable 0-63\nbindable_priv -\nweka_allowed 52\nweka_allowed 53\n" > "$d/probe/h1"
         printf "h1\t-\t-\t0-128\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 )
     case "$out" in
@@ -3083,7 +3149,7 @@ t_assert "pinning: a list with no real cpu at all still dies" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     err=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "ncpus 64\ntaskset 0-63\n" > "$d/probe/h1"
+        printf "ncpus 64\ntaskset 0-63\nbindable 0-63\nbindable_priv -\n" > "$d/probe/h1"
         printf "h1\t-\t-\t100-128\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 >>$WT_ASIDE )
     case "$err" in
@@ -3094,7 +3160,7 @@ t_assert "pinning: a valid list on a probed host still proceeds" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-     printf "ncpus 16\ntaskset 0-15\n" > "$d/probe/h1"
+     printf "ncpus 16\ntaskset 0-15\nbindable 0-15\nbindable_priv -\n" > "$d/probe/h1"
      printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-7" ]'
@@ -3423,16 +3489,18 @@ t_assert "cal.results: one width, both parsers accept what the shared layer defi
 
 t_assert "tuner: an unbindable cpu never reaches a staged cpus_allowed" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h1"
-    printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h2"
+    for h in h1 h2; do
+        sed -i.b "s/^bindable 0-7\$/bindable 0,1,2,4,6,7/" "$FIX/probe/$h"; printf "online 0-7\n" >> "$FIX/probe/$h"
+    done
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     # weka owns 5-7 and the OS 0-1, so 2-4 was usable; 3 refuses the bind
     grep -q "^cpus_allowed=2,4$" "$FIX/jobs/h1/011-bw.job" ||
         { grep "^cpus_allowed=" "$FIX/jobs/h1/011-bw.job" >&2; false; }'
 t_assert "tuner: a host-file cpu list is narrowed by the measurement too" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h1"
-    printf "online 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" >> "$FIX/probe/h2"
+    for h in h1 h2; do
+        sed -i.b "s/^bindable 0-7\$/bindable 0,1,2,4,6,7/" "$FIX/probe/$h"; printf "online 0-7\n" >> "$FIX/probe/$h"
+    done
     { printf "h1\t-\t-\t2-5\t-"
       for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
     (source ./wekatester
@@ -3454,8 +3522,8 @@ t_assert "tuner: isolcpus does not narrow cpus_allowed; only weka is excluded" b
 # detection that comes back empty while weka is running has to be audible.
 t_assert "tuner: weka running with no pinned cores found warns loudly" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
-    printf "ncpus 8\nwekanode 4\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    printf "ncpus 8\nwekanode 4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nwekanode 4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     out=$( (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$out" in
@@ -3464,8 +3532,8 @@ t_assert "tuner: weka running with no pinned cores found warns loudly" bash -c '
     esac'
 t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
-    printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
-    printf "ncpus 8\nwekanode 0\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
+    printf "ncpus 8\nwekanode 0\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    printf "ncpus 8\nwekanode 0\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n" > "$FIX/probe/h2"
     out=$( (source ./wekatester
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$WT_ASIDE )
     case "$out" in
@@ -3479,7 +3547,7 @@ t_assert "tuner: no weka on the host is silent, not a warning" bash -c '
 # reads per-process masks now; one wekanode process owns one core.
 t_assert "pinning: only the cores weka's node processes own are excluded (field client A)" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
-    { printf "ncpus 56\nwekanode 15\ntaskset 0-55\nisolated 4-55\n"
+    { printf "ncpus 56\nwekanode 15\ntaskset 0-55\nisolated 4-55\nbindable 0-55\nbindable_priv -\n"
       printf "weka_allowed 0-3\n"
       for c in $(seq 14 27); do printf "weka_allowed %s\n" "$c"; done; } > "$d/probe/h1"
     printf "h1\t-\t-\t4-13,28-55\t-\n" > "$d/targets.final"
@@ -3568,7 +3636,7 @@ $ENGINE_ORDER
 $LINE_RATE_SLOTS" ] || { printf "%s\n" "$aw" >&2; false; }'
 t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
     (source ./wekatester; WORK_DIR=$d
      # no list: 8 - weka 2,5 - the reserve 0,1 = 4
      [ "$(usable_cores h1)" = 4 ] &&
@@ -3594,7 +3662,7 @@ t_assert "pinning: a mixed isolated+housekeeping list is allowed with a note (sp
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     out=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-        printf "taskset 0-3\nisolated 4-15\npriv sudo\n" > "$d/probe/h1"
+        printf "taskset 0-3\nisolated 4-15\nbindable 0-15\nbindable_priv -\npriv sudo\n" > "$d/probe/h1"
         printf "h1\t-\t-\t0-15\t-\n" > "$d/targets.final"
         check_cpu_pinning) 2>&1 )
     case "$out" in
@@ -3606,7 +3674,7 @@ t_assert "pinning: a pure-isolated request needs no escalator (self-affinable)" 
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-     printf "taskset 0-3\nisolated 4-15\n" > "$d/probe/h1"
+     printf "taskset 0-3\nisolated 4-15\nbindable 0-15\nbindable_priv -\n" > "$d/probe/h1"
      printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
@@ -3614,7 +3682,7 @@ t_assert "pinning: privileges are as-needed -- self-affinable mask ignores an av
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth
-     printf "taskset 0-3\nisolated 4-15\npriv dzdo -n\n" > "$d/probe/h1"
+     printf "taskset 0-3\nisolated 4-15\nbindable 0-15\nbindable_priv -\npriv dzdo -n\n" > "$d/probe/h1"
      printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
@@ -4444,7 +4512,7 @@ t_assert "cal_plan max: a sync engine runs the job counts at iodepth 1, as the l
 # i/i+n/2 (split, as most x86 servers do), one socket
 topo_fixture() {
     local f=$1 n=$2 how=$3 c k; shift 3
-    { printf "ncpus %s\nonline 0-%s\nengines io_uring libaio psync \n" "$n" "$((n - 1))"
+    { printf "ncpus %s\nonline 0-%s\nbindable 0-%s\nbindable_priv -\nengines io_uring libaio psync \n" "$n" "$((n - 1))" "$((n - 1))"
       for c in "$@"; do printf "weka_allowed %s\n" "$c"; done
       for c in $(seq 0 $((n - 1))); do
           if [ "$how" = adjacent ]; then k="$(( c / 2 * 2 ))-$(( c / 2 * 2 + 1 ))"
@@ -4463,7 +4531,7 @@ t_assert "probe_cores: siblings numbered i and i+8 are found from the topology, 
     IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
     [ "${head%% *}" = 4 ] && [ "$phys" = 2,3,4,5 ] && [ "$all" = 2,3,4,5,10,11,12,13 ] && [ "$res" = "0,8 1,9" ] || { echo "$head|$phys|$all|$res" >&2; false; }'
 t_assert "cores_summary: with weka on core 0, a host-file list reserves nothing more and the sum still adds up" bash -c '
-    d=$(mktemp -d); printf "ncpus 8\nweka_allowed 0\nweka_allowed 7\n" > "$d/p"
+    d=$(mktemp -d); printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 0\nweka_allowed 7\n" > "$d/p"
     out=$(cores_line "$d/p" 2-6)
     case "$out" in "8 physical core(s) (no topology: one per cpu) - 2 weka DPDK - 0 reserved for the OS (none) - 1 outside the host-file cpu list = N=5: "*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "probe_cores: a list covering every cpu fio could use counts as none, however it is spelled; a narrower one is the operator reserve" bash -c '
@@ -4472,7 +4540,7 @@ t_assert "probe_cores: a list covering every cpu fio could use counts as none, h
     # on 18-31, with 0-1 14-15 16-17 reserved
     topo_fixture "$d/p" 32 adjacent 2 4 6 8 10 12
     # field client B: 64 cores without SMT, weka on 48-63: N=41
-    { printf "ncpus 64\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/q"
+    { printf "ncpus 64\nbindable 0-63\nbindable_priv -\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/q"
     # n ncores dpdk catchall unlisted unbound topo weka_core0 | phys | all | reserved
     all="18,19,20,21,22,23,24,25,26,27,28,29,30,31"
     for l in "" 0-31 1-31 14-31 0-63; do
@@ -4493,7 +4561,7 @@ t_assert "probe_cores: a list covering every cpu fio could use counts as none, h
     [ "$(cores_facts "$d/q" 2-47 | cut -d" " -f1)" = 46 ] || { echo "2-47" >&2; false; }'
 t_assert "probe_cores: two sockets reserve core 0 and the next of socket 0, then the first two of socket 1; 5-8 DPDK cores add one" bash -c '
     d=$(mktemp -d)
-    { printf "ncpus 64\nonline 0-63\n"
+    { printf "ncpus 64\nonline 0-63\nbindable 0-63\nbindable_priv -\n"
       for c in $(seq 24 31); do printf "weka_allowed %s\n" "$c"; done
       for c in $(seq 0 63); do k=$(( c % 32 ))
           printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s,%s\n" $c $(( k / 16 )) $c $k $c $k $(( k + 32 )); done; } > "$d/p"
@@ -4509,15 +4577,15 @@ t_assert "probe_cores, cores_summary, reserve_count and probe_aio_room give the 
     d=$(mktemp -d)
     topo_fixture "$d/p1" 32 adjacent 2 4 6 8 10 12
     topo_fixture "$d/p2" 16 split 6 7
-    { printf "ncpus 64\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/p3"
-    { printf "ncpus 64\nonline 0-63\n"
+    { printf "ncpus 64\nbindable 0-63\nbindable_priv -\n"; for c in $(seq 48 63); do printf "weka_allowed %s\n" "$c"; done; } > "$d/p3"
+    { printf "ncpus 64\nonline 0-63\nbindable 0-63\nbindable_priv -\n"
       for c in $(seq 24 31); do printf "weka_allowed %s\n" "$c"; done
       for c in $(seq 0 63); do k=$(( c % 32 ))
           printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\ntopo_thread_siblings_list %s %s,%s\n" $c $(( k / 16 )) $c $k $c $k $(( k + 32 )); done; } > "$d/p4"
     printf "ncpus 6\nonline 0-3,6-7\nbindable 0,1,2,3,6\nbindable_priv 7\naio_max_nr 65536\naio_nr 1024\n" > "$d/p5"
-    printf "ncpus 8\nweka_allowed 0\nweka_allowed 7\nweka_allowed 0-7\nisolated 4-7\naio_max_nr 100\naio_nr 200\n" > "$d/p6"
-    printf "engines psync \n" > "$d/p7"
-    { printf "ncpus 6\nonline 2-7\n"
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 0\nweka_allowed 7\nweka_allowed 0-7\nisolated 4-7\naio_max_nr 100\naio_nr 200\n" > "$d/p6"
+    printf "engines psync \nbindable -\n" > "$d/p7"
+    { printf "ncpus 6\nonline 2-7\nbindable 2-7\nbindable_priv -\n"
       for c in 2 3 4 5 6 7; do printf "topo_physical_package_id %s %s\ntopo_core_id %s %s\n" $c $(( c / 4 )) $c $(( c / 2 )); done; } > "$d/p8"
     aw=$(source ./wekatester; awkrun "BEGIN {
         nl = split(\"-|0-3|2-6|4-11|18-31|16-31|0-63|1-255\", LS, \"|\")
@@ -4826,7 +4894,7 @@ t_assert "tuner: a catch-all cpu list the OS reserve empties says so, and how to
     [ "$rc" -ne 0 ] && case "$err" in *"h1: the host file'"'"'s cpu list (0-15) covers every cpu fio could use, which counts as no list"*"list fewer cpus (a narrower list is the operator"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "pinning: under -a a list covering every cpu fio could use follows the tuner -- one note, the reserve out of the effective set" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
-    printf "ncpus 64\ntaskset 0-63\nweka_allowed 52\nweka_allowed 53\n" > "$d/probe/h1"
+    printf "ncpus 64\ntaskset 0-63\nbindable 0-63\nbindable_priv -\nweka_allowed 52\nweka_allowed 53\n" > "$d/probe/h1"
     # every cpu the host has and more, or every cpu but weka and core 0: the same
     for l in 0-128 1-51,54-63; do
         printf "h1\t-\t-\t%s\t-\n" "$l" > "$d/targets.final"
@@ -5975,9 +6043,9 @@ t_assert "identity: an empty ident line is a box with no readable id, not a fail
 # and a host without a request is skipped as before.
 t_assert "pinning: one pass over the fleet -- notes in host order, a rowless host pinned off core 0 and weka" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
-    printf "ncpus 8\ntaskset 0-7\nweka_allowed 2\n" > "$d/probe/h1"
-    printf "ncpus 8\ntaskset 0-7\n" > "$d/probe/h2"
-    printf "ncpus 4\ntaskset 0-3\npriv sudo -n\n" > "$d/probe/h3"
+    printf "ncpus 8\ntaskset 0-7\nbindable 0-7\nbindable_priv -\nweka_allowed 2\n" > "$d/probe/h1"
+    printf "ncpus 8\ntaskset 0-7\nbindable 0-7\nbindable_priv -\n" > "$d/probe/h2"
+    printf "ncpus 4\ntaskset 0-3\nbindable 0-3\nbindable_priv -\npriv sudo -n\n" > "$d/probe/h3"
     printf "h1\t-\t-\t0-3\t-\nh3\t-\t-\t0-7\t-\n" > "$d/targets.final"
     out=$( (source ./wekatester
         WORK_DIR=$d; HOSTS=(h1 h2 h3); AUTH_DIR=$d/auth

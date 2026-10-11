@@ -1,6 +1,6 @@
 # --- probe facts (the probe snippet's lines, P[1..np]) ---
-# Cpus on the first "key <list>" line: "-" means tested and empty; an absent
-# line (0) means untested, and the caller falls back to its own rule.
+# Cpus on the first "key <list>" line: "-" means tested and empty; 0 when
+# the line is absent.
 function probe_cpu_fact(P, np, key, S,    i, F) {
     split("", S)
     for (i = 1; i <= np; i++)
@@ -16,10 +16,11 @@ function probe_universe(P, np, ncpus, U,    c) {
     split("", U)
     for (c = 0; c < ncpus; c++) U[c] = 1
 }
-# Cpus outside the probe's bindable sets; empty when it could not read them.
+# Cpus outside the probe's bindable sets. probe_workers stops a host
+# without a bindable line, so none here is a broken probe, never a guess.
 function probe_unbindable(P, np, U, UB,    B, BP, c) {
     split("", UB)
-    if (!probe_cpu_fact(P, np, "bindable", B)) return
+    if (!probe_cpu_fact(P, np, "bindable", B)) awk_fail("probe: no bindable line, so which cpus this host binds is unknown")
     probe_cpu_fact(P, np, "bindable_priv", BP)
     for (c in U) if (!(c in B) && !(c in BP)) UB[c] = 1
 }
