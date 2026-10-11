@@ -1919,6 +1919,41 @@ t_assert "client list: the early check skips what staging skips, a long name wit
     hosts=(); for i in $(seq 1 450); do hosts+=("worker-$i.example.com"); done
     out=$( (source ./wekatester; HOSTS=("${hosts[@]}"); SET_DIR_OVERRIDE=$d/set; TARGET_DIR=/dev/shm/fio-jobfiles
             early_client_cmdline_check) 2>&1 ) || { echo "$out" >&2; exit 1; }'
+# A blank in filename_format: the seed and layout readers cut the name there
+# and the truncate list split it (a b -> truncate -s bM a); refused (Frank,
+# 2026-10-11).
+t_assert "staging: a filename_format with a space dies naming the jobfile and the value, before the probe and calibration" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    printf "# report iops\n[global]\nfilename_format=a b.\$jobnum.\$filenum\n[io]\nrw=randread\n" > "$SETFIX/041-sp.job"
+    w=$(mktemp -d); mkdir -p "$w/jobs"
+    err=$( (source ./wekatester
+        LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w; DRY_RUN=1
+        TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+        stage_jobfiles) 2>&1 >>$WT_ASIDE ) && { echo "staged: $err" >&2; exit 1; }
+    case "$err" in *"ERROR: $SETFIX/041-sp.job: filename_format must not contain whitespace: '"'"'a b.\$jobnum.\$filenum'"'"'"*) ;; *) echo "$err" >&2; exit 1;; esac
+    [ ! -e "$w/set/041-sp.job" ] || { echo "copied before the check" >&2; exit 1; }
+    m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
+    printf "%s\n" "$m" | awk "/check_filename_formats/ && !c {c = NR} /probe_workers/ && !p {p = NR} /^    calibrate\$/ {k = NR} END {exit !(c && p > c && k > c)}"'
+t_assert "staging: a filename_format with a tab, in a job section, dies the same way" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    t=$(printf "\t")
+    printf "# report iops\n[global]\nnumjobs=1\n[io]\nfilename_format=a\tb\nrw=randread\n" > "$SETFIX/041-tab.job"
+    w=$(mktemp -d); mkdir -p "$w/jobs"
+    err=$( (source ./wekatester
+        LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w; DRY_RUN=1
+        TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+        stage_jobfiles) 2>&1 >>$WT_ASIDE ) && { echo "staged: $err" >&2; exit 1; }
+    case "$err" in *"ERROR: $SETFIX/041-tab.job: filename_format must not contain whitespace: '"'"'a${t}b'"'"'"*) ;; *) echo "$err" >&2; exit 1;; esac'
+t_assert "staging: a filename_format without blanks still stages, host-prefixed" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    w=$(mktemp -d); mkdir -p "$w/jobs"
+    (source ./wekatester
+     HOSTS=(h1); MASTER=h1; WORK_DIR=$w; DRY_RUN=1
+     TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+     stage_jobfiles) >>$WT_ASIDE 2>&1 || exit 1
+    grep -qx "filename_format=h1.small.\$jobnum" "$w/jobs/h1/031-iops.job" &&
+    grep -qx "filename_format=h1.big/\$jobnum" "$w/jobs/h1/011-bw.job" ||
+    { cat "$w/jobs/h1/031-iops.job" >&2; false; }'
 t_assert "dry run: -n runs the pinning check, so what the real run pins -- or dies on -- shows up first" bash -c '
     m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
     dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")
