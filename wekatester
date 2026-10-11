@@ -6742,14 +6742,21 @@ stage_jobfiles() {
 
     discover_jobfiles "$JOBFILE_SRC"
 
-    # Source files plus a layout job: a set own layout file is kept, any other
-    # set gets one generated here, never in the source dir.
+    # Source files plus a layout job: a set own layout file is kept (under -g
+    # left out and regenerated), any other set gets one generated here, never
+    # in the source dir.
     SET_DIR="$WORK_DIR/set"
     mkdir -p "$SET_DIR"
     local job has_layout=0 v
     for job in "${JOBFILES[@]}"; do
+        if is_layout_file "$JOBFILE_SRC/$job"; then
+            if [ "$REGEN_LAYOUT" -eq 1 ]; then
+                log "-g: regenerating the layout in place of the set's own $job ($JOBFILE_SRC is untouched)"
+                continue
+            fi
+            has_layout=1
+        fi
         cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
-        is_layout_file "$JOBFILE_SRC/$job" && has_layout=1
     done
     if [ "$BULK" -eq 1 ]; then
         local twins

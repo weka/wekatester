@@ -1147,6 +1147,64 @@ t_assert "staging: a set with its own layout file is not regenerated" bash -c '
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
      stage_jobfiles >>$WT_ASIDE
      grep -q "sha256=0000" "$WORK_DIR/set/000-wekatester-layout.job")'
+# -g: the set's own layout job gives way to a fresh one in the STAGED copy;
+# the source directory is never changed (code review #2, Frank, 2026-10-11).
+t_assert "staging: -g stages a regenerated layout for a hand-edited own one, renamed or not; the source stays byte-identical" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    for name in 000-wekatester-layout.job 090-mylayout.job; do
+        s=$(mktemp -d); w=$(mktemp -d); o=$(mktemp); cp "$SETFIX"/*.job "$s/"; mkdir -p "$w/jobs"
+        (source ./wekatester; generate_layout "$s" "$s") >>$WT_ASIDE || exit 1
+        [ "$name" = 000-wekatester-layout.job ] || mv "$s/000-wekatester-layout.job" "$s/$name"
+        echo "# operator note" >> "$s/$name"; cp "$s/$name" "$o"
+        (source ./wekatester
+         LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w; REGEN_LAYOUT=1; DRY_RUN=1
+         TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$s
+         stage_jobfiles >>$WT_ASIDE
+         [ "${JOBFILES[*]}" = "000-wekatester-layout.job 011-bw.job 031-iops.job" ] &&
+         layout_variant_pristine "$w/set") || { echo "$name: not regenerated" >&2; exit 1; }
+        v="$w/jobs/localhost/000-wekatester-layout.job"
+        cmp "$o" "$s/$name" >>$WT_ASIDE && [ "$(ls "$s" | wc -l)" -eq 3 ] &&
+        { [ "$name" = 000-wekatester-layout.job ] || [ ! -e "$w/set/$name" ]; } &&
+        ! grep -q "operator note" "$v" && grep -qx "directory=/mnt/x" "$v" || { echo "$name:" >&2; cat "$v" >&2; exit 1; }
+    done'
+t_assert "staging: without -g a hand-edited own layout is staged as written" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE || exit 1
+    l="$SETFIX/000-wekatester-layout.job"; o=$(mktemp); echo "# operator note" >> "$l"; cp "$l" "$o"
+    w=$(mktemp -d); mkdir -p "$w/jobs"
+    (source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w; REGEN_LAYOUT=0; DRY_RUN=1
+     TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+     stage_jobfiles) >>$WT_ASIDE || exit 1
+    cmp "$o" "$l" >>$WT_ASIDE && cmp "$o" "$w/set/000-wekatester-layout.job" >>$WT_ASIDE &&
+    grep -qx "# operator note" "$w/jobs/localhost/000-wekatester-layout.job"'
+t_assert "staging -a -g: a hand-edited own layout is regenerated and re-derived per host, with no edited-layout warning" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE || exit 1
+    echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
+    err=$( (source ./wekatester
+     HOSTS=(h1 h2); MASTER=h1; WORK_DIR=$FIX; AUTO_LEVEL=max; REGEN_LAYOUT=1; DRY_RUN=1
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; SET_DIR_OVERRIDE=$FIX/src
+     stage_jobfiles) 2>&1 >>$WT_ASIDE ) || { echo "$err" >&2; exit 1; }
+    for h in h1 h2; do
+        v="$FIX/jobs/$h/000-wekatester-layout.job"
+        grep -q "re-derived by wekatester auto\[max\]" "$v" && ! grep -q "operator note" "$v" || { cat "$v" >&2; exit 1; }
+    done
+    case "$err" in *"user-edited layout"*) echo "$err" >&2; false;; *) true;; esac'
+t_assert "staging -g: a discovered engine reaches the regenerated layout as it reaches a generated one" bash -c '
+    d=$(mktemp -d); s=$(mktemp -d); mkdir -p "$d/jobs"
+    printf "# report bandwidth\n[global]\nfilesize=1G\nnumjobs=1\n[a]\nrw=read\n" > "$s/011-a.job"
+    printf "# report iops\n[global]\nfilesize=1G\nnumjobs=1\n[c]\nioengine=psync\nrw=randwrite\n" > "$s/032-c.job"
+    (source ./wekatester; generate_layout "$s" "$s") >>$WT_ASIDE || exit 1
+    echo "# operator note" >> "$s/000-wekatester-layout.job"
+    printf "h1 libaio\n" > "$d/engine.discovered"
+    (source ./wekatester
+     HOSTS=(h1 h2); MASTER=h1; WORK_DIR=$d; REGEN_LAYOUT=1; DRY_RUN=1; ENGINE=""
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/global; SET_DIR_OVERRIDE=$s
+     stage_jobfiles) >>$WT_ASIDE 2>&1 || exit 1
+    v="$d/jobs/h1/000-wekatester-layout.job"
+    grep -qx "ioengine=libaio" "$v" && ! grep -q "operator note" "$v" &&
+    grep -qx "ioengine=psync" "$d/jobs/h2/000-wekatester-layout.job" || { cat "$v" >&2; false; }'
 t_assert "tuner: a pristine layout is re-derived per host at every level, covering what each host runs" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report iops\n[global]\nfilesize=10G\nnumjobs=4\nioengine=libaio\ndirectory=/orig\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
