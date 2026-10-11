@@ -2554,6 +2554,21 @@ t_assert "cleanup: a privileged host gets a privileged fio kill, an unprivileged
     grep -q "^h1: .*sudo kill" "$d/oplog" &&
     grep -q "^h2: if \[ -f" "$d/oplog" &&
     ! grep -q "^h2: .*sudo" "$d/oplog"'
+# Review #19: an aborted run's fio must not load the cluster through the
+# fleet-wide end pressure/sar round trip.
+t_assert "cleanup: the fio kill comes before the end pressure/sar capture" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d/work; RUN_DIR=$d/run; mkdir -p "$WORK_DIR" "$RUN_DIR"
+     HOSTS=(h1 h2); FIO_STARTED=1; TARGET_DIR=/dev/shm/x; RUN_EPOCH=1
+     run_host() { case "$2" in
+         (*WEKATESTER_SYSINFO*) echo "PRESSURE $1" >> "$d/oplog";;
+         (*) echo "KILL $1" >> "$d/oplog";;
+     esac; }
+     cleanup) >>$WT_ASIDE 2>&1
+    cat "$d/oplog" >>$WT_ASIDE
+    awk "/^KILL/ { k++; last = NR } /^PRESSURE/ { p++; if (!first) first = NR }
+         END { exit !(k == 2 && p == 2 && last < first) }" "$d/oplog"'
 t_assert "run_jobs: layout is timed create_only -- no markers, no rebuild selection" bash -c '
     d=$(mktemp -d)
     out=$( (source ./wekatester

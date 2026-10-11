@@ -168,12 +168,6 @@ PORTEOF
 cleanup() {
     local host f priv pids=() kcmd i
     local -A grm=()
-    # the end-of-run pressure/sar capture rides the still-open connections;
-    # after this function the control masters are gone
-    if [ "$PRESSURE_END_DONE" -eq 0 ]; then
-        PRESSURE_END_DONE=1
-        snapshot_pressure end
-    fi
     [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
@@ -193,6 +187,13 @@ cleanup() {
         # These pids only: a bare wait also waits on the run-log tees, which
         # exit only after cleanup returns. That is a deadlock.
         wait "${pids[@]}" || true
+    fi
+    # fio stops first: an aborted run's servers must not load the cluster
+    # through this fleet-wide pressure/sar round trip. It rides the masters,
+    # which close only at the end of this function.
+    if [ "$PRESSURE_END_DONE" -eq 0 ]; then
+        PRESSURE_END_DONE=1
+        snapshot_pressure end
     fi
     # a run that ended before its fio started: the locks on their own, and
     # this run's group file when collect_fs_groups has not removed it (every
