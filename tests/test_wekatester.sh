@@ -3424,7 +3424,7 @@ t_assert "parse: a trailing valueless option still dies asking for an argument" 
 t_assert "mount guard: unwritable -d dies with the chmod hint before anything runs" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
-            run_host() { case "$2" in (findmnt*) echo "wekafs rw,forcedirect";; (*) return 1;; esac; }
+            run_host() { case "$2" in (findmnt*) printf "wekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";; (*) return 1;; esac; }
             verify_mount_mode) 2>&1 >>$WT_ASIDE )
     case "$err" in
         *"localhost: cannot create files in /mnt/weka"*"chmod 1777"*"/mnt/weka is not writable on every host"*) true;;
@@ -3452,7 +3452,7 @@ t_assert "mount guard: a -d on a local filesystem is refused before anything is 
     esac
     (source ./wekatester
      LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/data
-     run_host() { case "$2" in findmnt*) echo "nfs4 rw,noatime";; *) return 0;; esac; }
+     run_host() { case "$2" in findmnt*) printf "nfs4 rw,noatime\nweka /mnt/weka wekafs rw 0 0\n";; *) return 0;; esac; }
      verify_mount_mode)'
 
 # -r turns the forcedirect stop into a warning. The write probe still runs
@@ -3461,7 +3461,7 @@ t_assert "mount guard: a -d on a local filesystem is refused before anything is 
 t_assert "mount guard: -r makes a cached mount mode a warning and still probes writability" bash -c '
     out=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka; FAST_TRACK=1
-            run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (p=*) echo probed >&2;; (*) return 1;; esac; }
+            run_host() { case "$2" in (findmnt*) printf "wekafs rw,writecache\nweka /mnt/weka wekafs rw 0 0\n";; (p=*) echo probed >&2;; (*) return 1;; esac; }
             verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
     case "$out" in *"must be mounted with forcedirect"*) echo "died: $out" >&2; false;; *) true;; esac &&
     # the warning is said after the loop (one line per mode across hosts), so
@@ -3474,7 +3474,7 @@ t_assert "mount guard: -r makes a cached mount mode a warning and still probes w
 t_assert "mount guard: -r says a fleet-wide cached mode once, not once per host" bash -c '
     out=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka; FAST_TRACK=1
-            run_host() { case "$2" in (findmnt*) echo "wekafs rw,writecache";; (*) return 0;; esac; }
+            run_host() { case "$2" in (findmnt*) printf "wekafs rw,writecache\nweka /mnt/weka wekafs rw 0 0\n";; (*) return 0;; esac; }
             verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
     [ "$(printf "%s\n" "$out" | grep -c "WARNING")" -eq 1 ] &&
     case "$out" in
@@ -3485,9 +3485,9 @@ t_assert "mount guard: -r names the hosts when only some are cached, one line pe
     out=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(h1 h2 h3 h4); DIRECTORY=/mnt/weka; FAST_TRACK=1
             run_host() { case "$1:$2" in
-                (h1:findmnt*|h3:findmnt*) echo "wekafs rw,writecache";;
-                (h2:findmnt*) echo "wekafs rw,readcache";;
-                (h4:findmnt*) echo "wekafs rw,forcedirect";;
+                (h1:findmnt*|h3:findmnt*) printf "wekafs rw,writecache\nweka /mnt/weka wekafs rw 0 0\n";;
+                (h2:findmnt*) printf "wekafs rw,readcache\nweka /mnt/weka wekafs rw 0 0\n";;
+                (h4:findmnt*) printf "wekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*) return 0;; esac; }
             verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1 )
     [ "$(printf "%s\n" "$out" | grep -c "WARNING")" -eq 2 ] &&
@@ -3502,7 +3502,7 @@ t_assert "mount guard: -r names the hosts when only some are cached, one line pe
 t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka; FAST_TRACK=1
-            run_host() { case "$2" in (findmnt*) echo "wekafs rw,readcache";; (*) return 1;; esac; }
+            run_host() { case "$2" in (findmnt*) printf "wekafs rw,readcache\nweka /mnt/weka wekafs rw 0 0\n";; (*) return 1;; esac; }
             verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; false; } &&
     case "$err" in *"must be mounted with forcedirect"*) echo "remount advice under -r: $err" >&2; false;; *) true;; esac &&
@@ -3512,63 +3512,134 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
     esac'
 
 # The mount verified is the mount measured (Frank, 2026-10-11): the check
-# records each host's line, and right before the measured run every host
-# reads it again; any change stops the run, -r included.
-t_assert "mount recheck: the mount check records each host's line and its cksum, in its own round" bash -c '
+# records the destination mount's /proc/mounts line and its cksum, and right
+# before the measured run every host reads it again; any change to that line
+# stops the run, -r included.
+t_assert "mount recheck: the mount check records each host's full /proc/mounts line and its cksum, in its own session, stacked mounts included" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
-     LOCAL_MODE=0; HOSTS=(h1 h2); DIRECTORY=/mnt/weka; WORK_DIR=$d
-     run_host() { echo "$1|$2" >> "$d/calls"; case "$1:$2" in
-         (h1:findmnt*) echo "wekafs rw,relatime,forcedirect";;
-         (h2:findmnt*) echo "nfs4 rw,noatime";;
+     LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka; WORK_DIR=$d
+     run_host() { f=no; p=no
+         case "$2" in (*FSTYPE,OPTIONS*) f=yes;; esac
+         case "$2" in (*/proc/mounts*) p=yes;; esac
+         echo "$1 $f $p" >> "$d/calls"
+         case "$1:$2" in
+         (h1:findmnt*) printf "wekafs rw,relatime,forcedirect\nweka0 /mnt/weka wekafs rw,relatime,forcedirect 0 0\n";;
+         (h2:findmnt*) printf "nfs4 rw,noatime\nsrv:/x /mnt/weka nfs4 rw,noatime,vers=4.2 0 0\n";;
+         (h3:findmnt*) printf "wekafs rw,forcedirect\nwekafs rw,relatime,forcedirect\nweka1 /mnt/weka wekafs rw,relatime,forcedirect 0 0\n";;
          (*) return 0;; esac; }
      verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "the mount check failed" >&2; exit 1; }
-    [ "$(cat "$d/mount/0")" = "wekafs rw,relatime,forcedirect" ] &&
-    [ "$(cat "$d/mount/1")" = "nfs4 rw,noatime" ] &&
-    [ "$(wc -l < "$d/mount/sums")" -eq 2 ] &&
-    [ "$(cat "$d/mount/sums")" = "$(cd "$d/mount" && cksum 0 1)" ] &&
-    [ "$(grep -c findmnt "$d/calls")" -eq 2 ] ||
+    [ "$(cat "$d/mount/0")" = "weka0 /mnt/weka wekafs rw,relatime,forcedirect 0 0" ] &&
+    [ "$(cat "$d/mount/1")" = "srv:/x /mnt/weka nfs4 rw,noatime,vers=4.2 0 0" ] &&
+    [ "$(cat "$d/mount/2")" = "weka1 /mnt/weka wekafs rw,relatime,forcedirect 0 0" ] &&
+    [ "$(wc -l < "$d/mount/sums")" -eq 3 ] &&
+    [ "$(cat "$d/mount/sums")" = "$(cd "$d/mount" && cksum 0 1 2)" ] &&
+    [ "$(grep -c "^h[123] yes yes\$" "$d/calls")" -eq 3 ] &&
+    [ "$(grep -c " yes" "$d/calls")" -eq 3 ] ||
         { echo "record: $(head "$d"/mount/* 2>&1); calls: $(cat "$d/calls")" >&2; false; }'
-t_assert "mount recheck: a created destination is recorded with the line of the mount it was created on" bash -c '
+t_assert "mount recheck: a created destination is recorded with the /proc/mounts line of the mount it was created on" bash -c '
     d=$(mktemp -d)
     (export WEKATESTER_PROMPT_TTY=/dev/null
      source ./wekatester
      LOCAL_MODE=1; HOSTS=(h1); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1; WORK_DIR=$d
      run_host() { case "$2" in
          (findmnt*)  return 1;;
-         ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\n";;
+         ("[ ! -e"*) case "$2" in (*"/proc/mounts") ;; (*) return 1;; esac
+                     printf "/mnt/weka\nwekafs rw,relatime,forcedirect\nweka0 /mnt/weka wekafs rw,relatime,forcedirect 0 0\n";;
          (*)         return 0;; esac; }
      verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "the mount check failed" >&2; exit 1; }
-    [ "$(cat "$d/mount/0")" = "wekafs rw,relatime,forcedirect" ] ||
+    [ "$(cat "$d/mount/0")" = "weka0 /mnt/weka wekafs rw,relatime,forcedirect 0 0" ] ||
         { echo "record: $(head "$d"/mount/* 2>&1)" >&2; false; }'
-t_assert "mount recheck: unchanged mounts pass, one read per host, by the mount check's own command" bash -c '
+t_assert "mount recheck: a destination whose /proc/mounts line is not found stops the mount check" bash -c '
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2); DIRECTORY=/mnt/weka
+            run_host() { case "$1:$2" in
+                (h1:findmnt*) printf "wekafs rw,forcedirect\nweka0 /mnt/weka wekafs rw,forcedirect 0 0\n";;
+                (h2:findmnt*) printf "wekafs rw,forcedirect\n\n";;
+                (*) return 0;; esac; }
+            verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit" >&2; exit 1; }
+    case "$err" in *"h1:"*) echo "blamed h1: $err" >&2; exit 1;; esac
+    case "$err" in
+        *"h2: no /proc/mounts line for the mount holding /mnt/weka"*"/proc/mounts line was not found on every host"*) ;;
+        *) echo "$err" >&2; exit 1;;
+    esac'
+t_assert "mount recheck: unchanged lines pass, one read per host, and both reads use the one command builder" bash -c '
     d=$(mktemp -d)
     out=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(h1 h2); DIRECTORY=/mnt/weka; WORK_DIR=$d
-            run_host() { echo "$1|$2" >> "$d/calls"; case "$2" in (findmnt*) echo "wekafs rw,forcedirect";; (*) return 0;; esac; }
-            verify_mount_mode && : > "$d/calls" && check_mounts_unchanged && echo rc=0) 2>&1 )
+            q=$(printf "\047"); mount_line_cmd_v "$q/mnt/weka$q"; printf "%s" "$MOUNT_LINE_CMD" > "$d/expect"
+            run_host() { case "$2" in
+                (findmnt*) printf "%s" "$2" > "$d/verify.$1"; echo "$1 verify" >> "$d/calls"
+                           printf "wekafs rw,forcedirect\nweka0 /mnt/weka wekafs rw,forcedirect 0 0\n";;
+                ("t="*)    printf "%s" "$2" > "$d/recheck.$1"; echo "$1 recheck" >> "$d/calls"
+                           echo "weka0 /mnt/weka wekafs rw,forcedirect 0 0";;
+                (*) return 0;; esac; }
+            verify_mount_mode && check_mounts_unchanged && echo rc=0) 2>&1 )
     case "$out" in *ERROR*|*WARNING*) echo "$out" >&2; exit 1;; *rc=0*) ;; *) echo "$out" >&2; exit 1;; esac
-    [ "$(wc -l < "$d/calls")" -eq 2 ] &&
-    [ "$(grep -c "^h[12]|findmnt -T .*/mnt/weka.* -n -o FSTYPE,OPTIONS\$" "$d/calls")" -eq 2 ] ||
+    q=$(printf "\047")
+    for h in h1 h2; do
+        [ "$(cat "$d/recheck.$h")" = "$(cat "$d/expect")" ] &&
+        [ "$(cat "$d/verify.$h")" = "findmnt -T $q/mnt/weka$q -n -o FSTYPE,OPTIONS && $(cat "$d/expect")" ] ||
+            { echo "$h: verify [$(cat "$d/verify.$h")] recheck [$(cat "$d/recheck.$h")] expect [$(cat "$d/expect")]" >&2; exit 1; }
+    done
+    [ "$(grep -c " recheck\$" "$d/calls")" -eq 2 ] && [ "$(grep -c " verify\$" "$d/calls")" -eq 2 ] ||
         { echo "calls: $(cat "$d/calls")" >&2; false; }'
-t_assert "mount recheck: a changed or unreadable line stops the run under -r, naming each host with its old and new line" bash -c '
+t_assert "mount recheck: under -r a change to only an option, only the source or only dump/pass, an unreadable host, or a missing line each stop the run with the old and new line" bash -c '
     d=$(mktemp -d)
+    r="weka0 /mnt/weka wekafs rw,relatime,forcedirect 0 0"
+    printf "%s\n" "$r" > "$d/rec"
+    printf "%s\n" "$r" > "$d/now.h1"
+    printf "%s\n" "weka0 /mnt/weka wekafs rw,relatime,forcedirect,noatime 0 0" > "$d/now.h2"
+    printf "%s\n" "weka1 /mnt/weka wekafs rw,relatime,forcedirect 0 0" > "$d/now.h3"
+    printf "%s\n" "weka0 /mnt/weka wekafs rw,relatime,forcedirect 1 2" > "$d/now.h4"
     err=$( (source ./wekatester
-            LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka; WORK_DIR=$d; FAST_TRACK=1
+            LOCAL_MODE=0; HOSTS=(h1 h2 h3 h4 h5 h6); DIRECTORY=/mnt/weka; WORK_DIR=$d; FAST_TRACK=1
             run_host() { case "$1:$2" in
-                (h2:findmnt*) if [ -e "$d/changed" ]; then echo "wekafs rw,writecache"; else echo "wekafs rw,forcedirect"; fi;;
-                (h3:findmnt*) [ ! -e "$d/changed" ] || return 1; echo "wekafs rw,forcedirect";;
-                (*:findmnt*)  echo "wekafs rw,forcedirect";;
-                (*)           return 0;; esac; }
+                (*:findmnt*) printf "wekafs rw,relatime,forcedirect\n"; cat "$d/rec";;
+                (h5:t=*)     return 1;;
+                (h6:t=*)     ;;
+                (*:t=*)      cat "$d/now.$1";;
+                (*)          return 0;; esac; }
             verify_mount_mode || exit 9
-            : > "$d/changed"
             check_mounts_unchanged; echo "survived rc=$?") 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -eq 1 ] || { echo "rc=$rc: $err" >&2; exit 1; }
-    case "$err" in *"h1:"*) echo "named an unchanged host: $err" >&2; exit 1;; esac
-    case "$err" in
-        *"ERROR: h2: the mount at /mnt/weka changed since the mount check -- was \"wekafs rw,forcedirect\", now \"wekafs rw,writecache\""*"ERROR: h3: the mount at /mnt/weka changed since the mount check -- was \"wekafs rw,forcedirect\", now unreadable (findmnt rc=1)"*"the destination mount changed on 2 of 3 host(s) after it was verified; the measured run did not start"*) ;;
-        *) echo "$err" >&2; exit 1;;
-    esac'
+    case "$err" in *"ERROR: h1:"*) echo "named an unchanged host: $err" >&2; exit 1;; esac
+    w="the mount at /mnt/weka changed since the mount check -- was \"$r\", now"
+    for want in "h2: $w \"weka0 /mnt/weka wekafs rw,relatime,forcedirect,noatime 0 0\"" \
+                "h3: $w \"weka1 /mnt/weka wekafs rw,relatime,forcedirect 0 0\"" \
+                "h4: $w \"weka0 /mnt/weka wekafs rw,relatime,forcedirect 1 2\"" \
+                "h5: $w unreadable (rc=1)" \
+                "h6: $w no /proc/mounts line" \
+                "the destination mount changed on 5 of 6 host(s) after it was verified; the measured run did not start"; do
+        case "$err" in *"$want"*) ;; *) echo "missing [$want] in: $err" >&2; exit 1;; esac
+    done'
+# The remote string itself, run for real by sh and bash: findmnt is stubbed
+# to name the mount point, and a fixture stands in for /proc/mounts.
+t_assert "mount recheck: the real snippet -- a \\040 mount point matches, a stacked mount gives the last line, \\134 decodes, no match prints nothing" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"
+    printf "#!/bin/sh\necho \"\$*\" >> \"%s/asked\"\ncat \"%s/target\"\n" "$d" "$d" > "$d/bin/findmnt"; chmod +x "$d/bin/findmnt"
+    printf "%s\n" "rootfs / ext4 rw 0 0" "weka0 /mnt/my\\040weka wekafs rw,forcedirect 0 0" \
+        "weka0 /mnt/my\\040wekaX wekafs rw 0 0" "weka0 /mnt/stack wekafs rw,readcache 0 0" \
+        "weka1 /mnt/stack wekafs rw,forcedirect 0 0" "bs /mnt/a\\134b wekafs rw 0 0" > "$d/mounts"
+    cmd=$(source ./wekatester; mount_line_cmd_v "\"/x/y\""; printf "%s" "$MOUNT_LINE_CMD")
+    case "$cmd" in *" /proc/mounts") ;; *) echo "does not read /proc/mounts last: $cmd" >&2; exit 1;; esac
+    cmd="${cmd% /proc/mounts} $d/mounts"
+    for sh in sh bash; do
+        for c in "/mnt/my weka|weka0 /mnt/my\\040weka wekafs rw,forcedirect 0 0" \
+                 "/mnt/stack|weka1 /mnt/stack wekafs rw,forcedirect 0 0" \
+                 "/mnt/a\\b|bs /mnt/a\\134b wekafs rw 0 0" "/mnt/none|"; do
+            printf "%s\n" "${c%%|*}" > "$d/target"
+            out=$(PATH="$d/bin:$PATH" $sh -c "$cmd"); rc=$?
+            [ "$rc" -eq 0 ] && [ "$out" = "${c#*|}" ] || { echo "$sh, target [${c%%|*}]: rc=$rc out [$out]" >&2; exit 1; }
+        done
+        # findmnt -T names a stacked mount point once per mount
+        printf "%s\n" /mnt/stack /mnt/stack > "$d/target"
+        out=$(PATH="$d/bin:$PATH" $sh -c "$cmd"); rc=$?
+        [ "$rc" -eq 0 ] && [ "$out" = "weka1 /mnt/stack wekafs rw,forcedirect 0 0" ] ||
+            { echo "$sh, stacked findmnt: rc=$rc out [$out]" >&2; exit 1; }
+    done
+    grep -qx -- "-T /x/y -n -o TARGET" "$d/asked" || { cat "$d/asked" >&2; exit 1; }'
 t_assert "mount recheck: main runs it once, after the dry-run exit, right before run_jobs" bash -c '
     body=$(source ./wekatester; declare -f main)
     [ "$(printf "%s\n" "$body" | grep -c check_mounts_unchanged)" -eq 1 ] &&
@@ -3608,7 +3679,7 @@ t_assert "mount guard: missing -d under forcedirect wekafs is created unattended
             LOCAL_MODE=1; HOSTS=(h1 h2); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\n";;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) echo "MKDIR[$1] ${2##*; }" >&2;;
                 (p=*)       echo "PROBE[$1]" >&2;;
                 (*)         return 1;; esac; }
@@ -3631,7 +3702,7 @@ t_assert "mount guard: missing -d without -r needs a terminal and creates nothin
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)         return 1;; esac; }
             verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
@@ -3646,7 +3717,7 @@ t_assert "mount guard: the create prompt -- y creates, n quits without touching 
     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
     run_host() { case "$2" in
         (findmnt*)  return 1;;
-        ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+        ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
         (*"mkdir -p --"*) echo MKDIR >&2;;
         (*)         return 0;; esac; }
     yes_out=$(printf y | { verify_mount_mode; } 2>&1); yes_rc=$?
@@ -3665,7 +3736,7 @@ t_assert "prompts: an untimed question whose yes changes something takes a y -- 
     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt
     run_host() { case "$2" in
         (findmnt*)  return 1;;
-        ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+        ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
         (*"mkdir -p --"*) echo MKDIR >&2;;
         (*)         return 0;; esac; }
     out=$(printf "\n" | { verify_mount_mode; } 2>&1) && { echo "Enter went ahead: $out" >&2; exit 1; }
@@ -3712,7 +3783,7 @@ t_assert "mount guard: -r under a cached-mode parent warns, creates and probes" 
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\n";;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,writecache\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) echo MKDIR >&2;;
                 (p=*)       echo PROBED >&2;;
                 (*)         return 1;; esac; }
@@ -3728,7 +3799,7 @@ t_assert "mount guard: nothing is created while another host fails" bash -c '
             run_host() { case "$1:$2" in
                 (h1:findmnt*)  echo "wekafs rw,writecache";;
                 (h2:findmnt*)  return 1;;
-                (h2:"[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                (h2:"[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) echo MKDIR >&2;;
                 (*)            return 1;; esac; }
             verify_mount_mode) 2>&1 ); rc=$?
@@ -3752,7 +3823,7 @@ t_assert "mount guard: a parent that stops being wekafs before the create leaves
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) return 4;;
                 (p=*)       echo PROBED >&2;;
                 (*)         return 1;; esac; }
@@ -3768,7 +3839,7 @@ t_assert "mount guard: a failed mkdir dies with the chmod hint naming the parent
             LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1
             run_host() { case "$2" in
                 (findmnt*)  return 1;;
-                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\n";;
+                ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (*"mkdir -p --"*) return 1;;
                 (*)         echo PROBED >&2;; esac; }
             verify_mount_mode) 2>&1 >>$WT_ASIDE ); rc=$?
@@ -5550,7 +5621,7 @@ t_assert "mount guard: the rounds fan out -- every findmnt lands before any writ
     d=$(mktemp -d)
     (source ./wekatester
      LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka
-     run_host() { case "$2" in (findmnt*) echo "F $1" >> "$d/order"; echo "wekafs rw,forcedirect";;
+     run_host() { case "$2" in (findmnt*) echo "F $1" >> "$d/order"; printf "wekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                               (p=*) echo "P $1" >> "$d/order";; (*) return 1;; esac; }
      verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "guard failed" >&2; exit 1; }
     [ "$(wc -l < "$d/order")" -eq 6 ] &&
@@ -5560,9 +5631,9 @@ t_assert "mount guard: per-host failures still come out one per host, in host or
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka
             run_host() { case "$1:$2" in
-                (h1:findmnt*) echo "wekafs rw,forcedirect";;
+                (h1:findmnt*) printf "wekafs rw,forcedirect\nweka /mnt/weka wekafs rw 0 0\n";;
                 (h1:p=*)      return 1;;
-                (h2:findmnt*) echo "wekafs rw,readcache";;
+                (h2:findmnt*) printf "wekafs rw,readcache\nweka /mnt/weka wekafs rw 0 0\n";;
                 (h3:*)        return 1;;
                 (*)           return 0;; esac; }
             verify_mount_mode) 2>&1 >>$WT_ASIDE )

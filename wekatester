@@ -3818,10 +3818,21 @@ classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VE
     fi
 }
 
-# The destination's mount line: the mount check classifies it and records
-# it, and check_mounts_unchanged reads it again, with this same command.
-mount_line_cmd_v() {   # mount_line_cmd_v <dir> -> MOUNT_LINE_CMD
-    MOUNT_LINE_CMD="findmnt -T '$1' -n -o FSTYPE,OPTIONS"
+# One line: the /proc/mounts line of the mount holding <dir> (quoted for the
+# remote shell), or an empty one. The last line for its mount point wins, as
+# a stacked mount is the visible one; findmnt -T names the point once per
+# stacked mount.
+mount_line_cmd_v() {   # mount_line_cmd_v <quoted-dir> -> MOUNT_LINE_CMD
+    local prog='BEGIN { t = ENVIRON["T"]; i = index(t, "\n"); if (i) t = substr(t, 1, i - 1) }
+    {
+        m = $2
+        gsub(/\\040/, " ", m); gsub(/\\011/, "\t", m); gsub(/\\012/, "\n", m)
+        n = split(m, p, /\\134/); m = p[1]
+        for (k = 2; k <= n; k++) m = m "\\" p[k]
+        if (m == t) l = $0
+    }
+    END { print l }'
+    MOUNT_LINE_CMD="t=\$(findmnt -T $1 -n -o TARGET) && T=\"\$t\" awk '$prog' /proc/mounts"
 }
 
 # <dir>/<i> holds line i, and <dir>/sums one cksum over them all; the names
@@ -3847,7 +3858,7 @@ check_mounts_unchanged() {
     td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
-        mount_line_cmd_v "${HOST_DIRS[$i]}"
+        mount_line_cmd_v "'${HOST_DIRS[$i]}'"
         ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.out" ) &
         pids[$i]=$!
     done
@@ -3860,12 +3871,14 @@ check_mounts_unchanged() {
     mapfile -t old < "$WORK_DIR/mount/sums"
     mapfile -t new < "$td/now/sums"
     for i in "${!HOSTS[@]}"; do
-        [ "${rcs[$i]}" -ne 0 ] || [ "${old[$i]:-}" != "${new[$i]:-}" ] || continue
+        [ "${rcs[$i]}" -ne 0 ] || [ -z "${now[$i]}" ] || [ "${old[$i]:-}" != "${new[$i]:-}" ] || continue
         was=""; IFS= read -r was < "$WORK_DIR/mount/$i" || :
-        line="\"${now[$i]}\""; [ "${rcs[$i]}" -eq 0 ] || line="unreadable (findmnt rc=${rcs[$i]})"
+        if [ "${rcs[$i]}" -ne 0 ]; then line="unreadable (rc=${rcs[$i]})"
+        elif [ -z "${now[$i]}" ]; then line="no /proc/mounts line"
+        else line="\"${now[$i]}\""; fi
         changed+=("${HOSTS[$i]}: the mount at ${HOST_DIRS[$i]} changed since the mount check -- was \"$was\", now $line")
     done
-    rm -rf "$td"
+    rm -rf "${td:?}"
     if [ ${#changed[@]} -gt 0 ]; then
         for line in "${changed[@]}"; do log "ERROR: $line" >&2; done
         die "the destination mount changed on ${#changed[@]} of ${#HOSTS[@]} host(s) after it was verified; the measured run did not start"
@@ -3881,10 +3894,11 @@ create_dest_cmd() {   # create_dest_cmd <dir>
 }
 
 # For a missing destination: the nearest existing ancestor, then its findmnt
-# FSTYPE,OPTIONS. Nonzero when it does exist, or nothing does. dirname handles
-# a trailing slash and stops at /.
+# FSTYPE,OPTIONS and its mount's /proc/mounts line. Nonzero when it does
+# exist, or nothing does. dirname handles a trailing slash and stops at /.
 missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
-    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; findmnt -T \"\$p\" -n -o FSTYPE,OPTIONS"
+    mount_line_cmd_v '"$p"'
+    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; findmnt -T \"\$p\" -n -o FSTYPE,OPTIONS && $MOUNT_LINE_CMD"
 }
 
 # One probe file as the fio user; on a shared filesystem one failing host
@@ -3998,8 +4012,8 @@ verify_mount_mode() {
     # one name per run, so two runs sharing a destination never read each
     # other's group lines (collect_fs_groups)
     [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
-    local host line verdict failed=() mode_fail=0 write_fail=0 local_fail=0 gone_fail=0 hd anc i ft
-    local missing=() missing_dirs=() missing_parents=()
+    local host line verdict failed=() mode_fail=0 write_fail=0 local_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
+    local missing=() missing_dirs=() missing_parents=() procs=()
     local cached_hosts=() cached_modes=() mode who n
     # Three fan-outs: every host gets the same commands in the same order and
     # the messages come back in host order, as a serial walk produced them;
@@ -4011,15 +4025,16 @@ verify_mount_mode() {
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         hds[$i]=${HOST_DIRS[$i]}
-        mount_line_cmd_v "${hds[$i]}"
-        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
+        mount_line_cmd_v "'${hds[$i]}'"
+        ( run_host "${HOSTS[$i]}" "findmnt -T '${hds[$i]}' -n -o FSTYPE,OPTIONS && $MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
         pids[$i]=$!
     done
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}"; rcs[$i]=$?
-        # findmnt -n prints one line: read it, no $(cat) per host
-        line=""; IFS= read -r line < "$td/$i.mnt" || :
-        lines[$i]=$line
+        # findmnt's line (one per stacked mount), then the /proc/mounts line
+        mapfile -t pl < "$td/$i.mnt"
+        lines[$i]=${pl[0]:-}; procs[$i]=""
+        [ ${#pl[@]} -lt 2 ] || procs[$i]=${pl[-1]}
     done
     # findmnt fails for a path that does not exist: classify the nearest
     # ancestor that does, and remember that the destination is missing
@@ -4031,14 +4046,12 @@ verify_mount_mode() {
     done
     for i in "${!HOSTS[@]}"; do
         [ "${rcs[$i]}" -ne 0 ] || continue
-        line=""
-        if wait "${pids[$i]}"; then
-            # the file as $(cat) gives it (trailing newlines dropped), no fork
-            IFS= read -r -d '' line < "$td/$i.anc" || :
-            line=${line%"${line##*[!$'\n']}"}
-        fi
-        if [ "$line" != "${line#*$'\n'}" ]; then
-            ancs[$i]=${line%%$'\n'*}; lines[$i]=${line#*$'\n'}
+        pl=()
+        # the ancestor, its findmnt line(s), then its /proc/mounts line
+        if wait "${pids[$i]}"; then mapfile -t pl < "$td/$i.anc"; fi
+        if [ ${#pl[@]} -ge 2 ]; then
+            ancs[$i]=${pl[0]}; lines[$i]=${pl[1]}; procs[$i]=""
+            [ ${#pl[@]} -lt 3 ] || procs[$i]=${pl[-1]}
         else
             msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"
         fi
@@ -4077,6 +4090,12 @@ verify_mount_mode() {
                        continue
                    fi ;;
         esac
+        # the line check_mounts_unchanged holds the run to
+        if [ -z "${procs[$i]:-}" ]; then
+            msgs[$i]="$host: no /proc/mounts line for the mount holding ${anc:-$hd} (findmnt -T TARGET names a mount point /proc/mounts does not list)"
+            proc_fail=1
+            continue
+        fi
         if [ -n "$anc" ]; then
             missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc")
             continue   # created below, once the operator agrees, then probed
@@ -4098,7 +4117,7 @@ verify_mount_mode() {
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || failed+=("${msgs[$i]}")
     done
-    rm -rf "$td"
+    rm -rf "${td:?}"
     # The -r warning, one line per distinct cached mode: the host alone when
     # it is one host, "all N" when it is every host, the list otherwise.
     if [ ${#cached_hosts[@]} -gt 0 ]; then
@@ -4170,12 +4189,14 @@ verify_mount_mode() {
             die "the weka mount above a missing destination went away before it was created; nothing was created on a local disk -- check the weka client and re-run"
         [ "$write_fail" -eq 0 ] || \
             die "$DIRECTORY is not writable on every host; fio cannot lay out its files there"
+        [ "$proc_fail" -eq 0 ] || \
+            die "the destination mount's /proc/mounts line was not found on every host; the run is held to that line, so it cannot start"
         die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
     fi
     # the record check_mounts_unchanged compares against; a created
     # destination's line is its parent's, the mount it was created on. The
     # suite calls this phase without a work dir.
-    [ -z "${WORK_DIR:-}" ] || write_mount_lines "$WORK_DIR/mount" "${lines[@]}"
+    [ -z "${WORK_DIR:-}" ] || write_mount_lines "$WORK_DIR/mount" "${procs[@]}"
     debug "mount mode and writability ok on all hosts"
 }
 
