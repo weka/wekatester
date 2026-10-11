@@ -6585,6 +6585,12 @@ t_assert "build: a missing include or awk file stops it by name and leaves the t
     case "$out" in *"cannot read src/awk/y.awk"*) ;; *) echo "[$out]" >&2; exit 1;; esac
     echo "x=1" > "$d/src/sh/x.sh"
     "$d/build" && [ "$(sed -n 3p "$d/wekatester")" = "x=1" ] && head -2 "$d/wekatester" | grep -q "^# Built by ./build"'
+t_assert "build: an out exported by the caller does not redirect a no-argument build" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/src"; cp ./build "$d/"
+    printf "#!/usr/bin/env bash\nx=1\n" > "$d/src/wekatester.sh"
+    out=$d/leaked "$d/build" || exit 1
+    [ ! -e "$d/leaked" ] || { echo "built into the exported out" >&2; exit 1; }
+    [ "$(sed -n 3p "$d/wekatester")" = "x=1" ]'
 t_assert "build: an include cycle, an unknown directive or an assembly bash cannot parse stops it, target untouched" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/sh"; cp ./build "$d/"; echo keep > "$d/wekatester"
     try() {   # try <message>: the build fails within 20 s, saying it

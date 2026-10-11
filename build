@@ -5,6 +5,7 @@
 # Anything wrong stops it by name and leaves the target alone; an assembly
 # bash cannot parse is kept beside the target as <target>.rejected.
 set -euo pipefail
+out=""   # never the caller's: an exported out would redirect the build
 if [ $# -gt 0 ]; then case $1 in /*) out=$1 ;; *) out=$PWD/$1 ;; esac; fi
 cd "$(dirname "$0")"
 out=${out:-$PWD/wekatester}
