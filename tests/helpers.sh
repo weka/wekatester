@@ -200,6 +200,23 @@ readme_usage_block() {   # $1 = README path (default README.md)
 }
 
 
+# --- fan-out: did the per-host work overlap? ---
+# <file> holds "S <host> <usec>" and "E <host> <usec>" lines. True when there
+# are <n> and the last start precedes the first end: one host at a time
+# cannot produce that.
+spans_overlap() {   # spans_overlap <file> <n>
+    local k h t s=0 e=0 n=0
+    while read -r k h t; do
+        n=$((n + 1))
+        case $k in
+            (S) [ "$t" -le "$s" ] || s=$t ;;
+            (E) [ "$e" -ne 0 ] && [ "$t" -ge "$e" ] || e=$t ;;
+        esac
+    done < "$1"
+    [ "$n" -eq "$2" ] && [ "$s" -lt "$e" ] || { echo "no overlap:" >&2; cat "$1" >&2; return 1; }
+}
+export -f spans_overlap
+
 # --- interactive prompts: drive prompt_key over a pipe, capture UI on stdout ---
 # The prompt fds are variables precisely so the suite can point them at a pipe
 # and fd 1 -- no pty involved, nothing blocks waiting for a keystroke.

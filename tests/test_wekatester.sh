@@ -1512,6 +1512,43 @@ t_assert "cal_evidence: a worker that cannot be staged is warned about, and the 
     case "$out" in *"COPY[h2]"*) echo "copied after a failed mkdir: $out" >&2; false;; *) true;; esac &&
     case "$out" in *"WARNING: h2: cannot stage the rung x jobfile"*) true;; *) echo "$out" >&2; false;; esac &&
     grep -q "RUN\[h1\]" "$r/cal/parse.h1.out" && [ ! -e "$r/cal/parse.h2.out" ]'
+# The same fan-out as a failed layout's: every host at once, host order kept.
+t_assert "cal_evidence: every host's parse check runs at once" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d)
+    for h in h1 h2 h3; do mkdir -p "$d/cal/$h"; printf "[global]\nrw=write\n" > "$d/cal/$h/x.job"; done
+    printf "{}\n" > "$d/cal/res-x.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1; LOCAL_MODE=0
+            run_host() { case "$2" in (*--parse-only*)
+                echo "S $1 ${EPOCHREALTIME//[!0-9]/}" >> "$d/times"; sleep 1
+                echo "E $1 ${EPOCHREALTIME//[!0-9]/}" >> "$d/times";; esac; }
+            copy_to_host() { :; }
+            cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1 h2 h3) 2>&1 )
+    case "$out" in *"note: h3: the rung x jobfile parses cleanly"*) ;; *) echo "$out" >&2; exit 1;; esac
+    spans_overlap "$d/times" 6'
+t_assert "cal_evidence: the parse checks print in host order when the hosts finish out of order" bash -c '
+    d=$(mktemp -d); r=$(mktemp -d)
+    for h in h1 h2 h3; do mkdir -p "$d/cal/$h"; printf "[global]\nrw=write\n" > "$d/cal/$h/x.job"; done
+    printf "{}\n" > "$d/cal/res-x.json"
+    out=$( (source ./wekatester
+            WORK_DIR=$d; RUN_DIR=$r; TARGET_DIR=/dev/shm/x; FIO_BIN=fio; MASTER=h1; LOCAL_MODE=0
+            # h1 (the master) parses slowest, h2 cannot be staged, h3 fio rejects
+            run_host() { case "$2" in
+                ("mkdir -p '"'"'/dev/shm/x.cal/h2'"'"'") echo h2 >> "$d/done"; return 1;;
+                (*--parse-only*) [ "$1" != h1 ] || sleep 1; echo "$1" >> "$d/done"
+                                 [ "$1" != h3 ] || { echo "fio: bad option xyz"; return 1; };;
+            esac; }
+            copy_to_host() { :; }
+            cal_evidence "rung x" "$d/cal/res-x.json" x.job quiet h1 h2 h3) 2>&1 )
+    [ "$(wc -l < "$d/done")" -eq 3 ] && [ "$(tail -1 "$d/done")" = h1 ] \
+        || { echo "finish order:" $(cat "$d/done") >&2; exit 1; }
+    got=$(printf "%s\n" "$out" | sed -n "s/^[0-9:]* \(.*: h[123]: .*\)/\1/p")
+    want=$(printf "%s\n" \
+        "note: h1: the rung x jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" \
+        "WARNING: h2: cannot stage the rung x jobfile for a parse check on that host" \
+        "ERROR: h3: the host'"'"'s own fio rejects the rung x jobfile (full text: parse.h3.out in the run bundle):" \
+        "ERROR: h3:   fio: bad option xyz")
+    [ "$got" = "$want" ] || { printf "got:\n%s\nwant:\n%s\nout:\n%s\n" "$got" "$want" "$out" >&2; exit 1; }'
 # A flat five-line cap hid the one fact that mattered: how many jobs failed
 # the same way (field client C showed five cpu_set_affinity lines out of an
 # unknown number). Identical errors collapse to one line with a job count.
@@ -2371,6 +2408,65 @@ t_assert "run_jobs: a failed layout stages each worker's jobfile before that wor
     ! grep -q "^RUN\[h3\] .*--parse-only" "$d/oplog" &&
     [ -e "$d/out/parse.000-wekatester-layout.h2.out" ] &&
     [ ! -e "$d/out/parse.000-wekatester-layout.h3.out" ]'
+# One host after another, the postmortem was ~3 ssh sessions a host: 30-50 s
+# at 451 hosts before the run said why it failed (Frank, 2026-10-11). Every
+# host's staging and parse run at once now; the messages keep host order.
+t_assert "run_jobs: a failed layout's parse checks run on every host at once" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1 h2 h3); MASTER=h1; LOCAL_MODE=0
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$SET_DIR" "$RUN_DIR"
+     for h in h1 h2 h3; do
+         mkdir -p "$d/jobs/$h"
+         printf "[global]\n[l]\nfilesize=10G\n" > "$d/jobs/$h/000-wekatester-layout.job"
+     done
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { case "$2" in
+         (*--client=*) echo "{}";;
+         (*--parse-only*) echo "S $1 ${EPOCHREALTIME//[!0-9]/}" >> "$d/times"; sleep 1
+                          echo "E $1 ${EPOCHREALTIME//[!0-9]/}" >> "$d/times";;
+     esac; }
+     copy_to_host() { :; }
+     run_jobs) 2>&1 ) && { echo "a failed layout passed: $out" >&2; exit 1; }
+    case "$out" in *"note: h3: the layout jobfile parses cleanly"*) ;; *) echo "$out" >&2; exit 1;; esac
+    spans_overlap "$d/times" 6'
+t_assert "run_jobs: a failed layout's postmortem prints in host order when the hosts finish out of order" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1 h2 h3); MASTER=h1; LOCAL_MODE=0
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$SET_DIR" "$RUN_DIR"
+     for h in h1 h2 h3; do
+         mkdir -p "$d/jobs/$h"
+         printf "[global]\n[l]\nfilesize=10G\n" > "$d/jobs/$h/000-wekatester-layout.job"
+     done
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     # h1 (the master) parses slowest, h2 cannot be staged, h3 fio rejects
+     run_host() { case "$2" in
+         (*--client=*) echo "{}";;
+         ("mkdir -p '"'"'/dev/shm/x/h2'"'"'") echo h2 >> "$d/done"; return 1;;
+         (*--parse-only*) [ "$1" != h1 ] || sleep 1; echo "$1" >> "$d/done"
+                          [ "$1" != h3 ] || { echo "fio: bad option xyz"; return 1; };;
+     esac; }
+     copy_to_host() { :; }
+     run_jobs) 2>&1 ) && { echo "a failed layout passed: $out" >&2; exit 1; }
+    # the precondition: h1 did finish last
+    [ "$(wc -l < "$d/done")" -eq 3 ] && [ "$(tail -1 "$d/done")" = h1 ] \
+        || { echo "finish order:" $(cat "$d/done") >&2; exit 1; }
+    got=$(printf "%s\n" "$out" | sed -n "s/^[0-9:]* \(.*: h[123]: .*\)/\1/p")
+    want=$(printf "%s\n" \
+        "note: h1: the layout jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" \
+        "WARNING: h2: cannot stage the layout jobfile for a parse check on that host" \
+        "ERROR: h3: the host'"'"'s own fio rejects the layout jobfile (full text: parse.000-wekatester-layout.h3.out in the run bundle):" \
+        "ERROR: h3:   fio: bad option xyz")
+    [ "$got" = "$want" ] || { printf "got:\n%s\nwant:\n%s\nout:\n%s\n" "$got" "$want" "$out" >&2; exit 1; }
+    case "$out" in
+        *"h3:   fio: bad option xyz"*"ERROR: layout 000-wekatester-layout.job failed -- the files were not created"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 t_assert "sweep: deviants deleted per namespace, matching bytes credited (capped)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

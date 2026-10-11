@@ -69,18 +69,46 @@ fio_parse_postmortem() {   # fio_parse_postmortem <what> <host> <remote-jobfile>
     fi
 }
 
+# fio_parse_postmortem on every host at once (one at a time took 30-50 s at
+# 451 hosts); each host's output lands in a file, replayed in host order.
+# Staging copied the jobfiles to the master only: a worker gets its own copy.
+postmortem_hosts() {   # postmortem_hosts <what> <jobfile> <local-dir> <remote-dir> <out-prefix> <host>...
+    local what=$1 jf=$2 src=$3 dst=$4 pre=$5 td h i=0 pids=()
+    shift 5
+    [ $# -gt 0 ] || return 0
+    td=$(mktemp -d "$WORK_DIR/pm.XXXXXX") \
+        || { log "WARNING: cannot create a scratch dir for the $what parse check" >&2; return 0; }
+    for h in "$@"; do
+        ( if [ "$h" != "$MASTER" ]; then
+              run_host "$h" "mkdir -p '$dst/$h'" \
+                  && copy_to_host "$h" "$src/$h/$jf" "$dst/$h/" \
+                  || { log "WARNING: $h: cannot stage the $what jobfile for a parse check on that host" >&2
+                       exit 0; }
+          fi
+          fio_parse_postmortem "$what" "$h" "$dst/$h/$jf" "$pre.$h.out" ) > "$td/$i.out" 2> "$td/$i.err" &
+        pids+=($!); i=$((i + 1))
+    done
+    # SCOPED wait: a bare wait also waits on the run-log tees and hangs
+    for i in "${!pids[@]}"; do wait "${pids[$i]}" || :; done
+    for i in "${!pids[@]}"; do
+        cat -- "$td/$i.out"; cat -- "$td/$i.err" >&2
+    done
+    rm -rf -- "${td:?}"
+}
+
 # A failed calibration fio run files its evidence under cal/ in the bundle
 # (WORK_DIR is tmpfs, wiped on exit) and has each host fio parse its jobfile.
 # say: find the cause in fio own text and say it; quiet: check_fio_errors did.
 cal_evidence() {   # cal_evidence <what> <results.json> <jobfile-basename> <say|quiet> <host>...
-    local what=$1 res=$2 jf=$3 say=$4 h l shown=0
+    local what=$1 res=$2 jf=$3 say=$4 h l shown=0 hs=()
     shift 4
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     mkdir -p "$RUN_DIR/cal" || return 0
     [ ! -s "$res" ] || cp "$res" "$RUN_DIR/cal/" || true
     for h in "$@"; do
-        [ ! -s "$WORK_DIR/cal/$h/$jf" ] \
-            || cp "$WORK_DIR/cal/$h/$jf" "$RUN_DIR/cal/${jf%.job}.$h.job" || true
+        [ -s "$WORK_DIR/cal/$h/$jf" ] || continue
+        hs+=("$h")
+        cp "$WORK_DIR/cal/$h/$jf" "$RUN_DIR/cal/${jf%.job}.$h.job" || true
     done
     if [ "$say" = say ] && [ -s "$res" ]; then
         # One line per distinct error with its job count: how many failed the
@@ -96,19 +124,8 @@ $(LC_ALL=C awk -v what="$what" '
 EVIDEOF
         [ "$shown" -gt 0 ] || log "ERROR: $what: fio printed no error line before exiting; see ${res##*/} in the run bundle under cal/" >&2
     fi
-    for h in "$@"; do
-        [ -s "$WORK_DIR/cal/$h/$jf" ] || continue
-        # cal_push staged the jobfiles on the master only; a worker fio can
-        # parse only its own copy.
-        if [ "$h" != "$MASTER" ]; then
-            run_host "$h" "mkdir -p '$TARGET_DIR.cal/$h'" \
-                && copy_to_host "$h" "$WORK_DIR/cal/$h/$jf" "$TARGET_DIR.cal/$h/" \
-                || { log "WARNING: $h: cannot stage the $what jobfile for a parse check on that host" >&2
-                     continue; }
-        fi
-        fio_parse_postmortem "$what" "$h" "$TARGET_DIR.cal/$h/$jf" \
-            "$RUN_DIR/cal/parse.$h.out"
-    done
+    postmortem_hosts "$what" "$jf" "$WORK_DIR/cal" "$TARGET_DIR.cal" "$RUN_DIR/cal/parse" \
+        ${hs[@]+"${hs[@]}"}
 }
 
 
