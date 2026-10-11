@@ -5264,6 +5264,18 @@ t_assert "cal_engine_pick: per-type winners, ties to io_uring, the tally picks t
     printf "lat io_uring 100\nlat psync 95\n" > "$d/f" &&
     b=$(source ./wekatester; cal_engine_pick "$d/f") &&
     case "$b" in "psync lat: io_uring 100.0 us, psync 95.0 us -> psync") true;; *) echo "b=$b" >&2; false;; esac'
+t_assert "cal_shape_run: engine cells on a pinned 32-job x 64-file shape seed it first (review #17)" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
+     cal_ensure_seed() { echo "seed $*" >> "$d/calls"; }
+     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; }
+     cal_search() { echo "search $*" >> "$d/calls"; }
+     cal_shape_run 1 h1 8 0-7 0-15 0 libaio,psync - 0 64 "bw_r=1/64/-/32" "bw read") >>$WT_ASIDE 2>&1 ||
+        { echo "cal_shape_run failed" >&2; exit 1; }
+    # the seed covering 32 jobs x 64 files lands before the first engine cell
+    awk "/^seed h1 read 32 64\$/ && !s {s = NR} /^cell / && !c {c = NR} END {exit !(s && c && s < c)}" "$d/calls" &&
+    [ "$(grep -c "^cell h1 bw read [a-z]* 32 1 64 " "$d/calls")" = 2 ] || { cat "$d/calls" >&2; false; }'
 t_assert "cal_lat_values: latency in us and IOPS per client, entries of one client weighted by IO count" bash -c '
     d=$(mktemp -d)
     printf "%s\n" "{ \"client_stats\": [ { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 100000 }, \"iops\": 1000, \"total_ios\": 300 } }, { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 200000 }, \"iops\": 500, \"total_ios\": 100 } }, { \"jobname\": \"All clients\", \"read\": { \"lat_ns\": { \"mean\": 9 } } } ] }" > "$d/r.json"

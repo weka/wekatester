@@ -3353,6 +3353,9 @@ BUDEOF
             [ "$pq" = - ] || eqd=$pq
             [ "$pn" = - ] || enr=$pn
             CAL_PIN_FS=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
+            # seed what pins past usable x CAL_NR need, as cal_search does;
+            # else fio lays the files out inside the timed cell
+            cal_ensure_seed "$rep" "$edirn" "$enj" "$enr"
             for e in ${engines//,/ }; do
                 cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
                 printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
