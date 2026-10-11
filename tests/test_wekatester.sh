@@ -1879,6 +1879,22 @@ t_assert "client list: a fleet the fio command line cannot carry stops before an
     e=$(printf "%s\n" "$m" | grep -n "early_client_cmdline_check" | head -1 | cut -d: -f1)
     p=$(printf "%s\n" "$m" | grep -n "probe_workers" | head -1 | cut -d: -f1)
     [ -n "$e" ] && [ -n "$p" ] && [ "$e" -lt "$p" ] || { echo "early=$e probe=$p" >&2; false; }'
+t_assert "client list: the early check prices every jobfile staging runs, a long name without .job included" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set"
+    printf "[global]\n[a]\nrw=read\n" > "$d/set/011-$(printf "%250s" "" | tr " " x)"
+    printf "[global]\n[a]\nrw=write\n" > "$d/set/012-s.job"
+    hosts=(); for i in $(seq 1 450); do hosts+=("worker-$i.example.com"); done
+    err=$( (source ./wekatester; HOSTS=("${hosts[@]}"); SET_DIR_OVERRIDE=$d/set; TARGET_DIR=/dev/shm/fio-jobfiles
+            early_client_cmdline_check) 2>&1 ) && { echo "passed with a 254-byte name and 450 hosts: $err" >&2; exit 1; }
+    case "$err" in *"the fio command line for the longest job name this set can stage is "*" bytes with 450 hosts"*) ;; *) echo "$err" >&2; exit 1;; esac'
+t_assert "client list: the early check skips what staging skips, a long name without a digit prefix" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set"
+    printf "[global]\n[a]\nrw=randread\n" > "$d/set/021-latencyR.job"
+    x=$(printf "%246s" "" | tr " " x)
+    printf "notes\n" > "$d/set/notes$x.job"; printf "notes\n" > "$d/set/README$x"
+    hosts=(); for i in $(seq 1 450); do hosts+=("worker-$i.example.com"); done
+    out=$( (source ./wekatester; HOSTS=("${hosts[@]}"); SET_DIR_OVERRIDE=$d/set; TARGET_DIR=/dev/shm/fio-jobfiles
+            early_client_cmdline_check) 2>&1 ) || { echo "$out" >&2; exit 1; }'
 t_assert "dry run: -n runs the pinning check, so what the real run pins -- or dies on -- shows up first" bash -c '
     m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
     dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")

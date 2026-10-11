@@ -341,12 +341,14 @@ check_client_cmdline() {   # check_client_cmdline [what]
 
 # The same ceiling before anything starts on the hosts, pricing the longest
 # job name staging can produce: a set jobfile plus the 9 bytes of its longest
-# twin, never under the 25-byte layout and unlink names.
+# twin, never under the 25-byte layout and unlink names. The files are
+# staging's own list (discover_jobfiles).
 early_client_cmdline_check() {
-    local f n max=25 JOBFILES
-    for f in "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"/*.job; do
-        [ -f "$f" ] || continue
-        n=${f##*/}; n=$(( ${#n} + 9 ))
+    local src job n max=25 JOBFILES
+    src=${SET_DIR_OVERRIDE:-$(workload_src_dir)} || exit 1
+    discover_jobfiles "$src"
+    for job in "${JOBFILES[@]}"; do
+        n=$(( ${#job} + 9 ))
         [ "$n" -le "$max" ] || max=$n
     done
     JOBFILES=("$(printf '%*s' "$max" '' | tr ' ' x)")
