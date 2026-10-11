@@ -194,8 +194,7 @@ test_engines() {
 finalize_targets() {
     [ "$TARGETS" -eq 1 ] || return 0
     local host eng
-    resolve_targets phase2 "$TARGETS_FILE" "${ENGINE:--}" \
-        "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+    resolve_targets phase2 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
     HOST_DIRS_KEY=""   # a host_dir_v map of an earlier targets.final is stale

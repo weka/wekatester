@@ -21,6 +21,7 @@ WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfi
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
 DIRECTORY_EXPLICIT=0            # -d was given (CLI beats a host file's dir)
+CLI_DIR="-"                     # resolve_targets' cli-dir: -d's dir, or - when not given
 TARGETS=0                       # -t given: a host file is in play
 TARGETS_PATH=""                 # -t's explicit path ("" = bare -t, resolve later)
 TARGETS_FILE=""                 # the resolved host file actually in use
@@ -406,6 +407,7 @@ parse_args() {
     while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
         DIRECTORY=${DIRECTORY%/}
     done
+    [ "$DIRECTORY_EXPLICIT" -eq 0 ] || CLI_DIR=$DIRECTORY
 
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.
@@ -500,8 +502,7 @@ main() {
     # phase supplies the per-host logins the auth rounds use.
     if [ "$TARGETS" -eq 1 ]; then
         resolve_targets_file
-        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
             - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
             || die "host file resolution failed ($TARGETS_FILE)"
     fi

@@ -1357,6 +1357,9 @@ t_assert "parse: -o detached, --output=, and attached -o all set the output dir"
     (source ./wekatester; parse_args -o=out4 h1;        [ "$OUTPUT_DIR" = out4 ]) &&
     (source ./wekatester; parse_args -Oout5 h1;         [ "$OUTPUT_DIR" = out5 ])'
 
+t_assert "parse: CLI_DIR is the trimmed -d directory, or - without -d (resolve_targets' cli-dir)" bash -c '
+    (source ./wekatester; parse_args -d /x/ h1; [ "$CLI_DIR" = /x ]) &&
+    (source ./wekatester; parse_args h1;        [ "$CLI_DIR" = - ])'
 # --- the Python wekatester's long names: aliases of -d, -w and -f ---
 # (code review #7, Frank, 2026-10-11)
 t_assert "parse: --directory, detached or =, sets the -d directory and marks it explicit" bash -c '
