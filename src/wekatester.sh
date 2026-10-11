@@ -392,6 +392,11 @@ parse_args() {
         esac
     done
     MASTER=${HOSTS[0]:-}
+    # -d without its trailing slashes (the host file's column: trim_dir), or
+    # every "$hd/$glob" join misses what find prints. / stays /.
+    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
+        DIRECTORY=${DIRECTORY%/}
+    done
 
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.

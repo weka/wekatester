@@ -2589,6 +2589,38 @@ numjobs=44"
     grep -qF -- "if [ -d \"/mnt/weka/h1.0\" ]; then find \"/mnt/weka/h1.0\" -maxdepth 1 -type f -path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c -print -o -delete \); fi" "$d/oplog" &&
     ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c" "$d/oplog" &&
     grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +1073741823c -print -o -delete \)" "$d/oplog"'
+# Run for real: with -d <dir>/ the joined pattern held "//", find printed one
+# slash, and the sweep credited nothing and deleted no short file.
+t_assert "sweep: a trailing-slash -d still credits the laid-out files and deletes the short ones (find run for real)" bash -c '
+    d=$(mktemp -d); t=$d/dest
+    mkdir -p "$t/h1.0" "$t/h1.1"
+    mk() { head -c "$2" /dev/zero > "$t/$1"; }
+    mk h1.wt.0.0 1024; mk h1.wt.1.0 100; mk h1.0/0 2048; mk h1.1/0 2048; mk h1.1/1 10
+    out=$( (source ./wekatester
+     parse_args -d "$t/" h1
+     WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=0
+     mkdir -p "$d/jobs/h1" "$SET_DIR"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=$t
+fallocate=none
+[flat]
+filename_format=h1.wt.\$jobnum.\$filenum
+filesize=1K
+numjobs=2
+[nested]
+filename_format=h1.\$filenum/\$jobnum
+filesize=2K
+nrfiles=2
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { bash -c "$2"; }
+     sweep_layout_grid) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
+    [ "$(cat "$d/probe/h1.laidout")" = 5120 ] && [ "$left" = "./h1.0/0 ./h1.1/0 ./h1.wt.0.0 " ] ||
+        { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; false; }'
 # An old-format tuple (fs/nr/qd, no nj) is re-measured, and fill mode keeps
 # its fields: a mix nobody measured, which the writeback would make permanent.
 # The file cannot say whether the operator wrote it, so the run warns.
@@ -3530,6 +3562,16 @@ t_assert "resolve_targets: hostonly sees the host row and nothing generic; phase
      col() { printf "%s\n" "$1" | grep "^$2	" | cut -f4,5 | tr "\t" " "; }
      [ "$(col "$ho" h1)" = "- -" ] && [ "$(col "$ho" h2)" = "4-15 -" ] &&
      [ "$(col "$p1" h1)" = "0-127 /mnt/g" ] && [ "$(col "$p1" h2)" = "4-15 /mnt/g" ])'
+# A trailing slash doubled every "$hd/$glob" join, which find never prints:
+# both entry points drop it once, so no join has to.
+t_assert "destinations lose trailing slashes where they enter: -d /x/ and a host-file /x// are /x; / stays /" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nh1,,,,/x//\nh2,,,,//\n" > "$d/hl.csv"
+    (source ./wekatester; WORK_DIR=$d
+     parse_args -d /x/ h1; [ "$DIRECTORY" = /x ] || { echo "-d /x/: $DIRECTORY" >&2; exit 1; }
+     parse_args -d=/ h1; [ "$DIRECTORY" = / ] || { echo "-d=/: $DIRECTORY" >&2; exit 1; }
+     out=$(resolve_targets phase1 "$d/hl.csv" - - - h1 h2 | cut -f1,5 | tr "\t\n" " ;")
+     [ "$out" = "h1 /x;h2 /;" ] || { echo "host file: $out" >&2; false; })'
 # A mixed-direction file stages ONE direction's tuple, but both directions
 # were measured; the writeback must record each measured tuple into its own
 # slot, never the staged tuple into both -- numjobs included, since a
@@ -5620,6 +5662,21 @@ t_assert "-u: each filesystem group's shared set is removed from that group's fi
      run_host() { printf "%s|%s\n" "$1" "$2" >> "$d/cmds"; }
      cal_remove_dataset) >>$WT_ASIDE 2>&1
     [ "$(grep "/mnt/w/shared\." "$d/cmds" | cut -d"|" -f1 | sort | tr "\n" " ")" = "h1 h2 " ] || { cat "$d/cmds" >&2; false; }'
+t_assert "-u: a destination given with a trailing slash (-d or the host file) still has its dataset removed (run for real)" bash -c '
+    d=$(mktemp -d); t=$d/dest; mkdir -p "$t"
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nh1,,,,$t//\n" > "$d/hl.csv"
+    for via in -d hostfile; do
+        for f in shared.0.0 shared.1.0 h1.0.0 h1.0.1 other.0.0; do : > "$t/$f"; done
+        rm -f "${d:?}/targets.phase1"
+        out=$( (source ./wekatester
+         WORK_DIR=$d; LOCAL_MODE=0; CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.
+         if [ "$via" = -d ]; then parse_args -d "$t/" h1
+         else parse_args h1; resolve_targets phase1 "$d/hl.csv" - - - h1 > "$d/targets.phase1"; fi
+         run_host() { bash -c "$2"; }
+         cal_remove_dataset) 2>&1 ) || { echo "$via: $out" >&2; exit 1; }
+        left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
+        [ "$left" = "./other.0.0 " ] || { echo "$via: left $left; $out" >&2; exit 1; }
+    done'
 
 # --- host-file values pin their knobs (Frank, 2026-10-02) ---
 # A host-file value is the only value its knob takes in calibration, used as

@@ -550,6 +550,13 @@ function path_join(a, b) {   # os.path.join(a, b)
     if (substr(b, 1, 1) == "/" || a == "") return b
     return a (substr(a, length(a)) == "/" ? "" : "/") b
 }
+# A destination as typed, its trailing slashes dropped (/x// is /x, a root
+# of slashes stays /): every later "dir/glob" join must match what find prints.
+function trim_dir(p) {
+    if (p ~ /^\/+$/) return "/"
+    sub(/\/+$/, "", p)
+    return p
+}
 function squote(s) { return "\047" s "\047" }
 # Commands that delete the files <pattern> names under <hd>: find bounded at
 # the pattern depth, then the directories left empty.
@@ -1679,6 +1686,11 @@ parse_args() {
         esac
     done
     MASTER=${HOSTS[0]:-}
+    # -d without its trailing slashes (the host file's column: trim_dir), or
+    # every "$hd/$glob" join misses what find prints. / stays /.
+    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
+        DIRECTORY=${DIRECTORY%/}
+    done
 
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.
@@ -5892,7 +5904,7 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engi
             ne++; nk = 0
             if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
             if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }
-            if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = C[5] }
+            if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = trim_dir(C[5]) }
             # geometry: "bandwidthR:12/10G/1/8" or a bare "12/10G/1/8";
             # empty parts are unset
             for (s = 1; s <= nslot; s++) {

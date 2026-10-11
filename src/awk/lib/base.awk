@@ -60,6 +60,13 @@ function path_join(a, b) {   # os.path.join(a, b)
     if (substr(b, 1, 1) == "/" || a == "") return b
     return a (substr(a, length(a)) == "/" ? "" : "/") b
 }
+# A destination as typed, its trailing slashes dropped (/x// is /x, a root
+# of slashes stays /): every later "dir/glob" join must match what find prints.
+function trim_dir(p) {
+    if (p ~ /^\/+$/) return "/"
+    sub(/\/+$/, "", p)
+    return p
+}
 function squote(s) { return "\047" s "\047" }
 # Commands that delete the files <pattern> names under <hd>: find bounded at
 # the pattern depth, then the directories left empty.

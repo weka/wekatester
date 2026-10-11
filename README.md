@@ -119,7 +119,7 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `server ...` — the worker hostnames; the first one is the coordinator/master. Optional: give no server at all and wekatester benchmarks the local host instead, using no ssh, no keys, and no sshd (**local mode**). That is the quickest way to sanity-check a single client — `./wekatester -a max` and nothing else. In local mode the data files on the destination are prefixed with the box's short hostname (`hostname -s`, else `$HOSTNAME`), never `localhost` — `localhost.*` identifies nothing on a shared filesystem, and two boxes in local mode against the same mount would otherwise write (and `-u` unlink) each other's files.
 
-`-d directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time.
+`-d directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time. Trailing slashes are dropped, here and in the host file's `destination_folder` (`/mnt/weka/` is `/mnt/weka`; `/` stays `/`).
 
 `-w workload` — pick a workload set, a subdirectory of `fio-jobfiles`. See below.
 

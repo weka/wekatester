@@ -18,7 +18,7 @@ BEGIN {
         ne++; nk = 0
         if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
         if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }
-        if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = C[5] }
+        if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = trim_dir(C[5]) }
         # geometry: "bandwidthR:12/10G/1/8" or a bare "12/10G/1/8";
         # empty parts are unset
         for (s = 1; s <= nslot; s++) {
