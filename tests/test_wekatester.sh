@@ -3422,6 +3422,71 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
         *"WARNING: localhost: wekafs mounted readcache"*"cannot create files in /mnt/weka"*"is not writable on every host"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+
+# The mount verified is the mount measured (Frank, 2026-10-11): the check
+# records each host's line, and right before the measured run every host
+# reads it again; any change stops the run, -r included.
+t_assert "mount recheck: the mount check records each host's line and its cksum, in its own round" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     LOCAL_MODE=0; HOSTS=(h1 h2); DIRECTORY=/mnt/weka; WORK_DIR=$d
+     run_host() { echo "$1|$2" >> "$d/calls"; case "$1:$2" in
+         (h1:findmnt*) echo "wekafs rw,relatime,forcedirect";;
+         (h2:findmnt*) echo "nfs4 rw,noatime";;
+         (*) return 0;; esac; }
+     verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "the mount check failed" >&2; exit 1; }
+    [ "$(cat "$d/mount/0")" = "wekafs rw,relatime,forcedirect" ] &&
+    [ "$(cat "$d/mount/1")" = "nfs4 rw,noatime" ] &&
+    [ "$(wc -l < "$d/mount/sums")" -eq 2 ] &&
+    [ "$(cat "$d/mount/sums")" = "$(cd "$d/mount" && cksum 0 1)" ] &&
+    [ "$(grep -c findmnt "$d/calls")" -eq 2 ] ||
+        { echo "record: $(head "$d"/mount/* 2>&1); calls: $(cat "$d/calls")" >&2; false; }'
+t_assert "mount recheck: a created destination is recorded with the line of the mount it was created on" bash -c '
+    d=$(mktemp -d)
+    (export WEKATESTER_PROMPT_TTY=/dev/null
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(h1); DIRECTORY=/mnt/weka/wt; FAST_TRACK=1; WORK_DIR=$d
+     run_host() { case "$2" in
+         (findmnt*)  return 1;;
+         ("[ ! -e"*) printf "/mnt/weka\nwekafs rw,relatime,forcedirect\n";;
+         (*)         return 0;; esac; }
+     verify_mount_mode) >>$WT_ASIDE 2>&1 || { echo "the mount check failed" >&2; exit 1; }
+    [ "$(cat "$d/mount/0")" = "wekafs rw,relatime,forcedirect" ] ||
+        { echo "record: $(head "$d"/mount/* 2>&1)" >&2; false; }'
+t_assert "mount recheck: unchanged mounts pass, one read per host, by the mount check's own command" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2); DIRECTORY=/mnt/weka; WORK_DIR=$d
+            run_host() { echo "$1|$2" >> "$d/calls"; case "$2" in (findmnt*) echo "wekafs rw,forcedirect";; (*) return 0;; esac; }
+            verify_mount_mode && : > "$d/calls" && check_mounts_unchanged && echo rc=0) 2>&1 )
+    case "$out" in *ERROR*|*WARNING*) echo "$out" >&2; exit 1;; *rc=0*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ "$(wc -l < "$d/calls")" -eq 2 ] &&
+    [ "$(grep -c "^h[12]|findmnt -T .*/mnt/weka.* -n -o FSTYPE,OPTIONS\$" "$d/calls")" -eq 2 ] ||
+        { echo "calls: $(cat "$d/calls")" >&2; false; }'
+t_assert "mount recheck: a changed or unreadable line stops the run under -r, naming each host with its old and new line" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka; WORK_DIR=$d; FAST_TRACK=1
+            run_host() { case "$1:$2" in
+                (h2:findmnt*) if [ -e "$d/changed" ]; then echo "wekafs rw,writecache"; else echo "wekafs rw,forcedirect"; fi;;
+                (h3:findmnt*) [ ! -e "$d/changed" ] || return 1; echo "wekafs rw,forcedirect";;
+                (*:findmnt*)  echo "wekafs rw,forcedirect";;
+                (*)           return 0;; esac; }
+            verify_mount_mode || exit 9
+            : > "$d/changed"
+            check_mounts_unchanged; echo "survived rc=$?") 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -eq 1 ] || { echo "rc=$rc: $err" >&2; exit 1; }
+    case "$err" in *"h1:"*) echo "named an unchanged host: $err" >&2; exit 1;; esac
+    case "$err" in
+        *"ERROR: h2: the mount at /mnt/weka changed since the mount check -- was \"wekafs rw,forcedirect\", now \"wekafs rw,writecache\""*"ERROR: h3: the mount at /mnt/weka changed since the mount check -- was \"wekafs rw,forcedirect\", now unreadable (findmnt rc=1)"*"the destination mount changed on 2 of 3 host(s) after it was verified; the measured run did not start"*) ;;
+        *) echo "$err" >&2; exit 1;;
+    esac'
+t_assert "mount recheck: main runs it once, after the dry-run exit, right before run_jobs" bash -c '
+    body=$(source ./wekatester; declare -f main)
+    [ "$(printf "%s\n" "$body" | grep -c check_mounts_unchanged)" -eq 1 ] &&
+    case "$body" in *"dry_run_report;"*"exit 0;"*"check_mounts_unchanged;"*) true;; *) false;; esac &&
+    printf "%s\n" "$body" | grep -A1 check_mounts_unchanged | tail -n 1 | grep -q "^ *run_jobs;" ||
+        { echo "$body" >&2; false; }'
 # Live on the console every time it is raised; kept once per distinct
 # message; replayed into the run log FILE only,
 # never back onto the console (seen live: one -r warning printed four times).

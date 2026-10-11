@@ -126,6 +126,61 @@ classify_mount_line_v() {   # classify_mount_line_v <fstype options> -> MOUNT_VE
     fi
 }
 
+# The destination's mount line: the mount check classifies it and records
+# it, and check_mounts_unchanged reads it again, with this same command.
+mount_line_cmd_v() {   # mount_line_cmd_v <dir> -> MOUNT_LINE_CMD
+    MOUNT_LINE_CMD="findmnt -T '$1' -n -o FSTYPE,OPTIONS"
+}
+
+# <dir>/<i> holds line i, and <dir>/sums one cksum over them all; the names
+# are the indexes, so an unchanged line gives an identical sums line.
+write_mount_lines() {   # write_mount_lines <dir> <line>...
+    local d=$1 i=0 l names=()
+    shift
+    mkdir -p "$d" || die "cannot create $d"
+    for l in "$@"; do
+        printf '%s\n' "$l" > "$d/$i" || die "cannot write $d/$i"
+        names+=("$i"); i=$((i + 1))
+    done
+    (cd "$d" && cksum "${names[@]}") > "$d/sums" || die "cannot checksum the mount lines in $d"
+}
+
+# Right before the measured run, one parallel round: every host's mount line
+# must be the one verify_mount_mode recorded. A change, or a line that cannot
+# be read, stops the run, -r included.
+check_mounts_unchanged() {
+    log "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
+    [ -s "$WORK_DIR/mount/sums" ] || die "no mount record from the mount check in $WORK_DIR/mount"
+    local td i line was pids=() rcs=() now=() old=() new=() changed=()
+    td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
+    load_host_dirs
+    for i in "${!HOSTS[@]}"; do
+        mount_line_cmd_v "${HOST_DIRS[$i]}"
+        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.out" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}"; rcs[$i]=$?
+        line=""; IFS= read -r line < "$td/$i.out" || :
+        now[$i]=$line
+    done
+    write_mount_lines "$td/now" "${now[@]}"
+    mapfile -t old < "$WORK_DIR/mount/sums"
+    mapfile -t new < "$td/now/sums"
+    for i in "${!HOSTS[@]}"; do
+        [ "${rcs[$i]}" -ne 0 ] || [ "${old[$i]:-}" != "${new[$i]:-}" ] || continue
+        was=""; IFS= read -r was < "$WORK_DIR/mount/$i" || :
+        line="\"${now[$i]}\""; [ "${rcs[$i]}" -eq 0 ] || line="unreadable (findmnt rc=${rcs[$i]})"
+        changed+=("${HOSTS[$i]}: the mount at ${HOST_DIRS[$i]} changed since the mount check -- was \"$was\", now $line")
+    done
+    rm -rf "$td"
+    if [ ${#changed[@]} -gt 0 ]; then
+        for line in "${changed[@]}"; do log "ERROR: $line" >&2; done
+        die "the destination mount changed on ${#changed[@]} of ${#HOSTS[@]} host(s) after it was verified; the measured run did not start"
+    fi
+    debug "destination mount unchanged on all hosts"
+}
+
 # Creates a missing destination only when its nearest existing parent is
 # wekafs in this same session: a weka client that restarted since the check
 # leaves a root-disk mount point. Exit 4: not wekafs now.
@@ -264,7 +319,8 @@ verify_mount_mode() {
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         hds[$i]=${HOST_DIRS[$i]}
-        ( run_host "${HOSTS[$i]}" "findmnt -T '${hds[$i]}' -n -o FSTYPE,OPTIONS" > "$td/$i.mnt" ) &
+        mount_line_cmd_v "${hds[$i]}"
+        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
         pids[$i]=$!
     done
     for i in "${!HOSTS[@]}"; do
@@ -424,5 +480,9 @@ verify_mount_mode() {
             die "$DIRECTORY is not writable on every host; fio cannot lay out its files there"
         die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
     fi
+    # the record check_mounts_unchanged compares against; a created
+    # destination's line is its parent's, the mount it was created on. The
+    # suite calls this phase without a work dir.
+    [ -z "${WORK_DIR:-}" ] || write_mount_lines "$WORK_DIR/mount" "${lines[@]}"
     debug "mount mode and writability ok on all hosts"
 }

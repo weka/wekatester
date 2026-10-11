@@ -536,6 +536,7 @@ main() {
     check_capacity
     writeback_targets
     snapshot_jobfiles
+    check_mounts_unchanged
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
 }
