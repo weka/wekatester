@@ -3615,6 +3615,26 @@ t_assert "writeback: a cpu list that differs from the generic one is reason enou
     [ "$(sed -n 1p "$f")" = ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32," ] &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
         { cat "$f" >&2; false; }'
+# The writeback reads the directive through report_has, as staging does:
+# every spelling the README accepts fills its slot, and prose does not.
+wb_directive() {   # wb_directive <directive line>: the host line it records
+    d=$(wb_fixture); f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
+    printf "%s\ncpus_allowed=0-3\ndirectory=/mnt/w\nioengine=libaio\nnumjobs=4\nfilesize=1G\nnrfiles=8\niodepth=32\nrw=randread\n" "$1" > "$d/jobs/h1/031-i.job"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
+     writeback_targets) >>$WT_ASIDE
+    tail -1 "$f"
+}
+export -f wb_directive
+t_assert "writeback: #report iops and #  report iops fill the iops slot" bash -c '
+    for s in "#report iops" "#  report iops"; do
+        got=$(wb_directive "$s")
+        [ "$got" = "h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32," ] || { echo "$s: $got" >&2; exit 1; }
+    done'
+t_assert "writeback: prose (# reporting notes: iops) is no directive and fills no slot" bash -c '
+    got=$(wb_directive "# reporting notes: iops")
+    [ "$got" = "h1,ubuntu,libaio,0-3,/mnt/w,,,,,," ] || { echo "$got" >&2; false; }'
 t_assert "resolve_targets: hostonly sees the host row and nothing generic; phase1 still folds generics in" bash -c '
     d=$(mktemp -d)
     printf "host,user_login,ioengine,allowed_cpus,destination_folder\n,,,0-127,/mnt/g,,,,,,\nh2,,,4-15,,,,,,,\n" > "$d/hl.csv"
