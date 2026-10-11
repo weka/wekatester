@@ -16,7 +16,7 @@ function probe_universe(P, np, ncpus, U,    c) {
     split("", U)
     for (c = 0; c < ncpus; c++) U[c] = 1
 }
-# Cpus the probe measured as unbindable; empty when it could not test.
+# Cpus outside the probe's bindable sets; empty when it could not read them.
 function probe_unbindable(P, np, U, UB,    B, BP, c) {
     split("", UB)
     if (!probe_cpu_fact(P, np, "bindable", B)) return

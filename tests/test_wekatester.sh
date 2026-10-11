@@ -134,6 +134,11 @@ t_assert "usable_cores: cpus the probe measured as unbindable are excluded" bash
      # an operator list is its own reserve: only core 0 comes out of it
      [ "$(usable_cores h1 count 0-3)" = 2 ] &&
      [ "$(usable_cores h1 list 0-3)" = "1,2" ])'
+t_assert "usable_cores: a bindable line in cpuset range syntax reads as its cpus" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe"
+    printf "ncpus 8\nonline 0-7\nbindable 0-2,4,6-7\nbindable_priv -\n" > "$d/probe/h1"
+    (source ./wekatester; WORK_DIR=$d
+     [ "$(usable_cores h1 list)" = "2,4,6,7" ] || { echo "list: $(usable_cores h1 list)" >&2; false; })'
 t_assert "usable_cores: weka cores and unbindable cpus are both excluded" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
     printf "ncpus 8\nonline 0-7\nweka_allowed 1\nweka_allowed 2\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/probe/h1"
@@ -150,14 +155,129 @@ t_assert "usable_cores: an offline cpu id is not conjured from the count" bash -
 # --- probe remote snippet ---
 t_assert "probe snippet emits ncpus"   bash -c 'probe_stub | grep -q "ncpus 8"'
 t_assert "probe snippet emits engines" bash -c 'probe_stub | grep -q "engines.*io_uring"'
-# Whether a cpu can be bound at all is MEASURED, per cpu, not inferred from
-# isolcpus: fio answers an unbindable cpus_allowed with err=22
-# cpu_set_affinity per job, on the daemonized server, mid-run.
-t_assert "probe snippet measures which cpus can actually be bound" bash -c '
+# Which cpus can be bound is READ from the cgroup cpuset, never trial-bound
+# per cpu (Frank, 2026-10-11): fio answers an unbindable cpus_allowed with
+# err=22 cpu_set_affinity per job, on the daemonized server, mid-run.
+t_assert "probe: no cpuset to read falls back to the taskset affinity, under sh and bash" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-5
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        # no /proc/self/cgroup, then one naming a cgroup with no cpuset file
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+            { echo "$sh, no cgroup file:"; printf "%s\n" "$out"; exit 1; } >&2
+        cg_file "$d" /proc/self/cgroup "0::/user.slice"
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-5" ||
+            { echo "$sh, no cpuset file:"; printf "%s\n" "$out"; exit 1; } >&2
+        rm -f "$d/root/proc/self/cgroup"
+    done
     out=$(probe_stub)
-    printf "%s\n" "$out" | grep -qx "bindable 0,1,2,4,6,7" &&
-    printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
-        { printf "%s\n" "$out" >&2; false; }'
+    printf "%s\n" "$out" | grep -qx "bindable 0-7" || { printf "%s\n" "$out" >&2; false; }'
+t_assert "probe: cgroup v2 cpuset is read from the nearest cgroup that has one, under sh and bash" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    # c42j as found: no cpuset controller below user.slice
+    cg_file "$d" /proc/self/cgroup "0::/user.slice/user-1000.slice/session-1.scope"
+    cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-2,5
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-2,5" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+            { echo "$sh, from user.slice:"; printf "%s\n" "$out"; exit 1; } >&2
+    done
+    cg_file "$d" /sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cpuset.cpus.effective 1-2
+    out=$(cpuset_probe "$d" sh)
+    printf "%s\n" "$out" | grep -qx "bindable 1-2" || { echo "own cgroup:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: cgroup v1 reads the cpuset hierarchy, effective_cpus before cpus, under sh and bash" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    # hybrid: the cpuset controller is on v1, so the v2 root file is not it
+    cg_file "$d" /proc/self/cgroup "$(printf "12:cpuset:/docker/abc\n4:cpu,cpuacct:/docker/abc\n0::/docker/abc")"
+    cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
+    cg_file "$d" /sys/fs/cgroup/cpuset/cpuset.cpus 0-7
+    cg_file "$d" /sys/fs/cgroup/cpuset/docker/abc/cpuset.effective_cpus 2-5
+    cg_file "$d" /sys/fs/cgroup/cpuset/docker/abc/cpuset.cpus 1,3-4
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 2-5" ||
+            { echo "$sh, effective_cpus:"; printf "%s\n" "$out"; exit 1; } >&2
+    done
+    rm -f "$d/root/sys/fs/cgroup/cpuset/docker/abc/cpuset.effective_cpus"
+    out=$(cpuset_probe "$d" sh)
+    printf "%s\n" "$out" | grep -qx "bindable 1,3-4" || { echo "cpus:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: an escalated cgroup with a wider cpuset reads as bindable_priv, the difference" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    cat > "$d/bin/sudo" <<SUDO
+#!/bin/sh
+echo "sudo \$*" >> "$d/calls"
+case "\$*" in
+  "-n true") exit 0 ;;
+  "-n cat "*) echo "0::/system.slice/ssh.service" ;;
+  *) exit 1 ;;
+esac
+SUDO
+    cg_file "$d" /proc/self/cgroup "0::/user.slice/user-1000.slice/session-1.scope"
+    cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
+            { echo "$sh:"; printf "%s\n" "$out"; exit 1; } >&2
+    done
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-1,4
+    out=$(cpuset_probe "$d" sh)
+    printf "%s\n" "$out" | grep -qx "bindable_priv 2-3,5-7" || { echo "gaps:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: an escalator that cannot read its cgroup leaves bindable_priv unknown (-), never guessed" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    # sudo runs true and taskset but not cat: the per-cpu trial would have
+    # found 4-7 under it
+    cat > "$d/bin/sudo" <<SUDO
+#!/bin/sh
+echo "sudo \$*" >> "$d/calls"
+case "\$*" in
+  "-n true") exit 0 ;;
+  "-n taskset "*) shift; STUB_PRIV=1 exec "\$@" ;;
+  *) echo "sudo: a password is required" >&2; exit 1 ;;
+esac
+SUDO
+    cat > "$d/bin/taskset" <<TS
+#!/bin/sh
+echo "taskset \$*" >> "$d/calls"
+case "\$1" in
+  -cp) echo "pid \$2'"'"'s current affinity list: 0-7" ;;
+  -c) case "\$2" in [4-7]) [ -n "\${STUB_PRIV:-}" ] || exit 1 ;; esac; shift 2; exec "\$@" ;;
+esac
+TS
+    cg_file "$d" /proc/self/cgroup "0::/user.slice"
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv -" ||
+            { echo "$sh, cat refused:"; printf "%s\n" "$out"; exit 1; } >&2
+    done
+    # cat works but names no cgroup: still unknown
+    printf "#!/bin/sh\ncase \"\$*\" in \"-n true\") exit 0 ;; \"-n cat \"*) echo \"sudo: unable to resolve host x\" ;; *) exit 1 ;; esac\n" > "$d/bin/sudo"
+    out=$(cpuset_probe "$d" sh)
+    printf "%s\n" "$out" | grep -qx "bindable_priv -" || { echo "junk cgroup:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: one taskset and one escalated cat per host, never a launch per cpu" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    cat > "$d/bin/sudo" <<SUDO
+#!/bin/sh
+echo "sudo \$*" >> "$d/calls"
+case "\$*" in
+  "-n true") exit 0 ;;
+  "-n cat "*) echo "0::/" ;;
+  *) exit 1 ;;
+esac
+SUDO
+    cg_file "$d" /proc/self/cgroup "0::/user.slice"
+    cg_file "$d" /sys/fs/cgroup/cpuset.cpus.effective 0-7
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    want=$(printf "taskset -cp PID\nsudo -n true\nsudo -n cat $d/root/proc/self/cgroup")
+    for sh in "$(type -P sh)" "$(type -P bash)"; do
+        out=$(cpuset_probe "$d" "$sh")
+        got=$(sed "s/^taskset -cp [0-9]*\$/taskset -cp PID/" "$d/calls")
+        [ "$got" = "$want" ] && printf "%s\n" "$out" | grep -qx "bindable_priv 4-7" ||
+            { echo "$sh: $(wc -l < "$d/calls") launch(es):"; printf "%s\n" "$got" "--- output:" "$out"; exit 1; } >&2
+    done'
 t_assert "probe facts: an absent bindable line means UNTESTED, never none" bash -c '
     d=$(mktemp -d)
     printf "ncpus 8\n" > "$d/p"

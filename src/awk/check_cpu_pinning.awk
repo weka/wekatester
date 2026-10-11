@@ -43,7 +43,8 @@ BEGIN {
         for (i = 1; i <= np; i++) if (index(P[i], "priv ") == 1) { priv = substr(P[i], 6); break }
         expand(req_s, REQ); expand(cur_s, CUR); expand(iso_s, ISO)
         ncpus = ncpus_s ~ /^[0-9]+$/ ? ncpus_s + 0 : 0
-        # MEASURED facts (empty, untested, when the probe could not test)
+        # facts the probe READ from the cpuset (empty, untested, when it
+        # could not read them)
         tested = probe_cpu_fact(P, np, "bindable", BIND)
         probe_cpu_fact(P, np, "bindable_priv", BINDP)
         probe_universe(P, np, ncpus, U)
@@ -79,7 +80,7 @@ BEGIN {
         split("", PHANTOM)
         if (set_any(U)) for (c in REQ) if (!(c in U)) PHANTOM[c] = 1
         if (set_any(PHANTOM)) flag("phantom")
-        # cpus the host refuses to bind (measured): fio answers err=22
+        # cpus the host refuses to bind (outside the cpuset): fio answers err=22
         # cpu_set_affinity per job, after the run has started
         split("", UNBIND)
         if (tested) for (c in REQ) if (!(c in WEKA) && !(c in PHANTOM) && !(c in BIND) && !(c in BINDP)) UNBIND[c] = 1
@@ -112,9 +113,9 @@ BEGIN {
         iso_in = 0; iso_out = 0
         if (set_any(ISO)) for (c in REQ) if (c in ISO) iso_in = 1; else iso_out = 1
         if (iso_in && iso_out) flag("mixed")
-        # Which cpus need the escalator: MEASURED, those the probe could
-        # bind only under it. Without the measurement, isolated cpus are
-        # assumed self-affinable.
+        # Which cpus need the escalator: those only the escalated cgroup's
+        # cpuset holds. Without a bindable line, isolated cpus are assumed
+        # self-affinable.
         if (!set_any(EFF)) flag("allweka")
         else if (tested) {
             for (c in EFF) if (!(c in BIND)) { flag("outside"); break }

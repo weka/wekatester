@@ -4,28 +4,36 @@ probe_remote_cmd() {
     # Raw facts out: weka cores from each wekanode PROCESS mask (per task,
     # pinned helper threads read as phantom cores); ident (the machine id);
     # shape facts (cpu_model, memtotal_kb, aio_max_nr, aio_nr, topo_*, nic,
-    # weka_net or weka_net_err or weka_cli absent); measured per-cpu bind
-    # tests. WEKATESTER_SYSROOT is for the suite only.
+    # weka_net or weka_net_err or weka_cli absent); bindable cpus. WEKATESTER_SYSROOT
+    # is for the suite only.
+    # Bindable cpus are READ, never trial-bound: sched_setaffinity accepts the
+    # cgroup's cpuset. A cgroup without the controller takes its nearest
+    # ancestor's, so the read walks up; a v1 cpuset line (hybrid) beats 0::.
+    # No cpuset file: the taskset affinity. bindable_priv: what the
+    # escalator's cgroup adds, "-" if unknown.
     printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
-        echo \"taskset \$(taskset -cp \$\$ | awk -F': ' '{print \$2}')\"; \
+        _ts=\$(taskset -cp \$\$ | awk -F': ' '{print \$2}'); echo \"taskset \$_ts\"; \
         echo \"isolated \$([ -f \"\$_sr/sys/devices/system/cpu/isolated\" ] && cat \"\$_sr/sys/devices/system/cpu/isolated\")\"; \
         echo \"online \$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\")\"; \
         echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
         _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
-        if _o=\$(command -v taskset); then \
-            _on=\$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\"); \
-            _ids=\$(printf '%s' \"\${_on:-0-\$(( \$(getconf _NPROCESSORS_ONLN) - 1 ))}\" | awk 'BEGIN {RS = \",\"} {n = split(\$0, a, \"-\"); if (n == 2) {for (i = a[1]; i <= a[2]; i++) print i} else if (length(\$0)) print \$0 + 0}'); \
-            _bd=; _bp=; for c in \$_ids; do \
-                if _o=\$(taskset -c \$c true 2>&1); then _bd=\"\$_bd,\$c\"; \
-                elif [ -n \"\$_pv\" ] && _o=\$(\$_pv taskset -c \$c true 2>&1); then _bp=\"\$_bp,\$c\"; fi; \
-            done; \
-            [ -n \"\$_bd\" ] || _bd=,-; [ -n \"\$_bp\" ] || _bp=,-; \
-            echo \"bindable \${_bd#,}\"; echo \"bindable_priv \${_bp#,}\"; \
+        _cpuset() { printf '%s\\n' \"\$1\" | awk -F: '\$2 ~ /(^|,)cpuset(,|\$)/ {v1 = 1; d1 = \"/sys/fs/cgroup/\" \$2; p1 = substr(\$0, length(\$1) + length(\$2) + 3)} \$1 == \"0\" && \$2 == \"\" {v2 = 1; p2 = substr(\$0, 4)} \
+            END {if (v1) {d = d1; p = p1} else if (v2) {d = \"/sys/fs/cgroup\"; p = p2} else exit; \
+                for (;;) {if (p == \"/\") p = \"\"; if (v1) {print d p \"/cpuset.effective_cpus\"; print d p \"/cpuset.cpus\"} else print d p \"/cpuset.cpus.effective\"; if (p == \"\") break; sub(/\\/[^\\/]*\$/, \"\", p)}}' \
+            | while IFS= read -r _f; do [ -r \"\$_sr\$_f\" ] || continue; _v=\$(cat \"\$_sr\$_f\"); [ -z \"\$_v\" ] || { printf '%s\\n' \"\$_v\"; break; }; done; }; \
+        _bd=\$(_cpuset \"\$([ -r \"\$_sr/proc/self/cgroup\" ] && cat \"\$_sr/proc/self/cgroup\")\"); _bd=\${_bd:-\$_ts}; \
+        if [ -n \"\$_bd\" ]; then \
+            _bp=; if [ -n \"\$_pv\" ] && _g=\$(timeout 5 \$_pv cat \"\$_sr/proc/self/cgroup\" </dev/null 2>&1); then _bp=\$(_cpuset \"\$_g\"); fi; \
+            echo \"bindable \$_bd\"; \
+            echo \"bindable_priv \$(awk -v a=\"\$_bp\" -v b=\"\$_bd\" 'function ex(s, S,    n, P, i, r, c) {n = split(s, P, \",\"); for (i = 1; i <= n; i++) if (split(P[i], r, \"-\") == 2) {for (c = r[1] + 0; c <= r[2] + 0; c++) S[c] = 1} else if (P[i] != \"\") S[P[i] + 0] = 1} \
+                BEGIN {ex(a, A); ex(b, B); m = -1; for (c in A) if (c + 0 > m) m = c + 0; s = -1; o = \"\"; \
+                    for (c = 0; c <= m + 1; c++) {x = (c in A) && !(c in B); if (x && s < 0) s = c; else if (!x && s >= 0) {o = o \",\" (s == c - 1 ? s : s \"-\" (c - 1)); s = -1}} \
+                    print (o == \"\" ? \"-\" : substr(o, 2))}')\"; \
         fi; \
         _m=; if [ -z \"\$_sr\" ] && _o=\$(command -v lscpu); then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \

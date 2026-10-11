@@ -1,9 +1,10 @@
 # Shared fixtures for tests/test_wekatester.sh.
 
 # --- probe remote snippet stub (Task 4) ---
-# taskset refuses cpus 3 and 5, so the snippet's per-cpu bind test has
-# something to find; sudo always fails, so the escalator sweep is
-# deterministic wherever the suite runs.
+# An empty sysroot has no cgroup to read, so the bindable line is the
+# taskset affinity (0-7), not what taskset -c would accept (3 and 5 refused).
+# sudo always fails, so the escalator sweep is deterministic wherever the
+# suite runs.
 probe_stub() {
     stub=$(mktemp -d)   # leaked on purpose; tests are short-lived
     printf '#!/bin/sh\necho 8\n' > "$stub/getconf"
@@ -26,6 +27,33 @@ TASKSETEOF
     (source ./wekatester; FIO_BIN=fio; WEKATESTER_SYSROOT=$stub/root PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
 }
 export -f probe_stub
+
+# --- probe cpuset reads: a fake sysroot, and stubs that log every launch ---
+# cpuset_fixture <dir> <affinity>: <dir>/root is the sysroot, <dir>/bin the
+# stubs, <dir>/calls a line per taskset or sudo launch. taskset -c accepts
+# any cpu and sudo fails, until a test writes its own.
+cpuset_fixture() {
+    local d=$1
+    mkdir -p "$d/bin" "$d/root/proc/self"
+    printf '#!/bin/sh\necho 8\n' > "$d/bin/getconf"
+    printf '#!/bin/sh\nexit 1\n' > "$d/bin/pgrep"
+    printf '#!/bin/sh\necho " io_uring libaio"\n' > "$d/bin/fio"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    printf '#!/bin/sh\necho "sudo $*" >> "%s/calls"\nexit 1\n' "$d" > "$d/bin/sudo"
+    printf '#!/bin/sh\necho "taskset $*" >> "%s/calls"\ncase "$1" in\n  -cp) echo "pid $2'"'"'s current affinity list: %s" ;;\n  -c) shift 2; exec "$@" ;;\nesac\n' "$d" "$2" > "$d/bin/taskset"
+    chmod +x "$d/bin"/*
+}
+cg_file() {   # cg_file <dir> <path> <content>: a file in the fixture's sysroot
+    mkdir -p "$1/root${2%/*}"
+    printf '%s\n' "$3" > "$1/root$2"
+}
+cpuset_probe() {   # cpuset_probe <dir> <shell>: the probe's output there
+    local cmd
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
+    : > "$1/calls"
+    WEKATESTER_SYSROOT=$1/root PATH="$1/bin:$PATH" "$2" -c "$cmd" 2>&1
+}
+export -f cpuset_fixture cg_file cpuset_probe
 
 # --- tuner: fabricate probe dir + jobfile, run auto_tune ---
 tuner_fixture() {   # $1 = extra probe content variant
