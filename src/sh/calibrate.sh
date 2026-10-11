@@ -811,8 +811,9 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
     [ "$IGNORE_CAPACITY" -eq 1 ] \
         || die "not enough capacity for the calibration dataset (use --ignore-capacity to be asked anyway)"
     if try_interactive; then
-        confirm_explicit "not enough capacity for the calibration dataset: continue anyway and risk ENOSPC mid-calibration?" \
-            || die "not enough capacity"
+        confirm_explicit "not enough capacity for the calibration dataset: continue anyway and risk ENOSPC mid-calibration?"; rc=$?
+        close_interactive   # the run phase hands no child the terminal (base.sh)
+        [ "$rc" -eq 0 ] || die "not enough capacity"
     else
         log "WARNING: --ignore-capacity: not enough capacity for the calibration dataset, calibrating anyway (unattended)" >&2
     fi

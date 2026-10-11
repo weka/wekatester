@@ -4,7 +4,7 @@
 # own df (README). Over: die, or ask under --ignore-capacity. preview (a dry
 # run under -a): report, labelled, and stop nothing.
 check_capacity() {   # check_capacity [preview]
-    local host pids=() i failed=0 preview=${1:-}
+    local host pids=() i failed=0 preview=${1:-} rc
     mkdir -p "$WORK_DIR/df"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
@@ -27,8 +27,9 @@ check_capacity() {   # check_capacity [preview]
     [ "$IGNORE_CAPACITY" -eq 1 ] \
         || die "not enough capacity on at least one host (use --ignore-capacity to be asked anyway)"
     if try_interactive; then
-        confirm_explicit "not enough capacity: continue anyway and risk ENOSPC mid-run?" \
-            || die "not enough capacity"
+        confirm_explicit "not enough capacity: continue anyway and risk ENOSPC mid-run?"; rc=$?
+        close_interactive   # the run phase hands no child the terminal (base.sh)
+        [ "$rc" -eq 0 ] || die "not enough capacity"
     else
         log "WARNING: --ignore-capacity: not enough capacity, running anyway (unattended)" >&2
     fi

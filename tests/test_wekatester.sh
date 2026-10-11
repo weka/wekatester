@@ -5802,6 +5802,39 @@ bw write"); }
     case "$err" in *fs2*) echo "fs2 fits: $err" >&2; exit 1;; esac
     # 1 GiB of the first group shared set already laid out: 31 GiB still to write
     out=$(chk 31744 "shared.0.0 1073741824\n" 2>&1) || { echo "the credit did not count: $out" >&2; false; }'
+# The --ignore-capacity confirm runs after main closed the prompt fd, so it
+# must close what it reopened, yes or no. /dev/ptmx passes the [ -t 3 ] gate
+# with no terminal; asked=1 proves the fd was opened.
+t_assert "check_capacity: the --ignore-capacity confirm closes the prompt fd it opened, yes or no" bash -c '
+    d=$(mktemp -d)
+    chk() {   # chk <confirm status>
+        (export WEKATESTER_PROMPT_TTY=/dev/ptmx; source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1); DIRECTORY=/mnt/w; IGNORE_CAPACITY=1; ANSWER=$1
+         run_host() { :; }; list_staged() { :; }; awkrun() { return 3; }
+         confirm_explicit() { echo "asked=$PROMPT_OPENED"; return "$ANSWER"; }
+         state() { echo "opened=$PROMPT_OPENED child=$(bash -c "[ -t 3 ] && echo tty || echo none")"; }
+         die() { state; exit 1; }
+         check_capacity; state) 2>&1; }
+    want="asked=1
+opened=0 child=none"
+    out=$(chk 0); [ "$out" = "$want" ] || { echo "yes: $out" >&2; exit 1; }
+    out=$(chk 1); [ "$out" = "$want" ] || { echo "no: $out" >&2; false; }'
+t_assert "cal_capacity_check: the --ignore-capacity confirm closes the prompt fd it opened, yes or no" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    printf "1\th1\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th1\n" > "$d/cal/shapes"
+    chk() {   # chk <confirm status>
+        (export WEKATESTER_PROMPT_TTY=/dev/ptmx; source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1); DIRECTORY=/mnt/w; IGNORE_CAPACITY=1; ANSWER=$1
+         CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.; FILESIZE_MIB=1024; CAL_NR=1; CAL_NR_LADDER="1 2 4"
+         run_host() { :; }; awkrun() { return 3; }
+         confirm_explicit() { echo "asked=$PROMPT_OPENED"; return "$ANSWER"; }
+         state() { echo "opened=$PROMPT_OPENED child=$(bash -c "[ -t 3 ] && echo tty || echo none")"; }
+         die() { state; exit 1; }
+         cal_capacity_check "$d/cal/shapes" "bw read"; state) 2>&1; }
+    want="asked=1
+opened=0 child=none"
+    out=$(chk 0); [ "$out" = "$want" ] || { echo "yes: $out" >&2; exit 1; }
+    out=$(chk 1); [ "$out" = "$want" ] || { echo "no: $out" >&2; false; }'
 t_assert "-u: each filesystem group's shared set is removed from that group's first host" bash -c '
     d=$(mktemp -d); printf "h1 1\nh2 2\nh3 1\n" > "$d/groups"
     (source ./wekatester
