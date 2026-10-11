@@ -27,6 +27,7 @@ TARGETS_FILE=""                 # the resolved host file actually in use
 ENGINE=""                       # -e: force this fio ioengine everywhere
 DURATION=""                     # -x: one runtime (seconds) for every measured job
 RUN_STAMP=""                    # <date>-<time> of this run, set at run start
+RUN_EPOCH=""                    # the same run start, in epoch seconds
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
@@ -540,7 +541,8 @@ main() {
     # unwritable -o must not cost a benchmark).
     mkdir -p -- "$OUTPUT_DIR" || die "cannot create output directory $OUTPUT_DIR"
     [ -w "$OUTPUT_DIR" ] || die "output directory $OUTPUT_DIR is not writable"
-    printf -v RUN_STAMP '%(%Y%m%d-%H%M%S)T' -1
+    printf -v RUN_EPOCH '%(%s)T' -1
+    printf -v RUN_STAMP '%(%Y%m%d-%H%M%S)T' "$RUN_EPOCH"
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     start_run_log

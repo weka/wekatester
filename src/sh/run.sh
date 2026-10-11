@@ -88,21 +88,24 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
 PRESSURE_END_DONE=0
 snapshot_pressure() {   # snapshot_pressure <start|end>
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    local label=$1 host i pids=() hs=() cmd sar_s sar_e
+    local label=$1 host i pids=() hs=() cmd
     cmd='for f in cpu io memory; do
         echo "=== WEKATESTER_SYSINFO pressure-$f ==="
         if [ -r "/proc/pressure/$f" ]; then cat "/proc/pressure/$f"; else echo "not available"; fi
     done
     echo "=== WEKATESTER_SYSINFO loadavg ==="
     if [ -r /proc/loadavg ]; then cat /proc/loadavg; else echo "not available"; fi'
-    if [ "$label" = end ] && [ -n "$RUN_STAMP" ]; then
-        # the sar slice for the run window (same-day file; a run crossing
-        # midnight gets the tail from 00:00:00 -- sar cannot span files)
-        sar_s=${RUN_STAMP#*-}; sar_s=${sar_s:0:2}:${sar_s:2:2}:${sar_s:4:2}
-        printf -v sar_e '%(%H:%M:%S)T' -1
+    if [ "$label" = end ] && [ -n "$RUN_EPOCH" ]; then
+        # the run window's sar slice, in each worker's own time zone; a run
+        # that started on an earlier worker day gets today from 00:00:00
+        # (sar reads one day's file)
         cmd="$cmd
     echo '=== WEKATESTER_SYSINFO sar ==='
-    if _o=\$(command -v sar); then sar -A -s '$sar_s' -e '$sar_e' 2>&1 || true; else echo 'sar: not available'; fi"
+    if _o=\$(command -v sar); then
+        _s=\$(date -d @$RUN_EPOCH '+%F %H:%M:%S'); _n=\$(date '+%F %H:%M:%S')
+        if [ \"\${_s% *}\" = \"\${_n% *}\" ]; then _s=\${_s#* }; else _s=00:00:00; fi
+        sar -A -s \"\$_s\" -e \"\${_n#* }\" 2>&1 || true
+    else echo 'sar: not available'; fi"
     fi
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/pressure.$label.$host" ) &

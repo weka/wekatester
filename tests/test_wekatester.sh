@@ -6160,7 +6160,7 @@ t_assert "sysinfo: one file per item per host, missing tools say so" bash -c '
 t_assert "pressure: start and end land as labeled files, end pulls the sar slice" bash -c '
     d=$(mktemp -d); mkdir -p "$d/out"
     (source ./wekatester
-     WORK_DIR=$d; RUN_DIR=$d/out; HOSTS=(h1); RUN_STAMP=20260820-003501
+     WORK_DIR=$d; RUN_DIR=$d/out; HOSTS=(h1); RUN_STAMP=20260820-003501; RUN_EPOCH=1787200501
      run_host() { case "$2" in
          (*sar*) printf "%s\n" \
              "=== WEKATESTER_SYSINFO pressure-cpu ===" "some avg10=0.15" \
@@ -6185,19 +6185,60 @@ t_assert "pressure: no run dir means no capture, no error" bash -c '
     [ ! -f "$d/oplog" ]'
 t_assert "sysinfo and pressure, run for real: a tool on PATH runs, a missing one is not available" bash -c '
     d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/w" "$d/run"
-    for c in cat uname; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
+    for c in cat uname date; do p=$(type -P "$c") || { echo "no $c on this host" >&2; exit 1; }; ln -s "$p" "$b/$c"; done
     printf "#!/bin/sh\necho up 1 day\n" > "$b/uptime"
     printf "#!/bin/sh\necho sar \"\$@\"\n" > "$b/sar"
     chmod +x "$b/uptime" "$b/sar"
-    (source ./wekatester; HOSTS=(h1); WORK_DIR=$d/w; RUN_DIR=$d/run; RUN_STAMP=20261009-120000; FIO_BIN=fio
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$d/w; RUN_DIR=$d/run; RUN_STAMP=20261009-120000; RUN_EPOCH=$(date +%s); FIO_BIN=fio
      run_host() { printf "%s" "$2" > "$d/cmd.$1.$CMDK"; }
      CMDK=sysinfo snapshot_sysinfo; CMDK=pressure snapshot_pressure end) >>"$WT_ASIDE" 2>&1
     [ -s "$d/cmd.h1.sysinfo" ] && [ -s "$d/cmd.h1.pressure" ] || { echo "strings not captured" >&2; exit 1; }
     bash=$(type -P bash)
     s=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1.sysinfo")" 2>&1); p=$(PATH=$b "$bash" -c "$(cat "$d/cmd.h1.pressure")" 2>&1)
     printf "%s\n" "$s" | grep -qx "up 1 day" && printf "%s\n" "$s" | grep -qx "lspci: not available" &&
-    printf "%s\n" "$s" | grep -qx "weka: not available" && printf "%s\n" "$p" | grep -q "^sar -A -s 12:00:00 -e " ||
+    printf "%s\n" "$s" | grep -qx "weka: not available" && printf "%s\n" "$p" | grep -qE "^sar -A -s [0-9]{2}:[0-9]{2}:[0-9]{2} -e " ||
         { printf "%s\n" "$s" "$p"; exit 1; } >&2'
+# The sar window, run for real under bash: the worker's zone and day decide,
+# never the controller's (review #8, Frank, 2026-10-11).
+wt_sar_cmd() {   # wt_sar_cmd <start-epoch> <out-file>: the end-of-run string
+    local d; d=$(mktemp -d)
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$d; RUN_DIR=$d; RUN_EPOCH=$1; WT_SAR_OUT=$2
+     printf -v RUN_STAMP '%(%Y%m%d-%H%M%S)T' "$1"
+     run_host() { printf "%s" "$2" > "$WT_SAR_OUT"; }
+     snapshot_pressure end) >>"$WT_ASIDE" 2>&1
+}
+wt_sar_bin() {   # wt_sar_bin <dir> [sar]: cat and date, plus a fake sar
+    local c p
+    mkdir -p "$1"
+    for c in cat date; do p=$(type -P "$c") || { echo "no $c on this host" >&2; return 1; }; ln -s "$p" "$1/$c"; done
+    [ -z "$2" ] || { printf '#!/bin/sh\necho sar "$@"\n' > "$1/sar"; chmod +x "$1/sar"; }
+}
+export -f wt_sar_cmd wt_sar_bin
+t_assert "pressure sar: -s is the start in the worker zone, not the controller one" bash -c '
+    d=$(mktemp -d); bash=$(type -P bash); wt_sar_bin "$d/b" sar || exit 1
+    S=$(( $(date +%s) - 5 )); wt_sar_cmd "$S" "$d/cmd" && [ -s "$d/cmd" ] || { echo "no command captured" >&2; exit 1; }
+    seen=()
+    for z in UTC America/New_York; do
+        out=$(TZ=$z PATH=$d/b "$bash" -c "$(cat "$d/cmd")" 2>&1)
+        want=$(TZ=$z date -d @$S +%H:%M:%S)
+        [ "$(TZ=$z date -d @$S +%F)" = "$(TZ=$z date +%F)" ] || want=00:00:00
+        printf "%s\n" "$out" | command grep -qE "^sar -A -s $want -e [0-9]{2}:[0-9]{2}:[0-9]{2}\$" ||
+            { echo "$z: want -s $want, got:"; printf "%s\n" "$out"; exit 1; } >&2
+        seen+=("$want")
+    done
+    [ "${seen[0]}" != "${seen[1]}" ] || { echo "both zones gave -s ${seen[0]}" >&2; exit 1; }'
+t_assert "pressure sar: a start on an earlier worker day reads from 00:00:00" bash -c '
+    d=$(mktemp -d); bash=$(type -P bash); wt_sar_bin "$d/b" sar || exit 1
+    wt_sar_cmd $(( $(date +%s) - 2 * 86400 )) "$d/cmd" && [ -s "$d/cmd" ] || { echo "no command captured" >&2; exit 1; }
+    out=$(TZ=UTC PATH=$d/b "$bash" -c "$(cat "$d/cmd")" 2>&1)
+    printf "%s\n" "$out" | command grep -qE "^sar -A -s 00:00:00 -e [0-9]{2}:[0-9]{2}:[0-9]{2}\$" ||
+        { printf "%s\n" "$out"; exit 1; } >&2'
+t_assert "pressure sar: no sar on the worker says so" bash -c '
+    d=$(mktemp -d); bash=$(type -P bash); wt_sar_bin "$d/b" || exit 1
+    wt_sar_cmd $(date +%s) "$d/cmd" && [ -s "$d/cmd" ] || { echo "no command captured" >&2; exit 1; }
+    out=$(PATH=$d/b "$bash" -c "$(cat "$d/cmd")" 2>&1)
+    printf "%s\n" "$out" | command grep -qx "sar: not available" ||
+        { printf "%s\n" "$out"; exit 1; } >&2'
 
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,
