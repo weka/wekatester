@@ -42,7 +42,8 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     else
         LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
-    # mkdir is the atomic take; a host named twice finds this run's own lock
+    # mkdir is the atomic take; one machine under two names (parse_args refuses
+    # one name twice) finds this run's own lock
     LOCK_CMD+="; if ! mkdir \"\$lk\"; then [ -d \"\$lk\" ] || { echo nolock; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
     LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
 }

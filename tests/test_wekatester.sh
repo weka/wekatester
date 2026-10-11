@@ -103,6 +103,21 @@ t_assert "-- passes flag-shaped tokens through as servers" bash -c '
     source ./wekatester; parse_args -d /x -- -weird h2
     [ "${HOSTS[*]}" = "-weird h2" ] && [ "$DIRECTORY" = /x ]'
 
+# --- parse_args: a host named twice is refused (review #16, Frank 2026-10-11) ---
+# fio got --client=h1 twice and the two lock sessions raced.
+t_assert "h1 h1 h2 is refused, naming h1 and only h1" bash -c '
+    err=$( (source ./wekatester; parse_args h1 h1 h2) 2>&1 >>$WT_ASIDE ) && { echo "accepted" >&2; exit 1; }
+    case "$err" in *"h1 is named twice on the command line"*) ;; *) echo "$err" >&2; exit 1;; esac
+    case "$err" in *h2*) echo "names h2: $err" >&2; exit 1;; esac'
+t_assert "h1 h2 h1 h2 names both repeated hosts" bash -c '
+    err=$( (source ./wekatester; parse_args h1 h2 h1 h2) 2>&1 >>$WT_ASIDE ) && { echo "accepted" >&2; exit 1; }
+    case "$err" in *"h1 is named twice"*"h2 is named twice"*) ;; *) echo "$err" >&2; exit 1;; esac'
+t_assert "distinct hosts still pass" bash -c '
+    source ./wekatester; parse_args h1 h2 h3; [ "${HOSTS[*]}" = "h1 h2 h3" ]'
+t_assert "hosts after -- are checked too" bash -c '
+    err=$( (source ./wekatester; parse_args h1 -- h1) 2>&1 >>$WT_ASIDE ) && { echo "accepted" >&2; exit 1; }
+    case "$err" in *"h1 is named twice"*) ;; *) echo "$err" >&2; exit 1;; esac'
+
 # --- -C was removed (Frank, 2026-10-11): it names the removal, every form ---
 t_assert "-C, -cset, --customize and --customize=set say -C was removed" bash -c '
     for a in -C -cmyset --customize --customize=myset; do

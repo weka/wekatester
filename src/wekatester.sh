@@ -400,6 +400,19 @@ parse_args() {
 
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.
+    # A host named twice gave fio two --client= and raced two lock sessions.
+    # Same host = same string: a CLI host is an address (hosts.sh, host identity).
+    local h n dups="" rep=()
+    local -A count=()
+    for h in "${HOSTS[@]}"; do
+        n=${count["h:$h"]:-0}; count["h:$h"]=$((n + 1))
+        [ "$n" -ne 1 ] || rep+=("$h")
+    done
+    for h in "${rep[@]}"; do
+        n=${count["h:$h"]}; [ "$n" -eq 2 ] && n=twice || n="$n times"
+        dups="$dups${dups:+, }$h is named $n"
+    done
+    [ -z "$dups" ] || { usage >&2; die "$dups on the command line"; }
     if [ -n "$SUMMARIZE_FILE" ]; then
         # -r used to take a report list: name the change, not demote it to a
         # host.
