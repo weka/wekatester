@@ -3654,6 +3654,7 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
     printf "host,user_login,ioengine\nh1,,psync,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
     tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,$" &&
@@ -3664,6 +3665,7 @@ t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     before=$(cat "$f")
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     [ "$(cat "$f")" = "$before" ]'
 t_assert "writeback: -g overwrites without a prompt, but never login or allowed_cpus" bash -c '
@@ -3671,6 +3673,7 @@ t_assert "writeback: -g overwrites without a prompt, but never login or allowed_
     printf "h1,opc,psync,9-11,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -q "^h1,opc,libaio,9-11,/mnt/w,,,,,/1G/8/32,$"'
 # The layout job sorts first, so before it carried the marker its engine,
@@ -3698,6 +3701,7 @@ t_assert "writeback: a generic cpu list stays as written; the host line records 
     printf "host,user_login,ioengine,allowed_cpus\n,,,0-127,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 2p "$f")" = ",,,0-127,,,,,,," ] &&
     ! grep -q "superseded" "$f" &&
@@ -3708,6 +3712,7 @@ t_assert "writeback: generic engine and dir are defaults too; the host line reco
     printf ",,psync,0-127,/mnt/g,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",,psync,0-127,/mnt/g,,,,,," ] &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
@@ -3717,6 +3722,7 @@ t_assert "writeback: a host row beside a generic one keeps its own cpu list; the
     printf ",,,0-127,,,,,,,\nh1,opc,,9-11,,,,,,,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; REGEN_LAYOUT=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",,,0-127,,,,,,," ] &&
     grep -q "^# superseded by -a: h1,opc,,9-11" "$f" &&
@@ -3727,6 +3733,7 @@ t_assert "writeback: a cpu list that differs from the generic one is reason enou
     printf ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32,\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     [ "$(sed -n 1p "$f")" = ",ubuntu,libaio,0-127,/mnt/w,,,,,/1G/8/32," ] &&
     tail -1 "$f" | grep -q "^h1,ubuntu,libaio,0-3,/mnt/w,,,,,/1G/8/32,$" ||
@@ -3821,6 +3828,7 @@ t_assert "cal.results: one width, both parsers accept what the shared layer defi
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE ||
         { echo "writeback rejected: $row" >&2; false; }
     tail -1 "$f" | grep -q "^h1,"'
@@ -5052,6 +5060,7 @@ t_assert "writeback: a measured 1MiB latency tuple lands in its own column" bash
     f="$d/host.csv"; printf "host,user_login,ioengine\n" > "$f"
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=cal; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }   # no ssh to a fixture host
      writeback_targets) >>$WT_ASIDE
     tail -1 "$f" | grep -qx "h1,,,,,,,,,,,6/5120M/1/1" || { tail -1 "$f" >&2; false; }'
 t_assert "calibrate: under -b a latency set also measures the 1MiB test, into its own slot" bash -c '
