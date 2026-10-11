@@ -1004,6 +1004,15 @@ t_assert "validate_credentials splits login:key pairs; bare paths get the defaul
      validate_credentials
      [ "${IDENT_LOGINS[*]}" = "ubuntu  root" ] || { echo "logins: ${IDENT_LOGINS[*]}" >&2; exit 1; }
      [ "${IDENT_KEYS[*]}" = "$d/k1 $d/k2 $d/k3" ])'
+# The shell expands ~ only at a word's start: in -i ubuntu:~/k it arrives
+# literally, and wekatester expands it.
+t_assert "validate_credentials expands a leading ~/ in the key path, after a login or alone" bash -c '
+    d=$(mktemp -d); : > "$d/k"
+    (source ./wekatester
+     HOME=$d; LOCAL_MODE=0; IDENT_RAW=("ubuntu:~/k" "~/k")
+     validate_credentials
+     [ "${IDENT_LOGINS[*]}" = "ubuntu " ] && [ "${IDENT_KEYS[*]}" = "$d/k $d/k" ] ||
+         { echo "logins: ${IDENT_LOGINS[*]}; keys: ${IDENT_KEYS[*]}" >&2; false; })'
 # A bad key path must be named before the first ssh, not after ssh has already
 # failed for a reason the operator has to reverse-engineer from BatchMode noise.
 # A directory must be refused too: -i ~/.ssh is the likeliest typo and a

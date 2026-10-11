@@ -221,6 +221,12 @@ validate_credentials() {
                 *)   login=""; key=$entry ;;
             esac
             [ -n "$key" ] || die "empty key path in -i entry: '$entry'"
+            # the shell expands ~ only at a word's start, so login:~/k
+            # arrives as typed; ~user/ stays as typed
+            case $key in
+                '~') key=$HOME ;;
+                '~/'*) key=$HOME/${key#'~/'} ;;
+            esac
             { [ -f "$key" ] && [ -r "$key" ]; } || \
                 die "identity file not readable: $key"
             IDENT_LOGINS+=("$login")
