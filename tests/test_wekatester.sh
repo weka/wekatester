@@ -2862,6 +2862,94 @@ t_assert "engines: a HANGING test job is killed by the timeout and recorded as f
     took=$(( $(date +%s) - start ))
     grep -qx "localhost hangeng fail" "$d/engine.results" &&
     [ "$took" -lt 60 ]'
+t_assert "engines: a working engine's test returns the moment fio exits, well under a second each" bash -c '
+    # a poll would sleep a full second per candidate before its first look
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
+    printf "#!/bin/bash\nexit 0\n" > "$d/bin/fio"; chmod +x "$d/bin/fio"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=max
+     DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio
+     printf "engines io_uring libaio psync\n" > "$d/probe/localhost"
+     t0=$(date +%s%N); test_engines >>$WT_ASIDE 2>&1 || exit 1; t1=$(date +%s%N)
+     ms=$(( (t1 - t0) / 1000000 ))
+     [ "$(grep -c " ok$" "$d/engine.results")" = 3 ] || { cat "$d/engine.results" >&2; exit 1; }
+     [ "$ms" -lt 1000 ] || { echo "three engine tests took $ms ms" >&2; exit 1; })'
+t_assert "engines: a failing job's exit status is a fail; fio's stdout and stderr land in the evidence" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
+    cat > "$d/bin/fio" <<"EOF"
+#!/bin/bash
+case "$*" in (*ioengine=broken*) echo "fio: io_u error: Invalid argument" >&2; exit 1;; esac
+echo "{\"fio version\": \"stub\"}"
+EOF
+    chmod +x "$d/bin/fio"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
+        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
+        printf ",,broken,,,,,\n,,libaio,,,,,\n" > "$d/t.csv"
+        printf "engines broken libaio\n" > "$d/probe/localhost"
+        test_engines) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    grep -qx "localhost broken fail" "$d/engine.results" &&
+    grep -qx "localhost libaio ok" "$d/engine.results" &&
+    grep -qx "fio: io_u error: Invalid argument" "$d/et/localhost.broken.out" &&
+    grep -q "fio version" "$d/et/localhost.libaio.out" &&
+    case "$out" in
+        *"localhost: ioengine broken failed its test job"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "engines: a job ignoring TERM is killed at the timeout bound and recorded as fail, its test file gone" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
+    cat > "$d/bin/fio" <<"EOF"
+#!/bin/bash
+for a; do case $a in --filename=*) : > "${a#--filename=}";; esac; done
+trap "" TERM; sleep 30
+EOF
+    chmod +x "$d/bin/fio"
+    start=$(date +%s)
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
+        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
+        printf ",,stubborn,,,,,\n" > "$d/t.csv"
+        printf "engines stubborn\n" > "$d/probe/localhost"
+        WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) 2>&1 )
+    took=$(( $(date +%s) - start ))
+    # timeout -k 5: TERM at 1 s, KILL at 6 s
+    [ "$took" -ge 5 ] && [ "$took" -lt 15 ] || { echo "took $took s" >&2; exit 1; }
+    grep -qx "localhost stubborn fail" "$d/engine.results" &&
+    ! grep -q WEKATESTER_ENGINE_STUCK "$d/et/localhost.stubborn.out" &&
+    [ -z "$(ls -A "$d/dest")" ] &&
+    case "$out" in
+        *"localhost: ioengine stubborn failed its test job"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "engines: a job alive at the read bound is killed, recorded as fail, its test file gone" bash -c '
+    # a timeout(1) that never returns: only the read bound (timeout + 10 s) ends it
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
+    printf "#!/bin/bash\nexit 0\n" > "$d/bin/fio"
+    cat > "$d/bin/timeout" <<"EOF"
+#!/bin/bash
+for a; do case $a in --filename=*) : > "${a#--filename=}";; esac; done
+echo $$ > "${0%/*}/tpid"; trap "" TERM; exec sleep 300
+EOF
+    chmod +x "$d/bin/fio" "$d/bin/timeout"
+    start=$(date +%s)
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
+        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
+        printf ",,libaio,,,,,\n" > "$d/t.csv"
+        printf "engines libaio\n" > "$d/probe/localhost"
+        PATH=$d/bin:$PATH WEKATESTER_ENGINE_TEST_TIMEOUT=1 test_engines) 2>&1 )
+    took=$(( $(date +%s) - start ))
+    [ "$took" -ge 11 ] && [ "$took" -lt 25 ] || { echo "took $took s" >&2; exit 1; }
+    # the -9 reached it: exit 124 and the rm happen either way
+    tp=$(cat "$d/bin/tpid") || exit 1
+    if _o=$(kill -0 "$tp" 2>&1); then echo "the hung timeout $tp outlived the read bound" >&2; kill -9 "$tp"; exit 1; fi
+    grep -qx "localhost libaio fail" "$d/engine.results" &&
+    ! grep -q WEKATESTER_ENGINE_STUCK "$d/et/localhost.libaio.out" &&
+    [ -z "$(ls -A "$d/dest")" ] &&
+    case "$out" in
+        *"localhost: ioengine libaio failed its test job"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 t_assert "engines: test_engines returns while unrelated background children live (bare-wait)" bash -c '
     # the run-log tees are alive while test_engines runs; a bare `wait`
     # there deadlocks on them -- seen live as a silent hang right after the

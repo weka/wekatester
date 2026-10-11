@@ -94,22 +94,23 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         esac
         # A broken engine can hang, and a direct-IO write on a sick
         # mount parks fio in D state, where SIGKILL and timeout(1) both
-        # stall. So: background the bounded job, poll it, and abandon
-        # it if it will not die. A working engine takes milliseconds.
+        # stall. So: the bounded job reports its exit status down a pipe,
+        # read the moment it exits; past the read's bound it is killed, and
+        # abandoned if it will not die.
         tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
-        # _o keeps kill's complaints out of the evidence file
-        if run_host "$host" "f='$hd/.wekatester-enginetest.'\$\$; \
-                timeout -k 5 $tmo \
-                '$FIO_BIN' --name=et --ioengine=$c --rw=write --bs=64k \
+        # bash -c: process substitution and read -t are not POSIX. fio
+        # writes to fd 4, the session's stdout: one that will not die holds
+        # it until its IO ends, ssh too. -9 goes to timeout's process group,
+        # fio's too; _o keeps kill's complaints out of the evidence.
+        if run_host "$host" "bash -c 'f=\$1/.wekatester-enginetest.\$\$; exec 4>&1; \
+                exec 3< <(timeout -k 5 $tmo \"\$2\" --name=et --ioengine=$c --rw=write --bs=64k \
                 --filesize=64k --filename=\"\$f\" --direct=1 \
-                --output-format=json & p=\$!; i=0; \
-                while _o=\$(kill -0 \$p 2>&1) && [ \$i -lt $((tmo + 10)) ]; do sleep 1; i=\$((i+1)); done; \
-                if _o=\$(kill -0 \$p 2>&1); then \
-                    _o=\$(kill -9 \$p 2>&1); sleep 1; \
-                    _o=\$(kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
-                    rm -f \"\$f\"; exit 124; \
-                fi; \
-                wait \$p; rc=\$?; rm -f \"\$f\"; exit \$rc" \
+                --output-format=json >&4 4>&- & echo \$!; wait \$!; echo \$?); \
+                read -r p <&3; \
+                if read -t $((tmo + 10)) rc <&3; then rm -f \"\$f\"; exit \$rc; fi; \
+                _o=\$(kill -9 -- -\$p \$p 2>&1); sleep 1; \
+                _o=\$(kill -0 -- -\$p 2>&1 || kill -0 \$p 2>&1) && echo WEKATESTER_ENGINE_STUCK; \
+                rm -f \"\$f\"; exit 124' et '$hd' '$FIO_BIN'" \
                 > "$WORK_DIR/et/$host.$c.out" 2>&1; then
             echo "$host $c ok" >> "$results"
             [ "$mode" = all ] || return 0
