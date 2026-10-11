@@ -174,42 +174,52 @@ t_assert "probe: no cpuset to read falls back to the taskset affinity, under sh 
     done
     out=$(probe_stub)
     printf "%s\n" "$out" | grep -qx "bindable 0-7" || { printf "%s\n" "$out" >&2; false; }'
-# Neither answering is no measurement, so the probe says why and nothing
-# else (Frank, 2026-10-11): before, both lines were left out and the
-# pinning check guessed.
-t_assert "probe: no cpuset file and a failing taskset -cp print bindable_err with taskset's words, under sh and bash" bash -c '
+# fio launches under taskset -c, so a taskset -cp that fails or gives no
+# list is no measurement, whatever the cpuset says: the probe says why and
+# nothing else (Frank, 2026-10-11). Before, both lines were left out, or the
+# cpuset answered alone.
+t_assert "probe: a failing taskset -cp prints bindable_err with taskset's words, cpuset or none, under sh and bash" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
     cat > "$d/bin/taskset" <<TS
 #!/bin/sh
 echo "taskset: failed to get pid \$2 affinity: Operation not permitted" >&2
 exit 1
 TS
-    want="bindable_err no cgroup cpuset file was readable, and taskset -cp failed: taskset: failed to get pid [0-9]* affinity: Operation not permitted"
+    want="bindable_err taskset -cp failed: taskset: failed to get pid [0-9]* affinity: Operation not permitted"
     for sh in "$(type -P sh)" "$(type -P bash)"; do
-        # no /proc/self/cgroup, then one naming a cgroup with no cpuset file
-        for cg in none no-cpuset-file; do
+        # no /proc/self/cgroup, one naming a cgroup with no cpuset file, then a readable cpuset
+        for cg in none no-cpuset-file cpuset; do
             out=$(cpuset_probe "$d" "$sh")
             printf "%s\n" "$out" | grep -qx "$want" && printf "%s\n" "$out" | grep -qx "taskset " &&
             ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
                 { echo "$sh, $cg:"; printf "%s\n" "$out"; exit 1; } >&2
             cg_file "$d" /proc/self/cgroup "0::/user.slice"
+            [ "$cg" = none ] || cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
         done
-        rm -f "$d/root/proc/self/cgroup"
+        rm -f "${d:?}/root/proc/self/cgroup" "${d:?}/root/sys/fs/cgroup/user.slice/cpuset.cpus.effective"
     done
-    # taskset answers, but with no affinity list to read
+    # taskset answers, but with no affinity list to read, beside a readable cpuset
     printf "#!/bin/sh\necho \"no affinity here\"\n" > "$d/bin/taskset"
-    out=$(cpuset_probe "$d" bash)
-    printf "%s\n" "$out" | grep -qx "bindable_err no cgroup cpuset file was readable, and taskset -cp gave no affinity list: no affinity here" ||
-        { echo "no list:"; printf "%s\n" "$out"; false; } >&2'
-t_assert "probe: a failing taskset -cp beside a readable cpuset keeps the cpuset, no bindable_err" bash -c '
-    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
-    printf "#!/bin/sh\necho \"taskset: Operation not permitted\" >&2\nexit 1\n" > "$d/bin/taskset"
     cg_file "$d" /proc/self/cgroup "0::/user.slice"
     cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    out=$(cpuset_probe "$d" bash)
+    printf "%s\n" "$out" | grep -qx "bindable_err taskset -cp gave no affinity list: no affinity here" &&
+    ! printf "%s\n" "$out" | grep -q "^bindable " ||
+        { echo "no list:"; printf "%s\n" "$out"; false; } >&2'
+t_assert "probe: no taskset on PATH prints bindable_err naming it, even beside a readable cpuset, under sh and bash" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); cpuset_fixture "$d" 0-7
+    cg_file "$d" /proc/self/cgroup "0::/user.slice"
+    cg_file "$d" /sys/fs/cgroup/user.slice/cpuset.cpus.effective 0-3
+    # a PATH of the stubs and the tools the probe needs, taskset left out
+    mkdir "$d/nots"; cp "$d/bin/getconf" "$d/bin/pgrep" "$d/bin/fio" "$d/bin/timeout" "$d/bin/sudo" "$d/nots/"
+    for t in awk sort cat tr head grep readlink id; do ln -s "$(type -P "$t")" "$d/nots/$t"; done
+    ! PATH="$d/nots" "$(type -P bash)" -c "command -v taskset" || { echo "taskset still on the PATH" >&2; exit 1; }
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
     for sh in "$(type -P sh)" "$(type -P bash)"; do
-        out=$(cpuset_probe "$d" "$sh")
-        printf "%s\n" "$out" | grep -qx "bindable 0-3" && printf "%s\n" "$out" | grep -qx "bindable_priv -" &&
-        ! printf "%s\n" "$out" | grep -q "^bindable_err" ||
+        out=$(WEKATESTER_SYSROOT=$d/root PATH="$d/nots" "$sh" -c "$cmd" 2>&1)
+        printf "%s\n" "$out" | grep -qx "bindable_err taskset -cp failed: .*taskset.*not found" &&
+        printf "%s\n" "$out" | grep -qx "engines  io_uring libaio " &&
+        ! printf "%s\n" "$out" | grep -q "^bindable \|^bindable_priv" ||
             { echo "$sh:"; printf "%s\n" "$out"; exit 1; } >&2
     done'
 t_assert "probe: cgroup v2 cpuset is read from the nearest cgroup that has one, under sh and bash" bash -c '
@@ -2279,13 +2289,13 @@ t_assert "probe: hosts with no bindable cpus stop the run, each named with its r
             WORK_DIR=$d; DIRECTORY=/mnt/weka; ENGINE=""
             run_host() { case "$1" in
                 (h1) printf "ncpus 8\ntaskset 0-7\nbindable 0-7\nbindable_priv -\n";;
-                (h2) printf "ncpus 8\ntaskset \nbindable_err no cgroup cpuset file was readable, and taskset -cp failed: taskset: Operation not permitted\n";;
+                (h2) printf "ncpus 8\ntaskset \nbindable_err taskset -cp failed: taskset: Operation not permitted\n";;
                 (h3) printf "ncpus 8\n";;
             esac; }
             probe_workers) 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "probe_workers passed: $err" >&2; exit 1; }
     case "$err" in
-        *"h2: cannot tell which cpus fio may bind: no cgroup cpuset file was readable, and taskset -cp failed: taskset: Operation not permitted"*"h3: cannot tell which cpus fio may bind: its probe printed no bindable line"*"no cpu list fio can bind on: h2 h3 --"*"taskset -c"*) ;;
+        *"h2: cannot pin fio: taskset -cp failed: taskset: Operation not permitted"*"h3: cannot pin fio: its probe printed no bindable line"*"cannot pin fio on: h2 h3 --"*"taskset -c"*) ;;
         *) echo "$err" >&2; exit 1 ;;
     esac
     case "$err" in *"h1:"*|*"h1 "*) echo "named h1: $err" >&2; false ;; esac'

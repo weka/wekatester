@@ -9,16 +9,17 @@ probe_remote_cmd() {
     # Bindable cpus are READ, never trial-bound: sched_setaffinity accepts the
     # cgroup's cpuset. A cgroup without the controller takes its nearest
     # ancestor's, so the read walks up; a v1 cpuset line (hybrid) beats 0::.
-    # No cpuset file: the taskset affinity; neither: bindable_err and why,
-    # which stops the run. bindable_priv: what the escalator's cgroup adds,
-    # "-" if unknown.
+    # No cpuset file: the taskset affinity. A failed taskset -cp, or one with
+    # no list, is bindable_err and why, whatever the cpuset: fio launches
+    # under taskset -c. bindable_priv: what the escalator's cgroup adds, "-"
+    # if unknown.
     printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
         for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
-        _ts=; _te=; if _tso=\$(taskset -cp \$\$ 2>&1); then _ts=\$(printf '%s\\n' \"\$_tso\" | awk -F': ' '{print \$2}'); else _te=failed; fi; echo \"taskset \$_ts\"; \
+        _ts=; _te=; if _tso=\$(taskset -cp \$\$ 2>&1); then _ts=\$(printf '%s\\n' \"\$_tso\" | awk -F': ' '{print \$2}'); [ -n \"\$_ts\" ] || _te='gave no affinity list'; else _te=failed; fi; echo \"taskset \$_ts\"; \
         echo \"isolated \$([ -f \"\$_sr/sys/devices/system/cpu/isolated\" ] && cat \"\$_sr/sys/devices/system/cpu/isolated\")\"; \
         echo \"online \$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\")\"; \
         echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
@@ -28,14 +29,14 @@ probe_remote_cmd() {
                 for (;;) {if (p == \"/\") p = \"\"; if (v1) {print d p \"/cpuset.effective_cpus\"; print d p \"/cpuset.cpus\"} else print d p \"/cpuset.cpus.effective\"; if (p == \"\") break; sub(/\\/[^\\/]*\$/, \"\", p)}}' \
             | while IFS= read -r _f; do [ -r \"\$_sr\$_f\" ] || continue; _v=\$(cat \"\$_sr\$_f\"); [ -z \"\$_v\" ] || { printf '%s\\n' \"\$_v\"; break; }; done; }; \
         _bd=\$(_cpuset \"\$([ -r \"\$_sr/proc/self/cgroup\" ] && cat \"\$_sr/proc/self/cgroup\")\"); _bd=\${_bd:-\$_ts}; \
-        if [ -n \"\$_bd\" ]; then \
+        if [ -z \"\$_te\" ]; then \
             _bp=; if [ -n \"\$_pv\" ] && _g=\$(timeout 5 \$_pv cat \"\$_sr/proc/self/cgroup\" </dev/null 2>&1); then _bp=\$(_cpuset \"\$_g\"); fi; \
             echo \"bindable \$_bd\"; \
             echo \"bindable_priv \$(awk -v a=\"\$_bp\" -v b=\"\$_bd\" 'function ex(s, S,    n, P, i, r, c) {n = split(s, P, \",\"); for (i = 1; i <= n; i++) if (split(P[i], r, \"-\") == 2) {for (c = r[1] + 0; c <= r[2] + 0; c++) S[c] = 1} else if (P[i] != \"\") S[P[i] + 0] = 1} \
                 BEGIN {ex(a, A); ex(b, B); m = -1; for (c in A) if (c + 0 > m) m = c + 0; s = -1; o = \"\"; \
                     for (c = 0; c <= m + 1; c++) {x = (c in A) && !(c in B); if (x && s < 0) s = c; else if (!x && s >= 0) {o = o \",\" (s == c - 1 ? s : s \"-\" (c - 1)); s = -1}} \
                     print (o == \"\" ? \"-\" : substr(o, 2))}')\"; \
-        else echo \"bindable_err no cgroup cpuset file was readable, and taskset -cp \${_te:-gave no affinity list}: \$(printf '%s\\n' \"\${_tso:-no output}\" | head -1)\"; \
+        else echo \"bindable_err taskset -cp \$_te: \$(printf '%s\\n' \"\${_tso:-no output}\" | head -1)\"; \
         fi; \
         _m=; if [ -z \"\$_sr\" ] && _o=\$(command -v lscpu); then _m=\$(lscpu | awk -F: '/^Model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}'); fi; \
         if [ -z \"\$_m\" ] && [ -r \"\$_sr/proc/cpuinfo\" ]; then _m=\$(awk -F: '/^model name/ {sub(/^[ \\t]+/, \"\", \$2); print \$2; exit}' \"\$_sr/proc/cpuinfo\"); fi; \
@@ -398,17 +399,17 @@ probe_workers() {
     done
     [ ${#failed[@]} -eq 0 ] || die "probe failed on: ${failed[*]}"
 
-    # fio launches under taskset -c: a host whose bindable cpus the probe
-    # could not read cannot be pinned, and they are never guessed (Frank,
-    # 2026-10-11). One awk for the fleet.
+    # fio launches under taskset -c: a host where taskset -cp failed, or
+    # whose bindable cpus the probe could not read, cannot be pinned, and
+    # nothing is guessed (Frank, 2026-10-11). One awk for the fleet.
     local unread line
     unread=$(awkrun '#@awk probe_workers.bindable' "$WORK_DIR/probe" "${HOSTS[@]}") || die "cannot read the probe results in $WORK_DIR/probe"
     if [ -n "$unread" ]; then
         while IFS= read -r line; do
-            log "ERROR: ${line%% *}: cannot tell which cpus fio may bind: ${line#* }" >&2
+            log "ERROR: ${line%% *}: cannot pin fio: ${line#* }" >&2
             bad+=("${line%% *}")
         done <<<"$unread"
-        die "no cpu list fio can bind on: ${bad[*]} -- fio launches under taskset -c, so these hosts cannot be pinned, and their cpus are never guessed"
+        die "cannot pin fio on: ${bad[*]} -- fio launches under taskset -c, which needs a working taskset -cp and a known cpu list there; nothing is guessed"
     fi
 
     # -e names an engine explicitly, and the probe already knows what each
