@@ -256,7 +256,8 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
 
 # phase1: before the engine tests (no engine selectors yet); phase2: with
 # engine.results, the finished resolution; hostonly: each host OWN row only,
-# what the writeback merges against.
-resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
+# what the writeback merges against; engines: every line's ioengine, one per
+# line (no hosts needed).
+resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") awkrun '#@awk resolve_targets' "$@"
 }

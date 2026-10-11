@@ -52,6 +52,9 @@ BEGIN {
         }
         ENK[ne] = nk
     }
+    # ---- engines: every line's ioengine, the candidates test_engines proves ----
+    if (phase == "engines")
+        for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
     # ---- phase2 input: the engine test results ----
     if (phase == "phase2" && results != "-") {
         if ((n = readlines(results, L)) < 0) awk_fail("cannot read " results)

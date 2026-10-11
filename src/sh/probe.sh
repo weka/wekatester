@@ -138,7 +138,7 @@ test_engines() {
     mkdir -p "$WORK_DIR/et"
     : > "$results"
     if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
-        csv_engines=$(awk -F, '#@awk test_engines.csv' "$TARGETS_FILE" | sort -u | tr '\n' ' ')
+        csv_engines=$(resolve_targets engines "$TARGETS_FILE" - - -) || die "cannot read the ioengines of the host file ($TARGETS_FILE)"
     fi
     cand="$ENGINE $csv_engines"
     [ -z "$AUTO_LEVEL" ] || cand="$cand io_uring libaio psync"

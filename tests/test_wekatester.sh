@@ -3034,6 +3034,24 @@ t_assert "finalize: a host-line engine that failed its test dies naming host+evi
         *"assigns ioengine '\''weird_eng'\'' to h1 but its test job failed"*) true;;
         *) echo "$err" >&2; false;;
     esac'
+t_assert "engines: the candidates are read by the CSV reader: quotes, comments and the header as host-file parsing has them" bash -c '
+    f=$(mktemp)
+    printf "host,user_login,ioengine\n# h0,,\"commented\"\nh1,,\"io_uring\",\"8,10\"\n,,\" libaio \"\n,ubuntu,,,/mnt/x\n" > "$f"
+    out=$(source ./wekatester; resolve_targets engines "$f" - - -) || { echo "$out" >&2; exit 1; }
+    [ "$out" = "$(printf "io_uring\nlibaio")" ] || { echo "got: $out" >&2; false; }'
+t_assert "engines: a quoted host-file ioengine on a host line and a selector line is proven as itself and finalize keeps it" bash -c '
+    # a naive comma split kept the quotes: fio knew no "io_uring" and
+    # finalize_targets died on the host line
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest" "$d/bin"
+    printf "#!/bin/bash\nexit 0\n" > "$d/bin/fio"; chmod +x "$d/bin/fio"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(localhost); LOCAL_MODE=1; ENGINE=""; AUTO_LEVEL=""
+        DIRECTORY=$d/dest; FIO_BIN=$d/bin/fio; TARGETS=1; TARGETS_FILE=$d/t.csv
+        printf "host,user_login,ioengine\nlocalhost,,\"io_uring\",,,,,\n,,\"io_uring\",,,,,\n" > "$d/t.csv"
+        printf "engines io_uring libaio\n" > "$d/probe/localhost"
+        test_engines && finalize_targets) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    [ "$(cat "$d/engine.results")" = "localhost io_uring ok" ] &&
+    [ "$(cut -f3 "$d/targets.final")" = io_uring ] || { cat "$d/engine.results" "$d/targets.final" >&2; echo "$out" >&2; false; }'
 # --- ioengine discovery: -e > host file > the jobfile's own > discovered ---
 # A jobfile naming no engine used to run fio's default (psync) silently.
 t_assert "discovery: where a jobfile names no engine, each host gets the first of ENGINE_ORDER that passes, logged with the reason" bash -c '

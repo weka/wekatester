@@ -4750,8 +4750,7 @@ test_engines() {
     mkdir -p "$WORK_DIR/et"
     : > "$results"
     if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
-        csv_engines=$(awk -F, '!/^[[:space:]]*#/ {gsub(/[[:space:]]/, "", $3);
-            if ($3 != "" && $3 != "ioengine") print $3}' "$TARGETS_FILE" | sort -u | tr '\n' ' ')
+        csv_engines=$(resolve_targets engines "$TARGETS_FILE" - - -) || die "cannot read the ioengines of the host file ($TARGETS_FILE)"
     fi
     cand="$ENGINE $csv_engines"
     [ -z "$AUTO_LEVEL" ] || cand="$cand io_uring libaio psync"
@@ -5893,8 +5892,9 @@ host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
 
 # phase1: before the engine tests (no engine selectors yet); phase2: with
 # engine.results, the finished resolution; hostonly: each host OWN row only,
-# what the writeback merges against.
-resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
+# what the writeback merges against; engines: every line's ioengine, one per
+# line (no hosts needed).
+resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") awkrun 'BEGIN {
         phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
         kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS)
@@ -5949,6 +5949,9 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engi
             }
             ENK[ne] = nk
         }
+        # ---- engines: every line'\''s ioengine, the candidates test_engines proves ----
+        if (phase == "engines")
+            for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
         # ---- phase2 input: the engine test results ----
         if (phase == "phase2" && results != "-") {
             if ((n = readlines(results, L)) < 0) awk_fail("cannot read " results)
