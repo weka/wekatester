@@ -852,6 +852,25 @@ t_assert "run lock: under --break-lock a fio that turns zombie is gone, and a pi
         case "$out" in *"NOTE: localhost: --break-lock cleared another run"*"fio(99999991)"*LOCKED-BY-US*RELEASED*) ;; *) echo "then \"$after\": $out" >&2; exit 1;; esac
         [ ! -s "$LK/esc" ] || { echo "then \"$after\": escalated: $(cat "$LK/esc")" >&2; exit 1; }
     done'
+t_assert "run lock: --break-lock removes earlier runs' group files from the destination, other evidence or not, and nothing else there" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    g=$LK/dest/.wekatester-group.123.456.lst
+    mkdir "$LK/dest"; : > "$g"; : > "$g.bak"; : > "$LK/dest/keep.lst"
+    # without --break-lock the file stays
+    out=$(lk_run "DIRECTORY=$LK/dest")
+    case "$out" in *LOCKED-BY-US*RELEASED*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ -e "$g" ] || { echo "removed without --break-lock" >&2; exit 1; }
+    out=$(lk_run BREAK_LOCK=1 "DIRECTORY=$LK/dest")
+    case "$out" in *LOCKED-BY-US*RELEASED*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *cleared*) echo "$out" >&2; exit 1;; esac
+    [ ! -e "$g" ] && [ -e "$g.bak" ] && [ -e "$LK/dest/keep.lst" ] || { ls -A "$LK/dest" >&2; false; }'
+t_assert "run lock: --break-lock with no group files in the destination still heals and locks" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    mkdir -p "$LK/dest" "$LK/lock"; echo "ctl-9 pid 77 user x since then" > "$LK/lock/owner"; : > "$LK/dest/keep"
+    out=$(lk_run BREAK_LOCK=1 "DIRECTORY=$LK/dest")
+    case "$out" in *"NOTE: localhost: --break-lock cleared another run'"'"'s lock(ctl-9 pid 77 user x since then)"*LOCKED-BY-US*RELEASED*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *"No such file"*|*wekatester-group*) echo "$out" >&2; exit 1;; esac
+    [ "$(ls -A "$LK/dest")" = keep ] || { ls -A "$LK/dest" >&2; false; }'
 
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
 # operator to remount forcedirect then points away from the real fault, which
@@ -5673,6 +5692,29 @@ t_assert "fs groups: the hashes come back after every other check and before the
     dry=$(printf "%s\n" "$m" | sed -n "/if \[ \"\$DRY_RUN\" -eq 1 \]; then/,/exit 0/p")
     printf "%s\n" "$dry" | grep -q "collect_fs_groups" &&
     printf "%s\n" "$m" | awk "/check_cpu_pinning/ {p = NR} /collect_fs_groups/ {c = NR} /start_fio_servers/ {s = NR} END {exit !(p && c > p && s > c)}"'
+t_assert "fs groups: a run that dies after the write probe removes its group file at exit, and nothing else there" bash -c '
+    d=$(mktemp -d); : > "$d/keep"
+    out=$( (source ./wekatester
+        LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=$d; WORK_DIR=""; PRESSURE_END_DONE=1
+        GROUP_FILE=.wekatester-group.1.2.lst; lock_token; RUN_LOCKS[localhost]=1
+        trap cleanup EXIT
+        probe_writable localhost "$d" && [ -s "$d/$GROUP_FILE" ] && echo PROBED
+        die "stopped before collect_fs_groups") 2>&1 )
+    case "$out" in *PROBED*"stopped before collect_fs_groups"*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ ! -e "$d/.wekatester-group.1.2.lst" ] && [ -e "$d/keep" ] || { ls -A "$d" >&2; false; }'
+t_assert "fs groups: once collect_fs_groups has removed the group file, cleanup does not try again" bash -c '
+    w=$(mktemp -d)
+    (source ./wekatester
+     HOSTS=(h1 h2); GROUP_FILE=.g.lst; DIRECTORY=/mnt/x; PRESSURE_END_DONE=1; LOCK_TOKEN=t
+     run_host() { echo "$1 $2" >> "$w/log"; case "$2" in (sha256sum*) echo "aaaa  f";; esac; }
+     # control: before collect_fs_groups, cleanup removes it on both hosts
+     WORK_DIR=""; RUN_LOCKS=([h1]=1 [h2]=1); cleanup
+     echo "--" >> "$w/log"
+     WORK_DIR=$w; collect_fs_groups || exit 1
+     echo "flag $GROUP_FILE_REMOVED" >> "$w/log"
+     WORK_DIR=""; RUN_LOCKS=([h1]=1 [h2]=1); cleanup) >>$WT_ASIDE 2>&1 || { cat "$w/log" >&2; exit 1; }
+    awk "/^--\$/ {s = 1; next} /^flag / {s = 2; f = \$2; next} !s && /\.g\.lst/ {b++} s == 2 {a++} s == 2 && /\.g\.lst/ {bad++} END {exit !(b == 2 && f == 1 && a == 2 && !bad)}" "$w/log" ||
+        { cat "$w/log" >&2; false; }'
 t_assert "tuner: each filesystem group lays out its own shared set, on its first host" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     cp "$FIX/probe/h1" "$FIX/probe/h3"

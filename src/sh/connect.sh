@@ -166,7 +166,8 @@ PORTEOF
 }
 
 cleanup() {
-    local host f priv pids=() kcmd
+    local host f priv pids=() kcmd i
+    local -A grm=()
     # the end-of-run pressure/sar capture rides the still-open connections;
     # after this function the control masters are gone
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
@@ -193,11 +194,19 @@ cleanup() {
         # exit only after cleanup returns. That is a deadlock.
         wait "${pids[@]}" || true
     fi
-    # a run that ended before its fio started: the locks on their own
+    # a run that ended before its fio started: the locks on their own, and
+    # this run's group file when collect_fs_groups has not removed it (every
+    # host holds a lock by then; fio starts after it)
     if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
         pids=()
+        if [ -n "$GROUP_FILE" ] && [ "$GROUP_FILE_REMOVED" -eq 0 ]; then
+            load_host_dirs
+            for i in "${!HOSTS[@]}"; do
+                grm[${HOSTS[$i]}]="rm -f '${HOST_DIRS[$i]:?}/${GROUP_FILE:?}'; "
+            done
+        fi
         for host in "${!RUN_LOCKS[@]}"; do
-            run_host "$host" "$LOCK_RELEASE" &
+            run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
             pids+=($!)
         done
         RUN_LOCKS=()

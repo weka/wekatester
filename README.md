@@ -16,7 +16,7 @@ wekatester uses fio's native client/server mode:
 - ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
 - All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
 - With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
-- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio: a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start, which it never kills. A run that died without cleaning up leaves that evidence behind: `--break-lock` kills wekatester's own fio processes on those hosts (escalating for a root fio, and never a pid the kernel has since given to another process), removes its staging and its lock, and takes the lock.
+- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio: a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start, which it never kills. A run that died without cleaning up leaves that evidence behind: `--break-lock` kills wekatester's own fio processes on those hosts (escalating for a root fio, and never a pid the kernel has since given to another process), removes its staging and its lock, and takes the lock. It also removes every filesystem-group file (`.wekatester-group.*.lst`, below) in each host's destination, whether or not that host held other evidence. A destination shared with another controller's live run can lose that run's group file this way.
 
 # Usage
 ```
@@ -421,9 +421,10 @@ jobs will not reproduce is not the test's ceiling. So:
   has passed every other check, each returns that file's sha256, and equal
   hashes are one group. A separate subdirectory, even of the same filesystem,
   is a group of its own. Once every hash is in, each group's first host
-  removes the file, one removal per group. Each group has its
-  own representative for every shape, so a group's read cells read that
-  group's own set.
+  removes the file, one removal per group. A run that stops before then
+  removes its own file from every destination as it exits, dry runs too.
+  Each group has its own representative for every shape, so a group's read
+  cells read that group's own set.
 - **Writes use per-client sets** (`<host>.<fmt>`), because concurrent
   cross-client writes to shared files measure lease arbitration, not the
   client. A set whose calibration writes are all sequential gets

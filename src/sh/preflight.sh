@@ -39,6 +39,10 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
+        # every earlier run's group file in this host's destination (dd,
+        # set per host by preflight), evidence or not: cleanup released the
+        # lock of a run that died before collect_fs_groups
+        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*.lst; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
     else
         LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
@@ -65,8 +69,9 @@ preflight() {
     [ -n "$LOCK_TOKEN" ] || lock_token
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
+    load_host_dirs
     for i in "${!HOSTS[@]}"; do
-        run_host "${HOSTS[$i]}" "$LOCK_CMD" > "$WORK_DIR/lock/$i" &
+        run_host "${HOSTS[$i]}" "dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
@@ -218,7 +223,8 @@ probe_writable() {   # probe_writable <host> <dir>
 # Each client appends its name to the run group file in its destination; equal
 # sha256 means one directory, one group. Distinct files cannot hash alike: each
 # ends with a name only its own clients appended. Writes $WORK_DIR/groups,
-# "<host> <group>".
+# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes the file.
+GROUP_FILE_REMOVED=0
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
     local i h pids=() sum n=0 line summary
@@ -250,6 +256,7 @@ collect_fs_groups() {
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
     done
+    GROUP_FILE_REMOVED=1
     awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
     # the count, then each group's members, from one awk: a pass per group
     # was groups x hosts when every host has its own directory
