@@ -247,13 +247,6 @@ host_dir_v() {   # host_dir_v <host> -> HOST_DIR
     fi
 }
 
-host_priv() {   # host_priv <host> -> passwordless escalator prefix ("" if none)
-    # the probe emits a PREFIX ("dzdo -n", "ksu -e", "pbrun"), the first of
-    # dzdo/pbrun/sesu/pmrun/doas/ksu/sudo that runs true non-interactively
-    [ -f "$WORK_DIR/probe/$1" ] || return 0
-    awk '/^priv /{sub(/^priv /, ""); print; exit}' "$WORK_DIR/probe/$1"
-}
-
 # phase1: before the engine tests (no engine selectors yet); phase2: with
 # engine.results, the finished resolution; hostonly: each host OWN row only,
 # what the writeback merges against; engines: every line's ioengine, one per

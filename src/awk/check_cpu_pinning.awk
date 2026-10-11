@@ -39,7 +39,9 @@ BEGIN {
             np = 0
         }
         cur_s = fact(P, np, "taskset"); iso_s = fact(P, np, "isolated"); ncpus_s = fact(P, np, "ncpus")
-        priv = ""   # host_priv rule: the first "priv " line, the rest of it verbatim
+        # the probe's escalator PREFIX ("dzdo -n", "ksu -e", "pbrun"): the
+        # first "priv " line, the rest of it verbatim
+        priv = ""
         for (i = 1; i <= np; i++) if (index(P[i], "priv ") == 1) { priv = substr(P[i], 6); break }
         expand(req_s, REQ); expand(iso_s, ISO)
         ncpus = ncpus_s ~ /^[0-9]+$/ ? ncpus_s + 0 : 0

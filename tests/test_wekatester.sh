@@ -3994,12 +3994,6 @@ t_assert "pinning: privileges are as-needed -- self-affinable mask ignores an av
      printf "h1\t-\t-\t4-9\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-9" ] && test ! -s "$d/auth/h1.priv"'
-t_assert "host_priv: a multi-word escalator prefix survives intact" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    (source ./wekatester
-     WORK_DIR=$d
-     printf "ncpus 8\npriv ksu -e\n" > "$d/probe/h1"
-     [ "$(host_priv h1)" = "ksu -e" ] && [ -z "$(host_priv h2)" ])'
 t_assert "probe sweep: site escalators beat sudo, failing ones are skipped" bash -c '
     d=$(mktemp -d)
     printf "#!/bin/sh\nexit 1\n" > "$d/dzdo"
