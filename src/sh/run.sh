@@ -1,9 +1,8 @@
 # --- phase 4: run + summarize --------------------------------------------------
-# Report directives: "# report <items>" or "#report <items>", at least one
-# space after report so prose ("# reporting...") is not one; a bare "# report"
-# matches nothing and everything is reported.
-report_directive() {
-    sed -n 's/^#[[:space:]]*report[[:space:]]\{1,\}//p' "$1" | tr '\n' ' '
+# The items a jobfile's "# report" directives give its summary, read by the
+# rule staging and -a use (lib report_items; README, Workloads).
+report_items() {   # report_items <jobfile>
+    awkrun 'BEGIN { if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1]); print report_items(L, n) }' "$1"
 }
 
 # One results file per job, so a crashed suite keeps everything measured.
@@ -410,7 +409,7 @@ run_jobs() {
             echo
             continue
         fi
-        report=$(report_directive "$SET_DIR/$job")
+        report=$(report_items "$SET_DIR/$job") || die "cannot read the report directive of $job"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         debug "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
@@ -420,7 +419,7 @@ run_jobs() {
         # fio keys client_stats by the --client= name, not the worker hostname;
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
-        summ_one "$outfile" "$outfile" "${report:-bandwidth latency iops}" "${HOSTS[*]}" file \
+        summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
             || die "failed to summarize $outfile"
     done
     log "raw fio results: $RUN_DIR/"

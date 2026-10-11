@@ -637,7 +637,7 @@ t_assert "summarize: -s reports every metric group" bash -c '
     case "$out" in *bandwidth*) ;; *) echo "$out" >&2; exit 1;; esac
     case "$out" in *iops*)      ;; *) echo "$out" >&2; exit 1;; esac
     case "$out" in *latency*)   ;; *) echo "$out" >&2; exit 1;; esac'
-# The items argument itself lives on: report_directive still feeds it per job.
+# The items argument itself lives on: report_items still feeds it per job.
 t_assert "summarize: the items argument still narrows the report" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); fio_json_fixture "$d/r.json"
@@ -696,16 +696,57 @@ t_assert "summarize: this version's results are never taken for the Python forma
 # --- report directive parsing ---
 # The metric selector needs whitespace after "report", or prose comments get
 # parsed as report items.
-r() { f=$(mktemp); printf '%b' "$1" > "$f"; (source ./wekatester; report_directive "$f"); }
-# the items are newline-joined with tr, so one trailing space is expected
+r() { f=$(mktemp); printf '%b' "$1" > "$f"; (source ./wekatester; report_items "$f"); }
+# no directive (or prose) is every item; the known items in a fixed order
 t_assert "report directive: items are parsed" \
-    test "$(r '# report bandwidth latency\n[global]\n')" = "bandwidth latency "
+    test "$(r '# report bandwidth latency\n[global]\n')" = "bandwidth latency"
 t_assert "report directive: no space after # is fine" \
-    test "$(r '#report iops\n[global]\n')" = "iops "
+    test "$(r '#report iops\n[global]\n')" = "iops"
 t_assert "report directive: prose is not a directive" \
-    test -z "$(r '# reporting notes for the field\n[global]\n')"
+    test "$(r '# reporting notes for the field\n[global]\n')" = "bandwidth latency iops"
 t_assert "report directive: bare # report means default-all" \
-    test -z "$(r '# report\n[global]\n')"
+    test "$(r '# report\n[global]\n')" = "bandwidth latency iops"
+# The summary reads "# report" by report_has's rule, as staging and -a do
+# (N1). rjs: the metric groups run_jobs prints for a jobfile, or "none".
+rjs() {   # rjs <directive lines, printf %b>
+    local t out g s=""
+    t=$(mktemp -d); mkdir "$t/set" "$t/out"
+    printf '%b' "$1\n[global]\nfilesize=1M\n[x]\nrw=read\n" > "$t/set/011-x.job"
+    fio_json_single_fixture "$t/f.json"
+    out=$( (source ./wekatester
+            HOSTS=(vega-1); MASTER=vega-1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x
+            SET_DIR=$t/set; JOBFILES=(011-x.job); RUN_DIR=$t/out
+            run_host() { cat "$t/f.json"; }
+            run_jobs) 2>&1 ) || { echo "run_jobs failed: $out" >&2; return 1; }
+    for g in bandwidth iops latency; do case "$out" in *"average $g: "*) s="$s $g";; esac; done
+    case "$out" in *"(no non-zero metrics to report)"*) s="$s none";; esac
+    echo "${s# }"
+}
+t_assert "report directive: a CRLF jobfile's '# report iops' summarizes iops" \
+    test "$(rjs '# report iops\r\n[global]\r')" = "iops"
+t_assert "report directive: a tab between items summarizes both" \
+    test "$(rjs '# report bandwidth\tiops')" = "bandwidth iops"
+t_assert "report directive: \\034 after # is whitespace, as staging reads it" \
+    test "$(rjs '#\034report iops')" = "iops"
+# Every other spelling summarizes as it did before N1.
+while IFS='|' read -r spec want; do
+    t_assert "report directive: '$spec' summarizes '$want'" test "$(rjs "$spec")" = "$want"
+done <<'EOF'
+# no directive|bandwidth iops latency
+# report bandwidth latency|bandwidth latency
+#report iops|iops
+#  report iops|iops
+# report iops latency bandwidth|bandwidth iops latency
+# report bandwidth\n# report latency|bandwidth latency
+# reporting notes for the field|bandwidth iops latency
+# report: see the wiki|bandwidth iops latency
+## report iops|bandwidth iops latency
+  # report iops|bandwidth iops latency
+# report|bandwidth iops latency
+# report |none
+# report bw|none
+# report iops,latency|none
+EOF
 
 # --- local mode: trigger ---
 # With no server on the command line the run happens here, and the transport

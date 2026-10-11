@@ -761,14 +761,28 @@ function last_section(L, n,    i, s, name) {   # the last section's name, "" for
     for (i = 1; i <= n; i++) if ((s = section_name(L[i])) != "") name = s
     return name
 }
-# Does a "# report <items>" line (whitespace after "report") name <word>?
+# Is <line> a "# report <items>" directive (whitespace after "report")? RLENGTH
+# is then where its items start.
+function report_line(line) {
+    return match(line, /^#[ \t\n\013\014\r\034\035\036\037]*report[ \t\n\013\014\r\034\035\036\037]/)
+}
+# Does a directive name <word>?
 function report_has(L, n, word,    i, F, k, m) {
     for (i = 1; i <= n; i++) {
-        if (!match(L[i], /^#[ \t\n\013\014\r\034\035\036\037]*report[ \t\n\013\014\r\034\035\036\037]/)) continue
+        if (!report_line(L[i])) continue
         m = pysplit(substr(L[i], RLENGTH + 1), F)
         for (k = 1; k <= m; k++) if (F[k] == word) return 1
     }
     return 0
+}
+# The summary items: every one without a directive, else those report_has
+# finds ("" when a directive names none)
+function report_items(L, n,    i, k, W, s) {
+    for (i = 1; i <= n; i++) if (report_line(L[i])) break
+    if (i > n) return "bandwidth latency iops"
+    split("bandwidth latency iops", W, " "); s = ""
+    for (k = 1; k <= 3; k++) if (report_has(L, n, W[k])) s = s " " W[k]
+    return substr(s, 2)
 }
 # The value of a "<key>=<value>" line whose key matches the anchored ERE
 # <keys>, up to the first blank; "" for any other line
@@ -6861,11 +6875,10 @@ stage_jobfiles() {
 }
 
 # --- phase 4: run + summarize --------------------------------------------------
-# Report directives: "# report <items>" or "#report <items>", at least one
-# space after report so prose ("# reporting...") is not one; a bare "# report"
-# matches nothing and everything is reported.
-report_directive() {
-    sed -n 's/^#[[:space:]]*report[[:space:]]\{1,\}//p' "$1" | tr '\n' ' '
+# The items a jobfile's "# report" directives give its summary, read by the
+# rule staging and -a use (lib report_items; README, Workloads).
+report_items() {   # report_items <jobfile>
+    awkrun 'BEGIN { if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1]); print report_items(L, n) }' "$1"
 }
 
 # One results file per job, so a crashed suite keeps everything measured.
@@ -7399,7 +7412,7 @@ run_jobs() {
             echo
             continue
         fi
-        report=$(report_directive "$SET_DIR/$job")
+        report=$(report_items "$SET_DIR/$job") || die "cannot read the report directive of $job"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         debug "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
@@ -7409,7 +7422,7 @@ run_jobs() {
         # fio keys client_stats by the --client= name, not the worker hostname;
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
-        summ_one "$outfile" "$outfile" "${report:-bandwidth latency iops}" "${HOSTS[*]}" file \
+        summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
             || die "failed to summarize $outfile"
     done
     log "raw fio results: $RUN_DIR/"

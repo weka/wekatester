@@ -102,14 +102,28 @@ function last_section(L, n,    i, s, name) {   # the last section's name, "" for
     for (i = 1; i <= n; i++) if ((s = section_name(L[i])) != "") name = s
     return name
 }
-# Does a "# report <items>" line (whitespace after "report") name <word>?
+# Is <line> a "# report <items>" directive (whitespace after "report")? RLENGTH
+# is then where its items start.
+function report_line(line) {
+    return match(line, /^#[ \t\n\013\014\r\034\035\036\037]*report[ \t\n\013\014\r\034\035\036\037]/)
+}
+# Does a directive name <word>?
 function report_has(L, n, word,    i, F, k, m) {
     for (i = 1; i <= n; i++) {
-        if (!match(L[i], /^#[ \t\n\013\014\r\034\035\036\037]*report[ \t\n\013\014\r\034\035\036\037]/)) continue
+        if (!report_line(L[i])) continue
         m = pysplit(substr(L[i], RLENGTH + 1), F)
         for (k = 1; k <= m; k++) if (F[k] == word) return 1
     }
     return 0
+}
+# The summary items: every one without a directive, else those report_has
+# finds ("" when a directive names none)
+function report_items(L, n,    i, k, W, s) {
+    for (i = 1; i <= n; i++) if (report_line(L[i])) break
+    if (i > n) return "bandwidth latency iops"
+    split("bandwidth latency iops", W, " "); s = ""
+    for (k = 1; k <= 3; k++) if (report_has(L, n, W[k])) s = s " " W[k]
+    return substr(s, 2)
 }
 # The value of a "<key>=<value>" line whose key matches the anchored ERE
 # <keys>, up to the first blank; "" for any other line
