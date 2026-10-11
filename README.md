@@ -24,15 +24,15 @@ usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        wekatester -s results.json
        wekatester --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
 
-Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
-give them are not (-Cmyset names myset, never MYSET). A value may be attached
+Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
+give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
@@ -87,17 +87,12 @@ attaching is the way to pass a value that starts with a dash.
                           geometry. Bare -t = the set's own hostlist.csv,
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
-  -C[set], --customize[=set]
-                          copy a workload set, edit its host file (jobfiles
-                          on request), then run it;
-                          needs a terminal unless -r or -n is given. With no
-                          attached value the set may be the next bare token
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
-  -r             fast track: no prompts and no editors -- create whatever is
-                 needed and run; a wekafs destination that is not mounted
-                 forcedirect is a warning instead of a stop
+  -r             fast track: no prompts -- create whatever is needed and run;
+                 a wekafs destination that is not mounted forcedirect is a
+                 warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
                  no measured job runs, but a missing -d is created and, with
                  -a/-t/-e, the ioengines are proven with small fio jobs
@@ -165,28 +160,14 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 
 **Layouts heal incrementally, from evidence.** Before the capacity check, every run sweeps each host's destination against the exact file grid its staged layout implies: files whose SIZE deviates from the grid are deleted, files that match are kept and **credited against the capacity requirement**, and the layout phase's plain `create_only` pass then writes only what is missing. A geometry change heals just its delta (bumping `nrfiles` 502→510 creates 8 files, not 22TiB), an interrupted layout is repaired file-by-file on the next run, and nothing is trusted that wasn't measured — there are no marker files. Size is a sufficient test **because the generated layout job sets `fallocate=none`**: fio otherwise defaults to `fallocate=native` on Linux, which gives a file its full size before writing any data, so an interrupted layout would leave a full-size file of zeros that the sweep credits as complete and never rewrites — and the run then measures reads of nothing. Without preallocation a partial create leaves a short file, which fails the size test and is recreated. A set that ships its own layout job keeps it (only `-g` regenerates), so a hand-written layout job wants `fallocate=none` too. To force a from-scratch rebuild, remove the files (`-u` on a run, or `rm -rf` the grid).
 
-# Customizing workloads (-C)
-Jobfiles get edited in the field — `-C` makes that a guided flow instead of `cp -r` and hope:
+# Prompts, fast track and dry runs
+The host file and the workload set are prepared before a run: wekatester opens no editors. A few prompts remain, for things a run would otherwise create or risk: a missing host file (`-t`), a missing destination directory, a workload that does not fit, and the `-p` passwords. They read the terminal directly, so they work fine under `... | tee run.log`.
 
-```
-./wekatester -C -i ubuntu:key.pem 10.30.0.1 10.30.0.2         # temp set from -w's workload
-./wekatester -Cmyset host1 host2                              # named: ./fio-jobfiles/myset
-./wekatester -C ./path/to/set -- host1 host2                  # explicit path; hosts after --
-```
-
-The flow: the workload set is copied (shipped sets are never edited in place — `-C default` customizes a fresh copy, not `fio-jobfiles/default` itself), the set's `hostlist.csv` opens in your editor (`$VISUAL`, then `$EDITOR`, then `vi`) — the host file is the primary customization surface: per-host login, engine, cpus, destination, and per-direction geometry in one CSV — then a 5s prompt (default no) offers editing the jobfiles individually in run order, the layout job is generated, and you are offered a chance to edit it (5s prompt, default no). A set created without a name lands in `./fio-jobfiles/<date>-<time>/` and you choose whether to keep it for reuse (5s prompt, default keep); a set you chose not to keep is removed **only after a fully successful run** — any failure preserves your edits. Naming an existing *custom* set edits it as-is; adding an explicit `-w` on top of one asks (a real y/N, no timeout) before **replacing** its jobfiles with a fresh copy of that workload.
-
-With no attached set name, the token after `-C` is assumed to be a client; if it turns out unreachable over ssh, wekatester asks (5s, default yes) whether it was actually the set name. Put hosts after `--` to make it unambiguous.
-
-Unattended forms:
-
-- `-r` — fast track: no prompts, no editors; whatever is needed (set copy, layout, a missing destination directory under a wekafs mount) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). Temp sets are kept. A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so.
-- `-n` — dry run: everything is resolved, generated and staged, then the full paths of the created files, every staged jobfile's contents, and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and with `-a`, `-t` or `-e` the ioengines are proven with small one-file fio jobs. The pinning check runs too, so a dry run stops where the real run would. Combine with `-C` to prepare a set for manual editing.
+- `-r` — fast track: no prompts; whatever is needed (the layout, a missing destination directory under a wekafs mount) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so.
+- `-n` — dry run: everything is resolved, generated and staged, then every staged jobfile's contents and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and with `-a`, `-t` or `-e` the ioengines are proven with small one-file fio jobs. The pinning check runs too, so a dry run stops where the real run would.
 - `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too).
 
 A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it. A pristine layout job under `-a` is re-derived per host so it lays out what that host will run: its measured job counts and file geometry.
-
-`-C` needs a terminal for its editors and prompts; without one it refuses to run unless `-r` or `-n` is given. Prompts read the terminal directly, so they work fine under `... | tee run.log`.
 
 # Auto mode
 `-a` / `--auto` derives system-specific fio options from the workers instead
@@ -564,7 +545,7 @@ calibration, at the measured sizes.
 That one file is built, not edited: `./build` assembles it from `src/`, and both are committed. Edit `src/`, run `./build`, then run the suite (`bash tests/test_wekatester.sh`, with bash 4.4 or later first in PATH -- on a development Mac, Homebrew's). The suite tests the built `wekatester`, and fails while it differs from what `./build` makes of `src/`.
 
 - `src/wekatester.sh`: the defaults, usage, option parsing and `main`, and where each module goes in.
-- `src/sh/*.sh`: the rest of the bash, one module per part of a run: `base` (logging, the ssh transport, prompts), `awk` (the awk library and `awkrun`), `fiojson` (fio's JSON), `calibrate` (`-a`), `preflight` (reachability, mount mode, filesystem groups), `connect` (fio servers, limits, logins, teardown), `probe` (worker facts, engine tests, cpu pinning), `layout` (the capacity check, layout jobs), `hosts` (host files), `customize` (`-C`, the dry run), `stage`, and `run` (the run, its bundle and summary).
+- `src/sh/*.sh`: the rest of the bash, one module per part of a run: `base` (logging, the ssh transport, prompts), `awk` (the awk library and `awkrun`), `fiojson` (fio's JSON), `calibrate` (`-a`), `preflight` (reachability, mount mode, filesystem groups), `connect` (fio servers, limits, logins, teardown), `probe` (worker facts, engine tests, cpu pinning), `layout` (the capacity check, layout jobs), `hosts` (host files), `stage`, and `run` (the run, the dry run's report, the bundle and summary).
 - `src/awk/lib/*.awk`: the awk library, in the order `awkrun` prepends it.
 - `src/awk/<function>.awk`: every awk program longer than one line, named for the function that runs it (`<function>.<role>.awk` where one runs several).
 
@@ -612,7 +593,7 @@ client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,12/10G//4,1///1,1///1,
 
 A line naming a host assigns to that host (two lines naming the same host is an error, both line numbers named). Host-less lines are **selector** lines: their login and/or ioengine choose the hosts they apply to — a login selects hosts using that login, an ioengine selects hosts that **passed that engine's functional test** — and their remaining fields fold into any host whose more-specific settings left them unset. A host line beats two selectors beats one beats a global `,,...` line; a generic line never overrides a more specific one regardless of file order; equally specific conflicts keep the *first* line and print a warning. A host-less line's login is only ever a selector — logins are assigned by host lines, the CLI, or your ssh defaults. Empty fields mean "default"; geometry sub-fields may be omitted (`12/10G//8` sets numjobs, filesize and iodepth). Geometry is per type AND direction: the R columns shape read jobs, the W columns write jobs, and a mixed-direction jobfile takes the deeper-queued direction's whole tuple. Quote cpu lists (`"22,24"`), and `#` starts a comment.
 
-Without `-t` no host file is used — with one exception: a `-C` set's own `hostlist.csv` is always honored, because it is the set's customization surface, and from the first connection: its logins and destinations apply to that run as if `-t` named it (the set's own copy, or, for a set about to be created, the file it will copy). Bare `-t` looks in the job set folders first — an existing `-C` set's own `hostlist.csv`, then the `-w` set's — falling back to `./hostlist.csv`; when both a set-folder copy and `./hostlist.csv` exist, the set folder wins and is the copy later writebacks (`-a`) update. With `-C` and no file anywhere, the file is created in the custom set (where the editor opens it), never as a stray `./hostlist.csv`. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. `-C` sets own a copy (taken from the file in use or the source set, template otherwise), which opens first in the editor flow and serves later runs of that set. Precedence overall: **CLI flags > host file > jobfiles/tuner**.
+Without `-t` no host file is used. Bare `-t` looks in the `-w` set's folder first, falling back to `./hostlist.csv`; when both exist, the set folder wins and is the copy later writebacks (`-a`) update. The host file is taken as prepared for the run. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. Precedence overall: **CLI flags > host file > jobfiles/tuner**.
 
 **fio never lands on weka's pinned cores.** Every run probes every host, so a host the file gives no cpu list is pinned too: its fio server and jobs run on every cpu except weka's cores (both threads) and core 0's pair, limited to the cpus the login can bind without privilege (under `-a`, on the tuner's set). One note names how many hosts that covers. Only a host whose probe could not be read stays unpinned.
 
@@ -639,7 +620,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 
 - `results_<jobname>.json` — the raw fio JSON, one file per job, written as each job completes;
 - `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
-- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host, and a `-C` temp set may be gone later — this is the execution truth);
+- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host — this is the execution truth);
 - `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`), plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, and `sar-end` (the sysstat log slice covering the run window, when the box keeps one). A host missing a tool records `not available` instead of failing the run;
 - `cal/` — on every `-a` run: `shapes` and `shapes.txt` (the client shapes), per shape `s<n>/` with the engine cells, each search's history of readings, and the tuples it settled, every cell's jobfile and raw JSON, and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
 

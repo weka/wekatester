@@ -32,11 +32,8 @@ VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# -w was named, not defaulted: only then may -C recopy its jobfiles over a set.
-WORKLOAD_EXPLICIT=0
-
 # Run-shape flags.
-FAST_TRACK=0        # -r: no prompts, no editors -- create what is needed and run
+FAST_TRACK=0        # -r: no prompts -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
@@ -47,18 +44,7 @@ LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s
                     # on a 16 Gb/s instance) or when nothing can report it
 
-# -C/--customize: copy a workload set, edit it, run it.
-CUSTOMIZE=0
-CUSTOM_SET=""       # the set named by an attached value or a consumed bare token
-# A bare -C leaves its following bare token in HOSTS and only remembers it here:
-# it could be a client or a set name, and preflight is what tells them apart.
-C_CANDIDATE=""
-SET_DIR_OVERRIDE="" # the resolved custom set dir; stage_jobfiles runs it instead of -w
-TEMP_SET=0          # 1 = the set is a <date>-<time> temp dir
-TEMP_REMOVE=0       # 1 = operator chose not to keep it; removed after a clean run
-# The sets distributed with wekatester: -C never edits these in place, only
-# copies of them. Anything else under fio-jobfiles is a custom set.
-SHIPPED_SETS="default mixed 2x400Gb wekawithin smoke"
+SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
 # Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
 # TARGET_DIR export must not move it. Test plumbing only.
@@ -103,15 +89,15 @@ usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
 
-Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
-give them are not (-Cmyset names myset, never MYSET). A value may be attached
+Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
+give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
@@ -166,17 +152,12 @@ attaching is the way to pass a value that starts with a dash.
                           geometry. Bare -t = the set's own hostlist.csv,
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
-  -C[set], --customize[=set]
-                          copy a workload set, edit its host file (jobfiles
-                          on request), then run it;
-                          needs a terminal unless -r or -n is given. With no
-                          attached value the set may be the next bare token
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
-  -r             fast track: no prompts and no editors -- create whatever is
-                 needed and run; a wekafs destination that is not mounted
-                 forcedirect is a warning instead of a stop
+  -r             fast track: no prompts -- create whatever is needed and run;
+                 a wekafs destination that is not mounted forcedirect is a
+                 warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
                  no measured job runs, but a missing -d is created and, with
                  -a/-t/-e, the ioengines are proven with small fio jobs
@@ -264,12 +245,7 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
 
 parse_args() {
     HOSTS=()
-    # Whether -- appears anywhere decides a bare token after -C: with it, the
-    # set name; without, a client candidate.
-    local opt arg tok servers_only=0 dashdash=0 c_pending=0
-    for tok in "$@"; do
-        [ "$tok" = "--" ] && { dashdash=1; break; }
-    done
+    local opt arg servers_only=0
     while [ $# -gt 0 ]; do
         if [ "$servers_only" -eq 1 ]; then HOSTS+=("$1"); shift; continue; fi
         case "$1" in
@@ -281,8 +257,8 @@ parse_args() {
             --) servers_only=1; shift ;;
             -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; DIRECTORY_EXPLICIT=1; shift 2 ;;
             -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; DIRECTORY_EXPLICIT=1; shift ;;
-            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
-            -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; WORKLOAD_EXPLICIT=1; shift ;;
+            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; shift 2 ;;
+            -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; shift ;;
             -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
             -f?*) opt_val "$opt" -f; FIO_BIN=$OPT_VAL; shift ;;
             -s) need_arg "$1" $# "${2:-}"; SUMMARIZE_FILE=$2; shift 2 ;;
@@ -399,43 +375,16 @@ parse_args() {
                            [ -n "$arg" ] || { usage >&2; die "option --identity requires a value"; }
                            IDENT_RAW+=("$arg"); shift ;;
             -i?*)          opt_val "$opt" -i; IDENT_RAW+=("$OPT_VAL"); shift ;;
-            # -C with an attached value names the set outright. Bare -C arms
-            # the candidate rule handled by the bare-token arm below.
-            -c|--customize)  CUSTOMIZE=1; c_pending=1; shift ;;
-            -c?*)            CUSTOMIZE=1; opt_val "$opt" -c; CUSTOM_SET=$OPT_VAL; shift ;;
-            --customize=*)   CUSTOMIZE=1; CUSTOM_SET=${opt#--customize=}
-                             [ -n "$CUSTOM_SET" ] || { usage >&2; die "option --customize requires a value"; }
-                             shift ;;
+            # -C opened editors; name the removal rather than "unknown option"
+            -c|-c?*|--customize|--customize=*) usage >&2
+                die "-C/--customize was removed: wekatester opens no editors; prepare the host file (-t) and the workload set (-w) before the run" ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
             --version) echo "${0##*/} version $VERSION"; exit 0 ;;
             -h|--help) usage; exit 0 ;;
             -*) usage >&2; die "unknown option: $1" ;;
-            *)
-                if [ "$c_pending" -eq 1 ] && [ "$dashdash" -eq 1 ]; then
-                    # Clients come after --, so this token is the set name.
-                    [ -z "$CUSTOM_SET" ] || { usage >&2
-                        die "-C takes one set name before --; got '$CUSTOM_SET' and '$1'"; }
-                    CUSTOM_SET=$1
-                elif [ "$c_pending" -eq 1 ] && [ -z "$C_CANDIDATE" ]; then
-                    # A path separator, a shipped set name or an existing set
-                    # directory makes the token the set outright; only an
-                    # ambiguous bare word waits for preflight.
-                    c_claim=0
-                    case "$1" in (*/*) c_claim=1 ;; esac
-                    case " $SHIPPED_SETS " in (*" $1 "*) c_claim=1 ;; esac
-                    [ ! -d "$SCRIPT_DIR/fio-jobfiles/$1" ] || c_claim=1
-                    [ ! -d "./fio-jobfiles/$1" ] || c_claim=1
-                    if [ "$c_claim" -eq 1 ]; then
-                        CUSTOM_SET=$1
-                    else
-                        C_CANDIDATE=$1; HOSTS+=("$1")
-                    fi
-                else
-                    HOSTS+=("$1")
-                fi
-                shift ;;
+            *)  HOSTS+=("$1"); shift ;;
         esac
     done
     MASTER=${HOSTS[0]:-}
@@ -443,7 +392,6 @@ parse_args() {
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.
     if [ -n "$SUMMARIZE_FILE" ]; then
-        [ "$CUSTOMIZE" -eq 0 ] || { usage >&2; die "-C cannot be combined with -s"; }
         # -r used to take a report list: name the change, not demote it to a
         # host.
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
@@ -475,8 +423,6 @@ parse_args() {
 
 #@include sh/hosts.sh
 
-#@include sh/customize.sh
-
 #@include sh/stage.sh
 
 #@include sh/run.sh
@@ -497,11 +443,6 @@ main() {
     resolve_local_mode
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
-    # -C needs a terminal and an editor; say so now, not after setup.
-    if [ "$CUSTOMIZE" -eq 1 ] && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        require_interactive "-C"
-        resolve_editor
-    fi
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     echo
@@ -528,45 +469,18 @@ main() {
     # phase supplies the per-host logins the auth rounds use.
     if [ "$TARGETS" -eq 1 ]; then
         resolve_targets_file
-        # empty = the -C defer case: the set's file does not exist yet;
-        # the post-customize phase1 refresh picks it up once created
-        if [ -n "$TARGETS_FILE" ]; then
-            resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-                "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-                - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-                || die "host file resolution failed ($TARGETS_FILE)"
-        fi
-    elif [ "$CUSTOMIZE" -eq 1 ]; then
-        # -C without -t: the set host file is honored as if -t named it.
-        local early
-        early=$(custom_set_hostfile_early)
-        if [ -n "$early" ]; then
-            log "host file (the -C set's): $early"
-            resolve_targets phase1 "$early" "${ENGINE:--}" \
-                "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-                - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-                || die "host file resolution failed ($early)"
-        fi
+        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
+            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
+            || die "host file resolution failed ($TARGETS_FILE)"
     fi
     check_controller_procs
     [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight
     verify_mount_mode
-    # After host validation (no editing against a broken cluster), before any
-    # daemon (nothing to tear down while an editor is open). The prompt fd
-    # closes before the run so no child inherits the terminal.
-    if [ "$CUSTOMIZE" -eq 1 ]; then
-        customize_jobfiles
-        # The set host file is now the targets file: refresh phase1 and
-        # re-verify mounts; login edits wait for the next run.
-        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-            || die "host file resolution failed ($TARGETS_FILE)"
-        verify_mount_mode
-    fi
-    # Unconditional: -p, a -t host file created on the way, and a destination
-    # created by the mount pass open the prompt fd too, not only -C.
+    # -p, a -t host file created on the way, and a destination created by the
+    # mount pass open the prompt fd: it closes before the run so no child
+    # inherits the terminal.
     close_interactive
     early_client_cmdline_check
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -624,7 +538,6 @@ main() {
     snapshot_jobfiles
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
-    finish_temp_set
 }
 
 # run only when executed, not when sourced (tests source this file)

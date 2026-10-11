@@ -33,11 +33,8 @@ VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# -w was named, not defaulted: only then may -C recopy its jobfiles over a set.
-WORKLOAD_EXPLICIT=0
-
 # Run-shape flags.
-FAST_TRACK=0        # -r: no prompts, no editors -- create what is needed and run
+FAST_TRACK=0        # -r: no prompts -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
@@ -48,18 +45,7 @@ LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s
                     # on a 16 Gb/s instance) or when nothing can report it
 
-# -C/--customize: copy a workload set, edit it, run it.
-CUSTOMIZE=0
-CUSTOM_SET=""       # the set named by an attached value or a consumed bare token
-# A bare -C leaves its following bare token in HOSTS and only remembers it here:
-# it could be a client or a set name, and preflight is what tells them apart.
-C_CANDIDATE=""
-SET_DIR_OVERRIDE="" # the resolved custom set dir; stage_jobfiles runs it instead of -w
-TEMP_SET=0          # 1 = the set is a <date>-<time> temp dir
-TEMP_REMOVE=0       # 1 = operator chose not to keep it; removed after a clean run
-# The sets distributed with wekatester: -C never edits these in place, only
-# copies of them. Anything else under fio-jobfiles is a custom set.
-SHIPPED_SETS="default mixed 2x400Gb wekawithin smoke"
+SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
 # Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
 # TARGET_DIR export must not move it. Test plumbing only.
@@ -243,7 +229,7 @@ validate_credentials() {
     done
 }
 
-# --- interactive prompting (-C) --------------------------------------------------
+# --- interactive prompting (-p, a missing host file or destination, capacity) ---
 # Prompts use /dev/tty on one rw fd: children get /dev/null on stdin and
 # stdout is often piped. read -s must read through a redirection (read -u
 # echoes), and partial -n input is discarded on timeout, so the escape drain
@@ -347,46 +333,21 @@ confirm_explicit() {   # confirm_explicit <message>
     [ "$answer" = yes ]
 }
 
-# Only y means yes; EOF (the terminal went away) dies rather than answer.
-confirm_destructive() {   # confirm_destructive <message>
-    prompt_say "$1 [y/N] "
-    prompt_key 0 || { prompt_line ""; die "prompt input closed while waiting for an answer"; }
-    case "$PROMPT_KEY" in
-        y|Y) prompt_line yes; log "$1 yes"; return 0 ;;
-        *)   prompt_line no;  log "$1 no";  return 1 ;;
-    esac
-}
-
-# The value is a command (code -w): word-split, only the first word checked.
-resolve_editor() {
-    EDITOR_CMD=${VISUAL:-${EDITOR:-vi}}
-    set -- $EDITOR_CMD
-    [ $# -gt 0 ] || die "\$VISUAL/\$EDITOR is set but empty"
-    [ -n "$(command -v "$1")" ] || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
-}
-
-# All three fds go to the terminal: stdout may be a pipe.
-edit_jobfile() {   # edit_jobfile <path>
-    log "editing $1 with $EDITOR_CMD"
-    $EDITOR_CMD "$1" <&"$PROMPT_IN_FD" >&"$PROMPT_OUT_FD" 2>&"$PROMPT_OUT_FD" \
-        || die "editor exited $? on $1 -- nothing has been run"
-}
-
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [--line-rate Gb/s] [--break-lock]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-C[set]] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
 Basic performance test of a network/parallel filesystem (distributed fio).
 
-Option names are case-insensitive (-C is -c, --AUTO is --auto); the values you
-give them are not (-Cmyset names myset, never MYSET). A value may be attached
+Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
+give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
@@ -441,17 +402,12 @@ attaching is the way to pass a value that starts with a dash.
                           geometry. Bare -t = the set's own hostlist.csv,
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
-  -C[set], --customize[=set]
-                          copy a workload set, edit its host file (jobfiles
-                          on request), then run it;
-                          needs a terminal unless -r or -n is given. With no
-                          attached value the set may be the next bare token
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
-  -r             fast track: no prompts and no editors -- create whatever is
-                 needed and run; a wekafs destination that is not mounted
-                 forcedirect is a warning instead of a stop
+  -r             fast track: no prompts -- create whatever is needed and run;
+                 a wekafs destination that is not mounted forcedirect is a
+                 warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
                  no measured job runs, but a missing -d is created and, with
                  -a/-t/-e, the ioengines are proven with small fio jobs
@@ -1575,12 +1531,7 @@ set_auto_level() {   # set_auto_level <raw> <flag, for error messages>
 
 parse_args() {
     HOSTS=()
-    # Whether -- appears anywhere decides a bare token after -C: with it, the
-    # set name; without, a client candidate.
-    local opt arg tok servers_only=0 dashdash=0 c_pending=0
-    for tok in "$@"; do
-        [ "$tok" = "--" ] && { dashdash=1; break; }
-    done
+    local opt arg servers_only=0
     while [ $# -gt 0 ]; do
         if [ "$servers_only" -eq 1 ]; then HOSTS+=("$1"); shift; continue; fi
         case "$1" in
@@ -1592,8 +1543,8 @@ parse_args() {
             --) servers_only=1; shift ;;
             -d) need_arg "$1" $# "${2:-}"; DIRECTORY=$2; DIRECTORY_EXPLICIT=1; shift 2 ;;
             -d?*) opt_val "$opt" -d; DIRECTORY=$OPT_VAL; DIRECTORY_EXPLICIT=1; shift ;;
-            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; WORKLOAD_EXPLICIT=1; shift 2 ;;
-            -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; WORKLOAD_EXPLICIT=1; shift ;;
+            -w) need_arg "$1" $# "${2:-}"; WORKLOAD=$2; shift 2 ;;
+            -w?*) opt_val "$opt" -w; WORKLOAD=$OPT_VAL; shift ;;
             -f) need_arg "$1" $# "${2:-}"; FIO_BIN=$2; shift 2 ;;
             -f?*) opt_val "$opt" -f; FIO_BIN=$OPT_VAL; shift ;;
             -s) need_arg "$1" $# "${2:-}"; SUMMARIZE_FILE=$2; shift 2 ;;
@@ -1710,43 +1661,16 @@ parse_args() {
                            [ -n "$arg" ] || { usage >&2; die "option --identity requires a value"; }
                            IDENT_RAW+=("$arg"); shift ;;
             -i?*)          opt_val "$opt" -i; IDENT_RAW+=("$OPT_VAL"); shift ;;
-            # -C with an attached value names the set outright. Bare -C arms
-            # the candidate rule handled by the bare-token arm below.
-            -c|--customize)  CUSTOMIZE=1; c_pending=1; shift ;;
-            -c?*)            CUSTOMIZE=1; opt_val "$opt" -c; CUSTOM_SET=$OPT_VAL; shift ;;
-            --customize=*)   CUSTOMIZE=1; CUSTOM_SET=${opt#--customize=}
-                             [ -n "$CUSTOM_SET" ] || { usage >&2; die "option --customize requires a value"; }
-                             shift ;;
+            # -C opened editors; name the removal rather than "unknown option"
+            -c|-c?*|--customize|--customize=*) usage >&2
+                die "-C/--customize was removed: wekatester opens no editors; prepare the host file (-t) and the workload set (-w) before the run" ;;
             -v)   VERBOSITY=$((VERBOSITY + 1)); shift ;;
             -vv)  VERBOSITY=$((VERBOSITY + 2)); shift ;;
             -vvv) VERBOSITY=$((VERBOSITY + 3)); shift ;;
             --version) echo "${0##*/} version $VERSION"; exit 0 ;;
             -h|--help) usage; exit 0 ;;
             -*) usage >&2; die "unknown option: $1" ;;
-            *)
-                if [ "$c_pending" -eq 1 ] && [ "$dashdash" -eq 1 ]; then
-                    # Clients come after --, so this token is the set name.
-                    [ -z "$CUSTOM_SET" ] || { usage >&2
-                        die "-C takes one set name before --; got '$CUSTOM_SET' and '$1'"; }
-                    CUSTOM_SET=$1
-                elif [ "$c_pending" -eq 1 ] && [ -z "$C_CANDIDATE" ]; then
-                    # A path separator, a shipped set name or an existing set
-                    # directory makes the token the set outright; only an
-                    # ambiguous bare word waits for preflight.
-                    c_claim=0
-                    case "$1" in (*/*) c_claim=1 ;; esac
-                    case " $SHIPPED_SETS " in (*" $1 "*) c_claim=1 ;; esac
-                    [ ! -d "$SCRIPT_DIR/fio-jobfiles/$1" ] || c_claim=1
-                    [ ! -d "./fio-jobfiles/$1" ] || c_claim=1
-                    if [ "$c_claim" -eq 1 ]; then
-                        CUSTOM_SET=$1
-                    else
-                        C_CANDIDATE=$1; HOSTS+=("$1")
-                    fi
-                else
-                    HOSTS+=("$1")
-                fi
-                shift ;;
+            *)  HOSTS+=("$1"); shift ;;
         esac
     done
     MASTER=${HOSTS[0]:-}
@@ -1754,7 +1678,6 @@ parse_args() {
     # Combination checks live here rather than in main so they hold for every
     # caller -- the test suite drives parse_args directly.
     if [ -n "$SUMMARIZE_FILE" ]; then
-        [ "$CUSTOMIZE" -eq 0 ] || { usage >&2; die "-C cannot be combined with -s"; }
         # -r used to take a report list: name the change, not demote it to a
         # host.
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
@@ -3855,44 +3778,6 @@ preflight() {
             failed+=("$host: $FIO_BIN not found, or not an executable file")
         fi
     done
-    # A bare -C candidate that failed ssh is probably the set name: confirm
-    # (5s, default yes), or assume so unattended.
-    if [ ${#failed[@]} -gt 0 ] && [ "$CUSTOMIZE" -eq 1 ] && [ -z "$CUSTOM_SET" ] \
-            && [ -n "$C_CANDIDATE" ] && [ "${PREFLIGHT_RETRY:-0}" -eq 0 ]; then
-        local cand_failed=0 rest=() as_set=0 h2 new=()
-        for host in "${failed[@]}"; do
-            case "$host" in
-                "$C_CANDIDATE: ssh failed") cand_failed=1 ;;
-                *) rest+=("$host") ;;
-            esac
-        done
-        if [ "$cand_failed" -eq 1 ]; then
-            if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
-                as_set=1
-                log "'$C_CANDIDATE' is not reachable over ssh; treating it as the custom set name"
-            elif confirm_timed 5 yes "'$C_CANDIDATE' is not reachable over ssh; treat it as the custom set name?"; then
-                as_set=1
-            fi
-        fi
-        if [ "$as_set" -eq 1 ]; then
-            CUSTOM_SET=$C_CANDIDATE
-            C_CANDIDATE=""
-            for h2 in "${HOSTS[@]}"; do
-                [ "$h2" = "$CUSTOM_SET" ] || new+=("$h2")
-            done
-            HOSTS=()
-            [ ${#new[@]} -eq 0 ] || HOSTS=("${new[@]}")
-            MASTER=${HOSTS[0]:-}
-            failed=()
-            [ ${#rest[@]} -eq 0 ] || failed=("${rest[@]}")
-            if [ ${#HOSTS[@]} -eq 0 ]; then
-                # The candidate was the only "host": this is a local run now.
-                resolve_local_mode
-                PREFLIGHT_RETRY=1 preflight
-                return
-            fi
-        fi
-    fi
     if [ ${#failed[@]} -gt 0 ]; then
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
@@ -5356,21 +5241,6 @@ CSVEOF
     log "created host file $1"
 }
 
-# The directory an existing -C set name points at, lookup only. Shipped names
-# return nothing: they are always customized via a copy.
-custom_set_probe_dir() {
-    [ "$CUSTOMIZE" -eq 1 ] && [ -n "$CUSTOM_SET" ] || return 0
-    case " $SHIPPED_SETS " in *" $CUSTOM_SET "*) return 0 ;; esac
-    case "$CUSTOM_SET" in
-        /*|./*) [ ! -d "$CUSTOM_SET" ] || printf '%s' "$CUSTOM_SET" ;;
-        *)  if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
-                printf '%s' "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
-            elif [ -d "./fio-jobfiles/$CUSTOM_SET" ]; then
-                printf '%s' "./fio-jobfiles/$CUSTOM_SET"
-            fi ;;
-    esac
-}
-
 # --- host identity -------------------------------------------------------------
 # Internally a host is an ADDRESS (ssh target, fio --client=, a $WORK_DIR
 # path): no slash, localhost in local mode. Host files and data files use
@@ -5483,23 +5353,13 @@ host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
 
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
-    local candidate cdir
+    local candidate
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
     else
-        cdir=$(custom_set_probe_dir)
-        candidate=""
-        [ -z "$cdir" ] || [ ! -f "$cdir/hostlist.csv" ] || candidate="$cdir/hostlist.csv"
-        if [ -z "$candidate" ]; then
-            candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
-            [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
-            [ -f "$candidate" ] || candidate="./hostlist.csv"
-        fi
-        if [ ! -f "$candidate" ] && [ "$CUSTOMIZE" -eq 1 ]; then
-            TARGETS_FILE=""
-            log "host file: none found; it will be created in the custom set"
-            return 0
-        fi
+        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./hostlist.csv"
     fi
     if [ ! -f "$candidate" ]; then
         if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
@@ -5540,7 +5400,6 @@ targets_field() {   # targets_field <host> <fieldno> [phasefile]
 writeback_targets() {
     [ -n "$AUTO_LEVEL" ] || return 0
     local wb="$TARGETS_FILE" mode=fill
-    [ -n "$wb" ] || { [ -n "$SET_DIR_OVERRIDE" ] && wb="$SET_DIR_OVERRIDE/hostlist.csv"; }
     [ -n "$wb" ] && [ -f "$wb" ] || return 0
     # -g: derived and measured values win, no prompt. host, login and
     # allowed_cpus on the host OWN row are protected in the merge; a generic
@@ -5898,248 +5757,6 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly> <csv> <cli_engi
     }' "$@"
 }
 
-# --- customize workflow (-C) ------------------------------------------------------
-copy_set_into() {   # copy_set_into <srcdir> <dstdir>
-    local f
-    for f in "$1"/[0-9]*; do
-        [ -f "$f" ] || die "no jobfiles to copy from $1"
-        cp "$f" "$2/" || die "cannot copy ${f##*/} into $2"
-    done
-}
-
-# The -w set's directory, resolved exactly the way stage_jobfiles does.
-workload_src_dir() {
-    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
-    [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
-    [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
-    printf '%s' "$d"
-}
-
-# CUSTOM_SET to a directory of jobfiles. Writability is checked first: the
-# next step is an editor session.
-resolve_custom_set() {
-    local src dst created=0
-    src=$(workload_src_dir) || exit 1
-    case "$CUSTOM_SET" in
-        "")
-            # No name: a <date>-<time> set under ./fio-jobfiles, reusable later
-            # by that name with -w or -C.
-            [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
-                die "cannot create a custom set: ./fio-jobfiles is not writable here"
-            printf -v dst './fio-jobfiles/%(%Y%m%d-%H%M%S)T' -1
-            mkdir -p "$dst" || die "cannot create $dst"
-            copy_set_into "$src" "$dst"
-            created=1; TEMP_SET=1
-            ;;
-        /*|./*)
-            dst=$CUSTOM_SET
-            if [ -d "$dst" ]; then
-                [ -w "$dst" ] || die "custom set $dst is not writable"
-            else
-                mkdir -p "$dst" || die "cannot create $dst (missing write permission on its parent?)"
-                copy_set_into "$src" "$dst"
-                created=1
-            fi
-            ;;
-        *)
-            # a shipped set name means customize a copy, never the set itself
-            case " $SHIPPED_SETS " in
-                *" $CUSTOM_SET "*)
-                    log "'$CUSTOM_SET' ships with wekatester; customizing a copy of it"
-                    WORKLOAD=$CUSTOM_SET
-                    src=$(workload_src_dir) || exit 1
-                    [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
-                        die "cannot create a custom set: ./fio-jobfiles is not writable here"
-                    printf -v dst './fio-jobfiles/%(%Y%m%d-%H%M%S)T' -1
-                    mkdir -p "$dst" || die "cannot create $dst"
-                    copy_set_into "$src" "$dst"
-                    created=1; TEMP_SET=1
-                    SET_DIR_OVERRIDE=$dst
-                    log "custom set: $dst"
-                    return 0
-                    ;;
-            esac
-            # Bare name: same lookup as -w; created under ./fio-jobfiles when new.
-            if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
-                dst="$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
-                [ -w "$dst" ] || die "custom set $dst is not writable"
-            elif [ -d "./fio-jobfiles/$CUSTOM_SET" ]; then
-                dst="./fio-jobfiles/$CUSTOM_SET"
-                [ -w "$dst" ] || die "custom set $dst is not writable"
-            else
-                [ -d "./fio-jobfiles" ] && [ -w "./fio-jobfiles" ] || \
-                    die "cannot create a custom set: ./fio-jobfiles is not writable here"
-                dst="./fio-jobfiles/$CUSTOM_SET"
-                mkdir -p "$dst" || die "cannot create $dst"
-                copy_set_into "$src" "$dst"
-                created=1
-            fi
-            ;;
-    esac
-    # An existing set plus an explicit -w refreshes it from that workload: it
-    # destroys edits, so it takes a real yes, never unattended, and it REPLACES
-    # the jobfiles (a stale layout job included) rather than overlaying them.
-    if [ "$created" -eq 0 ] && [ "$WORKLOAD_EXPLICIT" -eq 1 ] \
-            && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        if confirm_destructive "replace the jobfiles in $dst with a fresh copy of $WORKLOAD?"; then
-            local old
-            for old in "$dst"/[0-9]*; do
-                [ -f "$old" ] && rm -f "$old"
-            done
-            copy_set_into "$src" "$dst"
-        fi
-    fi
-    SET_DIR_OVERRIDE=$dst
-    log "custom set: $dst"
-}
-
-# The guided flow (README, Customizing workloads); -r and -n skip its prompts.
-# A -C set owns its host file: the one this run resolved, else the source set
-# copy, else the template. Edits apply this run, except logins: connections are
-# already up.
-ensure_set_hostfile() {
-    local dst="$SET_DIR_OVERRIDE/hostlist.csv" src=""
-    if [ -f "$dst" ]; then
-        TARGETS=1; TARGETS_FILE=$dst
-        return 0
-    fi
-    if [ -n "$TARGETS_FILE" ] && [ -f "$TARGETS_FILE" ]; then
-        src=$TARGETS_FILE
-    elif [ -f "$(workload_src_dir)/hostlist.csv" ]; then
-        src="$(workload_src_dir)/hostlist.csv"
-    fi
-    if [ -n "$src" ]; then
-        cp "$src" "$dst" || die "cannot copy host file into $SET_DIR_OVERRIDE"
-        log "host file copied into the set: $dst"
-    else
-        write_targets_template "$dst"
-    fi
-    TARGETS=1; TARGETS_FILE=$dst
-    return 0
-}
-
-# The host file -C will use, known BEFORE connecting: the set own copy, else
-# the file customizing will copy in (ensure_set_hostfile choice, no side
-# effect). Empty when there is none yet.
-custom_set_hostfile_early() {
-    [ "$CUSTOMIZE" -eq 1 ] || return 0
-    local d src
-    d=$(custom_set_probe_dir)
-    if [ -n "$d" ] && [ -f "$d/hostlist.csv" ]; then
-        printf '%s' "$d/hostlist.csv"
-        return 0
-    fi
-    case " $SHIPPED_SETS " in
-        *" $CUSTOM_SET "*)
-            src="$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
-            [ -d "$src" ] || src="./fio-jobfiles/$CUSTOM_SET" ;;
-        *)  src=$(workload_src_dir) || return 0 ;;
-    esac
-    [ ! -f "$src/hostlist.csv" ] || printf '%s' "$src/hostlist.csv"
-}
-
-customize_jobfiles() {
-    echo
-    resolve_custom_set
-    ensure_set_hostfile
-    local dst=$SET_DIR_OVERRIDE job f interactive=1 had_layout=0
-    if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then interactive=0; fi
-
-    for f in "$dst"/[0-9]*; do
-        if is_layout_file "$f"; then had_layout=1; break; fi
-    done
-
-    if [ "$interactive" -eq 1 ]; then
-        # The host file is the primary editing surface; the jobfiles stay
-        # editable behind the prompt.
-        [ ! -f "$dst/hostlist.csv" ] || edit_jobfile "$dst/hostlist.csv"
-        if confirm_timed 5 no "edit the jobfiles individually too?"; then
-            [ -z "$AUTO_LEVEL" ] || log "note: -a $AUTO_LEVEL will override numjobs/iodepth/ioengine (and filesize/nrfiles/filename_format on iops/latency files) in the staged copies of these jobfiles"
-            discover_jobfiles "$dst"
-            for job in "${JOBFILES[@]}"; do
-                is_layout_file "$dst/$job" && continue   # layout editing is prompted below
-                edit_jobfile "$dst/$job"
-            done
-        fi
-    fi
-
-    # -g always regenerates; otherwise an existing layout is kept unattended
-    # and prompted (default keep) interactively; a set without one gets one
-    # silently.
-    if [ "$had_layout" -eq 1 ]; then
-        if [ "$REGEN_LAYOUT" -eq 1 ]; then
-            generate_layout "$dst" "$dst" || die "layout generation failed"
-        elif [ "$interactive" -eq 1 ] \
-                && confirm_timed 5 no "regenerate the existing layout job(s)?"; then
-            generate_layout "$dst" "$dst" || die "layout generation failed"
-        fi
-    else
-        generate_layout "$dst" "$dst" || die "layout generation failed"
-    fi
-
-    if [ "$interactive" -eq 1 ]; then
-        if confirm_timed 5 no "edit the layout job(s)?"; then
-            for f in "$dst"/[0-9]*; do
-                is_layout_file "$f" && edit_jobfile "$f"
-            done
-        fi
-        if [ "$TEMP_SET" -eq 1 ]; then
-            confirm_timed 5 yes "keep $dst for reuse after the run?" || TEMP_REMOVE=1
-        fi
-    fi
-    return 0
-}
-
-# Every die() path exits before this call, so a failed or partial run keeps
-# the set and its edits.
-finish_temp_set() {
-    [ "$TEMP_REMOVE" -eq 1 ] || return 0
-    log "removing temporary custom set $SET_DIR_OVERRIDE (not kept for reuse)"
-    rm -rf "$SET_DIR_OVERRIDE"
-}
-
-# -n: print what a real run would do, from the master staged variants (what
-# fio would read), and stop.
-dry_run_report() {
-    local job f line
-    echo
-    log "dry run: nothing was executed; details of what would have run:"
-    if cal_mode; then
-        local caldir=${SET_DIR_OVERRIDE:-$(workload_src_dir)} call
-        call=""
-        ! cal_ladders_once || call=$CAL_LADDERS
-        if [ -n "$call" ]; then
-            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
-            mkdir -p "$WORK_DIR/cal"
-            if cal_shapes_once; then
-                while IFS= read -r line; do log "  $line"; done < "$WORK_DIR/cal/shapes.txt"
-            else
-                log "WARNING: could not group the hosts into shapes" >&2
-            fi
-        else
-            log "-a $AUTO_LEVEL: nothing to calibrate in this set"
-        fi
-    fi
-    if [ -n "$SET_DIR_OVERRIDE" ]; then
-        log "custom set files (edit these, then re-run without -n):"
-        for f in "$SET_DIR_OVERRIDE"/[0-9]*; do
-            [ -f "$f" ] && echo "  $(cd "$(dirname "$f")" && pwd)/${f##*/}"
-        done
-    fi
-    log "workload source: $JOBFILE_SRC"
-    log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
-    for job in "${JOBFILES[@]}"; do
-        echo
-        echo "==== $job (staged variant for $MASTER) ===="
-        cat "$WORK_DIR/jobs/$MASTER/$job"
-    done
-    echo
-    [ ${#HOSTS[@]} -le 1 ] || \
-        log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
-    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
-    log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
-}
-
 # --- phase 3: stage jobfiles ---------------------------------------------------
 # Build $WORK_DIR/jobs/<host>/<job> for every host and copy the tree to
 # $TARGET_DIR on $MASTER in one transfer.
@@ -6147,8 +5764,8 @@ JOBFILES=()      # basenames, in run order
 JOBFILE_SRC=""   # local source directory
 SET_DIR=""       # merged view actually staged: source files + generated layout
 
-# Single source of truth for what runs and in what order -- the editor loop
-# and the runner must never disagree on either.
+# Single source of truth for what runs and in what order -- staging and the
+# runner must never disagree on either.
 discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
     # byte order whatever the locale: 021-latencyR.job before its -b twin
     # 021b-latencyR-1M.job (en_US collation would flip them)
@@ -6840,15 +6457,21 @@ check_aio_room() {
     esac
 }
 
+# The -w set's directory: the one beside wekatester, else under the current
+# directory.
+workload_src_dir() {
+    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+    printf '%s' "$d"
+}
+
 stage_jobfiles() {
     echo
-    # -C already resolved a set to run; otherwise -w names one.
     if [ -n "$SET_DIR_OVERRIDE" ]; then
         JOBFILE_SRC=$SET_DIR_OVERRIDE
     else
-        JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
-        [ -d "$JOBFILE_SRC" ] || JOBFILE_SRC="./fio-jobfiles/$WORKLOAD"
-        [ -d "$JOBFILE_SRC" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+        JOBFILE_SRC=$(workload_src_dir) || exit 1
     fi
 
     discover_jobfiles "$JOBFILE_SRC"
@@ -7044,8 +6667,41 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
     split_sysinfo "$WORK_DIR/pressure.$label." "-$label"
 }
 
-# The staged variants are the execution truth: a -C temp set may be gone, and
-# -a rewrites geometry per host.
+# -n: print what a real run would do, from the master staged variants (what
+# fio would read), and stop.
+dry_run_report() {
+    local job line call=""
+    echo
+    log "dry run: nothing was executed; details of what would have run:"
+    if cal_mode; then
+        ! cal_ladders_once || call=$CAL_LADDERS
+        if [ -n "$call" ]; then
+            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
+            mkdir -p "$WORK_DIR/cal"
+            if cal_shapes_once; then
+                while IFS= read -r line; do log "  $line"; done < "$WORK_DIR/cal/shapes.txt"
+            else
+                log "WARNING: could not group the hosts into shapes" >&2
+            fi
+        else
+            log "-a $AUTO_LEVEL: nothing to calibrate in this set"
+        fi
+    fi
+    log "workload source: $JOBFILE_SRC"
+    log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
+    for job in "${JOBFILES[@]}"; do
+        echo
+        echo "==== $job (staged variant for $MASTER) ===="
+        cat "$WORK_DIR/jobs/$MASTER/$job"
+    done
+    echo
+    [ ${#HOSTS[@]} -le 1 ] || \
+        log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
+    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
+    log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
+}
+
+# The staged variants are the execution truth: -a rewrites geometry per host.
 snapshot_jobfiles() {
     mkdir "$RUN_DIR/fio-jobfiles" || die "cannot create $RUN_DIR/fio-jobfiles"
     cp -R "$WORK_DIR/jobs/." "$RUN_DIR/fio-jobfiles/" \
@@ -7605,11 +7261,6 @@ main() {
     resolve_local_mode
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
-    # -C needs a terminal and an editor; say so now, not after setup.
-    if [ "$CUSTOMIZE" -eq 1 ] && [ "$FAST_TRACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        require_interactive "-C"
-        resolve_editor
-    fi
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     echo
@@ -7636,45 +7287,18 @@ main() {
     # phase supplies the per-host logins the auth rounds use.
     if [ "$TARGETS" -eq 1 ]; then
         resolve_targets_file
-        # empty = the -C defer case: the set's file does not exist yet;
-        # the post-customize phase1 refresh picks it up once created
-        if [ -n "$TARGETS_FILE" ]; then
-            resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-                "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-                - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-                || die "host file resolution failed ($TARGETS_FILE)"
-        fi
-    elif [ "$CUSTOMIZE" -eq 1 ]; then
-        # -C without -t: the set host file is honored as if -t named it.
-        local early
-        early=$(custom_set_hostfile_early)
-        if [ -n "$early" ]; then
-            log "host file (the -C set's): $early"
-            resolve_targets phase1 "$early" "${ENGINE:--}" \
-                "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-                - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-                || die "host file resolution failed ($early)"
-        fi
+        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
+            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
+            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
+            || die "host file resolution failed ($TARGETS_FILE)"
     fi
     check_controller_procs
     [ "$LOCAL_MODE" -eq 1 ] || establish_connections
     preflight
     verify_mount_mode
-    # After host validation (no editing against a broken cluster), before any
-    # daemon (nothing to tear down while an editor is open). The prompt fd
-    # closes before the run so no child inherits the terminal.
-    if [ "$CUSTOMIZE" -eq 1 ]; then
-        customize_jobfiles
-        # The set host file is now the targets file: refresh phase1 and
-        # re-verify mounts; login edits wait for the next run.
-        resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" \
-            "$([ "$DIRECTORY_EXPLICIT" -eq 1 ] && printf '%s' "$DIRECTORY" || printf -- -)" \
-            - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
-            || die "host file resolution failed ($TARGETS_FILE)"
-        verify_mount_mode
-    fi
-    # Unconditional: -p, a -t host file created on the way, and a destination
-    # created by the mount pass open the prompt fd too, not only -C.
+    # -p, a -t host file created on the way, and a destination created by the
+    # mount pass open the prompt fd: it closes before the run so no child
+    # inherits the terminal.
     close_interactive
     early_client_cmdline_check
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -7732,7 +7356,6 @@ main() {
     snapshot_jobfiles
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
-    finish_temp_set
 }
 
 # run only when executed, not when sourced (tests source this file)

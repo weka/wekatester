@@ -114,8 +114,41 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
     split_sysinfo "$WORK_DIR/pressure.$label." "-$label"
 }
 
-# The staged variants are the execution truth: a -C temp set may be gone, and
-# -a rewrites geometry per host.
+# -n: print what a real run would do, from the master staged variants (what
+# fio would read), and stop.
+dry_run_report() {
+    local job line call=""
+    echo
+    log "dry run: nothing was executed; details of what would have run:"
+    if cal_mode; then
+        ! cal_ladders_once || call=$CAL_LADDERS
+        if [ -n "$call" ]; then
+            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
+            mkdir -p "$WORK_DIR/cal"
+            if cal_shapes_once; then
+                while IFS= read -r line; do log "  $line"; done < "$WORK_DIR/cal/shapes.txt"
+            else
+                log "WARNING: could not group the hosts into shapes" >&2
+            fi
+        else
+            log "-a $AUTO_LEVEL: nothing to calibrate in this set"
+        fi
+    fi
+    log "workload source: $JOBFILE_SRC"
+    log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
+    for job in "${JOBFILES[@]}"; do
+        echo
+        echo "==== $job (staged variant for $MASTER) ===="
+        cat "$WORK_DIR/jobs/$MASTER/$job"
+    done
+    echo
+    [ ${#HOSTS[@]} -le 1 ] || \
+        log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
+    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
+    log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
+}
+
+# The staged variants are the execution truth: -a rewrites geometry per host.
 snapshot_jobfiles() {
     mkdir "$RUN_DIR/fio-jobfiles" || die "cannot create $RUN_DIR/fio-jobfiles"
     cp -R "$WORK_DIR/jobs/." "$RUN_DIR/fio-jobfiles/" \

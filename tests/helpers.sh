@@ -367,7 +367,7 @@ cal_json_fixture() {   # cal_json_fixture <file> <host:rbw:riops:wbw:wiops>...
     } > "$out"
 }
 
-# --- a small on-disk workload set for generator/customize tests ---
+# --- a small on-disk workload set for generator tests ---
 set_fixture() {   # creates $SETFIX with two jobfiles in distinct namespaces
     SETFIX=$(mktemp -d)
     printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=big/$jobnum\n[create]\ncreate_only=1\n[bw]\nrw=read\niodepth=1\n' > "$SETFIX/011-bw.job"

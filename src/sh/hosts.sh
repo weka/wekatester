@@ -25,21 +25,6 @@ CSVEOF
     log "created host file $1"
 }
 
-# The directory an existing -C set name points at, lookup only. Shipped names
-# return nothing: they are always customized via a copy.
-custom_set_probe_dir() {
-    [ "$CUSTOMIZE" -eq 1 ] && [ -n "$CUSTOM_SET" ] || return 0
-    case " $SHIPPED_SETS " in *" $CUSTOM_SET "*) return 0 ;; esac
-    case "$CUSTOM_SET" in
-        /*|./*) [ ! -d "$CUSTOM_SET" ] || printf '%s' "$CUSTOM_SET" ;;
-        *)  if [ -d "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET" ]; then
-                printf '%s' "$SCRIPT_DIR/fio-jobfiles/$CUSTOM_SET"
-            elif [ -d "./fio-jobfiles/$CUSTOM_SET" ]; then
-                printf '%s' "./fio-jobfiles/$CUSTOM_SET"
-            fi ;;
-    esac
-}
-
 # --- host identity -------------------------------------------------------------
 # Internally a host is an ADDRESS (ssh target, fio --client=, a $WORK_DIR
 # path): no slash, localhost in local mode. Host files and data files use
@@ -144,23 +129,13 @@ host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
 
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
-    local candidate cdir
+    local candidate
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
     else
-        cdir=$(custom_set_probe_dir)
-        candidate=""
-        [ -z "$cdir" ] || [ ! -f "$cdir/hostlist.csv" ] || candidate="$cdir/hostlist.csv"
-        if [ -z "$candidate" ]; then
-            candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
-            [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
-            [ -f "$candidate" ] || candidate="./hostlist.csv"
-        fi
-        if [ ! -f "$candidate" ] && [ "$CUSTOMIZE" -eq 1 ]; then
-            TARGETS_FILE=""
-            log "host file: none found; it will be created in the custom set"
-            return 0
-        fi
+        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        [ -f "$candidate" ] || candidate="./hostlist.csv"
     fi
     if [ ! -f "$candidate" ]; then
         if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
@@ -201,7 +176,6 @@ targets_field() {   # targets_field <host> <fieldno> [phasefile]
 writeback_targets() {
     [ -n "$AUTO_LEVEL" ] || return 0
     local wb="$TARGETS_FILE" mode=fill
-    [ -n "$wb" ] || { [ -n "$SET_DIR_OVERRIDE" ] && wb="$SET_DIR_OVERRIDE/hostlist.csv"; }
     [ -n "$wb" ] && [ -f "$wb" ] || return 0
     # -g: derived and measured values win, no prompt. host, login and
     # allowed_cpus on the host OWN row are protected in the merge; a generic

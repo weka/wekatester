@@ -145,7 +145,7 @@ validate_credentials() {
     done
 }
 
-# --- interactive prompting (-C) --------------------------------------------------
+# --- interactive prompting (-p, a missing host file or destination, capacity) ---
 # Prompts use /dev/tty on one rw fd: children get /dev/null on stdin and
 # stdout is often piped. read -s must read through a redirection (read -u
 # echoes), and partial -n input is discarded on timeout, so the escape drain
@@ -247,29 +247,4 @@ confirm_explicit() {   # confirm_explicit <message>
     prompt_line "$answer"
     log "$1 $answer"
     [ "$answer" = yes ]
-}
-
-# Only y means yes; EOF (the terminal went away) dies rather than answer.
-confirm_destructive() {   # confirm_destructive <message>
-    prompt_say "$1 [y/N] "
-    prompt_key 0 || { prompt_line ""; die "prompt input closed while waiting for an answer"; }
-    case "$PROMPT_KEY" in
-        y|Y) prompt_line yes; log "$1 yes"; return 0 ;;
-        *)   prompt_line no;  log "$1 no";  return 1 ;;
-    esac
-}
-
-# The value is a command (code -w): word-split, only the first word checked.
-resolve_editor() {
-    EDITOR_CMD=${VISUAL:-${EDITOR:-vi}}
-    set -- $EDITOR_CMD
-    [ $# -gt 0 ] || die "\$VISUAL/\$EDITOR is set but empty"
-    [ -n "$(command -v "$1")" ] || die "editor not found: $1 (from \$VISUAL/\$EDITOR)"
-}
-
-# All three fds go to the terminal: stdout may be a pipe.
-edit_jobfile() {   # edit_jobfile <path>
-    log "editing $1 with $EDITOR_CMD"
-    $EDITOR_CMD "$1" <&"$PROMPT_IN_FD" >&"$PROMPT_OUT_FD" 2>&"$PROMPT_OUT_FD" \
-        || die "editor exited $? on $1 -- nothing has been run"
 }

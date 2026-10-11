@@ -5,8 +5,8 @@ JOBFILES=()      # basenames, in run order
 JOBFILE_SRC=""   # local source directory
 SET_DIR=""       # merged view actually staged: source files + generated layout
 
-# Single source of truth for what runs and in what order -- the editor loop
-# and the runner must never disagree on either.
+# Single source of truth for what runs and in what order -- staging and the
+# runner must never disagree on either.
 discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
     # byte order whatever the locale: 021-latencyR.job before its -b twin
     # 021b-latencyR-1M.job (en_US collation would flip them)
@@ -230,15 +230,21 @@ check_aio_room() {
     esac
 }
 
+# The -w set's directory: the one beside wekatester, else under the current
+# directory.
+workload_src_dir() {
+    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
+    [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+    printf '%s' "$d"
+}
+
 stage_jobfiles() {
     echo
-    # -C already resolved a set to run; otherwise -w names one.
     if [ -n "$SET_DIR_OVERRIDE" ]; then
         JOBFILE_SRC=$SET_DIR_OVERRIDE
     else
-        JOBFILE_SRC="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
-        [ -d "$JOBFILE_SRC" ] || JOBFILE_SRC="./fio-jobfiles/$WORKLOAD"
-        [ -d "$JOBFILE_SRC" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
+        JOBFILE_SRC=$(workload_src_dir) || exit 1
     fi
 
     discover_jobfiles "$JOBFILE_SRC"

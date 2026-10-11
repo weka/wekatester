@@ -103,44 +103,12 @@ t_assert "-- passes flag-shaped tokens through as servers" bash -c '
     source ./wekatester; parse_args -d /x -- -weird h2
     [ "${HOSTS[*]}" = "-weird h2" ] && [ "$DIRECTORY" = /x ]'
 
-# --- parse_args: -C customize ---
-cz() { (source ./wekatester; parse_args "$@"
-        echo "$CUSTOMIZE|$CUSTOM_SET|$C_CANDIDATE|${HOSTS[*]-}"); }
-t_assert "-C off by default"                 test "$(cz h1)" = "0|||h1"
-t_assert "-Cmyset names the set"             test "$(cz -Cmyset h1)" = "1|myset||h1"
-t_assert "-c is the same option as -C"       test "$(cz -cmyset h1)" = "1|myset||h1"
-t_assert "an attached set name keeps its case" test "$(cz -CMySet h1)" = "1|MySet||h1"
-t_assert "--customize=set names the set"     test "$(cz --customize=MySet h1)" = "1|MySet||h1"
-t_assert "--customize= with no value errors" bash -c '
-    err=$( (source ./wekatester; parse_args --customize= h1) 2>&1 >>$WT_ASIDE )
-    rc=$?
-    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
-    case "$err" in *"--customize requires a value"*) true;; *) echo "$err" >&2; false;; esac'
-# Bare -C: the following bare token is only a CANDIDATE set name. It stays in
-# HOSTS so preflight can try it as a client first (Task 5 resolves it).
-t_assert "bare -C records a candidate without consuming it" test "$(cz -C h1)" = "1||h1|h1"
-t_assert "bare -C records only the first candidate"         test "$(cz -C h1 h2)" = "1||h1|h1 h2"
-t_assert "bare --customize records a candidate too"         test "$(cz --customize h1)" = "1||h1|h1"
-# With -- present the client list is unambiguous, so a bare pre--- token
-# following -C is the set name outright -- and only one of them may be.
-t_assert "-C name -- h1 consumes name as the set" test "$(cz -C name -- h1)" = "1|name||h1"
-t_assert "two bare set names before -- is a usage error" bash -c '
-    err=$( (source ./wekatester; parse_args -C a b -- h1) 2>&1 >>$WT_ASIDE )
-    rc=$?
-    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
-    case "$err" in *"one set name"*) true;; *) echo "$err" >&2; false;; esac'
-t_assert "-C with -s is a usage error" bash -c '
-    err=$( (source ./wekatester; parse_args -C -s /tmp/nope.json) 2>&1 >>$WT_ASIDE )
-    rc=$?
-    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc" >&2; false; } &&
-    case "$err" in *"-C"*"-s"*) true;; *) echo "$err" >&2; false;; esac'
-
-# --- parse_args: -w explicitness (Task 5 needs it for the recopy rule) ---
-t_assert "-w tracked as explicit only when given" bash -c '
-    source ./wekatester
-    ( parse_args h1; [ "$WORKLOAD_EXPLICIT" -eq 0 ] ) &&
-    ( parse_args -w mixed h1
-      [ "$WORKLOAD_EXPLICIT" -eq 1 ] && [ "$WORKLOAD" = mixed ] )'
+# --- -C was removed (Frank, 2026-10-11): it names the removal, every form ---
+t_assert "-C, -cset, --customize and --customize=set say -C was removed" bash -c '
+    for a in -C -cmyset --customize --customize=myset; do
+        err=$( (source ./wekatester; parse_args "$a" h1) 2>&1 >>$WT_ASIDE ) && { echo "$a: accepted" >&2; exit 1; }
+        case "$err" in *"-C/--customize was removed"*) ;; *) echo "$a: $err" >&2; exit 1;; esac
+    done'
 
 # --- mount guard classifier ---
 c() { (source ./wekatester; classify_mount_line_v "$1"; echo "$MOUNT_VERDICT"); }
@@ -962,30 +930,10 @@ t_assert "confirm_timed: esc beats a yes default" bash -c '
 t_assert "confirm_timed: timeout yields the stated default" bash -c '
     (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
      confirm_timed 1 yes "q?" < <(sleep 2) >>$WT_ASIDE)'
-t_assert "confirm_destructive: enter is NOT yes, y is, EOF dies" bash -c '
-    source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-    ! (printf "\n" | { confirm_destructive "sure?" >>$WT_ASIDE; }) &&
-    (printf "y" | { confirm_destructive "sure?" >>$WT_ASIDE; }) &&
-    ! ( { confirm_destructive "sure?" >>$WT_ASIDE; } </dev/null )'
 t_assert "require_interactive dies without a terminal" bash -c '
     out=$( (source ./wekatester; WEKATESTER_PROMPT_TTY=/dev/null PROMPT_TTY=/dev/null
-            require_interactive "-C") 2>&1 ); rc=$?
-    [ "$rc" -ne 0 ] && case "$out" in *"-C needs a terminal"*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "editor: files edited in run order, VISUAL beats EDITOR" bash -c '
-    source ./tests/helpers.sh; set_fixture; editor_fixture
-    (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-     VISUAL="$ED/stub-ed"; EDITOR=/nonexistent/editor; resolve_editor
-     discover_jobfiles "$SETFIX"
-     for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >>$WT_ASIDE
-    [ "$(cat "$ED/order")" = "011-bw.job
-031-iops.job" ]'
-t_assert "editor: nonzero exit aborts after exactly one file" bash -c '
-    source ./tests/helpers.sh; set_fixture; editor_fixture 3
-    ! (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-       EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
-       discover_jobfiles "$SETFIX"
-       for j in "${JOBFILES[@]}"; do edit_jobfile "$SETFIX/$j"; done) >>$WT_ASIDE 2>&1
-    [ "$(wc -l < "$ED/order")" -eq 1 ]'
+            require_interactive "-p") 2>&1 ); rc=$?
+    [ "$rc" -ne 0 ] && case "$out" in *"-p needs a terminal"*) true;; *) echo "$out" >&2; false;; esac'
 
 # --- layout generator ---
 t_assert "generator: one section per namespace with superset geometry" bash -c '
@@ -1108,77 +1056,7 @@ t_assert "tuner capacity: layout job does not double the required total" bash -c
     out=$( cap safe 0 h1 h2 2>&1 )
     case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 
-# --- customize workflow ---
-t_assert "resolve: bare name creates under ./fio-jobfiles and copies" bash -c '
-    source ./tests/helpers.sh
-    tmp=$(mktemp -d); cd "$tmp"
-    mkdir -p fio-jobfiles/default
-    printf "# report bandwidth\n[global]\nfilesize=1G\n[j]\nrw=read\n" > fio-jobfiles/default/011-x.job
-    (source "$OLDPWD/wekatester"
-     SCRIPT_DIR=$tmp; WORKLOAD=default; CUSTOM_SET=mynew
-     resolve_custom_set >>$WT_ASIDE
-     [ "$SET_DIR_OVERRIDE" = "./fio-jobfiles/mynew" ] && [ -f ./fio-jobfiles/mynew/011-x.job ])'
-t_assert "resolve: unwritable fio-jobfiles dies for a new bare name" bash -c '
-    source ./tests/helpers.sh
-    tmp=$(mktemp -d); cd "$tmp"
-    mkdir -p fio-jobfiles/default
-    printf "[j]\nrw=read\n" > fio-jobfiles/default/011-x.job
-    chmod -w fio-jobfiles
-    out=$( (source "$OLDPWD/wekatester"
-            SCRIPT_DIR=$tmp; WORKLOAD=default; CUSTOM_SET=mynew
-            resolve_custom_set) 2>&1 ); rc=$?
-    chmod +w fio-jobfiles
-    [ "$rc" -ne 0 ] && case "$out" in *"not writable"*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "resolve: existing path is used as-is (no copy)" bash -c '
-    source ./tests/helpers.sh; set_fixture
-    (source ./wekatester
-     WORKLOAD=default; CUSTOM_SET=$SETFIX
-     resolve_custom_set >>$WT_ASIDE
-     [ "$SET_DIR_OVERRIDE" = "$SETFIX" ] && [ ! -f "$SETFIX/011-bandwidthR.job" ])'
-t_assert "customize -r: layout generated silently, no editor, keep implied" bash -c '
-    source ./tests/helpers.sh; set_fixture; editor_fixture
-    (source ./wekatester
-     FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     EDITOR="$ED/stub-ed"
-     customize_jobfiles >>$WT_ASIDE
-     [ -f "$SETFIX/000-wekatester-layout.job" ] && [ "$TEMP_REMOVE" -eq 0 ]) || exit 1
-    [ ! -f "$ED/order" ]'
-t_assert "customize -r without -g: existing layout untouched" bash -c '
-    source ./tests/helpers.sh; set_fixture
-    printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
-    (source ./wekatester
-     FAST_TRACK=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     customize_jobfiles >>$WT_ASIDE)
-    grep -q "^mine$" "$SETFIX/000-wekatester-layout.job"'
-t_assert "customize -g: existing layout regenerated even fast-tracked" bash -c '
-    source ./tests/helpers.sh; set_fixture
-    printf "# wekatester-layout: generated sha256=feed\nmine\n" > "$SETFIX/000-wekatester-layout.job"
-    (source ./wekatester
-     FAST_TRACK=1; REGEN_LAYOUT=1; CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     customize_jobfiles >>$WT_ASIDE)
-    ! grep -q "^mine$" "$SETFIX/000-wekatester-layout.job" &&
-    grep -q "^create_only=1$" "$SETFIX/000-wekatester-layout.job"'
-t_assert "temp set removed only when marked and only via finish_temp_set" bash -c '
-    source ./tests/helpers.sh
-    d=$(mktemp -d)
-    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=0; finish_temp_set)
-    [ -d "$d" ] || exit 1
-    (source ./wekatester; SET_DIR_OVERRIDE=$d; TEMP_REMOVE=1; finish_temp_set >>$WT_ASIDE)
-    [ ! -d "$d" ]'
-t_assert "preflight: unreachable -C candidate becomes the set name (fast track)" bash -c '
-    source ./tests/helpers.sh
-    stub=$(mktemp -d)
-    printf "#!/bin/sh\nexit 255\n" > "$stub/ssh"; chmod +x "$stub/ssh"   # unreachable
-    (source ./wekatester
-     PATH="$stub:$PATH"
-     CUSTOMIZE=1; FAST_TRACK=1; C_CANDIDATE=mysetname
-     HOSTS=(mysetname); MASTER=mysetname; FIO_BIN=/usr/bin/true; WORK_DIR=$(mktemp -d)
-     printf "#!/bin/sh\nexit 1\n" > "$stub/pgrep"; chmod +x "$stub/pgrep"   # no fio running
-     uname() { echo Linux; }
-     preflight >>$WT_ASIDE 2>&1
-     [ "$CUSTOM_SET" = "mysetname" ] && [ "$LOCAL_MODE" -eq 1 ] && [ "$MASTER" = "localhost" ])'
-
-# --- review fixes: layout union geometry, shipped-set protection, ordering ---
+# --- review fixes: layout union geometry, ordering ---
 t_assert "generator: divergent geometries yield one section each (union, not grid)" bash -c '
     source ./tests/helpers.sh
     S=$(mktemp -d)
@@ -1227,23 +1105,6 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     # the layout lays out both sections, 58G/host, so the union raises the
     # per-host requirement above 54G, proving layout_footprint runs
     case "$out" in *"capacity: h1 needs ~58.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "-C with a shipped set name copies it, never edits in place" bash -c '
-    source ./tests/helpers.sh
-    tmp=$(mktemp -d); cd "$tmp"
-    # the -w set (default) exists in every install: resolve_custom_set looks
-    # it up first. Without it this subshell died, and the test ignored that.
-    mkdir -p fio-jobfiles/smoke fio-jobfiles/default
-    printf "# report bandwidth\n[global]\nfilesize=1M\n[j]\nrw=read\n" > fio-jobfiles/smoke/011-x.job
-    printf "# report bandwidth\n[global]\nfilesize=1M\n[j]\nrw=read\n" > fio-jobfiles/default/011-d.job
-    before=$(ls fio-jobfiles/smoke | cksum) && [ -n "$before" ] || exit 1
-    (source "$OLDPWD/wekatester"
-     SCRIPT_DIR=$tmp; CUSTOM_SET=smoke; FAST_TRACK=1; CUSTOMIZE=1
-     customize_jobfiles >>$WT_ASIDE
-     [ "$TEMP_SET" -eq 1 ] &&
-     case "$SET_DIR_OVERRIDE" in ./fio-jobfiles/2*) true;; *) false;; esac &&
-     [ -f "$SET_DIR_OVERRIDE/000-wekatester-layout.job" ]) || exit 1
-    after=$(ls fio-jobfiles/smoke | cksum)
-    [ "$before" = "$after" ]'
 t_assert "staging: marker layout with a late-sorting name is forced first" bash -c '
     source ./tests/helpers.sh; set_fixture; no_ssh_fixture
     (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE
@@ -1255,19 +1116,6 @@ t_assert "staging: marker layout with a late-sorting name is forced first" bash 
      TARGET_DIR="$d/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
      stage_jobfiles >>$WT_ASIDE
      [ "${JOBFILES[0]}" = "090-mylayout.job" ] && [ "${#JOBFILES[@]}" -eq 3 ])'
-t_assert "recopy replaces: old jobfiles and stale layout are cleared" bash -c '
-    source ./tests/helpers.sh
-    tmp=$(mktemp -d); cd "$tmp"
-    mkdir -p fio-jobfiles/fresh custom
-    printf "[global]\nfilesize=1M\n[new]\nrw=read\n" > fio-jobfiles/fresh/011-new.job
-    printf "[global]\nfilesize=1M\n[old]\nrw=read\n" > custom/011-old.job
-    printf "# wekatester-layout: generated sha256=stale\nSTALE\n" > custom/000-wekatester-layout.job
-    (source "$OLDPWD/wekatester"
-     PROMPT_IN_FD=0; PROMPT_OUT_FD=1
-     SCRIPT_DIR=$tmp; WORKLOAD=fresh; WORKLOAD_EXPLICIT=1; CUSTOM_SET=./custom
-     printf "y" | { resolve_custom_set >>$WT_ASIDE; }
-     [ -f ./custom/011-new.job ] && [ ! -f ./custom/011-old.job ] &&
-     [ ! -f ./custom/000-wekatester-layout.job ])'
 
 # --- -o/--output and the results directory ---
 t_assert "parse: results dir defaults to ./results" bash -c '
@@ -1399,12 +1247,12 @@ t_assert "-s on a bundle with no results files errors" bash -c '
 # --- every value-taking option works attached, detached, and =-attached ---
 t_assert "parse: attached values work for -d -w -f -s -i" bash -c '
     (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -iubuntu:/k h1
-     [ "$DIRECTORY" = /x ] && [ "$WORKLOAD" = smoke ] && [ "$WORKLOAD_EXPLICIT" = 1 ] &&
+     [ "$DIRECTORY" = /x ] && [ "$WORKLOAD" = smoke ] &&
      [ "$FIO_BIN" = /opt/fio ] && [ "${IDENT_RAW[0]}" = ubuntu:/k ]) &&
     (source ./wekatester; parse_args -sfile.json; [ "$SUMMARIZE_FILE" = file.json ])'
 t_assert "parse: =-attached values strip exactly one leading =" bash -c '
     (source ./wekatester; parse_args -d=/x h1;  [ "$DIRECTORY" = /x ]) &&
-    (source ./wekatester; parse_args -c=foo h1; [ "$CUSTOM_SET" = foo ])'
+    (source ./wekatester; parse_args -w=foo h1; [ "$WORKLOAD" = foo ])'
 t_assert "parse: an attached value keeps its case even when the option is folded" bash -c '
     (source ./wekatester; parse_args -WSmoke h1; [ "$WORKLOAD" = Smoke ])'
 t_assert "parse: attaching is the escape hatch for a dash-leading value" bash -c '
@@ -1685,23 +1533,6 @@ t_assert "sets: every shipped jobfile says what it reports, so calibration measu
 bw write
 iops read
 iops write" ] || { echo "$out" >&2; false; }'
-t_assert "-C: the set host file -- its own, or the one customizing will copy in -- is known before connecting" bash -c '
-    tmp=$(mktemp -d); cd "$tmp"
-    mkdir -p fio-jobfiles/default fio-jobfiles/smoke custom/mine
-    printf "h1,ubuntu,,,/mnt/fast/io500dir\n" > custom/mine/hostlist.csv
-    printf "h1,opc,,,/mnt/w\n" > fio-jobfiles/smoke/hostlist.csv
-    early() { (source "$OLDPWD/wekatester"; SCRIPT_DIR=$tmp; CUSTOMIZE=1; CUSTOM_SET=$1; WORKLOAD=${2:-default}; custom_set_hostfile_early); }
-    [ "$(early ./custom/mine)" = "./custom/mine/hostlist.csv" ] || { echo "own: $(early ./custom/mine)" >&2; exit 1; }
-    [ "$(early smoke)" = "$tmp/fio-jobfiles/smoke/hostlist.csv" ] || { echo "shipped: $(early smoke)" >&2; exit 1; }
-    # a new set copies the -w set: none there yet, so nothing to honor
-    [ -z "$(early ./custom/new)" ] || { echo "new: $(early ./custom/new)" >&2; exit 1; }
-    printf "h1,root,,,/mnt/x\n" > fio-jobfiles/default/hostlist.csv
-    [ "$(early ./custom/new)" = "$tmp/fio-jobfiles/default/hostlist.csv" ] || { echo "new from -w: $(early ./custom/new)" >&2; exit 1; }
-    # main reads it before any connection is made
-    m=$(sed -n "/^main() {/,/^}/p" "$OLDPWD/wekatester")
-    e=$(printf "%s\n" "$m" | grep -n "custom_set_hostfile_early" | head -1 | cut -d: -f1)
-    c=$(printf "%s\n" "$m" | grep -n "establish_connections" | head -1 | cut -d: -f1)
-    [ -n "$e" ] && [ -n "$c" ] && [ "$e" -lt "$c" ] || { echo "early=$e connect=$c" >&2; false; }'
 # --- brutal: the exhaustive grid ---
 # Both measured levels gate the calibration phase; only one of them is brutal.
 t_assert "parse: -a brutal sets the level, and :secs sets the cell duration" bash -c '
@@ -2608,21 +2439,7 @@ t_assert "targets: host-less lines never assign a login" bash -c '
     # h1 has no login, so the root-selector line does not match it at all
     echo "$out" | grep -q "^h1	-	-	-	-" || { echo "$out" >&2; false; }'
 
-# --- host files (-t): flag, file resolution, prompts, -C ownership ---
-t_assert "parse: -c claims paths, shipped names and existing sets without an ssh probe" bash -c '
-    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/realset
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     parse_args -c realset -d /mnt/x
-     [ "$CUSTOM_SET" = realset ] && [ -z "$C_CANDIDATE" ] && [ ${#HOSTS[@]} -eq 0 ]) &&
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     parse_args -c ./someplace/set -d /mnt/x
-     [ "$CUSTOM_SET" = ./someplace/set ] && [ -z "$C_CANDIDATE" ]) &&
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     parse_args -c smoke -d /mnt/x
-     [ "$CUSTOM_SET" = smoke ] && [ -z "$C_CANDIDATE" ]) &&
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     parse_args -c maybehost -d /mnt/x
-     [ -z "$CUSTOM_SET" ] && [ "$C_CANDIDATE" = maybehost ] && [ "${HOSTS[0]}" = maybehost ])'
+# --- host files (-t): flag, file resolution, prompts ---
 t_assert "parse: -t consumes an existing file whatever its name" bash -c '
     d=$(mktemp -d); cd "$d"; touch myhosts
     (source "$OLDPWD/wekatester"
@@ -2677,65 +2494,6 @@ t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
      [ "$TARGETS_FILE" = "./hostlist.csv" ]) >>$WT_ASIDE'
-t_assert "bare -t: an existing -C set folder's hostlist.csv beats ./hostlist.csv" bash -c '
-    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/mine
-    printf "host,user_login\n" > hostlist.csv
-    printf "host,user_login\nh7,opc\n" > fio-jobfiles/mine/hostlist.csv
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     TARGETS=1; CUSTOMIZE=1; CUSTOM_SET=mine; WORKLOAD=default
-     resolve_targets_file
-     [ "$TARGETS_FILE" = "$d/fio-jobfiles/mine/hostlist.csv" ]) >>$WT_ASIDE'
-t_assert "bare -t with -C and no file anywhere defers creation to the set" bash -c '
-    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles
-    out=$( (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     TARGETS=1; CUSTOMIZE=1; CUSTOM_SET=newset; WORKLOAD=default
-     resolve_targets_file
-     [ -z "$TARGETS_FILE" ] || exit 1) 2>&1 ) &&
-    case "$out" in *"created in the custom set"*) true;; *) echo "$out" >&2; false;; esac &&
-    [ ! -f "$d/hostlist.csv" ]'
-t_assert "custom_set_probe_dir: shipped names and missing dirs probe to nothing" bash -c '
-    d=$(mktemp -d); cd "$d"; mkdir -p fio-jobfiles/real
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     CUSTOMIZE=1
-     CUSTOM_SET=default; a=$(custom_set_probe_dir)
-     CUSTOM_SET=ghost;   b=$(custom_set_probe_dir)
-     CUSTOM_SET=real;    c=$(custom_set_probe_dir)
-     [ -z "$a" ] && [ -z "$b" ] && [ "$c" = "$d/fio-jobfiles/real" ])'
-t_assert "-C sets own a hostfile: resolved file copied in, template when none" bash -c '
-    d=$(mktemp -d); cd "$d"; mkdir -p set1 set2 fio-jobfiles/default
-    printf "[global]\n[j]\nrw=read\n" > fio-jobfiles/default/011-a.job
-    printf "host,user_login\nh9,opc\n" > mine.csv
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     SET_DIR_OVERRIDE=$d/set1; TARGETS=1; TARGETS_FILE=$d/mine.csv
-     ensure_set_hostfile
-     grep -q h9,opc "$d/set1/hostlist.csv" && [ "$TARGETS_FILE" = "$d/set1/hostlist.csv" ]) &&
-    (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
-     SET_DIR_OVERRIDE=$d/set2; TARGETS=0
-     ensure_set_hostfile
-     head -1 "$d/set2/hostlist.csv" | grep -q "^host,user_login" &&
-     [ "$TARGETS" -eq 1 ] && [ "$TARGETS_FILE" = "$d/set2/hostlist.csv" ])'
-t_assert "customize: host file opens first; jobfiles only behind the prompt (default no)" bash -c '
-    source ./tests/helpers.sh; set_fixture; editor_fixture
-    (source ./wekatester
-     CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
-     exec 9<<<"nnn"
-     PROMPT_IN_FD=9; PROMPT_OUT_FD=2
-     customize_jobfiles) >>$WT_ASIDE 2>&1
-    head -1 "$ED/order" | grep -q "hostlist.csv" &&
-    [ "$(wc -l < "$ED/order")" -eq 1 ]'
-t_assert "customize: answering yes to the prompt edits the jobfiles after the host file" bash -c '
-    source ./tests/helpers.sh; set_fixture; editor_fixture
-    (source ./wekatester
-     CUSTOMIZE=1; WORKLOAD=default; CUSTOM_SET=$SETFIX
-     EDITOR="$ED/stub-ed"; unset VISUAL; resolve_editor
-     exec 9<<<"ynn"
-     PROMPT_IN_FD=9; PROMPT_OUT_FD=2
-     customize_jobfiles) >>$WT_ASIDE 2>&1
-    head -1 "$ED/order" | grep -q "hostlist.csv" &&
-    [ "$(wc -l < "$ED/order")" -gt 1 ] &&
-    sed -n 2p "$ED/order" | grep -q "011-"
-'
 t_assert "auth rounds: the host file pins a host's login when the credential has none" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
@@ -3261,14 +3019,6 @@ t_assert "resolve_targets: hostonly sees the host row and nothing generic; phase
      col() { printf "%s\n" "$1" | grep "^$2	" | cut -f4,5 | tr "\t" " "; }
      [ "$(col "$ho" h1)" = "- -" ] && [ "$(col "$ho" h2)" = "4-15 -" ] &&
      [ "$(col "$p1" h1)" = "0-127 /mnt/g" ] && [ "$(col "$p1" h2)" = "4-15 /mnt/g" ])'
-t_assert "writeback: -C set owns the target when -t was not given" bash -c '
-    d=$(wb_fixture); mkdir "$d/set"
-    (source ./wekatester; write_targets_template "$d/set/hostlist.csv") >>$WT_ASIDE
-    (source ./wekatester
-     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=""; SET_DIR_OVERRIDE=$d/set
-     FAST_TRACK=1
-     writeback_targets) >>$WT_ASIDE
-    tail -1 "$d/set/hostlist.csv" | grep -q "^h1,ubuntu,libaio,0-3"'
 # A mixed-direction file stages ONE direction's tuple, but both directions
 # were measured; the writeback must record each measured tuple into its own
 # slot, never the staged tuple into both -- numjobs included, since a
@@ -3672,8 +3422,8 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
         *"WARNING: localhost: wekafs mounted readcache"*"cannot create files in /mnt/weka"*"is not writable on every host"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-# Live on the console every time it is raised; kept once per distinct message
-# (the mount guard runs twice under -C); replayed into the run log FILE only,
+# Live on the console every time it is raised; kept once per distinct
+# message; replayed into the run log FILE only,
 # never back onto the console (seen live: one -r warning printed four times).
 t_assert "prerun warnings: logged live, kept deduplicated, replayed into the run log file only" bash -c '
     d=$(mktemp -d); : > "$d/wekatester.log"
@@ -5566,9 +5316,9 @@ t_assert "help: every parsed option appears in -h as its own token" bash -c '
     # the strength of its long form alone.
     h=$(./wekatester -h)
     miss=""
-    for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -C -v -h \
+    for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -v -h \
              --output --engine --password --targets --duration --unlink \
-             --auto --ignore-capacity --identity --customize --version --help; do
+             --auto --ignore-capacity --identity --version --help; do
         printf "%s\n" "$h" | grep -qE -- "(^|[[:space:][(])${o}([^-A-Za-z0-9]|$)" ||
             miss="$miss $o"
     done

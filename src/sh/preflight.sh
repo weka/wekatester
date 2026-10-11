@@ -90,44 +90,6 @@ preflight() {
             failed+=("$host: $FIO_BIN not found, or not an executable file")
         fi
     done
-    # A bare -C candidate that failed ssh is probably the set name: confirm
-    # (5s, default yes), or assume so unattended.
-    if [ ${#failed[@]} -gt 0 ] && [ "$CUSTOMIZE" -eq 1 ] && [ -z "$CUSTOM_SET" ] \
-            && [ -n "$C_CANDIDATE" ] && [ "${PREFLIGHT_RETRY:-0}" -eq 0 ]; then
-        local cand_failed=0 rest=() as_set=0 h2 new=()
-        for host in "${failed[@]}"; do
-            case "$host" in
-                "$C_CANDIDATE: ssh failed") cand_failed=1 ;;
-                *) rest+=("$host") ;;
-            esac
-        done
-        if [ "$cand_failed" -eq 1 ]; then
-            if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
-                as_set=1
-                log "'$C_CANDIDATE' is not reachable over ssh; treating it as the custom set name"
-            elif confirm_timed 5 yes "'$C_CANDIDATE' is not reachable over ssh; treat it as the custom set name?"; then
-                as_set=1
-            fi
-        fi
-        if [ "$as_set" -eq 1 ]; then
-            CUSTOM_SET=$C_CANDIDATE
-            C_CANDIDATE=""
-            for h2 in "${HOSTS[@]}"; do
-                [ "$h2" = "$CUSTOM_SET" ] || new+=("$h2")
-            done
-            HOSTS=()
-            [ ${#new[@]} -eq 0 ] || HOSTS=("${new[@]}")
-            MASTER=${HOSTS[0]:-}
-            failed=()
-            [ ${#rest[@]} -eq 0 ] || failed=("${rest[@]}")
-            if [ ${#HOSTS[@]} -eq 0 ]; then
-                # The candidate was the only "host": this is a local run now.
-                resolve_local_mode
-                PREFLIGHT_RETRY=1 preflight
-                return
-            fi
-        fi
-    fi
     if [ ${#failed[@]} -gt 0 ]; then
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
