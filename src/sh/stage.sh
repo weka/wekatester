@@ -193,8 +193,9 @@ override_staged() {   # override_staged <all|measured> <key> <value> [<key> <val
 
 # Predictable paths (README, Workloads): unique_filename=0 and a "<name>."
 # prefix on filename_format; a $clientuid format keeps its own scheme. The same
-# pass stamps cpus_allowed_policy=split on every cpu list, and gives a pinned
-# host list to variants without cpus_allowed.
+# pass stamps cpus_allowed_policy=split on every cpu list, gives a pinned
+# host list to variants without cpus_allowed, and trims a jobfile's own list
+# to that host list, with a note (nothing left stops the run).
 stamp_unique_names() {
     local host cpus args=()
     # one awk for the fleet (was one python per host, ~30ms each, serial):

@@ -6585,8 +6585,9 @@ override_staged() {   # override_staged <all|measured> <key> <value> [<key> <val
 
 # Predictable paths (README, Workloads): unique_filename=0 and a "<name>."
 # prefix on filename_format; a $clientuid format keeps its own scheme. The same
-# pass stamps cpus_allowed_policy=split on every cpu list, and gives a pinned
-# host list to variants without cpus_allowed.
+# pass stamps cpus_allowed_policy=split on every cpu list, gives a pinned
+# host list to variants without cpus_allowed, and trims a jobfile's own list
+# to that host list, with a note (nothing left stops the run).
 stamp_unique_names() {
     local host cpus args=()
     # one awk for the fleet (was one python per host, ~30ms each, serial):
@@ -6599,7 +6600,24 @@ stamp_unique_names() {
     done
     [ ${#args[@]} -gt 0 ] || return 0
     list_staged "$WORK_DIR/staged.list" && awkrun '
-    function stamp(path, name, cpus,    L, n, O, m, i, k, s, hasfmt, hascpus, haspol, INS, ni, g) {
+    # A jobfile'\''s own cpu list against the host'\''s fio cpus (auth/<host>.cpus):
+    # "" when inside them, else the trimmed line, with a note; nothing left stops
+    function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
+        v = strip(substr(s, index(s, "=") + 1))
+        if (match(v, /[ \t]/)) v = substr(v, 1, RSTART - 1)
+        job = path; sub(/.*\//, "", job)
+        parse_cpulist(cpus, EFF)
+        if (!parse_cpulist(v, REQ) || !set_any(REQ))
+            awk_fail(host ": jobfile " job ": cpus_allowed (" v ") is not a cpu list, so it cannot be held to this host\047s fio cpus (" cpus ")")
+        for (c in REQ) if (c in EFF) RUN[c] = 1
+        if (!set_any(RUN))
+            awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ": never weka\047s cores or core 0\047s pair) -- list cpus within it, or drop the line and staging fills it in")
+        if (set_size(RUN) == set_size(REQ)) return ""
+        run = fmt_cpulist(RUN)
+        print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus ": never weka\047s cores or core 0\047s pair); executing on the remainder (" run ")" > "/dev/stderr"
+        return "cpus_allowed=" run
+    }
+    function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, hasfmt, hascpus, haspol, INS, ni, g) {
         if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
         hasfmt = 0; hascpus = 0; haspol = 0; g = 0; m = 0
         for (i = 1; i <= n; i++) {
@@ -6610,8 +6628,13 @@ stamp_unique_names() {
                     L[i] = "filename_format=" name "." substr(s, 17)
             } else if (index(s, "unique_filename=") == 1)
                 continue   # replaced by the forced 0 below
+            else if (s ~ /^cpus_allowed[ \t]*=/) {
+                # every one, in any section: fio never runs on weka'\''s cores or
+                # core 0'\''s pair, whatever a cpu list says
+                hascpus = 1
+                if (cpus != "" && (t = trim_cpus(host, path, s, cpus)) != "") L[i] = t
+            }
             O[++m] = L[i]
-            if (index(s, "cpus_allowed=") == 1) hascpus = 1
             if (index(s, "cpus_allowed_policy=") == 1) haspol = 1
             if (!g && s == "[global]") g = m
         }
@@ -6639,7 +6662,7 @@ stamp_unique_names() {
         for (i = 1; i <= m; i++) {
             split(M[i], F, "\t")
             if (F[2] == "") awk_fail(F[1] ": no staged jobfiles")
-            stamp(F[2], NAME[F[1]], CPUS[F[1]])
+            stamp(F[2], NAME[F[1]], CPUS[F[1]], F[1])
         }
     }' "$WORK_DIR/staged.list" "${args[@]}" || die "cannot stamp deterministic filenames"
 }

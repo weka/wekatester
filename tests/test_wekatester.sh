@@ -2439,24 +2439,65 @@ t_assert "stamping: formats get the host prefix, unique_filename forced 0, defau
     grep -q "^filename_format=h1.\$jobname.\$jobnum.\$filenum$" "$b" &&
     grep -q "^filename_format=\$clientuid.\$jobnum$" "$c" &&
     grep -q "^unique_filename=0$" "$c"'
-t_assert "stamping: pinned hosts get cpus_allowed filled and policy=split, explicit lines win" bash -c '
+t_assert "stamping: pinned hosts get cpus_allowed filled and policy=split; a jobfile list inside the host's cpus, any policy, and an unpinned host's list win" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; HOSTS=(h1 h2)
      AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1" "$d/jobs/h2"
      printf "4-15,28-55" > "$AUTH_DIR/h1.cpus"
      printf "[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
-     printf "[global]\ncpus_allowed=2,3\ncpus_allowed_policy=shared\n[b]\nrw=read\n" > "$d/jobs/h1/012-b.job"
+     printf "[global]\ncpus_allowed=5,6\ncpus_allowed_policy=shared\n[b]\nrw=read\n" > "$d/jobs/h1/012-b.job"
      printf "[global]\ncpus_allowed=5-9\n[c]\nrw=read\n" > "$d/jobs/h2/013-c.job"
      printf "[global]\nfilesize=1G\n[e]\nrw=read\n" > "$d/jobs/h2/014-e.job"
      stamp_unique_names)
     a=$d/jobs/h1/011-a.job; b=$d/jobs/h1/012-b.job
     c=$d/jobs/h2/013-c.job; e=$d/jobs/h2/014-e.job
     grep -q "^cpus_allowed=4-15,28-55$" "$a" && grep -q "^cpus_allowed_policy=split$" "$a" &&
-    grep -q "^cpus_allowed=2,3$" "$b" && grep -q "^cpus_allowed_policy=shared$" "$b" &&
+    grep -q "^cpus_allowed=5,6$" "$b" && grep -q "^cpus_allowed_policy=shared$" "$b" &&
     ! grep -q "4-15" "$b" && ! grep -q "policy=split" "$b" &&
     grep -q "^cpus_allowed=5-9$" "$c" && grep -q "^cpus_allowed_policy=split$" "$c" &&
     ! grep -q "cpus_allowed" "$e"'
+# A jobfile's own cpus_allowed survived staging as written, so a plain run
+# could land on core 0's pair or weka's cores: fio's sched_setaffinity is
+# bounded by the cgroup cpuset, not by the server's taskset (2026-10-11).
+t_assert "stamping: a jobfile cpus_allowed reaching outside the host's cpus is trimmed, every line, with a note" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "2-5\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\ncpus_allowed=0-3\n[a]\nrw=read\n[b]\nrw=write\n  cpus_allowed = 4-7\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
+    a=$d/jobs/h1/011-a.job
+    grep -qx "cpus_allowed=2-3" "$a" && grep -qx "cpus_allowed=4-5" "$a" &&
+    ! grep -q "0-3" "$a" && ! grep -q "4-7" "$a" && grep -qx "cpus_allowed_policy=split" "$a" || { cat "$a" >&2; exit 1; }
+    case "$err" in
+        *"note: h1: jobfile 011-a.job: cpus_allowed (0-3) includes cpus outside this host"*"fio cpus (2-5: never weka"*"executing on the remainder (2-3)"*) ;;
+        *) echo "0-3: $err" >&2; exit 1 ;;
+    esac
+    case "$err" in (*"cpus_allowed (4-7) includes"*"(4-5)"*) ;; (*) echo "4-7: $err" >&2; exit 1 ;; esac'
+t_assert "stamping: a jobfile cpus_allowed inside the host's cpus stages unchanged, with no note" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "2-5\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\ncpus_allowed=3,4\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
+    [ -z "$err" ] || { echo "a note: $err" >&2; exit 1; }
+    [ "$(grep -c "^cpus_allowed=" "$d/jobs/h1/011-a.job")" = 1 ] && grep -qx "cpus_allowed=3,4" "$d/jobs/h1/011-a.job"'
+t_assert "stamping: a jobfile cpus_allowed with no cpu in the host's cpus stops the run, naming the jobfile, its list and the host's cpus" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "2-5\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\ncpus_allowed=0-1,6-7\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) 2>&1 >>$WT_ASIDE ) && { echo "no stop" >&2; exit 1; }
+    case "$err" in
+        *"h1: jobfile 011-a.job: cpus_allowed (0-1,6-7) names no cpu fio may use on this host (2-5"*) ;;
+        *) echo "$err" >&2; exit 1 ;;
+    esac'
 t_assert "stamping: staged variants and the generated layout carry it end to end" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)

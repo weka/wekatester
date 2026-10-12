@@ -1,4 +1,21 @@
-function stamp(path, name, cpus,    L, n, O, m, i, k, s, hasfmt, hascpus, haspol, INS, ni, g) {
+# A jobfile's own cpu list against the host's fio cpus (auth/<host>.cpus):
+# "" when inside them, else the trimmed line, with a note; nothing left stops
+function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
+    v = strip(substr(s, index(s, "=") + 1))
+    if (match(v, /[ \t]/)) v = substr(v, 1, RSTART - 1)
+    job = path; sub(/.*\//, "", job)
+    parse_cpulist(cpus, EFF)
+    if (!parse_cpulist(v, REQ) || !set_any(REQ))
+        awk_fail(host ": jobfile " job ": cpus_allowed (" v ") is not a cpu list, so it cannot be held to this host\047s fio cpus (" cpus ")")
+    for (c in REQ) if (c in EFF) RUN[c] = 1
+    if (!set_any(RUN))
+        awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ": never weka\047s cores or core 0\047s pair) -- list cpus within it, or drop the line and staging fills it in")
+    if (set_size(RUN) == set_size(REQ)) return ""
+    run = fmt_cpulist(RUN)
+    print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus ": never weka\047s cores or core 0\047s pair); executing on the remainder (" run ")" > "/dev/stderr"
+    return "cpus_allowed=" run
+}
+function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, hasfmt, hascpus, haspol, INS, ni, g) {
     if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
     hasfmt = 0; hascpus = 0; haspol = 0; g = 0; m = 0
     for (i = 1; i <= n; i++) {
@@ -9,8 +26,13 @@ function stamp(path, name, cpus,    L, n, O, m, i, k, s, hasfmt, hascpus, haspol
                 L[i] = "filename_format=" name "." substr(s, 17)
         } else if (index(s, "unique_filename=") == 1)
             continue   # replaced by the forced 0 below
+        else if (s ~ /^cpus_allowed[ \t]*=/) {
+            # every one, in any section: fio never runs on weka's cores or
+            # core 0's pair, whatever a cpu list says
+            hascpus = 1
+            if (cpus != "" && (t = trim_cpus(host, path, s, cpus)) != "") L[i] = t
+        }
         O[++m] = L[i]
-        if (index(s, "cpus_allowed=") == 1) hascpus = 1
         if (index(s, "cpus_allowed_policy=") == 1) haspol = 1
         if (!g && s == "[global]") g = m
     }
@@ -38,6 +60,6 @@ BEGIN {
     for (i = 1; i <= m; i++) {
         split(M[i], F, "\t")
         if (F[2] == "") awk_fail(F[1] ": no staged jobfiles")
-        stamp(F[2], NAME[F[1]], CPUS[F[1]])
+        stamp(F[2], NAME[F[1]], CPUS[F[1]], F[1])
     }
 }
