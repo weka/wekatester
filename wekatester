@@ -2903,10 +2903,11 @@ cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine
     }
     # a pinned depth at a pinned job count is used as written: no guard
     function fits(k) { return (PNJ && PQD) || over(k) == "" }
-    # One note per job count and depth, naming every limit that refused it.
-    function guard(k,    why, n) {
+    # One note per job count and depth, naming every limit that refused it and
+    # the ladder it stopped: the queue ladder unless <which> says.
+    function guard(k, which,    why, n) {
         why = over(k)
-        n = sprintf("the queue ladder stopped short of numjobs=%d iodepth=%d: %s", kj(k), kq(k), why)
+        n = sprintf("the %s ladder stopped short of numjobs=%d iodepth=%d: %s", which == "" ? "queue" : which, kj(k), kq(k), why)
         if (index(why, "libaio") == 1) n = n " (raise fs.aio-max-nr and re-measure with -g to search deeper)"
         if (!(n in NOTED)) { NOTED[n] = 1; NOTES[++nnotes] = n }
     }
@@ -3012,6 +3013,8 @@ cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine
             n1 = 0; nv = 0
             for (i = 1; i <= nbl; i++) {
                 k = key(BW_LOW[i], QD1, NRT)
+                # both guards grow with numjobs: no wider count fits either
+                if (!fits(k)) { guard(k, "job"); nhigh = 0; break }
                 if (best(k, 1) == "") cell("numjobs", k)
                 D1[++n1] = k; V[++nv] = best(k, 1)
                 if (target && !EXH && best(k, 1) >= target)
@@ -3060,6 +3063,7 @@ cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine
             # at or below N: one job per physical core at iodepth=1 nrfiles=1, nothing else
             for (i = 1; i <= nil; i++) {
                 k = key(IOPS_LOW[i], QD1, NRT)
+                if (!fits(k)) { guard(k, "job"); nhigh = 0; break }   # as for bandwidth
                 if (best(k, 1) == "") cell("numjobs", k)
                 POOL[++np] = k
                 trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d", IOPS_LOW[i], human(best(k, 1)), QD1)
@@ -3258,7 +3262,7 @@ cal_todo_has() {   # cal_todo_has <todo> <line>
 cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
     local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 aio=${10} pins=${11} ladders=${12}
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
-    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax
+    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax ran
     CAL_SID=$sid
     host_dir_v "$rep"; CAL_REP_DIR=$HOST_DIR
     host_name_v "$rep"; CAL_REP_NAME=$HOST_NAME
@@ -3352,10 +3356,18 @@ BUDEOF
             # seed what pins past usable x CAL_NR need, as cal_search does;
             # else fio lays the files out inside the timed cell
             cal_ensure_seed "$rep" "$edirn" "$enj" "$enr"
+            ran=0
             for e in ${engines//,/ }; do
+                # libaio past the aio room dies with EAGAIN: rank the others
+                if [ "$e" = libaio ] && [ "$aio" != - ] && [ $((enj * eqd)) -gt "$aio" ]; then
+                    log "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
+                    continue
+                fi
                 cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
                 printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
+                ran=1
             done
+            [ "$ran" -eq 1 ] || die "shape $sid: no candidate ioengine can run the $etype engine cell: numjobs=$enj iodepth=$eqd needs $((enj * eqd)) aio events with libaio, and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr or pin another ioengine (-e or the host file)"
             CAL_PIN_FS=""
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
@@ -3569,8 +3581,8 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
 }
 
 # Pins checked against each shape aio room before anything starts: pinned nj
-# x pinned qd (1 if open), when libaio is pinned or a candidate. Over: an
-# alert and a stop, the host file untouched.
+# (if open, the fewest its search runs) x pinned qd (1 if open), when libaio
+# is pinned or a candidate. Over: an alert and a stop, the host file untouched.
 cal_aio_preflight() {   # cal_aio_preflight <shapes>
     awkrun 'BEGIN {
         if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
@@ -3586,10 +3598,14 @@ cal_aio_preflight() {   # cal_aio_preflight <shapes>
                 nv = lsplit(substr(W[k], e + 1), V, "/")
                 q = V[1]; j = nv >= 4 ? V[4] : "-"
                 if (q !~ /^[0-9]+$/ && j !~ /^[0-9]+$/) continue
-                ev = (j ~ /^[0-9]+$/ ? j : 1) * (q ~ /^[0-9]+$/ ? q : 1)
+                # an open numjobs costs the fewest jobs its search runs (cal_plan):
+                # 1 for bandwidth, N/2 for IOPS, N for latency
+                typ = substr(W[k], 1, index(W[k], "_") - 1); nn = P[3] + 0
+                lo = typ == "bw" ? 1 : typ == "iops" ? (int(nn / 2) > 1 ? int(nn / 2) : 1) : (nn > 1 ? nn : 1)
+                ev = (j ~ /^[0-9]+$/ ? j : lo) * (q ~ /^[0-9]+$/ ? q : 1)
                 if (ev <= aio + 0) continue
                 bad = 1
-                if (j !~ /^[0-9]+$/) j = "1 (open)"
+                if (j !~ /^[0-9]+$/) j = lo " (open: the fewest jobs its search runs)"
                 if (q !~ /^[0-9]+$/) q = "1 (open)"
                 how = pinned == "libaio" ? "pinned" : "one of the engines calibration tries"
                 printf "ERROR: shape %s (%s): %s pinned at numjobs=%s iodepth=%s needs %.0f aio events at once with libaio (%s), and the kernel has room for %s there (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr, pin another ioengine (-e or the host file), or change the pin\n", P[1], P[2], substr(W[k], 1, e - 1), j, q, ev, how, aio > "/dev/stderr"

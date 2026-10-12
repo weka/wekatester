@@ -12,10 +12,14 @@ BEGIN {
             nv = lsplit(substr(W[k], e + 1), V, "/")
             q = V[1]; j = nv >= 4 ? V[4] : "-"
             if (q !~ /^[0-9]+$/ && j !~ /^[0-9]+$/) continue
-            ev = (j ~ /^[0-9]+$/ ? j : 1) * (q ~ /^[0-9]+$/ ? q : 1)
+            # an open numjobs costs the fewest jobs its search runs (cal_plan):
+            # 1 for bandwidth, N/2 for IOPS, N for latency
+            typ = substr(W[k], 1, index(W[k], "_") - 1); nn = P[3] + 0
+            lo = typ == "bw" ? 1 : typ == "iops" ? (int(nn / 2) > 1 ? int(nn / 2) : 1) : (nn > 1 ? nn : 1)
+            ev = (j ~ /^[0-9]+$/ ? j : lo) * (q ~ /^[0-9]+$/ ? q : 1)
             if (ev <= aio + 0) continue
             bad = 1
-            if (j !~ /^[0-9]+$/) j = "1 (open)"
+            if (j !~ /^[0-9]+$/) j = lo " (open: the fewest jobs its search runs)"
             if (q !~ /^[0-9]+$/) q = "1 (open)"
             how = pinned == "libaio" ? "pinned" : "one of the engines calibration tries"
             printf "ERROR: shape %s (%s): %s pinned at numjobs=%s iodepth=%s needs %.0f aio events at once with libaio (%s), and the kernel has room for %s there (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr, pin another ioengine (-e or the host file), or change the pin\n", P[1], P[2], substr(W[k], 1, e - 1), j, q, ev, how, aio > "/dev/stderr"

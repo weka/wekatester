@@ -602,7 +602,7 @@ cal_todo_has() {   # cal_todo_has <todo> <line>
 cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
     local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 aio=${10} pins=${11} ladders=${12}
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
-    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax
+    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax ran
     CAL_SID=$sid
     host_dir_v "$rep"; CAL_REP_DIR=$HOST_DIR
     host_name_v "$rep"; CAL_REP_NAME=$HOST_NAME
@@ -696,10 +696,18 @@ BUDEOF
             # seed what pins past usable x CAL_NR need, as cal_search does;
             # else fio lays the files out inside the timed cell
             cal_ensure_seed "$rep" "$edirn" "$enj" "$enr"
+            ran=0
             for e in ${engines//,/ }; do
+                # libaio past the aio room dies with EAGAIN: rank the others
+                if [ "$e" = libaio ] && [ "$aio" != - ] && [ $((enj * eqd)) -gt "$aio" ]; then
+                    log "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
+                    continue
+                fi
                 cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
                 printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
+                ran=1
             done
+            [ "$ran" -eq 1 ] || die "shape $sid: no candidate ioengine can run the $etype engine cell: numjobs=$enj iodepth=$eqd needs $((enj * eqd)) aio events with libaio, and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr or pin another ioengine (-e or the host file)"
             CAL_PIN_FS=""
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
@@ -809,8 +817,8 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
 }
 
 # Pins checked against each shape aio room before anything starts: pinned nj
-# x pinned qd (1 if open), when libaio is pinned or a candidate. Over: an
-# alert and a stop, the host file untouched.
+# (if open, the fewest its search runs) x pinned qd (1 if open), when libaio
+# is pinned or a candidate. Over: an alert and a stop, the host file untouched.
 cal_aio_preflight() {   # cal_aio_preflight <shapes>
     awkrun '#@awk cal_aio_preflight' "$1"
     case $? in

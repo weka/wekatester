@@ -342,12 +342,15 @@ beat N by that much.
   nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at that count's
   winning iodepth and one step deeper. The leader rule decides. With libaio,
   every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
-  by default), so the probe reads the room left on every client, and a 2N/4N
-  queue-ladder cell past the room of the shape's tightest member is not run:
-  the log says where the ladder stopped and to raise `fs.aio-max-nr` and
-  re-measure with `-g` to search deeper (the host file keeps the shorter
-  answer until then). The qd1 rungs, the latency ladders and the engine cells
-  need at most about 16N events and are not checked. Once everything is
+  by default), so the probe reads the room left on every client, and a
+  bandwidth or IOPS cell past the room of the shape's tightest member is not
+  run, at any job count: the log says where the job or queue ladder stopped
+  and to raise `fs.aio-max-nr` and re-measure with `-g` to search deeper (the
+  host file keeps the shorter answer until then). A search where no cell fits
+  stops, naming the limit. A libaio engine cell past the room is skipped, and
+  the engine is chosen from the other candidates' cells. The latency ladders
+  run N jobs at iodepth 1 and are not checked; a pinned iodepth there is
+  checked before the run (below). Once everything is
   staged, any libaio job past its host's room — a host-file answer recorded
   when the limit was higher, `-e libaio` over an answer another engine found —
   stops the run before the first test (see What lands in the host file).
@@ -519,14 +522,16 @@ executing them.
 **A kernel aio room that would be exceeded stops the run before it starts.**
 libaio sets up numjobs x iodepth aio events at once, and past
 `fs.aio-max-nr` (less what is in use) the job fails with EAGAIN. A
-calibration pin whose smallest cell would exceed a shape's room, with libaio
+calibration pin whose smallest cell would exceed a shape's room (an open
+numjobs counts as the fewest jobs its search runs: 1 for bandwidth, N/2 for
+IOPS, N for latency), with libaio
 pinned or among the engines calibration tries, and a staged libaio job past
 its host's room, both stop with an alert naming the slot or job, the events
 and the room; nothing has run and the host file is unchanged. The pin
 check runs before the fio servers start, the staged-job check before the
 first test, and a dry run (`-n`) runs both. A searched
 cell past the room is skipped by the planner's guard instead, and the
-verdict says so.
+verdict says so; a search with no cell that fits stops, naming the guard.
 
 Every staged jobfile records what auto derived for that host in header
 comments. Auto also warns when workers differ (core counts, weka cores).

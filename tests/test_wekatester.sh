@@ -5337,6 +5337,21 @@ t_assert "cal_plan cal and brutal: when a guard refuses every cell the search st
     no_fit iops libaio 0 "stopped short of numjobs=32 iodepth=8: libaio would set up 256 aio events and the kernel has room for 100" pin_nj=32 aio=100 iopsqd=8,16 &&
     no_fit bw psync 33554432 "stopped short of numjobs=64 iodepth=1: its in-flight buffers exceed the memory guard (CAL_MEM_PCT)" pin_nj=64 &&
     no_fit iops psync 131072 "stopped short of numjobs=64 iodepth=1: its in-flight buffers exceed the memory guard (CAL_MEM_PCT)" pin_nj=64'
+t_assert "cal_plan: the aio guard holds at or below N too -- no job count runs past the room, and none wider is tried" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    over() { ! awk -v r="$1" "\$2 * \$3 > r" "$d/asked" | grep -q . || { cat "$d/asked" >&2; false; }; }
+    # Bugbot "Aio guard skipped on low rungs": iodepth 64 pinned, room 256
+    out=$(plan_sim "$d" iops read libaio 8 0 0 pin_qd=64 aio=256) || { echo "$out" >&2; exit 1; }
+    over 256 && [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 4 64 1;confirm 4 64 1;" ] || exit 1
+    case "$out" in "done 4 64 1 "*"the job ladder stopped short of numjobs=8 iodepth=64: libaio would set up 512 aio events and the kernel has room for 256 (raise fs.aio-max-nr"*) ;; *) echo "$out" >&2; exit 1;; esac
+    out=$(CAL_SIM_BWCAP=1125899906842624 plan_sim "$d" bw read libaio 8 0 0 pin_qd=64 aio=256) || { echo "$out" >&2; exit 1; }
+    over 256 && grep -q "^numjobs 4 64 1$" "$d/asked" && ! grep -q "^wide " "$d/asked" || exit 1
+    # nothing pinned: N=64 at iodepth 1 is past a room of 32
+    out=$(plan_sim "$d" iops read libaio 64 0 0 aio=32) || { echo "$out" >&2; exit 1; }
+    over 32 && grep -q "^numjobs 32 1 1$" "$d/asked" || exit 1
+    # no room even for one job: the search stops, naming the guard
+    err=$( (source ./wekatester; : > "$d/e"; cal_plan next bw read libaio 8 0 0 "$d/e" $K aio=0) 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"no bandwidth cell fits (the job ladder stopped short of numjobs=1 iodepth=1: libaio would set up 1 aio events and the kernel has room for 0"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "libaio_events:numjobs x iodepth per section, summed while sections run together, a stonewall starting a new group" bash -c '
     d=$(mktemp -d)
     printf "[global]\nioengine=libaio\nnumjobs=4\n[create]\ncreate_only=1\n[io]\nstonewall\niodepth=32\n" > "$d/a"
@@ -5442,6 +5457,18 @@ t_assert "cal_shape_run: engine cells on a pinned 32-job x 64-file shape seed it
     # the seed covering 32 jobs x 64 files lands before the first engine cell
     awk "/^seed h1 read 32 64\$/ && !s {s = NR} /^cell / && !c {c = NR} END {exit !(s && c && s < c)}" "$d/calls" &&
     [ "$(grep -c "^cell h1 bw read [a-z]* 32 1 64 " "$d/calls")" = 2 ] || { cat "$d/calls" >&2; false; }'
+t_assert "cal_shape_run: a libaio engine cell past the aio room is skipped and the engine chosen from the others" bash -c '
+    d=$(mktemp -d)
+    # room 16: the bw cell (8 jobs x iodepth 1) fits, the iops one (8 x 16) does not
+    out=$( (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
+     cal_ensure_seed() { :; }
+     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; }
+     cal_search() { :; }
+     cal_shape_run 1 h1 8 0-7 0-15 0 libaio,psync - 0 16 "" "$(printf "bw read\niops read")") 2>&1 ) ||
+        { echo "cal_shape_run failed: $out" >&2; exit 1; }
+    [ "$(cut -d" " -f3,5 "$d/calls" | tr "\n" ";")" = "bw libaio;bw psync;iops psync;" ] || { cat "$d/calls" >&2; exit 1; }
+    case "$out" in *"no iops engine cell for libaio: numjobs=8 iodepth=16 would set up 128 aio events and the kernel has room for 16 (fs.aio-max-nr less fs.aio-nr, as probed)"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "cal_lat_values: latency in us and IOPS per client, entries of one client weighted by IO count" bash -c '
     d=$(mktemp -d)
     printf "%s\n" "{ \"client_stats\": [ { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 100000 }, \"iops\": 1000, \"total_ios\": 300 } }, { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 200000 }, \"iops\": 500, \"total_ios\": 100 } }, { \"jobname\": \"All clients\", \"read\": { \"lat_ns\": { \"mean\": 9 } } } ] }" > "$d/r.json"
@@ -6141,6 +6168,15 @@ t_assert "cal_aio_preflight: a pin past the aio room stops calibration before an
     (source ./wekatester; cal_aio_preflight "$d/fits") && (source ./wekatester; cal_aio_preflight "$d/noaio") || exit 1
     err=$( (source ./wekatester; cal_aio_preflight "$d/nj") 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
     case "$err" in *"bw_r pinned at numjobs=200 iodepth=1 (open) needs 200 aio events at once with libaio (pinned)"*) true;; *) echo "$err" >&2; false;; esac'
+t_assert "cal_aio_preflight: an open numjobs costs the fewest jobs its search runs -- 1 for bandwidth, N/2 for IOPS, N for latency" bash -c '
+    d=$(mktemp -d)
+    row() { printf "1\th1\t16\t2-17\t2-33\t0\tio_uring,libaio\t-\t0\t256\t%s\th1\n" "$1" > "$d/$2"; }
+    row "iops_r=64/-/-/-" iops; row "bw_r=64/-/-/-" bw; row "lat_w=64/-/-/-" lat; row "iops_r=32/-/-/-" fits
+    err=$( (source ./wekatester; cal_aio_preflight "$d/iops") 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"iops_r pinned at numjobs=8 (open: the fewest jobs its search runs) iodepth=64 needs 512 aio events"*) ;; *) echo "$err" >&2; exit 1;; esac
+    err=$( (source ./wekatester; cal_aio_preflight "$d/lat") 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
+    case "$err" in *"lat_w pinned at numjobs=16 (open: the fewest jobs its search runs) iodepth=64 needs 1024 aio events"*) ;; *) echo "$err" >&2; exit 1;; esac
+    (source ./wekatester; cal_aio_preflight "$d/bw") && (source ./wekatester; cal_aio_preflight "$d/fits")'
 t_assert "writeback: a host line is commented out and its new version written directly below it; others stay put" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
     printf "host,user_login,ioengine\nh2,,,,\nh1,,psync,,,,,\nh9,,,,\n" > "$f"

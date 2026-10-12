@@ -77,10 +77,11 @@ function over(k,    why) {
 }
 # a pinned depth at a pinned job count is used as written: no guard
 function fits(k) { return (PNJ && PQD) || over(k) == "" }
-# One note per job count and depth, naming every limit that refused it.
-function guard(k,    why, n) {
+# One note per job count and depth, naming every limit that refused it and
+# the ladder it stopped: the queue ladder unless <which> says.
+function guard(k, which,    why, n) {
     why = over(k)
-    n = sprintf("the queue ladder stopped short of numjobs=%d iodepth=%d: %s", kj(k), kq(k), why)
+    n = sprintf("the %s ladder stopped short of numjobs=%d iodepth=%d: %s", which == "" ? "queue" : which, kj(k), kq(k), why)
     if (index(why, "libaio") == 1) n = n " (raise fs.aio-max-nr and re-measure with -g to search deeper)"
     if (!(n in NOTED)) { NOTED[n] = 1; NOTES[++nnotes] = n }
 }
@@ -186,6 +187,8 @@ BEGIN {
         n1 = 0; nv = 0
         for (i = 1; i <= nbl; i++) {
             k = key(BW_LOW[i], QD1, NRT)
+            # both guards grow with numjobs: no wider count fits either
+            if (!fits(k)) { guard(k, "job"); nhigh = 0; break }
             if (best(k, 1) == "") cell("numjobs", k)
             D1[++n1] = k; V[++nv] = best(k, 1)
             if (target && !EXH && best(k, 1) >= target)
@@ -234,6 +237,7 @@ BEGIN {
         # at or below N: one job per physical core at iodepth=1 nrfiles=1, nothing else
         for (i = 1; i <= nil; i++) {
             k = key(IOPS_LOW[i], QD1, NRT)
+            if (!fits(k)) { guard(k, "job"); nhigh = 0; break }   # as for bandwidth
             if (best(k, 1) == "") cell("numjobs", k)
             POOL[++np] = k
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d", IOPS_LOW[i], human(best(k, 1)), QD1)
