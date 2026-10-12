@@ -6208,13 +6208,15 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                 n = override_lines(L, n, "directory", HD[h])
                 if (auto) n = auto_job(j, h, ROW, L, n)
                 else if (has_final && hr && !LAY[j] && (kind = KIND[j]) != "") {
-                    job_directions(j, D)
+                    job_directions(j, D); nrset = ""
                     if ((slot = pick_slot(kind, D, ROW)) != "")
                         for (q = 1; q <= 4; q++) {
                             if ((v = row_get(ROW, slot "_" TUPLE[q])) == "") continue
                             n = override_lines(L, n, KNOB[q], v)
                             GEO[h] = 1
+                            if (q == 3) nrset = v
                         }
+                    filenum_fmt(j, nrset, L, n)
                 }
                 writelines(work "/jobs/" h "/" NM[j], L, n)
             }
@@ -6240,6 +6242,23 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
         split("", D)
         if (DR[j]) D["read"] = 1
         if (DW[j]) D["write"] = 1
+    }
+    # fio opens a filename_format without $filenum once per file: one path,
+    # nrfiles times. Where staging set nrfiles above 1, each such format line
+    # gets ".$filenum", so the job and the layout derived from it name distinct
+    # files. One note per job.
+    function filenum_fmt(j, nr, L, n,    i, v) {
+        if (nr !~ /^[0-9]+$/ || nr + 0 <= 1) return
+        for (i = 1; i <= n; i++) {
+            if (jf_key(L[i]) != "filename_format") continue
+            v = jf_value(L[i])
+            if (index(v, "$filenum")) continue
+            L[i] = "filename_format=" v ".$filenum"
+            if (!(j in FNOTED)) {
+                FNOTED[j] = 1
+                print "note: " NM[j] ": filename_format=" v " has no $filenum, so nrfiles above 1 would open one file repeatedly; staged as " v ".$filenum" > "/dev/stderr"
+            }
+        }
     }
     # The facts -a staging needs per host: cpus (probe_cores, the host-file
     # list its base), engines and weka cores, with their warnings, in host
@@ -6326,7 +6345,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
     }
     # One job variant for one host under -a, on lines L (directory already
     # set); returns the new line count. Overrides land in the order applied.
-    function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no) {
+    function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no, nrset) {
         if (LAY[j]) {
             # an edited layout: staged with corrections only
             return override_lines(L, n, "cpus_allowed", CAL[h])
@@ -6357,6 +6376,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                         print "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)" > "/dev/stderr"
                 }
                 n = override_lines(L, n, KNOB[q], v)
+                if (q == 3) nrset = v
             }
         if (floor) {
             # the one-job twin: numjobs=iodepth=nrfiles=1, the data per job of
@@ -6369,6 +6389,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                 n = override_lines(L, n, "filesize", (v > 1 ? v : 1) "M")
             }
         }
+        else filenum_fmt(j, nrset, L, n)
         if ((v = row_get(ROW, "engine")) != "") n = override_lines(L, n, "ioengine", v)
         if (kind == "iops" && nolat) {
             # iops cells measured with latency accounting off; the staged job

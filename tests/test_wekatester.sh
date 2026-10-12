@@ -422,6 +422,47 @@ t_assert "tuner: blank-spelled and indented key lines are replaced in place as k
     grep -qxF "# numjobs = 4" "$v" && grep -qxF "; iodepth = 9" "$v" && grep -qxF "  [bw]" "$v" &&
     [ "$(grep -cE "^[[:space:]]*\[global\]" "$v")" = 1 ] || { cat "$v" >&2; false; }'
 
+# A calibrated nrfiles on a format without $filenum made fio open one path
+# nrfiles times (wekawithin, smoke; Bugbot, 2026-10-11). fnum stages -a max:
+# h1 with a host-file row, h2 without; prints each staged format and nrfiles,
+# then the notes.
+fnum() {   # fnum <filename_format> <nrfiles>
+    (source ./tests/helpers.sh; tuner_fixture
+     printf "# report bandwidth\n[global]\nfilesize=4G\nfilename_format=%s\ndirectory=/orig\nnumjobs=32\nioengine=libaio\n[create]\nblocksize=1Mi\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n" "$1" > "$FIX/src/011-bw.job"
+     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE 2>&1 || exit 9
+     row=(h1); for i in $(seq 1 36); do row+=(-); done
+     row[5]=4; row[6]=1280M; row[7]=$2; row[8]=1
+     (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+     err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) 2>&1 >>$WT_ASIDE ) || { echo "$err"; exit 9; }
+     for f in h1/011-bw.job h1/000-wekatester-layout.job h2/011-bw.job h2/000-wekatester-layout.job; do
+         echo "$f:" $(grep -E "^(filename_format|nrfiles)=" "$FIX/jobs/$f")
+     done
+     printf "%s\n" "$err" | grep "^note: .*filename_format" || :)
+}
+export -f fnum
+t_assert "-a max: nrfiles 4 on a format without \$filenum stages .\$filenum in the job and its layout, one note; a host without the row is untouched" bash -c '
+    out=$(fnum "wekawithin/\$jobnum" 4)
+    want="h1/011-bw.job: nrfiles=4 filename_format=wekawithin/\$jobnum.\$filenum
+h1/000-wekatester-layout.job: filename_format=wekawithin/\$jobnum.\$filenum nrfiles=4
+h2/011-bw.job: filename_format=wekawithin/\$jobnum
+h2/000-wekatester-layout.job: filename_format=wekawithin/\$jobnum
+note: 011-bw.job: filename_format=wekawithin/\$jobnum has no \$filenum, so nrfiles above 1 would open one file repeatedly; staged as wekawithin/\$jobnum.\$filenum"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "-a max: a format that has \$filenum stays as written at nrfiles 4, no note" bash -c '
+    out=$(fnum "\$filenum/\$jobnum" 4)
+    want="h1/011-bw.job: nrfiles=4 filename_format=\$filenum/\$jobnum
+h1/000-wekatester-layout.job: filename_format=\$filenum/\$jobnum nrfiles=4
+h2/011-bw.job: filename_format=\$filenum/\$jobnum
+h2/000-wekatester-layout.job: filename_format=\$filenum/\$jobnum"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "-a max: nrfiles 1 leaves a format without \$filenum as written, no note" bash -c '
+    out=$(fnum "wekawithin/\$jobnum" 1)
+    want="h1/011-bw.job: nrfiles=1 filename_format=wekawithin/\$jobnum
+h1/000-wekatester-layout.job: filename_format=wekawithin/\$jobnum
+h2/011-bw.job: filename_format=wekawithin/\$jobnum
+h2/000-wekatester-layout.job: filename_format=wekawithin/\$jobnum"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+
 # --- capacity check (universal: every run, per host, from staged variants) ---
 cap() {   # cap <tier> <ignore 0|1> <host>... -- stages via auto_tune, then checks
     local tier=$1 ign=$2; shift 2
@@ -3843,6 +3884,29 @@ t_assert "plain staging: host-file dir/geometry/engine land per host, layout re-
      grep -q "^ioengine=psync$" "$v1" && grep -q "^ioengine=libaio$" "$v2" &&
      grep -q "^numjobs=32$" "$v2" &&
      grep -q "^numjobs=4$" "$l1" && grep -q "^filesize=1G$" "$l1" && grep -q "^nrfiles=2$" "$l1")'
+# Plain staging writes the host file nrfiles too, so it extends the format as
+# -a does; a jobfile's own nrfiles stays the operator's.
+t_assert "plain staging: a host-file nrfiles 2 on x/\$jobnum stages x/\$jobnum.\$filenum in the job and layout; the host without a row and a jobfile's own nrfiles keep theirs" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/global; HOSTS=(h1 h2); mkdir -p "$d/jobs" "$d/set"
+     printf "# report iops\n[global]\nfilename_format=x/\$jobnum\ndirectory=/orig\nfilesize=10G\nnumjobs=32\nioengine=libaio\n[j]\nrw=randread\niodepth=8\n" > "$d/set/031-i.job"
+     printf "# report bandwidth\n[global]\nfilename_format=y/\$jobnum\nnrfiles=3\ndirectory=/orig\nfilesize=1G\nnumjobs=2\nioengine=libaio\n[b]\nrw=read\n" > "$d/set/011-b.job"
+     (source ./wekatester; generate_layout "$d/set" "$d/set") >>$WT_ASIDE
+     { printf "h1\t-\t-\t-\t-"
+       for i in $(seq 6 37); do
+          case $i in (22) printf "\t4";; (23) printf "\t1G";; (24) printf "\t2";;
+                     (25) printf "\t16";; (*) printf "\t-";; esac
+       done; printf "\n"
+       printf "h2"; for i in $(seq 2 37); do printf "\t-"; done; printf "\n"
+     } > "$d/targets.final"
+     stage_variants "$d/set") 2>"$d/err" >>$WT_ASIDE || { cat "$d/err" >&2; exit 1; }
+    has() { [ "$(grep -c "^filename_format=" "$d/jobs/$1")" = 1 ] && grep -qxF "filename_format=$2" "$d/jobs/$1" || { echo "$1 wants $2:" >&2; cat "$d/jobs/$1" >&2; false; }; }
+    has h1/031-i.job "x/\$jobnum.\$filenum" && has h2/031-i.job "x/\$jobnum" &&
+    has h1/011-b.job "y/\$jobnum" && has h2/011-b.job "y/\$jobnum" &&
+    grep -qxF "filename_format=x/\$jobnum.\$filenum" "$d/jobs/h1/000-wekatester-layout.job" &&
+    grep -qxF "filename_format=y/\$jobnum" "$d/jobs/h1/000-wekatester-layout.job" &&
+    [ "$(grep -c "has no \$filenum" "$d/err")" = 1 ] || { cat "$d/jobs/h1/000-wekatester-layout.job" "$d/err" >&2; false; }'
 t_assert "tuner: host-file dir/cpus/geometry/engine land per host; a host without a row keeps the jobfile values" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     { printf "h1\t-\tpsync\t2,4\t/mnt/pin\t3\t2G\t-\t9"
