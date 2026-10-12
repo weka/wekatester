@@ -88,6 +88,8 @@ function note(    s, i) { s = ""; for (i = 1; i <= nnotes; i++) s = s "; " NOTES
 function reading(k,    n) { n = nreads(k); return n > 1 ? sprintf("%s (best of %d)", human(best(k, 0)), n) : human(best(k, 0)) }
 function of_line(k) { return linerate > 0 ? sprintf(" = %.1f%% of the %.2f GiB/s line rate", best(k, 0) * 100 / linerate, linerate / 1073741824) : "" }
 function add(A, n, v) { A[n + 1] = v; return n + 1 }
+# Every cell refused by a guard: stop, as -a safe does, never a zero tuple.
+function none_fit() { awk_fail(sprintf("cal_plan: -a %s: no %s cell fits (%s)", LVL, ctype == "bw" ? "bandwidth" : "IOPS", substr(note(), 3))) }
 BEGIN {
     act = ARGV[1]; ctype = ARGV[2]; eng = ARGV[4]
     N = py_int(ARGV[5]) + 0; if (N < 1) N = 1
@@ -221,6 +223,7 @@ BEGIN {
         nk = 0
         for (i = 1; i <= n1; i++) KS[++nk] = D1[i]
         for (i = 1; i <= n2; i++) KS[++nk] = D2[i]
+        if (!nk) none_fit()
         k = confirm_then_pick(KS, nk)
         why = EXH ? sprintf("the leader of every rung measured, by %g%%", THR) : target ? sprintf("never reached %g%% of line rate; the leader by %g%%", LINE, THR) : sprintf("the leader by %g%%", THR)
         finish(k, sprintf("%s -> %s%s (%s, %s)%s", geo(k), reading(k), of_line(k), why, where(kj(k)), note()))
@@ -272,6 +275,7 @@ BEGIN {
                 break
             }
         }
+        if (!np) none_fit()
         k = confirm_then_pick(POOL, np)
         finish(k, sprintf("%s -> %s (%s; %s)%s", geo(k), reading(k), trail, where(kj(k)), note()))
     }

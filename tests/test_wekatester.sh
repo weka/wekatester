@@ -5320,7 +5320,24 @@ t_assert "cal_plan: a cell both guards refuse names both, with no advice to rais
     out=$(plan_sim "$d" bw write libaio 47 0 157286400 exh=1 aio=100) || { echo "$out" >&2; exit 1; }
     case "$out" in *"stopped short of numjobs=94 iodepth=2: its in-flight buffers exceed the memory guard (CAL_MEM_PCT) and libaio would set up 188 aio events and the kernel has room for 100"*) ;; *) echo "$out" >&2; exit 1;; esac
     case "$out" in *"raise fs.aio-max-nr"*) echo "$out" >&2; false;; *) true;; esac'
-t_assert "libaio_events: numjobs x iodepth per section, summed while sections run together, a stonewall starting a new group" bash -c '
+t_assert "cal_plan cal and brutal: when a guard refuses every cell the search stops naming it, never a zero tuple" bash -c '
+    d=$(mktemp -d); : > "$d/h"
+    no_fit() {   # no_fit <bw|iops> <engine> <memcap> <want> <k=v>...
+        local t=$1 e=$2 mc=$3 want=$4 l out what=bandwidth; shift 4
+        [ "$t" = bw ] || what=IOPS
+        for l in "cal exh=0 confirm=3" "brutal exh=1 confirm=5"; do
+            out=$( (source ./wekatester; cal_plan next "$t" read "$e" 8 0 "$mc" "$d/h" $K lvl=$l "$@") 2>&1 ) &&
+                { echo "no stop ($t $e $l $*): $out" >&2; return 1; }
+            case "$out" in *"ERROR: cal_plan: -a ${l%% *}: no $what cell fits (pinned by the host file: numjobs="*"$want"*) ;;
+                *) echo "$t $e $l $*: $out" >&2; return 1;; esac
+        done
+    }
+    no_fit bw libaio 0 "stopped short of numjobs=32 iodepth=1: libaio would set up 32 aio events and the kernel has room for 16" pin_nj=32 aio=16 &&
+    no_fit iops libaio 0 "stopped short of numjobs=32 iodepth=1: libaio would set up 32 aio events and the kernel has room for 16" pin_nj=32 aio=16 &&
+    no_fit iops libaio 0 "stopped short of numjobs=32 iodepth=8: libaio would set up 256 aio events and the kernel has room for 100" pin_nj=32 aio=100 iopsqd=8,16 &&
+    no_fit bw psync 33554432 "stopped short of numjobs=64 iodepth=1: its in-flight buffers exceed the memory guard (CAL_MEM_PCT)" pin_nj=64 &&
+    no_fit iops psync 131072 "stopped short of numjobs=64 iodepth=1: its in-flight buffers exceed the memory guard (CAL_MEM_PCT)" pin_nj=64'
+t_assert "libaio_events:numjobs x iodepth per section, summed while sections run together, a stonewall starting a new group" bash -c '
     d=$(mktemp -d)
     printf "[global]\nioengine=libaio\nnumjobs=4\n[create]\ncreate_only=1\n[io]\nstonewall\niodepth=32\n" > "$d/a"
     printf "[global]\nioengine=libaio\n[r]\nnumjobs=3\niodepth=8\n[w]\nnumjobs=2\niodepth=16\n" > "$d/b"
