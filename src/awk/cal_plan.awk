@@ -211,7 +211,8 @@ BEGIN {
             D1[++n1] = k; V[++nv] = best(k, 1)
             if (target && !EXH && best(k, 1) >= target)
                 finish(k, sprintf("%s -> %s%s (the first numjobs at >= %g%% of line rate, one job per physical core)%s", geo(k), human(best(k, 0)), of_line(k), LINE, note()))
-            if (!target && !EXH && plateau(V, nv)) break
+            # a plateau skips the rungs below N/2, never N/2 and N themselves
+            if (!target && !EXH && BW_LOW[i] < N2 && plateau(V, nv)) while (i < nbl && BW_LOW[i + 1] < N2) i++
         }
         # past N the siblings join, and iodepth x nrfiles are searched
         n2 = 0

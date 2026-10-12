@@ -5035,13 +5035,26 @@ t_assert "cal_plan bw: short of line rate, 2N and 4N walk iodepth for every nrfi
     esac &&
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;numjobs 16 1 1;wide 32 1 1;wide 32 2 1;wide 32 4 1;wide 32 1 2;wide 32 2 2;wide 32 4 2;wide 32 1 4;wide 32 2 4;wide 32 4 4;wide 64 1 1;wide 64 2 1;wide 64 4 1;wide 64 1 2;wide 64 2 2;wide 64 4 2;wide 64 1 4;wide 64 2 4;wide 64 4 4;confirm 16 1 1;confirm 32 1 1;confirm 32 1 2;" ] ||
         { cat "$d/asked" >&2; false; }'
-t_assert "cal_plan bw: no line rate, the job ladder stops where it flattens" bash -c '
+t_assert "cal_plan bw: no line rate, a flat job ladder still measures N/2 and N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=4294967296 plan_sim "$d" bw read io_uring 32 0 0)
     case "$out" in "done 4 1 1 numjobs=4 iodepth=1 nrfiles=1 -> 4.00 GiB/s (best of 2) (the leader by 3%, one job per physical core)") true;;
         *) echo "$out" >&2; false;; esac &&
-    ! grep -q "^numjobs 32 " "$d/asked" && grep -q "^numjobs 16 " "$d/asked" &&
+    grep -q "^numjobs 32 " "$d/asked" && grep -q "^numjobs 16 " "$d/asked" &&
     grep -q "^wide 64 1 1$" "$d/asked" && grep -q "^wide 128 1 1$" "$d/asked"'
+t_assert "cal_plan bw: a plateau skips the rungs below N/2 only (flat from 1 job, N=32: 1 2 4 16 32)" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    CAL_SIM_BWCAP=1073741824 plan_sim "$d" bw read io_uring 32 0 0 >>$WT_ASIDE
+    [ "$(awk "\$1 == \"numjobs\" { printf \"%s \", \$2 }" "$d/asked")" = "1 2 4 16 32 " ] || { cat "$d/asked" >&2; false; }'
+t_assert "cal_plan bw: flat from 1 job at N=16, no line rate, still measures 8 and 16" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    CAL_SIM_BWCAP=1073741824 plan_sim "$d" bw read io_uring 16 0 0 >>$WT_ASIDE
+    [ "$(awk "\$1 == \"numjobs\" { printf \"%s \", \$2 }" "$d/asked")" = "1 2 4 8 16 " ] || { cat "$d/asked" >&2; false; }'
+t_assert "cal_plan bw: flat from 1 job at N=16, a reading beat the line rate, still measures 8 and 16" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    out=$(CAL_SIM_BWCAP=1073741824 plan_sim "$d" bw read io_uring 16 500000000 0)
+    case "$out" in *"a reading beat the line rate by more than 5%"*) true;; *) echo "$out" >&2; false;; esac &&
+    [ "$(awk "\$1 == \"numjobs\" { printf \"%s \", \$2 }" "$d/asked")" = "1 2 4 8 16 " ] || { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan bw: a reading well above line rate means line rate is not the ceiling" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" bw read io_uring 16 12500000000 0)
