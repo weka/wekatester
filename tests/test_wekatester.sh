@@ -1562,6 +1562,19 @@ t_assert "capacity: layout union raises required above per-namespace max" bash -
     # the layout lays out both sections, 58G/host, so the union raises the
     # per-host requirement above 54G, proving layout_footprint runs
     case "$out" in *"capacity: h1 needs ~58.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+# A hand layout's geometry falls back to [global] (Bugbot "Layout capacity
+# ignores global knobs", 2026-10-12): 4 jobs x 2 files x 10G = 80G, above
+# the measured 40G, either way it is keyed.
+t_assert "capacity: a hand layout keeping numjobs/nrfiles/filesize in [global] is priced" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "[global]\nnumjobs=4\nnrfiles=2\nfilesize=10G\ndirectory=/orig\n[layout-1]\ncreate_only=1\n" > "$FIX/src/000-wekatester-layout.job"
+    out=$( cap safe 0 h1 h2 2>&1 )
+    case "$out" in *"capacity: h1 needs ~80.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "capacity: a hand layout keyed in its section is priced the same" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "[global]\ndirectory=/orig\n[layout-1]\ncreate_only=1\nnumjobs=4\nnrfiles=2\nfilesize=10G\n" > "$FIX/src/000-wekatester-layout.job"
+    out=$( cap safe 0 h1 h2 2>&1 )
+    case "$out" in *"capacity: h1 needs ~80.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "staging: marker layout with a late-sorting name is forced first" bash -c '
     source ./tests/helpers.sh; set_fixture; no_ssh_fixture
     (source ./wekatester; generate_layout "$SETFIX" "$SETFIX") >>$WT_ASIDE

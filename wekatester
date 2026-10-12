@@ -5333,24 +5333,18 @@ check_capacity() {   # check_capacity [preview]
         }
         return 0
     }
-    # the layout job: per job section numjobs x nrfiles x filesize, or
-    # numjobs x size=
-    function layout_footprint(L, n,    i, s, total, insec, nj, nr, b, perfile, k, v) {
-        total = 0; insec = 0
-        for (i = 1; i <= n; i++) {
-            s = strip(L[i])
-            if (s ~ /^\[.+\]$/) {
-                if (insec) total += nj * (perfile ? nr : 1) * b
-                insec = s != "[global]"; nj = 1; nr = 1; b = 0; perfile = 1
-                continue
-            }
-            if (!insec || (v = key_value(s, "numjobs|nrfiles|filesize|size")) == "") continue
-            k = jf_key(s)
-            if (k == "numjobs") nj = need_int(v, "the layout numjobs")
-            else if (k == "nrfiles") nr = need_int(v, "the layout nrfiles")
-            else { if ((b = parse_size(v)) == "") b = 0; perfile = k == "filesize" }
+    # the layout job: per job section (create_only ones too), [global] the
+    # fallback, numjobs x nrfiles x filesize, or numjobs x size=; an
+    # unreadable size prices nothing
+    function layout_footprint(L, n,    LSN, LKV, ns, s, total, nj, v, b) {
+        ns = ini_parse(L, n, LSN, LKV); total = 0
+        for (s = 1; s <= ns; s++) {
+            nj = need_int(sec_value(L, n, LKV, s, "numjobs", "1"), "the layout numjobs")
+            if ((v = sec_value(L, n, LKV, s, "filesize", "")) != "") {
+                if ((b = parse_size(v)) == "") continue
+                total += nj * b * need_int(sec_value(L, n, LKV, s, "nrfiles", "1"), "the layout nrfiles")
+            } else if ((b = parse_size(sec_value(L, n, LKV, s, "size", ""))) != "") total += nj * b
         }
-        if (insec) total += nj * (perfile ? nr : 1) * b
         return total
     }
     BEGIN {
