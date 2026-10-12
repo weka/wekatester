@@ -30,8 +30,8 @@ function layout_footprint(L, n,    i, s, total, insec, nj, nr, b, perfile, k, v)
             insec = s != "[global]"; nj = 1; nr = 1; b = 0; perfile = 1
             continue
         }
-        if (!insec || !match(s, /^(numjobs|nrfiles|filesize|size)=[^ \t\n\013\014\r\034\035\036\037]+/)) continue
-        k = substr(s, 1, index(s, "=") - 1); v = substr(s, length(k) + 2, RLENGTH - length(k) - 1)
+        if (!insec || (v = key_value(s, "numjobs|nrfiles|filesize|size")) == "") continue
+        k = jf_key(s)
         if (k == "numjobs") nj = need_int(v, "the layout numjobs")
         else if (k == "nrfiles") nr = need_int(v, "the layout nrfiles")
         else { if ((b = parse_size(v)) == "") b = 0; perfile = k == "filesize" }

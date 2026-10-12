@@ -400,6 +400,27 @@ t_assert "mixed report treats file as latency" bash -c '
     printf "# report iops latency\n[global]\nnumjobs=4\nioengine=libaio\nfilesize=1G\n[j]\nrw=randwrite\niodepth=8\n" > "$FIX/src/022-mixed.job"
     (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^numjobs=4$" "$FIX/jobs/h1/022-mixed.job"'
+# override_lines replaced only lines starting "key=", so an authored
+# "numjobs = 4" survived -a beside the staged numjobs=, and fio took the
+# job's own (Frank, 2026-10-11). Keys now match as fio reads them (jf_key).
+t_assert "tuner: blank-spelled and indented key lines are replaced in place as key=value; comments and headers stay" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n  [global]\nfilesize = 10G\n numjobs = 4\ndirectory =/orig\n\tioengine\t= libaio\ncpus_allowed = 0-7\n[create]\ncreate_only=1\n  [bw]\nstonewall\nrw=read\n  iodepth = 1\nnrfiles= 3\n# numjobs = 4\n; iodepth = 9\n" > "$FIX/src/011-bw.job"
+    row=(h1); for i in $(seq 1 36); do row+=(-); done
+    row[2]=psync; row[5]=3; row[6]=2G; row[7]=2; row[8]=5
+    (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+    (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1 || exit 1
+    v="$FIX/jobs/h1/011-bw.job"; w="$FIX/jobs/h2/011-bw.job"
+    for kv in numjobs=3 filesize=2G nrfiles=2 iodepth=5 directory=/mnt/weka ioengine=psync cpus_allowed=2-4; do
+        k=${kv%%=*}
+        [ "$(grep -cE "^[[:space:]]*$k[[:space:]]*=" "$v")" = 1 ] && grep -qx "$kv" "$v" || { echo "$kv:" >&2; cat "$v" >&2; exit 1; }
+    done
+    for kv in directory=/mnt/weka cpus_allowed=2-4; do
+        k=${kv%%=*}
+        [ "$(grep -cE "^[[:space:]]*$k[[:space:]]*=" "$w")" = 1 ] && grep -qx "$kv" "$w" || { echo "h2 $kv:" >&2; cat "$w" >&2; exit 1; }
+    done
+    grep -qxF "# numjobs = 4" "$v" && grep -qxF "; iodepth = 9" "$v" && grep -qxF "  [bw]" "$v" &&
+    [ "$(grep -cE "^[[:space:]]*\[global\]" "$v")" = 1 ] || { cat "$v" >&2; false; }'
 
 # --- capacity check (universal: every run, per host, from staged variants) ---
 cap() {   # cap <tier> <ignore 0|1> <host>... -- stages via auto_tune, then checks
@@ -461,6 +482,22 @@ t_assert "non-auto staging produces per-host variants" bash -c '
      stage_variants "$FIX/src")
     test -f "$FIX/jobs/h1/011-bw.job" && test -f "$FIX/jobs/h2/011-bw.job" &&
     grep -q "^directory=/mnt/weka$" "$FIX/jobs/h2/011-bw.job"'
+t_assert "non-auto staging replaces blank-spelled -d, host-file geometry and engine lines in place, and -e after them" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n  [global]\n directory = /orig\nfilesize = 10G\nnumjobs = 4\nioengine = libaio\n  [bw]\nrw=read\n  iodepth = 1\n  nrfiles= 3\n# numjobs = 4\n" > "$FIX/src/011-bw.job"
+    row=(h1); for i in $(seq 1 36); do row+=(-); done
+    row[2]=psync; row[5]=3; row[6]=2G; row[7]=2; row[8]=5
+    (IFS=$(printf "\t"); echo "${row[*]}") > "$FIX/targets.final"
+    (source ./wekatester
+     WORK_DIR=$FIX; DIRECTORY=/mnt/weka; HOSTS=(h1 h2); AUTO_LEVEL=""; ENGINE=""
+     stage_variants "$FIX/src") >>$WT_ASIDE 2>&1 || exit 1
+    v="$FIX/jobs/h1/011-bw.job"; w="$FIX/jobs/h2/011-bw.job"
+    once() { [ "$(grep -cE "^[[:space:]]*${2%%=*}[[:space:]]*=" "$1")" = 1 ] && grep -qx "$2" "$1" || { echo "$2:" >&2; cat "$1" >&2; false; }; }
+    for kv in numjobs=3 filesize=2G nrfiles=2 iodepth=5 directory=/mnt/weka ioengine=psync; do once "$v" "$kv" || exit 1; done
+    once "$w" directory=/mnt/weka && grep -qxF "numjobs = 4" "$w" &&
+    grep -qxF "# numjobs = 4" "$v" && [ "$(grep -cE "^[[:space:]]*\[global\]" "$v")" = 1 ] || exit 1
+    (source ./wekatester; WORK_DIR=$FIX; HOSTS=(h1 h2); override_staged all ioengine sync) >>$WT_ASIDE 2>&1 || exit 1
+    once "$v" ioengine=sync && once "$w" ioengine=sync'
 
 # Auto staging at the real call site (wekatester:540). These exercise the
 # argument order that stage_variants passes to auto_tune: a dropped or
@@ -2505,6 +2542,19 @@ t_assert "stamping: a jobfile cpus_allowed inside the host's cpus stages unchang
      stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
     [ -z "$err" ] || { echo "a note: $err" >&2; exit 1; }
     [ "$(grep -c "^cpus_allowed=" "$d/jobs/h1/011-a.job")" = 1 ] && grep -qx "cpus_allowed=3,4" "$d/jobs/h1/011-a.job"'
+t_assert "stamping: blank-spelled filename_format, unique_filename and cpus_allowed_policy lines are read as fio reads them" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "2-5\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\nfilename_format = y.\$filenum\n[a]\n  unique_filename = 1\ncpus_allowed = 3,4\n cpus_allowed_policy = shared\n# unique_filename = 1\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) >>$WT_ASIDE 2>&1 || exit 1
+    a=$d/jobs/h1/011-a.job
+    [ "$(grep -cE "^[[:space:]]*filename_format[[:space:]]*=" "$a")" = 1 ] && grep -qx "filename_format=h1.y.\$filenum" "$a" &&
+    [ "$(grep -cE "^[[:space:]]*unique_filename[[:space:]]*=" "$a")" = 1 ] && grep -qx "unique_filename=0" "$a" &&
+    grep -qxF "# unique_filename = 1" "$a" && grep -qxF "cpus_allowed = 3,4" "$a" &&
+    ! grep -q "policy=split" "$a" || { cat "$a" >&2; false; }'
 t_assert "stamping: a jobfile cpus_allowed with no cpu in the host's cpus stops the run, naming the jobfile, its list and the host's cpus" bash -c '
     d=$(mktemp -d)
     err=$( (source ./wekatester
@@ -4104,7 +4154,9 @@ t_assert "schema: one spelling of the fields, the slot columns and the direction
     b=$(awkrun "BEGIN { L[1] = \"[x]\"; L[2] = \"rw=randrw:8\"; file_directions(L, 2, D); print ((\"read\" in D) ? \"read\" : \"-\"), ((\"write\" in D) ? \"write\" : \"-\") }") &&
     [ "$b" = "read write" ]'
 # The jobfile rules, held to the answers the python gave them before it went
-# (tests/golden/jobfile-rules.txt), input for input.
+# (tests/golden/jobfile-rules.txt), input for input. One answer differs since
+# jf_key: e's "filename_format= y" reads y, as fio reads it (python skipped
+# it for z).
 t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind, file_directions, pick_slot and pick_engine give the recorded answers" bash -c '
     d=$(mktemp -d)
     printf "# report latency\n[global]\nbs=4k\nrw=randread\n[lat]\nbs=1M\n" > "$d/a"
@@ -4138,6 +4190,24 @@ t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind
         print engine_order()
     }" "$d"/[a-g])
     want=$(cat tests/golden/jobfile-rules.txt) && [ -n "$aw" ] && [ "$aw" = "$want" ] || { printf "want:\n%s\nawk:\n%s\n" "$want" "$aw" >&2; false; }'
+t_assert "jobfile rules: jf_key reads a key as fio does; override_lines replaces by it and finds an indented [global]" bash -c '
+    aw=$(source ./wekatester; awkrun "BEGIN {
+        n = split(\"numjobs=4|  numjobs = 4|\tnumjobs\t=\t4|# numjobs = 4|; numjobs=4|  [job]|[a=b]||stonewall|=4\", T, \"|\")
+        for (i = 1; i <= n; i++) printf \"%s;\", jf_key(T[i])
+        print \"\"
+        L[1] = \"  ioengine = psync  \"; print first_value(L, 1, \"ioengine\"), key_value(L[1], \"ioengine|bs\")
+        L[1] = \"[global]\"; L[2] = \"# numjobs = 4\"; L[3] = \"  [job]\"; L[4] = \"  numjobs = 4\"
+        n = override_lines(L, 4, \"numjobs\", 1); for (i = 1; i <= n; i++) printf \"%s|\", L[i]
+        print \"\"
+        L[1] = \"# numjobs = 4\"; L[2] = \"  [global]\"; L[3] = \"[job]\"
+        n = override_lines(L, 3, \"numjobs\", 1); for (i = 1; i <= n; i++) printf \"%s|\", L[i]
+        print \"\"
+    }")
+    want="numjobs;numjobs;numjobs;;;;;;;;
+psync psync
+[global]|# numjobs = 4|  [job]|numjobs=1|
+# numjobs = 4|  [global]|numjobs=1|[job]|"
+    [ "$aw" = "$want" ] || { printf "want:\n%s\nawk:\n%s\n" "$want" "$aw" >&2; false; }'
 # The host file is read and written by awk now, and python's csv module is
 # the behaviour it keeps: held to the module itself, record for record.
 t_assert "awk and python agree: the host-file CSV, read and written" bash -c '

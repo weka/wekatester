@@ -16,7 +16,7 @@ BEGIN {
         if (twin in EXISTS) awk_fail("-b: the set already has a file named " twin)
         hasbs = 0
         for (i = 1; i <= n; i++)
-            if (match(L[i], /^(bs|blocksize)=/)) { L[i] = substr(L[i], 1, RLENGTH) "1Mi"; hasbs = 1 }
+            if ((k = jf_key(L[i])) == "bs" || k == "blocksize") { L[i] = k "=1Mi"; hasbs = 1 }
         if (!hasbs) n = override_lines(L, n, "bs", "1Mi")
         for (i = n; i >= 1; i--) L[i + 1] = L[i]
         L[1] = "# -b: the 1MiB twin of " name ", staged by wekatester"

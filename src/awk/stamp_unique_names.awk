@@ -1,8 +1,7 @@
 # A jobfile's own cpu list against the host's fio cpus (auth/<host>.cpus):
 # "" when inside them, else the trimmed line, with a note; nothing left stops
 function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
-    v = strip(substr(s, index(s, "=") + 1))
-    if (match(v, /[ \t]/)) v = substr(v, 1, RSTART - 1)
+    v = jf_word(s)
     job = path; sub(/.*\//, "", job)
     parse_cpulist(cpus, EFF)
     if (!parse_cpulist(v, REQ) || !set_any(REQ))
@@ -15,25 +14,25 @@ function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
     print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")" > "/dev/stderr"
     return "cpus_allowed=" run
 }
-function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, hasfmt, hascpus, haspol, INS, ni, g) {
+function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, v, hasfmt, hascpus, haspol, INS, ni, g) {
     if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
     hasfmt = 0; hascpus = 0; haspol = 0; g = 0; m = 0
     for (i = 1; i <= n; i++) {
-        s = strip(L[i])
-        if (index(s, "filename_format=") == 1) {
-            hasfmt = 1
-            if (!index(substr(s, 17), "$clientuid") && index(substr(s, 17), "shared.") != 1)
-                L[i] = "filename_format=" name "." substr(s, 17)
-        } else if (index(s, "unique_filename=") == 1)
+        s = strip(L[i]); k = jf_key(s)
+        if (k == "filename_format") {
+            hasfmt = 1; v = jf_value(s)
+            if (!index(v, "$clientuid") && index(v, "shared.") != 1)
+                L[i] = "filename_format=" name "." v
+        } else if (k == "unique_filename")
             continue   # replaced by the forced 0 below
-        else if (s ~ /^cpus_allowed[ \t]*=/) {
+        else if (k == "cpus_allowed") {
             # every one, in any section: fio never runs on weka's cores or
             # core 0's pair, whatever a cpu list says
             hascpus = 1
             if (cpus != "" && (t = trim_cpus(host, path, s, cpus)) != "") L[i] = t
         }
         O[++m] = L[i]
-        if (index(s, "cpus_allowed_policy=") == 1) haspol = 1
+        if (k == "cpus_allowed_policy") haspol = 1
         if (!g && s == "[global]") g = m
     }
     ni = 0; INS[++ni] = "unique_filename=0"

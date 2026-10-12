@@ -1,12 +1,24 @@
 # --- jobfiles ---
+# A jobfile line's key as fio reads it: the line stripped, split at the
+# first "=", the key stripped; "" for a blank, #/; comment, section header or
+# line without "=". Every jobfile key read or replaced goes through it.
+function jf_key(line,    c, p) {
+    line = strip(line); c = substr(line, 1, 1)
+    if (c == "#" || c == ";" || c == "[" || !(p = index(line, "="))) return ""
+    return strip(substr(line, 1, p - 1))
+}
+function jf_value(line) {   # a jf_key line's value, stripped
+    line = strip(line)
+    return strip(substr(line, index(line, "=") + 1))
+}
+function jf_word(line,    v) {   # jf_value up to its first blank; "" for none
+    v = jf_value(line)
+    return match(v, /^[^ \t\n\013\014\r\034\035\036\037]+/) ? substr(v, 1, RLENGTH) : ""
+}
 # The first key=<value> line, its value up to the first blank; "" when none.
-function first_value(L, n, key,    i, v, kv, o) {
-    kv = key "="; o = length(key) + 2
-    for (i = 1; i <= n; i++) {
-        if (index(L[i], kv) != 1) continue
-        v = substr(L[i], o)
-        if (match(v, /^[^ \t\n\013\014\r\034\035\036\037]+/)) return substr(v, 1, RLENGTH)
-    }
+function first_value(L, n, key,    i, v) {
+    for (i = 1; i <= n; i++)
+        if (jf_key(L[i]) == key && (v = jf_word(L[i])) != "") return v
     return ""
 }
 function is_layout_marked(L, n,    i) {   # the layout marker in the first three lines
@@ -14,14 +26,14 @@ function is_layout_marked(L, n,    i) {   # the layout marker in the first three
         if (index(L[i], layout_marker()) == 1) return 1
     return 0
 }
-# key=value on lines L: replace every key= line, else insert after the first
-# [global], else create [global]. Returns the new line count; in
-# place, so L may keep stale entries past it.
+# key=value on lines L: replace every key line (jf_key) with key=value, else
+# insert after the first [global], else create [global]. Returns the new
+# line count; in place, so L may keep stale entries past it.
 function override_lines(L, n, key, value,    i, hit, g, kv) {
     kv = key "="; hit = 0; g = 0
     for (i = 1; i <= n; i++)
-        if (index(L[i], kv) == 1) { L[i] = kv value; hit = 1 }
-        else if (!g && index(L[i], "[global]") == 1) g = i
+        if (jf_key(L[i]) == key) { L[i] = kv value; hit = 1 }
+        else if (!g && strip(L[i]) == "[global]") g = i
     if (hit) return n
     if (!g) {
         for (i = n; i >= 1; i--) L[i + 2] = L[i]
@@ -91,11 +103,10 @@ function parse_size(s,    u, m) {
     m = u == "" ? 0 : index("kmgt", tolower(u))
     return int(substr(s, 1, RLENGTH) * (m ? 2 ^ (10 * m) : 1))
 }
-# A section header ("[name]", blanks may follow): its name, else ""
+# A section header ("[name]", blanks may surround it): its name, else ""
 function section_name(line,    t) {
-    if (line !~ /^\[.+\][ \t\n\013\014\r\034\035\036\037]*$/) return ""
-    t = rstrip(line)
-    return substr(t, 2, length(t) - 2)
+    t = strip(line)
+    return t ~ /^\[.+\]$/ ? substr(t, 2, length(t) - 2) : ""
 }
 function last_section(L, n,    i, s, name) {   # the last section's name, "" for none
     name = ""
@@ -125,12 +136,10 @@ function report_items(L, n,    i, k, W, s) {
     for (k = 1; k <= 3; k++) if (report_has(L, n, W[k])) s = s " " W[k]
     return substr(s, 2)
 }
-# The value of a "<key>=<value>" line whose key matches the anchored ERE
-# <keys>, up to the first blank; "" for any other line
-function key_value(line, keys,    v) {
-    if (!match(line, "^(" keys ")=[^ \t\n\013\014\r\034\035\036\037]+")) return ""
-    v = substr(line, 1, RLENGTH)
-    return substr(v, index(v, "=") + 1)
+# The value of a "<key>=<value>" line whose key (jf_key) matches the ERE
+# <keys>, anchored, up to the first blank; "" for any other line
+function key_value(line, keys) {
+    return jf_key(line) ~ ("^(" keys ")$") ? jf_word(line) : ""
 }
 # Bytes of the measured (last) section bs, else [global], else 4k; a split
 # value (4k,8k) by its first entry.

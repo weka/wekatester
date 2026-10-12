@@ -1,5 +1,5 @@
 # one layout jobfile: its spec lines into OUT[1..n] (n returned), and
-# FA[1], whether a line reads exactly fallocate=none
+# FA[1], whether a line sets fallocate=none
 function grid_spec(path, OUT, FA,    L, n, SN, KV, ns, s, fmt, fsz, size, nr, nj, glob, no, i) {
     if ((n = readlines(path, L)) < 0) awk_fail("cannot read " path)
     ns = ini_parse(L, n, SN, KV); no = 0
@@ -19,7 +19,7 @@ function grid_spec(path, OUT, FA,    L, n, SN, KV, ns, s, fmt, fsz, size, nr, nj
         OUT[++no] = sprintf("%.0f\t%s\t%d\t%.0f", size, glob, 1 + count_char(glob, "/"), size * nr * nj)
     }
     FA[1] = 0
-    for (i = 1; i <= n; i++) if (L[i] == "fallocate=none") FA[1] = 1
+    for (i = 1; i <= n; i++) if (jf_key(L[i]) == "fallocate" && jf_value(L[i]) == "none") FA[1] = 1
     return no
 }
 BEGIN {

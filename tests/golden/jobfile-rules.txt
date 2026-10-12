@@ -19,7 +19,7 @@ ValueError
 1048576 lat1m read - lat
 1048576 lat1m read write - y
 65536 lat read $filenum/$jobnum j
-4096 lat - z -
+4096 lat - y -
 4096 lat - - -
 2097152 lat1m read write - global
 bw read bw_r

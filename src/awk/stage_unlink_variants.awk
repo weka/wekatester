@@ -7,8 +7,9 @@ BEGIN {
         m = 0; split("", O)
         for (i = 1; i <= n; i++) {
             if (index(L[i], layout_marker()) == 1) continue
-            if (L[i] ~ /^filesize=/ || L[i] ~ /^size=/) O[++m] = "filesize=4k"
-            else if (L[i] ~ /^(blocksize|bs)=/) O[++m] = "blocksize=4k"
+            k = jf_key(L[i])
+            if (k == "filesize" || k == "size") O[++m] = "filesize=4k"
+            else if (k == "blocksize" || k == "bs") O[++m] = "blocksize=4k"
             else O[++m] = L[i]
         }
         # every section must unlink: a hand-written layout may have no
