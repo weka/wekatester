@@ -10,6 +10,11 @@ for b in "$BASH" "$(command -v bash)"; do
     v=$("$b" -c 'echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))')
     [ "$v" -ge 404 ] || { echo "the suite needs bash 4.4 or later, and $b is older -- on a Mac: PATH=/opt/homebrew/bin:\$PATH bash tests/test_wekatester.sh" >&2; exit 1; }
 done
+# Every mktemp in the suite and its tests lands under one root: removed after
+# a passing run, kept after a failing one (each run used to leave hundreds of
+# /tmp/tmp.* behind; Frank, 2026-10-11).
+WT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/wt-suite.XXXXXX") || exit 1
+export TMPDIR=$WT_TMP
 if [ "$(uname -s)" != Linux ]; then
     WT_LINUX_SHIM=$(mktemp -d)
     printf '#!/bin/sh\necho Linux\n' > "$WT_LINUX_SHIM/uname"; chmod +x "$WT_LINUX_SHIM/uname"
@@ -6879,4 +6884,9 @@ EOF
 
 rm -f -- "${WT_ASIDE:?}"
 echo; echo "passed $PASS, failed $FAIL"
+if [ "$FAIL" -eq 0 ]; then
+    out=$(rm -rf -- "${WT_TMP:?}" 2>&1) || echo "could not remove $WT_TMP: $out"
+else
+    echo "kept the tests' temporary files: $WT_TMP"
+fi
 [ "$FAIL" -eq 0 ]
