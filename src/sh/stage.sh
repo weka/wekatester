@@ -21,12 +21,14 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # A filename_format with a blank is refused (Frank, 2026-10-11): the seed,
 # layout and namespace readers cut it at the blank, so they address other
 # files than fio opens. Every staged format derives from these source lines.
-check_filename_formats() {   # check_filename_formats <dir>
+# cpumask and numa_cpu_nodes are refused too (Frank, 2026-10-11): staging
+# trims only cpus_allowed, so they could place fio on weka's cores.
+check_jobfile_lines() {   # check_jobfile_lines <dir>
     local f files=() bad LC_ALL=C
     for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
     [ ${#files[@]} -gt 0 ] || return 0
-    bad=$(awkrun '#@awk check_filename_formats' "${files[@]}") \
-        || die "${bad:-cannot check the filename_format lines in $1}"
+    bad=$(awkrun '#@awk check_jobfile_lines' "${files[@]}") \
+        || die "${bad:-cannot check the jobfile lines in $1}"
 }
 
 # Auto mode stages through the tuner; plain mode copies with the directory
@@ -276,7 +278,7 @@ stage_jobfiles() {
     fi
 
     discover_jobfiles "$JOBFILE_SRC"
-    check_filename_formats "$JOBFILE_SRC"
+    check_jobfile_lines "$JOBFILE_SRC"
 
     # Source files plus a layout job: a set own layout file is kept (under -g
     # left out and regenerated), any other set gets one generated here, never

@@ -6043,19 +6043,27 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
 # A filename_format with a blank is refused (Frank, 2026-10-11): the seed,
 # layout and namespace readers cut it at the blank, so they address other
 # files than fio opens. Every staged format derives from these source lines.
-check_filename_formats() {   # check_filename_formats <dir>
+# cpumask and numa_cpu_nodes are refused too (Frank, 2026-10-11): staging
+# trims only cpus_allowed, so they could place fio on weka's cores.
+check_jobfile_lines() {   # check_jobfile_lines <dir>
     local f files=() bad LC_ALL=C
     for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
     [ ${#files[@]} -gt 0 ] || return 0
     bad=$(awkrun 'BEGIN {
-        # every filename_format line, any section, blanks around key and value
-        # dropped as fio drops them; the first bad one printed, exit 1
+        # every line, any section, blanks around key and value dropped as fio
+        # drops them; the first bad one printed, exit 1
         for (a = 1; a < ARGC; a++) {
             if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
             for (i = 1; i <= n; i++) {
                 line = strip(L[i]); c = substr(line, 1, 1)
                 if (c == "#" || c == ";" || !(p = index(line, "="))) continue
-                if (strip(substr(line, 1, p - 1)) != "filename_format") continue
+                k = strip(substr(line, 1, p - 1))
+                # only cpus_allowed is held to the host'\''s fio cpus at staging
+                if (k == "cpumask" || k == "numa_cpu_nodes") {
+                    print ARGV[a] ": \047" line "\047: " k " can place fio on weka\047s cores or core 0\047s pair; use cpus_allowed, which wekatester holds to each host\047s fio cpus"
+                    exit 1
+                }
+                if (k != "filename_format") continue
                 v = strip(substr(line, p + 1))
                 if (v ~ /[ \t\013\014\r\034\035\036\037]/) {
                     print ARGV[a] ": filename_format must not contain whitespace: \047" v "\047"
@@ -6064,7 +6072,7 @@ check_filename_formats() {   # check_filename_formats <dir>
             }
         }
     }' "${files[@]}") \
-        || die "${bad:-cannot check the filename_format lines in $1}"
+        || die "${bad:-cannot check the jobfile lines in $1}"
 }
 
 # Auto mode stages through the tuner; plain mode copies with the directory
@@ -6818,7 +6826,7 @@ stage_jobfiles() {
     fi
 
     discover_jobfiles "$JOBFILE_SRC"
-    check_filename_formats "$JOBFILE_SRC"
+    check_jobfile_lines "$JOBFILE_SRC"
 
     # Source files plus a layout job: a set own layout file is kept (under -g
     # left out and regenerated), any other set gets one generated here, never
@@ -7655,7 +7663,7 @@ main() {
     close_interactive
     early_client_cmdline_check
     # before calibration seeds anything from it
-    check_filename_formats "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"
+    check_jobfile_lines "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"
     if [ "$DRY_RUN" -eq 1 ]; then
         # every run probes: only the probe knows where weka's pinned cores
         # are, and fio never lands on them (Frank, 2026-09-29)

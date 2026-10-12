@@ -508,7 +508,7 @@ main() {
     close_interactive
     early_client_cmdline_check
     # before calibration seeds anything from it
-    check_filename_formats "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"
+    check_jobfile_lines "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"
     if [ "$DRY_RUN" -eq 1 ]; then
         # every run probes: only the probe knows where weka's pinned cores
         # are, and fio never lands on them (Frank, 2026-09-29)
