@@ -183,7 +183,7 @@ BEGIN {
         nk = 0
         for (i = 1; i <= nfx; i++) {
             k = key(FIXED_NJ[i], qd, nr)
-            if (!fits(k)) { guard(k); break }   # both guards grow with numjobs: a wider count cannot fit either
+            if (!fits(k)) { guard(k, "job"); break }   # both guards grow with numjobs: a wider count cannot fit either
             if (best(k, 1) == "") cell("numjobs", k)
             KS[++nk] = k
         }

@@ -4973,7 +4973,7 @@ t_assert "cal_plan max: the guards still stop a job count the fixed iodepth cann
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" iops read libaio 16 0 0 lvl=max fq=32 fn=2 confirm=0 aio=600)
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 32 2;numjobs 16 32 2;" ] &&
-    case "$out" in *"stopped short of numjobs=32 iodepth=32: libaio would set up 1024 aio events and the kernel has room for 600"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *"the job ladder stopped short of numjobs=32 iodepth=32: libaio would set up 1024 aio events and the kernel has room for 600"*) ;; *) echo "$out" >&2; exit 1;; esac
     out=$(plan_sim "$d" bw read io_uring 16 0 0 lvl=safe fq=1 fn=1 confirm=0 pin_qd=4 pin_nj=12)
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 12 4 1;" ] || { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan max: a sync engine runs the job counts at iodepth 1, as the ladders give it" bash -c '
