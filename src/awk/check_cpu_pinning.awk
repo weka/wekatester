@@ -121,6 +121,9 @@ BEGIN {
         else for (c in EFF) if (!(c in BIND)) { flag("outside"); break }
         for (c in REQ) if (c in WEKA) { flag("overlap"); break }
         w = join_sorted(WEKA, ",")
-        print host, req_s, (cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)
+        # tab-separated, the request with its blanks dropped: "2-5, 7"
+        # split on blanks shifted every later field into the wrong one
+        req_p = req_s; gsub(/[ \t]/, "", req_p); OFS = "\t"
+        print host, req_p,(cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)
     }
 }

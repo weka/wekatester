@@ -3816,6 +3816,29 @@ t_assert "pinning: a valid list on a probed host still proceeds" bash -c '
      printf "h1\t-\t-\t4-7\t-\n" > "$d/targets.final"
      check_cpu_pinning)
     [ "$(cat "$d/auth/h1.cpus")" = "4-7" ]'
+# Bugbot "Spaced CPU lists break pinning": a quoted host-file cell keeps its
+# blank, and the verdict split on blanks recorded weka's core (9) instead.
+t_assert "pinning: a spaced list records the same cpus as the unspaced one" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 16\ntaskset 0-15\nbindable 0-15\nbindable_priv -\nweka_allowed 9\n" > "$d/probe/h1"
+    for req in "2-5,7" "2-5, 7"; do
+        printf "h1\t-\t-\t%s\t-\n" "$req" > "$d/targets.final"
+        (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) >>$WT_ASIDE 2>&1 || exit 1
+        [ "$(cat "$d/auth/h1.cpus")" = "2-5,7" ] || { echo "$req: $(cat "$d/auth/h1.cpus")" >&2; exit 1; }
+    done'
+t_assert "pinning: a spaced list needing the escalator records cpus and the escalator" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 16\ntaskset 0-3\nbindable 0-3\nbindable_priv 4-15\nweka_allowed 9\npriv sudo -n\n" > "$d/probe/h1"
+    printf "h1\t-\t-\t2-5, 10\t-\n" > "$d/targets.final"
+    (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) >>$WT_ASIDE 2>&1 || exit 1
+    [ "$(cat "$d/auth/h1.cpus")" = "2-5,10" ] && [ "$(cat "$d/auth/h1.priv")" = "sudo -n" ]'
+t_assert "pinning: a spaced list overlapping weka trims it and says so" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/auth"
+    printf "ncpus 16\ntaskset 0-15\nbindable 0-15\nbindable_priv -\nweka_allowed 9\n" > "$d/probe/h1"
+    printf "h1\t-\t-\t8-10, 12\t-\n" > "$d/targets.final"
+    out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    case "$out" in (*"requested cpus (8-10,12) overlap weka'\''s dedicated cores (9); executing on the remainder (8,10,12)"*) true;; (*) echo "$out" >&2; exit 1;; esac &&
+    [ "$(cat "$d/auth/h1.cpus")" = "8,10,12" ]'
 # The postmortem for a seed whose jobs did not run: fio --client exits 0 and
 # the daemonized server keeps the rejection text, so cal_evidence asks the
 # host fio to re-parse the jobfile -- a dirty parse is surfaced verbatim, a

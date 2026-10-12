@@ -5002,7 +5002,7 @@ check_cpu_pinning() {
     # One awk for every host (six per host took 20s at 451 hosts). Per host
     # with a request, in host order: host, request, taskset, cpu count, four
     # cpu sets, comma-joined flags, then the escalator prefix (it has spaces);
-    # "-" for empty.
+    # tab-separated, "-" for empty.
     awkrun '
     # a cpu list the way this check reads one: blanks around a part
     # dropped, an empty part skipped
@@ -5127,12 +5127,15 @@ check_cpu_pinning() {
             else for (c in EFF) if (!(c in BIND)) { flag("outside"); break }
             for (c in REQ) if (c in WEKA) { flag("overlap"); break }
             w = join_sorted(WEKA, ",")
-            print host, req_s, (cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)
+            # tab-separated, the request with its blanks dropped: "2-5, 7"
+            # split on blanks shifted every later field into the wrong one
+            req_p = req_s; gsub(/[ \t]/, "", req_p); OFS = "\t"
+            print host, req_p,(cur_s == "" ? "-" : cur_s), (ncpus_s == "" ? "-" : ncpus_s), (w == "" ? "none" : w), fmt_or(EFF, "none"), fmt_or(PHANTOM, "none"), fmt_or(UNBIND, "none"), fmt_or(OS0, "none"), (flags == "" ? "ok" : flags), (priv == "" ? "-" : priv)
         }
     }' "$WORK_DIR/targets.final" "$WORK_DIR/probe" "${AUTO_LEVEL:--}" "${HOSTS[@]}" \
         > "$WORK_DIR/pin.verdicts" || die "cpu pinning check failed"
     local dedicated effective phantom unbindable os0 vflags nolist_hosts=() nolist_eff=()
-    while read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
+    while IFS=$'\t' read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
         [ "$cur" != "-" ] || cur=""
         [ "$ncpus" != "-" ] || ncpus=""
         [ "$priv" != "-" ] || priv=""

@@ -278,12 +278,12 @@ check_cpu_pinning() {
     # One awk for every host (six per host took 20s at 451 hosts). Per host
     # with a request, in host order: host, request, taskset, cpu count, four
     # cpu sets, comma-joined flags, then the escalator prefix (it has spaces);
-    # "-" for empty.
+    # tab-separated, "-" for empty.
     awkrun '
     #@awk check_cpu_pinning' "$WORK_DIR/targets.final" "$WORK_DIR/probe" "${AUTO_LEVEL:--}" "${HOSTS[@]}" \
         > "$WORK_DIR/pin.verdicts" || die "cpu pinning check failed"
     local dedicated effective phantom unbindable os0 vflags nolist_hosts=() nolist_eff=()
-    while read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
+    while IFS=$'\t' read -r host req cur ncpus dedicated effective phantom unbindable os0 vflags priv; do
         [ "$cur" != "-" ] || cur=""
         [ "$ncpus" != "-" ] || ncpus=""
         [ "$priv" != "-" ] || priv=""
