@@ -131,6 +131,8 @@ BEGIN {
     U1[N] = 1; U1[N2] = 1
     for (v in U1) BW_LOW[++nbl] = v + 0
     sort_arr(BW_LOW, nbl, 1)
+    # 2N and 4N both run, guards allowing: a ladder stops after STOP rungs
+    # in a row fail to lead, and N -> 2N -> 4N has only two (Frank, 2026-10-11)
     nhigh = 2; HIGH[1] = 2 * N; HIGH[2] = 4 * N
     nil = 0; IOPS_LOW[++nil] = N2; if (N != N2) IOPS_LOW[++nil] = N
     nfx = 0; FIXED_NJ[++nfx] = N2; if (N != N2) FIXED_NJ[++nfx] = N; FIXED_NJ[++nfx] = 2 * N
@@ -149,7 +151,7 @@ BEGIN {
     if (PNJ) pinned = pinned (pinned == "" ? "" : ", ") "numjobs=" PNJ
     if (PQD) pinned = pinned (pinned == "" ? "" : ", ") "iodepth=" PQD
     if (PNR) pinned = pinned (pinned == "" ? "" : ", ") "nrfiles=" PNR
-    if (act == "budget") {
+    if (act == "budget") {   # the most cells: every rung of 2N and 4N, as both run
         if (ctype == "lat" || ctype == "lat1m") n = nnrl
         else if (FIXED) n = nfx + CONFIRM
         else if (ctype == "bw") n = nbl + nhigh * nnrl * nbq + CONFIRM
@@ -211,12 +213,10 @@ BEGIN {
                 finish(k, sprintf("%s -> %s%s (the first numjobs at >= %g%% of line rate, one job per physical core)%s", geo(k), human(best(k, 0)), of_line(k), LINE, note()))
             if (!target && !EXH && plateau(V, nv)) break
         }
-        top1 = 0
-        for (i = 1; i <= n1; i++) if (best(D1[i], 1) > top1) top1 = best(D1[i], 1)
         # past N the siblings join, and iodepth x nrfiles are searched
         n2 = 0
         for (h = 1; h <= nhigh; h++) {
-            nj = HIGH[h]; top2 = 0; got = 0
+            nj = HIGH[h]; got = 0
             for (r = 1; r <= nnrl; r++) {
                 nv = 0; split("", V)
                 for (q = 1; q <= nbq; q++) {
@@ -225,7 +225,6 @@ BEGIN {
                     if (best(k, 1) == "") cell("wide", k)
                     D2[++n2] = k; got = 1
                     v = best(k, 1); V[++nv] = v
-                    if (v > top2) top2 = v
                     if (target && !EXH && v >= target)
                         finish(k, sprintf("%s -> %s%s (numjobs up to N=%d on the physical cores did not reach %g%% of line rate; this is the first cell with the siblings in that did)%s", geo(k), human(v), of_line(k), N, LINE, note()))
                     if (!EXH && plateau(V, nv)) break
@@ -234,10 +233,6 @@ BEGIN {
             # a guard refused every nrfiles at this count, so it was never
             # measured, and 4N cannot fit either
             if (!got) break
-            if (!EXH && nj == 2 * N && !ahead(top2, top1)) {
-                NOTES[++nnotes] = sprintf("2N (%d jobs, siblings in) did not beat N by %g%%; 4N was not tried", nj, THR)
-                break
-            }
         }
         nk = 0
         for (i = 1; i <= n1; i++) KS[++nk] = D1[i]
@@ -258,8 +253,6 @@ BEGIN {
             POOL[++np] = k
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d", IOPS_LOW[i], human(best(k, 1)), QD1)
         }
-        top_low = 0
-        for (i = 1; i <= np; i++) if (best(POOL[i], 1) > top_low) top_low = best(POOL[i], 1)
         # past N the siblings join, and iodepth x nrfiles are searched
         for (h = 1; h <= nhigh; h++) {
             nj = HIGH[h]; nm = 0; split("", MINE)
@@ -290,10 +283,6 @@ BEGIN {
                 }
             top = walk(MINE, nm, 1)
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d nrfiles %d", nj, human(best(top, 1)), kq(top), kr(top))
-            if (!EXH && nj == 2 * N && !ahead(best(top, 1), top_low)) {
-                NOTES[++nnotes] = sprintf("2N (%d jobs, siblings in) did not beat N by %g%%; 4N was not tried", nj, THR)
-                break
-            }
         }
         if (!np) none_fit()
         k = confirm_then_pick(POOL, np)

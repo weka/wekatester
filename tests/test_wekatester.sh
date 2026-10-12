@@ -4817,22 +4817,22 @@ t_assert "cal_plan bw: the first numjobs at 95% of line rate is the answer, one 
     esac &&
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;" ] ||
         { cat "$d/asked" >&2; false; }'
-t_assert "cal_plan bw: short of line rate, 2N walks iodepth for every nrfiles; 2N not beating N skips 4N" bash -c '
+t_assert "cal_plan bw: short of line rate, 2N and 4N walk iodepth for every nrfiles; 4N runs though 2N did not beat N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=9663676416 plan_sim "$d" bw write libaio 16 12500000000 0)
     case "$out" in
-        "done 16 1 1 numjobs=16 iodepth=1 nrfiles=1 -> 9.00 GiB/s (best of 2) = 77.3% of the 11.64 GiB/s line rate (never reached 95% of line rate; the leader by 3%, one job per physical core); 2N (32 jobs, siblings in) did not beat N by 3%; 4N was not tried") true;;
+        "done 16 1 1 numjobs=16 iodepth=1 nrfiles=1 -> 9.00 GiB/s (best of 2) = 77.3% of the 11.64 GiB/s line rate (never reached 95% of line rate; the leader by 3%, one job per physical core)") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;numjobs 16 1 1;wide 32 1 1;wide 32 2 1;wide 32 4 1;wide 32 1 2;wide 32 2 2;wide 32 4 2;wide 32 1 4;wide 32 2 4;wide 32 4 4;confirm 16 1 1;confirm 32 1 1;confirm 32 1 2;" ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 1 1 1;numjobs 2 1 1;numjobs 4 1 1;numjobs 8 1 1;numjobs 16 1 1;wide 32 1 1;wide 32 2 1;wide 32 4 1;wide 32 1 2;wide 32 2 2;wide 32 4 2;wide 32 1 4;wide 32 2 4;wide 32 4 4;wide 64 1 1;wide 64 2 1;wide 64 4 1;wide 64 1 2;wide 64 2 2;wide 64 4 2;wide 64 1 4;wide 64 2 4;wide 64 4 4;confirm 16 1 1;confirm 32 1 1;confirm 32 1 2;" ] ||
         { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan bw: no line rate, the job ladder stops where it flattens" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_BWCAP=4294967296 plan_sim "$d" bw read io_uring 32 0 0)
-    case "$out" in "done 4 1 1 numjobs=4 iodepth=1 nrfiles=1 -> 4.00 GiB/s (best of 2) (the leader by 3%, one job per physical core); 2N (64 jobs, siblings in) did not beat N by 3%; 4N was not tried") true;;
+    case "$out" in "done 4 1 1 numjobs=4 iodepth=1 nrfiles=1 -> 4.00 GiB/s (best of 2) (the leader by 3%, one job per physical core)") true;;
         *) echo "$out" >&2; false;; esac &&
     ! grep -q "^numjobs 32 " "$d/asked" && grep -q "^numjobs 16 " "$d/asked" &&
-    grep -q "^wide 64 1 1$" "$d/asked" && ! grep -q "^wide 128 " "$d/asked"'
+    grep -q "^wide 64 1 1$" "$d/asked" && grep -q "^wide 128 1 1$" "$d/asked"'
 t_assert "cal_plan bw: a reading well above line rate means line rate is not the ceiling" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" bw read io_uring 16 12500000000 0)
@@ -4865,11 +4865,11 @@ t_assert "cal_plan iops: a file count that wins is recorded" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_IOPSKNEE=64 CAL_SIM_NRBEST=4 plan_sim "$d" iops write io_uring 16 0 0)
     case "$out" in "done 32 2 4 numjobs=32 iodepth=2 nrfiles=4 -> 1,030,000 IOPS"*) true;; *) echo "$out" >&2; false;; esac'
-t_assert "cal_plan iops: 2N that does not beat N ends the search before 4N" bash -c '
+t_assert "cal_plan iops: 4N runs though 2N did not beat N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_IOPSCAP=100000 plan_sim "$d" iops read io_uring 16 0 0)
-    case "$out" in "done 8 1 1 "*"2N (32 jobs, siblings in) did not beat N by 3%; 4N was not tried") true;; *) echo "$out" >&2; false;; esac &&
-    ! grep -q " 64 " "$d/asked"'
+    case "$out" in "done 8 1 1 "*"32 jobs 100,000 IOPS at iodepth 1 nrfiles 1, 64 jobs 100,000 IOPS at iodepth 1 nrfiles 1; one job per physical core)") true;; *) echo "$out" >&2; false;; esac &&
+    grep -q "^iodepth 64 1 1$" "$d/asked"'
 t_assert "cal_plan iops: a sync engine keeps iodepth at 1 and still walks the job counts and files" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" iops read psync 8 0 0)
@@ -4940,6 +4940,13 @@ t_assert "cal_plan budget: the most cells a search can take" bash -c '
     g=$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K lvl=max confirm=0)
     [ "$a" = 38 ] && [ "$b" = 3 ] && [ "$c" = 33 ] && [ "$e" = 67 ] && [ "$f" = 3 ] && [ "$g" = 3 ] ||
         { echo "bw=$a lat=$b iops=$c brutal-iops=$e safe-bw=$f max-lat=$g" >&2; false; }'
+t_assert "cal_plan cal: 4N runs when 2N did not lead N, and a search with no early stop takes exactly its budget" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    # flat at 100,000 IOPS: 2N leads nothing; two-rung ladders cannot plateau
+    out=$(CAL_SIM_IOPSCAP=100000 plan_sim "$d" iops read io_uring 16 0 0 nrc=1 iopsqd=1,2) || { echo "$out" >&2; exit 1; }
+    grep -q "^iodepth 32 2 1$" "$d/asked" && grep -q "^iodepth 64 1 1$" "$d/asked" && grep -q "^iodepth 64 2 1$" "$d/asked" || { cat "$d/asked" >&2; exit 1; }
+    b=$(source ./wekatester; cal_plan budget iops read x 16 0 0 /dev/null $K nrc=1 iopsqd=1,2)
+    [ "$b" = 9 ] && [ "$(wc -l < "$d/asked" | tr -d " ")" = "$b" ] || { echo "budget $b"; cat "$d/asked"; false; } >&2'
 
 # -a safe and -a max (Frank, 2026-10-05): numjobs N/2, N and 2N only, at one
 # iodepth and nrfiles per type; every rung measured; a rung leads only 3% ahead.

@@ -329,8 +329,9 @@ engine.
 and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
 for bandwidth (`CAL_BW_QD_LADDER`) and 1–512 for IOPS (`CAL_IOPS_QD_LADDER`) —
 run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs in a
-row that fail to take the lead (see the leader rule), and 4N runs only when 2N
-beat N by that much.
+row that fail to take the lead (see the leader rule). N → 2N → 4N is only
+two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
+(below).
 
 - **Bandwidth** walks numjobs 1, 2, 4 … N/2, N. The first rung at 95% of line
   rate is the answer. If none reaches it, 2N and 4N walk iodepth for every
