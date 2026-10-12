@@ -5377,7 +5377,7 @@ check_capacity() {   # check_capacity [preview]
                 else if (credit > req) credit = req
             }
             req -= credit
-            avail = 0; key = ""
+            avail = ""; key = ""
             if ((n = readlines(work "/df/" h, L)) >= 2) {
                 if (pysplit(L[2], F) < 4 || (avail = py_int(F[4])) == "") awk_fail(h ": cannot read the df line: " L[2])
                 avail *= 1024
@@ -5387,13 +5387,13 @@ check_capacity() {   # check_capacity [preview]
                 if (n >= 3 && strip(L[3]) == "wekafs") { fs = F[1]; sub(/.*\//, "", fs); key = fs SUBSEP F[2] }
             }
             print "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
-            # avail 0 = df unavailable, not a full filesystem: nothing to check
-            if (avail && req > avail) {
+            # avail "" = no df line, unchecked; 0 is a full filesystem
+            if (avail != "" && req > avail) {
                 over = 1
                 if (preview) print "note: " h ": the jobfiles as written need ~" gib(req) "GiB but only " gib(avail) "GiB is available; -a stages the calibrated sizes instead and checks again after calibration"
                 else print "ERROR: " h ": workload needs ~" gib(req) "GiB but only " gib(avail) "GiB is available" > "/dev/stderr"
             }
-            if (key != "" && avail) {
+            if (key != "") {
                 if (!(key in PN)) { PN[key] = 0; PNEED[key] = 0; PAVAIL[key] = avail; PK[++npool] = key }
                 PH[key, ++PN[key]] = h; PNEED[key] += req
                 if (avail < PAVAIL[key]) PAVAIL[key] = avail

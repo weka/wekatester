@@ -515,6 +515,23 @@ t_assert "capacity: unusable df reports 0.0GiB available, unchecked, no abort" b
         *"has 0.0GiB available"*) ! grep -q ERROR <<< "$out" || { echo "$out" >&2; false; } ;;
         *) echo "$out" >&2; false ;;
     esac'
+t_assert "capacity: a full filesystem (Available 0) is a shortfall, not an unread df" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 20971520 0 100%% /mnt/weka\n" > "$FIX/probe/_df"
+    err=$( cap max 0 h1 h2 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc: $err" >&2; false; } &&
+    case "$err" in *ERROR*"h1: workload needs"*"only 0.0GiB is available"*"not enough capacity"*) true;; *) echo "unexpected stderr: $err" >&2; false;; esac'
+t_assert "capacity: a df header without its data line stays unchecked" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n" > "$FIX/probe/_df"
+    out=$( cap max 0 h1 h2 2>&1 ) || { echo "aborted: $out" >&2; exit 1; }
+    case "$out" in *"capacity: h1 needs"*"has 0.0GiB available"*) ! grep -q ERROR <<< "$out" || { echo "$out" >&2; false; } ;; *) echo "$out" >&2; false ;; esac'
+t_assert "capacity: Available 1 is still a shortfall" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 20971520 20971519 1 100%% /mnt/weka\n" > "$FIX/probe/_df"
+    err=$( cap max 0 h1 h2 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc: $err" >&2; false; } &&
+    case "$err" in *ERROR*"h1: workload needs"*"only 0.0GiB is available"*"not enough capacity"*) true;; *) echo "unexpected stderr: $err" >&2; false;; esac'
 # --- stage_variants: per-host jobfile staging (Task 8) ---
 t_assert "non-auto staging produces per-host variants" bash -c '
     source ./tests/helpers.sh; tuner_fixture
