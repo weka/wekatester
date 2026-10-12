@@ -144,34 +144,34 @@ t_assert "an unnamed type is not network" test "$(c '')" = "local "
 t_assert "WEKATESTER_NETWORK_FSTYPES adds a network type" test "$(WEKATESTER_NETWORK_FSTYPES=fuse.myfs c 'myfs /mnt/weka fuse.myfs rw 0 0')" = "network"
 t_assert "only the type and options fields count: a source or mount point named wekafs or forcedirect does not" test "$(c 'wekafs /mnt/forcedirect xfs rw,noatime 0 0')" = "local xfs"
 
-# --- usable cores: an unbindable cpu is not usable, and numjobs is this count ---
-t_assert "usable_cores: cpus the probe measured as unbindable are excluded" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nonline 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/probe/h1"
-    (source ./wekatester; WORK_DIR=$d
-     # 0 and 1 are the OS reserve; 3 and 5 refuse the bind
-     [ "$(usable_cores h1 count)" = 4 ] || { echo "count: $(usable_cores h1 count)" >&2; false; } &&
-     [ "$(usable_cores h1 list)" = "2,4,6,7" ] || { echo "list: $(usable_cores h1 list)" >&2; false; } &&
-     # an operator list is its own reserve: only core 0 comes out of it
-     [ "$(usable_cores h1 count 0-3)" = 2 ] &&
-     [ "$(usable_cores h1 list 0-3)" = "1,2" ])'
-t_assert "usable_cores: a bindable line in cpuset range syntax reads as its cpus" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nonline 0-7\nbindable 0-2,4,6-7\nbindable_priv -\n" > "$d/probe/h1"
-    (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1 list)" = "2,4,6,7" ] || { echo "list: $(usable_cores h1 list)" >&2; false; })'
-t_assert "usable_cores: weka cores and unbindable cpus are both excluded" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nonline 0-7\nweka_allowed 1\nweka_allowed 2\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/probe/h1"
-    (source ./wekatester; WORK_DIR=$d
-     # weka owns 1 and 2, so the reserve is 0 and 3; 5 refuses the bind
-     [ "$(usable_cores h1 list)" = "4,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
-t_assert "usable_cores: an offline cpu id is not conjured from the count" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
+# --- usable cores (probe_cores): an unbindable cpu is not usable ---
+# cores_facts: "n ... | phys | all | reserved"; all is every thread fio gets
+t_assert "probe_cores: cpus the probe measured as unbindable are excluded" bash -c '
+    d=$(mktemp -d)
+    printf "ncpus 8\nonline 0-7\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/p"
+    # 0 and 1 are the OS reserve; 3 and 5 refuse the bind
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "${head%% *}" = 4 ] && [ "$all" = "2,4,6,7" ] || { echo "no list: $head|$all" >&2; exit 1; }
+    # an operator list is its own reserve: only core 0 comes out of it
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p" 0-3)"
+    [ "${head%% *}" = 2 ] && [ "$all" = "1,2" ] || { echo "0-3: $head|$all" >&2; exit 1; }'
+t_assert "probe_cores: a bindable line in cpuset range syntax reads as its cpus" bash -c '
+    d=$(mktemp -d)
+    printf "ncpus 8\nonline 0-7\nbindable 0-2,4,6-7\nbindable_priv -\n" > "$d/p"
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "$all" = "2,4,6,7" ] || { echo "all: $all" >&2; false; }'
+t_assert "probe_cores: weka cores and unbindable cpus are both excluded" bash -c '
+    d=$(mktemp -d)
+    printf "ncpus 8\nonline 0-7\nweka_allowed 1\nweka_allowed 2\nbindable 0,1,2,4,6,7\nbindable_priv -\n" > "$d/p"
+    # weka owns 1 and 2, so the reserve is 0 and 3; 5 refuses the bind
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "$all" = "4,6,7" ] || { echo "all: $all" >&2; false; }'
+t_assert "probe_cores: an offline cpu id is not conjured from the count" bash -c '
+    d=$(mktemp -d)
     # 6 online cpus, ids 0-3 and 6-7: the count alone would have said 0-5
-    printf "ncpus 6\nonline 0-3,6-7\nbindable 0,1,2,3,6,7\nbindable_priv -\n" > "$d/probe/h1"
-    (source ./wekatester; WORK_DIR=$d
-     [ "$(usable_cores h1 list)" = "2,3,6,7" ] || { echo "$(usable_cores h1 list)" >&2; false; })'
+    printf "ncpus 6\nonline 0-3,6-7\nbindable 0,1,2,3,6,7\nbindable_priv -\n" > "$d/p"
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "$all" = "2,3,6,7" ] || { echo "all: $all" >&2; false; }'
 
 # --- probe remote snippet ---
 t_assert "probe snippet emits ncpus"   bash -c 'probe_stub | grep -q "ncpus 8"'
@@ -2135,79 +2135,65 @@ t_assert "cal_required: a missing set directory is an error, not silence" bash -
     out=$( (source ./wekatester; cal_required /nonexistent/set) 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && case "$out" in *"cal_required"*"/nonexistent/set"*) true;; *) false;; esac'
 
-# --- usable_cores: the tuner's core arithmetic, callable from bash ---
-# The calibration ladder sizes numjobs from this, so it must answer exactly
-# what auto_tune's own facts block computes for the same probe file -- a
-# divergence would make "the knee arrived below full cores" a lie.
-uc() {   # uc <probe-file-content>; prints the count
+# --- probe_cores: N, the tuner's core arithmetic ---
+# The calibration ladder and staging size numjobs from this; staging and
+# calibration stop on N < 1 (the tuner tests below).
+pc() {   # pc <probe-file-content>; prints probe_cores' N
     local d out rc
     d=$(mktemp -d) || return 1
-    mkdir -p "$d/probe"
     # every probe carries a bindable line; this one refuses no cpu
-    printf '%s\nbindable 0-63\nbindable_priv -\n' "$1" > "$d/probe/h1"
-    out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) ); rc=$?
-    rm -rf "$d"
-    [ "$rc" -eq 0 ] || { echo "ERROR: usable_cores exited $rc"; return "$rc"; }
-    printf '%s' "$out"
+    printf '%s\nbindable 0-63\nbindable_priv -\n' "$1" > "$d/p"
+    out=$(cores_facts "$d/p"); rc=$?
+    rm -rf -- "${d:?}"
+    [ "$rc" -eq 0 ] || { echo "ERROR: probe_cores exited $rc"; return "$rc"; }
+    printf '%s' "${out%% *}"
 }
-uc_fails() {   # uc_fails <pattern> [probe-file-content]; empty = no probe file
-    local pat=$1 d err rc
-    d=$(mktemp -d) || return 1
-    mkdir -p "$d/probe"
-    [ -z "${2:-}" ] || printf '%s\n' "$2" > "$d/probe/h1"
-    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 >>$WT_ASIDE ); rc=$?
-    rm -rf "$d"
-    [ "$rc" -ne 0 ] || { echo "usable_cores unexpectedly succeeded" >&2; return 1; }
-    case "$err" in (*$pat*) return 0 ;; esac
-    echo "$err" >&2; return 1
-}
-t_assert "usable_cores: weka's single-cpu masks are dedicated cores" \
-    test "$(uc 'ncpus 8
+t_assert "probe_cores: weka's single-cpu masks are dedicated cores" \
+    test "$(pc 'ncpus 8
 weka_allowed 5
 weka_allowed 6
 weka_allowed 7')" = 3
-t_assert "usable_cores: a wide utility-thread mask owns nothing" \
-    test "$(uc 'ncpus 8
+t_assert "probe_cores: a wide utility-thread mask owns nothing" \
+    test "$(pc 'ncpus 8
 weka_allowed 0,3-4
 weka_allowed 0-7')" = 6
-t_assert "usable_cores: no weka at all leaves every core but the OS reserve" \
-    test "$(uc 'ncpus 4')" = 2
+t_assert "probe_cores: no weka at all leaves every core but the OS reserve" \
+    test "$(pc 'ncpus 4')" = 2
 # isolcpus does NOT narrow the set: weka's cores and the OS reserve are all
 # that is subtracted (saving-calf 2026-08-20 -- confining the OS cost 4-7%
 # write iops; split affinity makes a cross-partition mask safe).
-t_assert "usable_cores: isolcpus does not narrow the set" \
-    test "$(uc 'ncpus 8
+t_assert "probe_cores: isolcpus does not narrow the set" \
+    test "$(pc 'ncpus 8
 isolated 4-7
 weka_allowed 4
 weka_allowed 5')" = 4
-t_assert "usable_cores: weka owning every isolated cpu just leaves the rest" \
-    test "$(uc 'ncpus 8
+t_assert "probe_cores: weka owning every isolated cpu just leaves the rest" \
+    test "$(pc 'ncpus 8
 isolated 4-7
 weka_allowed 4
 weka_allowed 5
 weka_allowed 6
 weka_allowed 7')" = 2
-# An empty answer is not a count: fio has no valid numjobs=0, so a probe that
-# cannot be read has to fail loudly rather than size a ladder at zero jobs.
-t_assert "usable_cores: an unreadable probe is an error, not a zero" \
-    uc_fails usable_cores
-t_assert "usable_cores: a probe with no ncpus is an error, not a zero" \
-    uc_fails "leaves fio no cpus" 'engines psync
-bindable 0-7'
-t_assert "usable_cores: a probe with no bindable line is an error, never a guess" \
-    uc_fails "no bindable line" 'ncpus 8'
-t_assert "usable_cores: a list naming cpus the host does not have is trimmed; one covering every cpu fio could use counts as none" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nbindable 0-7\nbindable_priv -\n" > "$d/probe/h1"
+# A probe with no ncpus names no cpu: N=0, which staging and calibration stop
+# on, never a ladder sized at zero jobs.
+t_assert "probe_cores: a probe with no ncpus counts no cpus" \
+    test "$(pc 'engines psync')" = 0
+t_assert "probe_cores: a probe with no bindable line is an error, never a guess" bash -c '
+    d=$(mktemp -d); printf "ncpus 8\n" > "$d/p"
+    err=$(cores_facts "$d/p" 2>&1 >>$WT_ASIDE) && { echo "no error" >&2; exit 1; }
+    case "$err" in (*"no bindable line"*) ;; (*) echo "$err" >&2; exit 1 ;; esac'
+t_assert "probe_cores: a list naming cpus the host does not have is trimmed; one covering every cpu fio could use counts as none" bash -c '
+    d=$(mktemp -d)
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\n" > "$d/p"
     # 3-11 is an operator list with phantoms: trimmed to 3-7, and only core
     # 0 comes out of it (the operator-list exemption)
-    out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "3-11") )
-    [ "$out" = "3,4,5,6,7" ] || { echo "3-11: $out" >&2; exit 1; }
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p" 3-11)"
+    [ "$all" = "3,4,5,6,7" ] || { echo "3-11: $all" >&2; exit 1; }
     # 0-11 names every cpu the box has, 1-11 every one but core 0, which fio
     # never gets: no choice either way, so the full reserve (0 and 1) applies
     for l in 0-11 1-11; do
-        out=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1 list "$l") )
-        [ "$out" = "2,3,4,5,6,7" ] || { echo "$l: $out" >&2; exit 1; }
+        IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p" "$l")"
+        [ "$all" = "2,3,4,5,6,7" ] || { echo "$l: $all" >&2; exit 1; }
     done'
 t_assert "cores_summary: cores a host-file list leaves out, or the host cannot bind, get terms of their own so the sum adds up" bash -c '
     d=$(mktemp -d); printf "ncpus 8\nbindable 0-7\nbindable_priv -\n" > "$d/p"
@@ -4126,20 +4112,28 @@ t_assert "schema: the awk layer reads the schema, the floor marker, the engine o
 $FLOOR_MARKER
 $ENGINE_ORDER
 $LINE_RATE_SLOTS" ] || { printf "%s\n" "$aw" >&2; false; }'
-t_assert "usable_cores: an operator cpu list is the base, minus weka pins" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
-    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 2\nweka_allowed 5\n" > "$d/probe/h1"
-    (source ./wekatester; WORK_DIR=$d
-     # no list: 8 - weka 2,5 - the reserve 0,1 = 4
-     [ "$(usable_cores h1)" = 4 ] &&
-     # a list: minus weka and core 0 only
-     [ "$(usable_cores h1 count "0-3")" = 2 ] &&
-     [ "$(usable_cores h1 list "0-3")" = "1,3" ] &&
-     # nothing left is an error naming the arithmetic, never a guess
-     ! err=$(usable_cores h1 count "2,5" 2>&1) &&
-     case "$err" in (*"leaves fio no cpus"*) true ;; (*) echo "$err" >&2; false ;; esac)'
-t_assert "usable_cores: a node's auxiliary threads are not extra weka cores (field client A)" \
-    test "$(uc "ncpus 56
+t_assert "probe_cores: an operator cpu list is the base, minus weka pins" bash -c '
+    d=$(mktemp -d)
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 2\nweka_allowed 5\n" > "$d/p"
+    # no list: 8 - weka 2,5 - the reserve 0,1 = 4
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p")"
+    [ "${head%% *}" = 4 ] || { echo "no list: $head" >&2; exit 1; }
+    # a list: minus weka and core 0 only
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p" 0-3)"
+    [ "${head%% *}" = 2 ] && [ "$all" = "1,3" ] || { echo "0-3: $head|$all" >&2; exit 1; }
+    # weka cores only: nothing left (staging stops on it: the next test)
+    IFS="|" read -r head phys all res <<< "$(cores_facts "$d/p" 2,5)"
+    [ "${head%% *}" = 0 ] && [ -z "$all" ] || { echo "2,5: $head|$all" >&2; exit 1; }'
+t_assert "tuner: a host-file cpu list of only weka's cores stops, naming the list, never a guess" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "ncpus 8\nbindable 0-7\nbindable_priv -\nweka_allowed 2\nweka_allowed 5\nengines io_uring libaio psync \n" > "$FIX/probe/h1"
+    cp "$FIX/probe/h1" "$FIX/probe/h2"
+    rows() { for h in h1 h2; do printf "%s\t-\t-\t%s\t-" "$h" "$1"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; done; }
+    rows 2,5 > "$FIX/targets.final"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) 2>&1 ) && { echo "no stop" >&2; exit 1; }
+    case "$err" in (*"h1: the host file"*"cpu list (2,5) leaves fio no cpus"*) ;; (*) echo "$err" >&2; exit 1 ;; esac'
+t_assert "probe_cores: a node's auxiliary threads are not extra weka cores (field client A)" \
+    test "$(pc "ncpus 56
 weka_allowed 0-3
 $(for c in $(seq 14 27); do printf 'weka_allowed %s\n' "$c"; done)")" = 35
 # The regression was in WHERE the probe looks, so pin that down directly.
@@ -5079,12 +5073,12 @@ t_assert "reserve rules: 2 up to 24 cores, 4 above, +1 per 4 DPDK past 4, at mos
 0,1,2,3
 0,2,4,6
 2,3" ] || { echo "$out" >&2; false; }'
-t_assert "usable_cores: a client too small for its DPDK cores stops, naming the arithmetic" bash -c '
-    d=$(mktemp -d); mkdir -p "$d/probe"
+t_assert "tuner: a client too small for its DPDK cores stops, naming the arithmetic" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
     # lab 3 as built: 8 cores, 6 of them weka DPDK -- the reserve wants 3, gets 2
-    topo_fixture "$d/probe/h1" 16 adjacent 4 6 8 10 12 14
-    err=$( (source ./wekatester; WORK_DIR=$d; usable_cores h1) 2>&1 ); rc=$?
-    [ "$rc" -ne 0 ] && case "$err" in *"leaves fio no cpus: 8 physical core(s) - 6 weka DPDK - 2 reserved for the OS (0-1 2-3) = N=0"*) true;; *) echo "$err" >&2; false;; esac'
+    topo_fixture "$FIX/probe/h1" 16 adjacent 4 6 8 10 12 14; cp "$FIX/probe/h1" "$FIX/probe/h2"
+    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 ) && { echo "no stop" >&2; exit 1; }
+    case "$err" in *"h1: no cpus left for fio -- 8 physical core(s) - 6 weka DPDK - 2 reserved for the OS (0-1 2-3) = N=0"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "probe: the cpu topology comes from sysfs as topo lines" bash -c '
     d=$(mktemp -d); r=$d/root
     for c in 0 1; do mkdir -p "$r/sys/devices/system/cpu/cpu$c/topology"

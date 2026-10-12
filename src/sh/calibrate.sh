@@ -18,20 +18,6 @@ cal_required() {   # cal_required <setdir> [bulk 0|1]
     awkrun '#@awk cal_required' "${2:-0}" "${files[@]}"
 }
 
-# N for one host by probe_cores, the staging rule. count = N; phys = one
-# thread per usable core (N/2, N jobs); list = every thread (2N, 4N). Fails
-# rather than print 0: numjobs=0 is no fio job.
-usable_cores() {   # usable_cores <host> [count|phys|list] [cpulist]
-                   # an operator cpu list is the base: weka cores and core 0
-                   # pair come out of it, unless it covers every usable cpu
-                   # (probe_cores)
-    [ -f "$WORK_DIR/probe/$1" ] || {
-        log "ERROR: usable_cores: no probe facts for $1 ($WORK_DIR/probe/$1)" >&2
-        return 1
-    }
-    awkrun '#@awk usable_cores' "$WORK_DIR/probe/$1" "${2:-count}" "${3:-}" || return 1
-}
-
 # Calibration measures on the workload own files when filename_format can
 # address the grid ($filenum and $jobnum, no $jobname, which would resolve to
 # the cal section name), else in a private scratch. One dataset then serves

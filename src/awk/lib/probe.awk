@@ -98,8 +98,8 @@ function place_reserve(ORD, nk, SOCK, DPDK, core0, want, RES,    n, i, s, ns, SO
     }
     return n
 }
-# The cpus fio may use, in physical cores: ONE rule for staging, calibration,
-# usable_cores and the pinning check (README, Usable cores). DPDK cores go
+# The cpus fio may use, in physical cores: ONE rule for staging, calibration
+# and the pinning check (README, Usable cores). DPDK cores go
 # whole (WEKAPP-550768). R gets n, ncores, dpdk, nres, res, weka_core0,
 # unlisted, unbound, topo, catchall. Three functions: awk caps parameters plus
 # locals at 50.
