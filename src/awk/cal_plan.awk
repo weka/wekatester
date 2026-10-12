@@ -45,24 +45,40 @@ function leader(KS, n, decision,    lead, i) {
     for (i = 1; i <= n; i++) if (lead == "" || ahead(best(KS[i], decision), best(lead, decision))) lead = KS[i]
     return lead
 }
-# Confirm order: best reading, then least outstanding IO, fewer jobs,
-# shallower queue, ladder nrfiles. Does a sort before b?
-function before(a, b,    x, y) {
-    if ((x = best(a, 1)) != (y = best(b, 1))) return x > y
+# Least outstanding IO, then fewer jobs, shallower queue, ladder nrfiles.
+# Is a lighter than b?
+function lighter(a, b,    x, y) {
     if ((x = kj(a) * kq(a)) != (y = kj(b) * kq(b))) return x < y
     if ((x = kj(a)) != (y = kj(b))) return x < y
     if ((x = kq(a)) != (y = kq(b))) return x < y
     if ((x = (kr(a) != NRT)) != (y = (kr(b) != NRT))) return x < y
     return kr(a) < kr(b)
 }
-function confirm_then_pick(KS, n,    I, i, j, t) {
-    for (i = 1; i <= n; i++) {   # a stable insertion sort
+# Confirm order: best reading, then the lighter. Does a sort before b?
+function before(a, b,    x, y) {
+    if ((x = best(a, 1)) != (y = best(b, 1))) return x > y
+    return lighter(a, b)
+}
+# KS into I, a stable insertion sort: by confirm order, or lightest first
+function order(KS, n, I, confirm,    i, j, t) {
+    for (i = 1; i <= n; i++) {
         t = KS[i]
-        for (j = i - 1; j >= 1 && before(t, I[j]); j--) I[j + 1] = I[j]
+        for (j = i - 1; j >= 1 && (confirm ? before(t, I[j]) : lighter(t, I[j])); j--) I[j + 1] = I[j]
         I[j + 1] = t
     }
+}
+# cal's ladders measure about lightest first, and its walk keeps that
+# order; brutal measures nrfiles outer, iodepth inner, so its walk sorts
+# the cells lightest first, choosing as cal does (Frank, 2026-10-11).
+function walk(KS, n, decision,    I) {
+    if (!EXH) return leader(KS, n, decision)
+    order(KS, n, I, 0)
+    return leader(I, n, decision)
+}
+function confirm_then_pick(KS, n,    I, i) {
+    order(KS, n, I, 1)
     for (i = 1; i <= n && i <= CONFIRM; i++) if (nreads(I[i]) < 2) cell("confirm", I[i])
-    return leader(KS, n, 0)
+    return walk(KS, n, 0)
 }
 function human(v) { return ctype == "bw" ? sprintf("%.2f GiB/s", v / 1073741824) : commas(v) " IOPS" }
 function geo(k) { return sprintf("numjobs=%d iodepth=%d nrfiles=%d", kj(k), kq(k), kr(k)) }
@@ -272,7 +288,7 @@ BEGIN {
                         POOL[++np] = k; MINE[++nm] = k
                     }
                 }
-            top = leader(MINE, nm, 1)
+            top = walk(MINE, nm, 1)
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d nrfiles %d", nj, human(best(top, 1)), kq(top), kr(top))
             if (!EXH && nj == 2 * N && !ahead(best(top, 1), top_low)) {
                 NOTES[++nnotes] = sprintf("2N (%d jobs, siblings in) did not beat N by %g%%; 4N was not tried", nj, THR)

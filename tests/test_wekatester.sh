@@ -4917,6 +4917,20 @@ t_assert "cal_plan brutal: every combination the ladders define is measured, and
     out=$(plan_sim "$d" lat read io_uring 32 0 0 exh=1) &&
     [ "$(tr "\n" ";" < "$d/asked")" = "nrfiles 32 1 1;nrfiles 32 1 2;nrfiles 32 1 4;" ] &&
     case "$out" in "done 32 1 1 "*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "cal_plan brutal: the leader walk goes lightest first, so a lighter cell 2.3% ahead keeps a heavier one out" bash -c '
+    d=$(mktemp -d)
+    # N=2, every cell measured: 8 jobs x iodepth 2 nrfiles 1 (16 outstanding)
+    # is measured before 8 x 1 nrfiles 2 (8 outstanding), which is 2.3% faster
+    for t in bw iops; do
+        : > "$d/h"
+        for c in "numjobs 1 1 1" "numjobs 2 1 1" "w 4 1 1" "w 4 2 1" "w 4 1 2" "w 4 2 2" "w 8 1 1" "w 8 2 1" "w 8 1 2" "w 8 2 2"; do
+            set -- $c; v=100
+            case "$2 $3 $4" in ("8 2 1") v=1000;; ("8 1 2") v=1023;; esac
+            echo "$1 io_uring $2 $3 $4 30 $v" >> "$d/h"
+        done
+        a=$(source ./wekatester; cal_plan next $t read io_uring 2 0 0 "$d/h" $K lvl=brutal exh=1 confirm=0 nrc=1,2 bwqd=1,2 iopsqd=1,2)
+        case "$a" in "done 8 1 2 "*) ;; *) echo "$t: $a" >&2; exit 1;; esac
+    done'
 t_assert "cal_plan budget: the most cells a search can take" bash -c '
     a=$(source ./wekatester; cal_plan budget bw read x 16 0 0 /dev/null $K)
     b=$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K)

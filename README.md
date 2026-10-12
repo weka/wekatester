@@ -363,9 +363,13 @@ beat N by that much.
 three cells (`CAL_CONFIRM`) first get a second reading, under `brutal` the top
 five; `safe` and `max` measure each job count once. Contention only subtracts,
 so a second chance can raise a cell and never lower it, and the best reading
-is what a cell is credited with. Then the cells are walked in the order the ladder
-measured them, and a cell takes the lead only when it is at least 3%
-(`CAL_SHAPE_THR`) better than the leader. The last leader is the answer, so
+is what a cell is credited with. Then the cells are walked lightest first,
+and a cell takes the lead only when it is at least 3%
+(`CAL_SHAPE_THR`) better than the leader. Under `cal` the walk follows the
+order the ladders measured the cells, which is close to lightest first.
+`brutal` measures nrfiles outer and iodepth inner, so its walk sorts the
+cells by outstanding IO (numjobs × iodepth), then fewer jobs, the shallower
+queue and fewer files. The last leader is the answer, so
 a deeper or wider setting has to earn its place by a clear margin.
 
 Every write cell is followed by `CAL_SETTLE` (10s), so the next cell does not
