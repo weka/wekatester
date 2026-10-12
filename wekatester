@@ -6622,10 +6622,10 @@ stamp_unique_names() {
             awk_fail(host ": jobfile " job ": cpus_allowed (" v ") is not a cpu list, so it cannot be held to this host\047s fio cpus (" cpus ")")
         for (c in REQ) if (c in EFF) RUN[c] = 1
         if (!set_any(RUN))
-            awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ": never weka\047s cores or core 0\047s pair) -- list cpus within it, or drop the line and staging fills it in")
+            awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ") -- list cpus within it, or drop the line and staging fills it in")
         if (set_size(RUN) == set_size(REQ)) return ""
         run = fmt_cpulist(RUN)
-        print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus ": never weka\047s cores or core 0\047s pair); executing on the remainder (" run ")" > "/dev/stderr"
+        print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")" > "/dev/stderr"
         return "cpus_allowed=" run
     }
     function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, hasfmt, hascpus, haspol, INS, ni, g) {

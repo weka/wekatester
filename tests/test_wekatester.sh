@@ -2491,7 +2491,7 @@ t_assert "stamping: a jobfile cpus_allowed reaching outside the host's cpus is t
     grep -qx "cpus_allowed=2-3" "$a" && grep -qx "cpus_allowed=4-5" "$a" &&
     ! grep -q "0-3" "$a" && ! grep -q "4-7" "$a" && grep -qx "cpus_allowed_policy=split" "$a" || { cat "$a" >&2; exit 1; }
     case "$err" in
-        *"note: h1: jobfile 011-a.job: cpus_allowed (0-3) includes cpus outside this host"*"fio cpus (2-5: never weka"*"executing on the remainder (2-3)"*) ;;
+        *"note: h1: jobfile 011-a.job: cpus_allowed (0-3) includes cpus outside this host"*"s fio cpus (2-5); executing on the remainder (2-3)"*) ;;
         *) echo "0-3: $err" >&2; exit 1 ;;
     esac
     case "$err" in (*"cpus_allowed (4-7) includes"*"(4-5)"*) ;; (*) echo "4-7: $err" >&2; exit 1 ;; esac'
@@ -2514,9 +2514,34 @@ t_assert "stamping: a jobfile cpus_allowed with no cpu in the host's cpus stops 
      printf "[global]\ncpus_allowed=0-1,6-7\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
      stamp_unique_names) 2>&1 >>$WT_ASIDE ) && { echo "no stop" >&2; exit 1; }
     case "$err" in
-        *"h1: jobfile 011-a.job: cpus_allowed (0-1,6-7) names no cpu fio may use on this host (2-5"*) ;;
+        *"h1: jobfile 011-a.job: cpus_allowed (0-1,6-7) names no cpu fio may use on this host (2-5) -- list cpus"*) ;;
         *) echo "$err" >&2; exit 1 ;;
     esac'
+# Under -a, stage_hosts already writes every cpus_allowed from the set
+# check_cpu_pinning records, so the trim must change nothing; a narrower
+# recorded set proves it still reads auth/<host>.cpus.
+t_assert "stamping: under -a the trim is a no-op, with or without a host-file list, and says nothing" bash -c '
+    source ./tests/helpers.sh
+    for list in - 1-6 3-6; do
+        tuner_fixture
+        printf "# report iops\n[global]\nfilesize=1G\nnumjobs=2\ncpus_allowed=0-7\n[io]\nbs=4k\nrw=randread\niodepth=8\n" > "$FIX/src/031-iops.job"
+        (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE 2>&1 || exit 1
+        { printf "h1\t-\t-\t%s\t-" "$list"; for i in $(seq 6 37); do printf "\t-"; done; printf "\n"; } > "$FIX/targets.final"
+        (source ./wekatester; WORK_DIR=$FIX; HOSTS=(h1 h2); AUTO_LEVEL=max; check_cpu_pinning) >>$WT_ASIDE 2>&1 || exit 1
+        [ -s "$FIX/auth/h1.cpus" ] && [ -s "$FIX/auth/h2.cpus" ] || { echo "$list: no auth cpus" >&2; exit 1; }
+        (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "$FIX/targets.final" h1 h2) >>$WT_ASIDE 2>&1 || exit 1
+        before=$(grep -r "^cpus_allowed=" "$FIX/jobs" | sort)
+        err=$( (source ./wekatester; WORK_DIR=$FIX; HOSTS=(h1 h2); AUTH_DIR=$FIX/auth; stamp_unique_names) 2>&1 >>$WT_ASIDE ) ||
+            { echo "$list: stamp failed: $err" >&2; exit 1; }
+        after=$(grep -r "^cpus_allowed=" "$FIX/jobs" | sort)
+        [ -z "$err" ] && [ "$(printf "%s\n" "$before" | wc -l)" -eq 6 ] && [ "$before" = "$after" ] &&
+            ! printf "%s\n" "$before" | grep -q "=0-7$" ||
+            { echo "$list: auth h1 $(cat "$FIX/auth/h1.cpus"), h2 $(cat "$FIX/auth/h2.cpus"); note: $err"
+              echo "before:"; echo "$before"; echo "after:"; echo "$after"; exit 1; } >&2
+    done
+    printf "3\n" > "$FIX/auth/h1.cpus"
+    err=$( (source ./wekatester; WORK_DIR=$FIX; HOSTS=(h1 h2); AUTH_DIR=$FIX/auth; stamp_unique_names) 2>&1 >>$WT_ASIDE )
+    case "$err" in (*"note: h1: jobfile 031-iops.job: cpus_allowed ("*") includes cpus outside"*"executing on the remainder (3)"*) ;; (*) echo "control: $err" >&2; exit 1 ;; esac'
 t_assert "stamping: staged variants and the generated layout carry it end to end" bash -c '
     source ./tests/helpers.sh; no_ssh_fixture
     d=$(mktemp -d)
