@@ -14,7 +14,14 @@ BEGIN {
         if (!CN[r] || strip(all) == "") continue
         if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
         if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
+        # an unquoted cpu list ("0-3, 8") splits into cells and shifts every
+        # later column; trailing empty cells (spreadsheet padding) are fine
+        for (w = CN[r]; w > ncols && strip(CV[r, w]) == ""; w--) ;
+        if (w > ncols)
+            awk_fail(path ":" r ": " w " cells, but a host-file row has at most " ncols " -- quote cpu lists, e.g. \"0-3,8\"")
         for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
+        if (C[5] != "" && substr(C[5], 1, 1) != "/")
+            awk_fail(path ":" r ": destination dir \047" C[5] "\047 is not an absolute path -- quote cpu lists, e.g. \"0-3,8\"")
         ne++; nk = 0
         if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
         if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }

@@ -5502,6 +5502,26 @@ t_assert "targets: the 1MiB latency columns come last, and an 11-column row stil
     a=$(printf "%s\n" "$out" | awk -F"\t" "\$1==\"h1\" {print \$30, \$31, \$32, \$33, \$34, \$35, \$36, \$37}")
     b=$(printf "%s\n" "$out" | awk -F"\t" "\$1==\"h2\" {print NF, \$6, \$30}")
     [ "$a" = "2 5120M 1 1 4 5120M 2 1" ] && [ "$b" = "37 12 -" ] || { echo "a=$a b=$b" >&2; false; }'
+# An unquoted "0-3, 8" splits into a cell and shifts every later column: a
+# full row grows past the last column, a short one moves " 8" into the dir.
+t_assert "targets: an unquoted cpu list stops the run, naming the line and asking for quotes" bash -c '
+    f=$(mktemp); g=$(mktemp)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nh1,ubuntu,io_uring,0-3, 8,/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8,1/1G/1/1,1/1G/1/1\n" > "$f"
+    printf "# a short row\nh1,ubuntu,io_uring,0-3, 8,/mnt/weka\n" > "$g"
+    e1=$( (rt phase1 "$f" - - - h1) 2>&1 >>$WT_ASIDE ); r1=$?
+    e2=$( (rt phase1 "$g" - - - h1) 2>&1 >>$WT_ASIDE ); r2=$?
+    [ "$r1" -ne 0 ] && [ "$r2" -ne 0 ] &&
+    case "$e1" in (*"$f:2: 14 cells"*"at most 13"*"quote cpu lists"*) true;; (*) false;; esac &&
+    case "$e2" in (*"$g:2: destination dir '\''8'\''"*"quote cpu lists"*) true;; (*) false;; esac ||
+        { echo "r1=$r1 e1=$e1 r2=$r2 e2=$e2" >&2; false; }'
+t_assert "targets: the same cpu list quoted parses, as do trailing empty cells and the template with its example row" bash -c '
+    f=$(mktemp); d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nh1,ubuntu,io_uring,\"0-3, 8\",/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8,1/1G/1/1,1/1G/1/1,,\n" > "$f"
+    a=$(rt phase1 "$f" - - - h1 | awk -F"\t" "{print NF \"|\" \$4 \"|\" \$5 \"|\" \$6 \"|\" \$37}")
+    (source ./wekatester; write_targets_template "$d/t.csv") >>$WT_ASIDE 2>&1 &&
+    sed -n "s/^# Example:  \(client-1,.*\)/\1/p" "$d/t.csv" >> "$d/t.csv" &&
+    b=$(rt phase1 "$d/t.csv" - - - client-1 | awk -F"\t" "{print \$3 \"|\" \$4 \"|\" \$5 \"|\" \$30}")
+    [ "$a" = "37|0-3, 8|/mnt/weka|12|1" ] && [ "$b" = "io_uring|8,10|/mnt/weka|-" ] || { echo "a=$a b=$b" >&2; false; }'
 t_assert "writeback: a measured 1MiB latency tuple lands in its own column" bash -c '
     d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/auth"
     : > "$d/engine.results"
