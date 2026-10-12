@@ -3,16 +3,15 @@ function need_int(v, what) {   # int(), or a stop where python raised
     if ((v = py_int(v)) == "") awk_fail("capacity: " what " is not a number")
     return v
 }
-# one staged jobfile: numjobs x filesize x nrfiles, or numjobs x size=
-# (fio: the job total across its files)
-function footprint(path, L, n,    nj, fs, sz, nr, b, job) {
-    nj = first_value(L, n, "numjobs"); nj = need_int(nj == "" ? "1" : nj, path ": numjobs")
-    if ((fs = first_value(L, n, "filesize")) != "") {
+# one job section s of a staged jobfile (job_sections): numjobs x filesize
+# x nrfiles, or numjobs x size= (fio: the job total across its files)
+function footprint(path, L, n, KV, s,    nj, fs, sz, nr, b, job) {
+    nj = need_int(sec_value(L, n, KV, s, "numjobs", "1"), path ": numjobs")
+    if ((fs = sec_value(L, n, KV, s, "filesize", "")) != "") {
         if ((b = parse_size(fs)) == "") awk_fail("capacity: " path ": filesize=" fs " is not a byte count")
-        nr = first_value(L, n, "nrfiles")
-        return nj * b * need_int(nr == "" ? "1" : nr, path ": nrfiles")
+        return nj * b * need_int(sec_value(L, n, KV, s, "nrfiles", "1"), path ": nrfiles")
     }
-    if ((sz = first_value(L, n, "size")) != "") {
+    if ((sz = sec_value(L, n, KV, s, "size", "")) != "") {
         if ((b = parse_size(sz)) != "") return nj * b
         job = path; sub(/.*\//, "", job)
         print "WARNING: " job ": size=" sz " is not a byte count; it contributes nothing to the capacity estimate" > "/dev/stderr"
@@ -70,11 +69,18 @@ BEGIN {
             if (job == "000-wekatester-relayout.job" || job == "999-wekatester-unlink.job") continue
             if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)
             if (job == layout_job() || is_layout_marked(L, n)) { layout += layout_footprint(L, n); continue }
-            if ((ns = first_value(L, n, "filename_format")) == "") ns = "__default__:" job
-            # a group fleet-shared dataset is priced once, on its first host
-            if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
-            if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
-            if ((b = footprint(p, L, n)) > NSV[ns]) NSV[ns] = b
+            # Per job section: one filename_format is one set of files, costing
+            # its largest section; without one, fio names files after the
+            # section, a namespace of its own. Namespaces sum below.
+            nsec = job_sections(L, n, SN, KV, J)
+            for (x = 1; x <= nsec; x++) {
+                s = J[x]
+                if ((ns = sec_value(L, n, KV, s, "filename_format", "")) == "") ns = "__default__:" job (s == "g" ? "" : SUBSEP SN[s])
+                # a group fleet-shared dataset is priced once, on its first host
+                if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
+                if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
+                if ((b = footprint(p, L, n, KV, s)) > NSV[ns]) NSV[ns] = b
+            }
         }
         req = 0
         for (k = 1; k <= nns; k++) req += NSV[NSK[k]]

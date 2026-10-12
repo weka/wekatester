@@ -11,29 +11,35 @@ function lay_engine(L, n,    eng) {
     if (!(eng in LAY_TALLY)) LAY_EORD[++LAY_NE] = eng
     LAY_TALLY[eng]++
 }
-function lay_add(L, n, fname, where,    fmt, key, sec, fs, sz, sb, v, nj, nr, k, c, d) {
-    # No filename_format: fio names files after the section, so the layout
-    # section takes the measured section name.
-    if ((fmt = first_value(L, n, "filename_format")) != "") { key = fmt; sec = "" }
-    else {
-        if ((sec = last_section(L, n)) == "") sec = fname
-        key = "__jobname__:" sec
+# One contributor per job section (job_sections), each knob the section's own
+# else [global], as fio reads it; never the file's first key.
+function lay_add(L, n, fname, where,    SN, KV, J, nsec, x, s, fmt, key, sec, fs, sz, sb, v, nj, nr, k, c, d) {
+    nsec = job_sections(L, n, SN, KV, J)
+    for (x = 1; x <= nsec; x++) {
+        s = J[x]
+        # No filename_format: fio names files after the section, so the
+        # layout section takes the measured section name.
+        if ((fmt = sec_value(L, n, KV, s, "filename_format", "")) != "") { key = fmt; sec = "" }
+        else {
+            if ((sec = s == "g" ? last_section(L, n) : SN[s]) == "") sec = fname
+            key = "__jobname__:" sec
+        }
+        fs = sec_value(L, n, KV, s, "filesize", ""); sz = sec_value(L, n, KV, s, "size", ""); sb = -1
+        # size=50% and the like are not derivable: no size of their own
+        if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
+        if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
+        nj = py_int(sec_value(L, n, KV, s, "numjobs", "1")); nr = py_int(sec_value(L, n, KV, s, "nrfiles", "1"))
+        if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
+        if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
+        k = LAY_NS[key]
+        # a group's members and like sections add the same grid again:
+        # lay_prune keeps only the first of equals, and sorting the rest was
+        # O(members^2)
+        d = k SUBSEP nj SUBSEP nr SUBSEP sprintf("%.17g", sb)
+        if (d in LAY_DUP) continue
+        LAY_DUP[d] = 1; c = ++LAY_NC[k]
+        LAY_CNJ[k, c] = nj; LAY_CNR[k, c] = nr; LAY_CSB[k, c] = sb; LAY_CFS[k, c] = fs; LAY_CSZ[k, c] = sz
     }
-    fs = first_value(L, n, "filesize"); sz = first_value(L, n, "size"); sb = -1
-    # size=50% and the like are not derivable: no size of their own
-    if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
-    if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
-    nj = first_value(L, n, "numjobs"); nj = nj == "" ? 1 : py_int(nj)
-    nr = first_value(L, n, "nrfiles"); nr = nr == "" ? 1 : py_int(nr)
-    if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
-    if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
-    k = LAY_NS[key]
-    # a group's members add the same grid again: lay_prune keeps only the
-    # first of equals, and sorting the rest was O(members^2)
-    d = k SUBSEP nj SUBSEP nr SUBSEP sprintf("%.17g", sb)
-    if (d in LAY_DUP) return
-    LAY_DUP[d] = 1; c = ++LAY_NC[k]
-    LAY_CNJ[k, c] = nj; LAY_CNR[k, c] = nr; LAY_CSB[k, c] = sb; LAY_CFS[k, c] = fs; LAY_CSZ[k, c] = sz
 }
 # Keep contributors no kept grid covers; widest first, stable, so a dominated
 # entry meets its dominator first.

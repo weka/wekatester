@@ -248,12 +248,30 @@ function ini_parse(L, n, SN, KV,    i, line, c, cur, ns, p) {
             else cur = ns
             continue
         }
-        if ((p = index(line, "=")) && cur != "")
-            KV[cur, strip(substr(line, 1, p - 1))] = strip(substr(line, p + 1))
+        if (cur == "") continue
+        if ((p = index(line, "="))) KV[cur, strip(substr(line, 1, p - 1))] = strip(substr(line, p + 1))
+        else KV[cur, line] = ""   # a bare bool (create_only): set, value ""
     }
     return ns
 }
 function ini_get(KV, s, key, dflt) {
     return ((s, key) in KV) ? KV[s, key] : (("g", key) in KV) ? KV["g", key] : dflt
+}
+# A job_sections job's knob up to the first blank: ini_get for a section,
+# first_value for "g"; <dflt> for none
+function sec_value(L, n, KV, s, key, dflt,    v) {
+    if (s == "g") v = first_value(L, n, key)
+    else if (match(v = ini_get(KV, s, key, ""), /^[^ \t\n\013\014\r\034\035\036\037]+/)) v = substr(v, 1, RLENGTH)
+    else v = ""
+    return v == "" ? dflt : v
+}
+# The jobs whose files fio sizes: ini_parse into SN/KV, the sections'
+# indexes into J[1..n], create_only ones aside. None ([global] only, or all
+# create_only): the one job "g", the whole file read as before.
+function job_sections(L, n, SN, KV, J,    ns, s, nj) {
+    ns = ini_parse(L, n, SN, KV); nj = 0
+    for (s = 1; s <= ns; s++) if (ini_get(KV, s, "create_only", "0") == "0") J[++nj] = s
+    if (!nj) J[++nj] = "g"
+    return nj
 }
 

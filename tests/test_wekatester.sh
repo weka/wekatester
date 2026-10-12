@@ -532,6 +532,49 @@ t_assert "capacity: Available 1 is still a shortfall" bash -c '
     err=$( cap max 0 h1 h2 2>&1 >>$WT_ASIDE ); rc=$?
     [ "$rc" -ne 0 ] || { echo "expected nonzero exit, got $rc: $err" >&2; false; } &&
     case "$err" in *ERROR*"h1: workload needs"*"only 0.0GiB is available"*"not enough capacity"*) true;; *) echo "unexpected stderr: $err" >&2; false;; esac'
+
+# Geometry is read per job section ([global] the fallback), never the first
+# key in the file (Bugbot "Layout geometry uses first key wins", 2026-10-11).
+# geo <plain|preview> <jobfile printf format>: h1's staged layout sections on
+# one line, then its capacity line.
+geo() {
+    (source ./tests/helpers.sh; tuner_fixture; rm -f "$FIX/src/011-bw.job"
+     [ "$2" = - ] && printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n" > "$FIX/src/011-j.job" || printf "$2" > "$FIX/src/011-j.job"
+     (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
+      WORK_DIR=$FIX; HOSTS=(h1); DIRECTORY=/mnt/weka; AUTO_LEVEL=""; ENGINE=""; IGNORE_CAPACITY=0
+      run_host() { cat "$FIX/probe/_df"; }
+      generate_layout "$FIX/src" "$FIX/src" || exit 9
+      if [ "$1" = plain ]; then stage_variants "$FIX/src" && check_capacity
+      else auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 && check_capacity preview; fi) > "$FIX/out" 2>&1 || { cat "$FIX/out"; exit 9; }
+     awk '/^\[/ { s = $0 != "[global]" } s && NF && !/^(blocksize|create_only)=/' "$FIX/jobs/h1/000-wekatester-layout.job" | tr "\n" " " | sed 's/ $//'; echo
+     grep "^capacity" "$FIX/out")
+}
+export -f geo
+J1='[global]\ndirectory=/orig\nioengine=libaio\nfilename_format=j1/$jobnum.$filenum\nnumjobs=1\nnrfiles=1\nfilesize=1G\n[create]\ncreate_only=1\n[big]\nnumjobs=4\nnrfiles=8\nfilesize=4G\nrw=read\n'
+J2='[global]\ndirectory=/orig\nioengine=libaio\nfilename_format=j2/$jobnum.$filenum\n[a]\nnumjobs=2\nfilesize=2G\nrw=read\n[b]\nnumjobs=8\nnrfiles=2\nfilesize=1G\nrw=read\n'
+export J1 J2
+t_assert "layout geometry: a section's own numjobs/nrfiles/filesize beat [global] (layout and capacity, plain)" bash -c '
+    out=$(geo plain "$J1")
+    want="[layout-1] filename_format=j1/\$jobnum.\$filenum filesize=4G nrfiles=8 numjobs=4
+capacity: h1 needs ~128.0GiB, has 1024.0GiB available"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "layout geometry: the -a preview re-derives the layout per section too" bash -c '
+    out=$(geo preview "$J1")
+    want="[layout-1] filename_format=j1/\$jobnum.\$filenum filesize=4G nrfiles=8 numjobs=4
+capacity before calibration: h1 needs ~128.0GiB, has 1024.0GiB available"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+# [a] and [b] share one namespace: both grids laid out, chained; the measured
+# sections cost the larger (16 GiB), the layout its 20 GiB total, which wins
+t_assert "layout geometry: two sections of one namespace each get a layout grid; capacity prices them" bash -c '
+    out=$(geo plain "$J2")
+    want="[layout-1] filename_format=j2/\$jobnum.\$filenum filesize=1G nrfiles=2 numjobs=8 [layout-2] wait_for=layout-1 filename_format=j2/\$jobnum.\$filenum filesize=2G numjobs=2
+capacity: h1 needs ~20.0GiB, has 1024.0GiB available"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "layout geometry: a [global]-only jobfile lays out and prices as before" bash -c '
+    out=$(geo plain -)
+    want="[bw] filesize=10G numjobs=4
+capacity: h1 needs ~40.0GiB, has 1024.0GiB available"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
 # --- stage_variants: per-host jobfile staging (Task 8) ---
 t_assert "non-auto staging produces per-host variants" bash -c '
     source ./tests/helpers.sh; tuner_fixture
