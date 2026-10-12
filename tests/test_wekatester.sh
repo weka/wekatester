@@ -2656,6 +2656,47 @@ t_assert "stamping: a jobfile cpus_allowed inside the host's cpus stages unchang
      stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
     [ -z "$err" ] || { echo "a note: $err" >&2; exit 1; }
     [ "$(grep -c "^cpus_allowed=" "$d/jobs/h1/011-a.job")" = 1 ] && grep -qx "cpus_allowed=3,4" "$d/jobs/h1/011-a.job"'
+# fio reads "2-5, 7" whole (atoi per item); the trim read it only to the
+# first blank, so cpus after it were dropped or never checked (Bugbot).
+t_assert "stamping: a jobfile cpu list with blanks is read whole: inside the host's cpus it stages canonically, with no note" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "0-15\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\ncpus_allowed=2-5, 7\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
+    [ -z "$err" ] || { echo "a note: $err" >&2; exit 1; }
+    a=$d/jobs/h1/011-a.job
+    [ "$(grep -c "cpus_allowed=" "$a")" = 1 ] && grep -qx "cpus_allowed=2-5,7" "$a" || { cat "$a" >&2; exit 1; }'
+t_assert "stamping: a jobfile cpu list with blanks reaching outside the host's cpus keeps every cpu after the blank, with the note" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1)
+     AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+     printf "2-15\n" > "$AUTH_DIR/h1.cpus"
+     printf "[global]\ncpus_allowed=0-3, 8\n[a]\nrw=read\n" > "$d/jobs/h1/011-a.job"
+     stamp_unique_names) 2>&1 >>$WT_ASIDE ) || { echo "stamp failed: $err" >&2; exit 1; }
+    a=$d/jobs/h1/011-a.job
+    [ "$(grep -c "cpus_allowed=" "$a")" = 1 ] && grep -qx "cpus_allowed=2-3,8" "$a" || { cat "$a" >&2; exit 1; }
+    case "$err" in
+        *"note: h1: jobfile 011-a.job: cpus_allowed (0-3, 8) includes cpus outside this host"*"s fio cpus (2-15); executing on the remainder (2-3,8)"*) ;;
+        *) echo "note: $err" >&2; exit 1 ;;
+    esac'
+t_assert "stamping: a jobfile cpus_allowed that is not a cpu list still stops the run, blanks or not" bash -c '
+    for v in "0-3 foo" "2 5"; do
+        d=$(mktemp -d)
+        err=$( (source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1)
+         AUTH_DIR=$d/auth; mkdir -p "$AUTH_DIR" "$d/jobs/h1"
+         printf "0-15\n" > "$AUTH_DIR/h1.cpus"
+         printf "[global]\ncpus_allowed=%s\n[a]\nrw=read\n" "$v" > "$d/jobs/h1/011-a.job"
+         stamp_unique_names) 2>&1 >>$WT_ASIDE ) && { echo "$v: no stop" >&2; exit 1; }
+        case "$err" in
+            *"h1: jobfile 011-a.job: cpus_allowed ($v) is not a cpu list"*) ;;
+            *) echo "$v: $err" >&2; exit 1 ;;
+        esac
+    done'
 t_assert "stamping: blank-spelled filename_format, unique_filename and cpus_allowed_policy lines are read as fio reads them" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

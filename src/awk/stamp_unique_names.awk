@@ -1,7 +1,10 @@
 # A jobfile's own cpu list against the host's fio cpus (auth/<host>.cpus):
-# "" when inside them, else the trimmed line, with a note; nothing left stops
-function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
-    v = jf_word(s)
+# "" when inside them as written, else the line canonical (blanks dropped, or
+# trimmed with a note); nothing left stops. The whole value: fio reads
+# "2-5, 7" as 2-5 and 7 (atoi per item), and py_int strips each item too.
+function trim_cpus(host, path, s, cpus,    v, w, job, REQ, EFF, RUN, c, run) {
+    v = jf_value(s); w = v
+    gsub(/[ \t\n\013\014\r\034\035\036\037]+/, "", w)
     job = path; sub(/.*\//, "", job)
     parse_cpulist(cpus, EFF)
     if (!parse_cpulist(v, REQ) || !set_any(REQ))
@@ -9,7 +12,7 @@ function trim_cpus(host, path, s, cpus,    v, job, REQ, EFF, RUN, c, run) {
     for (c in REQ) if (c in EFF) RUN[c] = 1
     if (!set_any(RUN))
         awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ") -- list cpus within it, or drop the line and staging fills it in")
-    if (set_size(RUN) == set_size(REQ)) return ""
+    if (set_size(RUN) == set_size(REQ)) return w == v ? "" : "cpus_allowed=" w
     run = fmt_cpulist(RUN)
     print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")" > "/dev/stderr"
     return "cpus_allowed=" run
