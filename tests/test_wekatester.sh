@@ -7063,12 +7063,16 @@ t_assert "kernel log: dmesg refused and no escalator falls back to journalctl -k
     diff <(printf "%s\n" "dmesg: read kernel buffer failed: Operation not permitted" "(dmesg exited 1)" \
         "not available: dmesg failed as a non-root user and no passwordless escalator works" \
         "# journalctl -k --since @$E (the run start)" "journalctl -k --no-pager -o short-iso --since @$E") "$d/out/sysinfo/h1/kernel-log-end" >&2'
-t_assert "kernel log: the last 2000 lines are kept and the drop is said; an empty window is said" bash -c '
+t_assert "kernel log: the last 2000 lines are kept and the drop is said; an overwritten start, a boot inside the run and an empty window are said" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
     for i in $(seq 1 2500); do echo "[  950.000000] line $i"; done > "$d/dmesg.out"
     nic_pressure "$d" end "$(( $(date +%s) - 100 ))"; k=$d/out/sysinfo/h1/kernel-log-end
-    [ "$(sed -n 2p "$k")" = "(500 earlier lines dropped: the last 2000 kept)" ] && [ "$(sed -n 3p "$k")" = "[  950.000000] line 501" ] &&
-    [ "$(tail -n 1 "$k")" = "[  950.000000] line 2500" ] && [ "$(wc -l < "$k")" -eq 2002 ] || { head -n 3 "$k"; exit 1; } >&2
+    [ "$(sed -n 2p "$k")" = "(the oldest line in the buffer is at 950 s, after the run start: earlier lines were overwritten)" ] &&
+    [ "$(sed -n 3p "$k")" = "(500 earlier lines dropped: the last 2000 kept)" ] && [ "$(sed -n 4p "$k")" = "[  950.000000] line 501" ] &&
+    [ "$(tail -n 1 "$k")" = "[  950.000000] line 2500" ] && [ "$(wc -l < "$k")" -eq 2003 ] || { head -n 4 "$k"; exit 1; } >&2
+    echo "[  950.000000] line 1" > "$d/dmesg.out"; rm -rf "$d/out"; nic_pressure "$d" end "$(( $(date +%s) - 2000 ))"
+    [ "$(sed -n 2p "$k")" = "(this host booted after the run start: dmesg holds nothing from before the boot)" ] &&
+    [ "$(sed -n 3p "$k")" = "[  950.000000] line 1" ] || { head -n 3 "$k"; exit 1; } >&2
     printf "[  100.000000] long before\n" > "$d/dmesg.out"; rm -rf "$d/out"
     nic_pressure "$d" end "$(( $(date +%s) - 100 ))"
     [ "$(tail -n 1 "$k")" = "(no kernel log line in the window)" ] || { cat "$k"; exit 1; } >&2'

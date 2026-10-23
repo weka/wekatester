@@ -190,9 +190,11 @@ pressure_counters_cmd() {
 kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
     printf '_ks=%s\n' "$1"
     printf '%s' '_kring() { awk -v s="$1" -v m=2000 '\''
-        s != "" && match($0, /^\[ *[0-9]+\.[0-9]+\]/) { t = substr($0, 2, RLENGTH - 2) + 0; on = (t >= s + 0) }
+        s != "" && match($0, /^\[ *[0-9]+\.[0-9]+\]/) { t = substr($0, 2, RLENGTH - 2) + 0; if (!seen++) first = t; on = (t >= s + 0) }
         s == "" || on { L[n++ % m] = $0 }
-        END { if (!n) print "(no kernel log line in the window)"; i = n > m ? n - m : 0; if (i) print "(" i " earlier lines dropped: the last " m " kept)"; for (; i < n; i++) print L[i % m] }'\''; }
+        END { if (s != "" && s + 0 < 0) print "(this host booted after the run start: dmesg holds nothing from before the boot)"
+            else if (seen && first > s + 0) print "(the oldest line in the buffer is at " first " s, after the run start: earlier lines were overwritten)"
+            if (!n) print "(no kernel log line in the window)"; i = n > m ? n - m : 0; if (i) print "(" i " earlier lines dropped: the last " m " kept)"; for (; i < n; i++) print L[i % m] }'\''; }
     echo "=== WEKATESTER_SYSINFO kernel-log ==="
     _kr=; _kw=
     if [ -r "$_sr/proc/uptime" ]; then read -r _up _o < "$_sr/proc/uptime"; _kr=$(( _ks - $(date +%s) + ${_up%.*} - 1 )); fi
