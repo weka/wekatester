@@ -1748,6 +1748,34 @@ t_assert "run bundle: a failing pigz keeps the directory and says so; finalize r
         *"ERROR: could not compress $d/res/20260101-000005; leaving it uncompressed"*"finalize returned"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+t_assert "run bundle: cmdline is the argv shell-quoted, \$0 first; settings holds what it resolved to" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester
+     RUN_DIR=$d; ARGV_TYPED=(./wekatester -a cal:15 -w "my set" "" "it'\''s" h1 h2)
+     parse_args -a cal:15 -w "my set" h1 h2; record_run) >>$WT_ASIDE 2>&1 || exit 1
+    eval "a=($(cat "$d/cmdline"))"
+    [ ${#a[@]} -eq 9 ] && [ "${a[0]}" = ./wekatester ] && [ "${a[4]}" = "my set" ] && [ -z "${a[5]}" ] &&
+    [ "${a[6]}" = "it'\''s" ] && [ "${a[8]}" = h2 ] && [ "$(wc -l < "$d/cmdline")" -eq 1 ] || { cat "$d/cmdline" >&2; exit 1; }
+    [ "$(cat "$d/settings")" = "$(printf "version\t%s\nworkload\tmy set\nauto\tcal\ncal-seconds\t15\nmaster\th1\nhosts\th1 h2" \
+        "$(./wekatester --version | sed "s/.* //")")" ] || { cat "$d/settings" >&2; false; }'
+t_assert "run bundle: no -a records auto and cal-seconds as -; sourced runs (no argv) write no cmdline" bash -c '
+    d=$(mktemp -d)
+    (source ./wekatester; RUN_DIR=$d; parse_args h1; record_run) >>$WT_ASIDE 2>&1 || exit 1
+    [ ! -e "$d/cmdline" ] && grep -q "^auto	-$" "$d/settings" && grep -q "^cal-seconds	-$" "$d/settings"'
+t_assert "run bundle: the run records argv and settings right after the run dir exists, before the log starts" bash -c '
+    m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
+    seq=$(printf "%s\n" "$m" | grep -A2 "mkdir \"\$RUN_DIR\"" | sed "s/^ *//;s/ *||.*//" | tr "\n" "|")
+    [ "$seq" = "mkdir \"\$RUN_DIR\"|record_run|start_run_log|" ] || { echo "$seq" >&2; exit 1; }
+    g=$(grep -A3 "BASH_SOURCE\[0\]" ./wekatester | sed "s/^ *//" | tr "\n" "|")
+    case "$g" in *"|ARGV_TYPED=(\"\$0\" \"\$@\")|parse_args \"\$@\"|main|") true;; *) echo "$g" >&2; false;; esac'
+t_assert "run bundle: fs groups are kept as fs-groups when a run dir exists, and not in a dry run" bash -c '
+    w=$(mktemp -d); r=$(mktemp -d)
+    (source ./wekatester
+     WORK_DIR=$w; RUN_DIR=$r; HOSTS=(h1 h2 h3); GROUP_FILE=.g.lst; DIRECTORY=/mnt/x
+     run_host() { case "$2" in (sha256sum*) case "$1" in (h3) echo "bbbb  f";; (*) echo "aaaa  f";; esac;; esac; }
+     collect_fs_groups
+     WORK_DIR=$(mktemp -d); RUN_DIR=""; collect_fs_groups; ls "$WORK_DIR" > "$w/dry") >>$WT_ASIDE 2>&1 || exit 1
+    [ "$(tr "\n" " " < "$r/fs-groups")" = "h1 1 h2 1 h3 2 " ] && grep -q "^groups$" "$w/dry"'
 
 # --- -s reads run bundles straight from the archive (nothing extracted) ---
 t_assert "-s summarizes every job in a bundle, in order, skipping layout results" bash -c '

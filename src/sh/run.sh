@@ -28,6 +28,22 @@ start_run_log() {
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
+# What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
+# settings holds what it resolved to, one "<key><tab><value>" per line.
+# Missing pieces only cost -s its header lines, never the run.
+record_run() {
+    local q
+    if [ ${#ARGV_TYPED[@]} -gt 0 ]; then
+        printf -v q '%q ' "${ARGV_TYPED[@]}"
+        printf '%s\n' "${q% }" > "$RUN_DIR/cmdline" \
+            || log "WARNING: could not record the command line in $RUN_DIR/cmdline" >&2
+    fi
+    q=-; ! cal_mode || q=$CAL_RUNTIME
+    printf 'version\t%s\nworkload\t%s\nauto\t%s\ncal-seconds\t%s\nmaster\t%s\nhosts\t%s\n' \
+        "$VERSION" "$WORKLOAD" "${AUTO_LEVEL:--}" "$q" "$MASTER" "${HOSTS[*]}" > "$RUN_DIR/settings" \
+        || log "WARNING: could not record the run settings in $RUN_DIR/settings" >&2
+}
+
 # Per-host system context, one file per item under sysinfo/<host>/ (README,
 # Output). A missing tool or file records "not available".
 snapshot_sysinfo() {

@@ -32,6 +32,7 @@ RUN_EPOCH=""                    # the same run start, in epoch seconds
 RUN_DIR=""                      # $OUTPUT_DIR/$RUN_STAMP: results, log, jobfiles
 VERBOSITY=0
 SUMMARIZE_FILE=""               # -s: just summarize an existing results file
+ARGV_TYPED=()                   # the command line as typed, $0 first (record_run)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Run-shape flags.
@@ -551,6 +552,7 @@ main() {
     printf -v RUN_STAMP '%(%Y%m%d-%H%M%S)T' "$RUN_EPOCH"
     RUN_DIR="$OUTPUT_DIR/$RUN_STAMP"
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
+    record_run
     start_run_log
     replay_prerun_warnings
     snapshot_sysinfo
@@ -583,6 +585,7 @@ main() {
 
 # run only when executed, not when sourced (tests source this file)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    ARGV_TYPED=("$0" "$@")
     parse_args "$@"
     main
 fi

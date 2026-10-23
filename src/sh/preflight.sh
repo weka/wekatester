@@ -258,6 +258,9 @@ collect_fs_groups() {
     done
     GROUP_FILE_REMOVED=1
     awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
+    # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
+    [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
+        || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
     # the count, then each group's members, from one awk: a pass per group
     # was groups x hosts when every host has its own directory
     summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")
