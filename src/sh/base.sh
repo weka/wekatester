@@ -108,6 +108,22 @@ ere_quote_v() {   # ere_quote_v <string> -> ERE_QUOTED
     ERE_QUOTED=$q
 }
 
+# Every passwordless escalator a sweep tries, in this order (site tools
+# before sudo, each with its no-prompt flag), and how long each try may
+# take. Remote strings word the list with escalator_words_v.
+ESCALATORS=("dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n")
+ESCALATOR_TIMEOUT=5
+# a multi-word entry in <q> quotes, or with / the tool names for a message
+escalator_words_v() {   # escalator_words_v <'|"|/> -> ESCALATOR_WORDS
+    local e w=
+    for e in "${ESCALATORS[@]}"; do
+        if [ "$1" = / ]; then w+=${w:+/}${e%% *}
+        elif [ "$e" != "${e% *}" ]; then w+=${w:+ }$1$e$1
+        else w+=${w:+ }$e; fi
+    done
+    ESCALATOR_WORDS=$w
+}
+
 # No server given: benchmark this host over loopback; only the transport
 # changes.
 resolve_local_mode() {

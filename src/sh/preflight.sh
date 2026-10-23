@@ -32,11 +32,12 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order): a root fio needs one. still() keeps the pids alive
         # and still ours: a zombie is gone, and a reused pid is not ours.
+        escalator_words_v "'"
         LOCK_CMD+="; still() { l2=; for p in \$left; do a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout 5 \$pc kill -9 \$left 2>&1) && break; done; sleep 1; still; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout $ESCALATOR_TIMEOUT \$pc kill -9 \$left 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
         # every earlier run's group file in this host's destination (dd,

@@ -13,6 +13,7 @@ probe_remote_cmd() {
     # no list, is bindable_err and why, whatever the cpuset: fio launches
     # under taskset -c. bindable_priv: what the escalator's cgroup adds, "-"
     # if unknown.
+    escalator_words_v "'"
     printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
         echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
@@ -23,7 +24,7 @@ probe_remote_cmd() {
         echo \"isolated \$([ -f \"\$_sr/sys/devices/system/cpu/isolated\" ] && cat \"\$_sr/sys/devices/system/cpu/isolated\")\"; \
         echo \"online \$([ -r \"\$_sr/sys/devices/system/cpu/online\" ] && cat \"\$_sr/sys/devices/system/cpu/online\")\"; \
         echo \"ident \$(if [ -r /sys/class/dmi/id/product_uuid ]; then cat /sys/class/dmi/id/product_uuid; elif [ -r /etc/machine-id ]; then cat /etc/machine-id; fi)\"; \
-        _pv=; for pc in 'dzdo -n' pbrun sesu pmrun 'doas -n' 'ksu -e' 'sudo -n'; do set -- \$pc; _o=\$(command -v \$1) || continue; if _o=\$(timeout 5 \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
+        _pv=; for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue; if _o=\$(timeout $ESCALATOR_TIMEOUT \$pc true </dev/null 2>&1); then echo \"priv \$pc\"; _pv=\$pc; break; fi; done; \
         _cpuset() { printf '%s\\n' \"\$1\" | awk -F: '\$2 ~ /(^|,)cpuset(,|\$)/ {v1 = 1; d1 = \"/sys/fs/cgroup/\" \$2; p1 = substr(\$0, length(\$1) + length(\$2) + 3)} \$1 == \"0\" && \$2 == \"\" {v2 = 1; p2 = substr(\$0, 4)} \
             END {if (v1) {d = d1; p = p1} else if (v2) {d = \"/sys/fs/cgroup\"; p = p2} else exit; \
                 for (;;) {if (p == \"/\") p = \"\"; if (v1) {print d p \"/cpuset.effective_cpus\"; print d p \"/cpuset.cpus\"} else print d p \"/cpuset.cpus.effective\"; if (p == \"\") break; sub(/\\/[^\\/]*\$/, \"\", p)}}' \
@@ -355,7 +356,8 @@ check_cpu_pinning() {
                     log "ERROR: $host: effective cpus_allowed: $effective (requested: $req)" >&2
                     log "ERROR: $host: current taskset:        ${cur:-unknown}" >&2
                     log "ERROR: $host: weka dedicated cores:   $dedicated" >&2
-                    die "$host: the effective cpus are outside the current taskset and no passwordless escalator (dzdo/pbrun/sesu/pmrun/doas/ksu/sudo) works"
+                    escalator_words_v /
+                    die "$host: the effective cpus are outside the current taskset and no passwordless escalator ($ESCALATOR_WORDS) works"
                 fi ;;
         esac
         # escalate ONLY where the effective mask cannot be self-applied:

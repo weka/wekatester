@@ -112,6 +112,7 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
 # - when none; _pl labels its values). _priv finds the first passwordless
 # escalator (the probe's order), once. WEKATESTER_SYSROOT is for the suite.
 remote_helpers_cmd() {
+    escalator_words_v '"'
     printf '%s' '_sr=${WEKATESTER_SYSROOT:-}
     _nc() {
         if ! _o=$(command -v "$1"); then echo "not available: $1 not installed"; return 1; fi
@@ -141,9 +142,9 @@ remote_helpers_cmd() {
     _priv() {
         if [ $_ps -eq 0 ]; then
             _ps=1
-            for _pc in "dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n"; do
+            for _pc in '"$ESCALATOR_WORDS"'; do
                 _o=$(command -v "${_pc%% *}") || continue
-                if _o=$(timeout 5 $_pc true </dev/null 2>&1); then _pv=$_pc; break; fi
+                if _o=$(timeout '"$ESCALATOR_TIMEOUT"' $_pc true </dev/null 2>&1); then _pv=$_pc; break; fi
             done
         fi
         [ -n "$_pv" ]
