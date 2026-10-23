@@ -464,6 +464,35 @@ EOF
 }
 export -f lock_fixture
 
+# --- fio version check: preflight in remote mode over the lock fixture ---
+# fv_preflight <allow 0|1> <host>=<version|FAIL|EMPTY>..., after a fresh
+# lock_fixture: each session runs here under bash with that host's fio stub
+# and lock dir; $LK/sent.<host> holds what it was sent. Prints the output,
+# FIO_VERSION_NOTE= and settings; returns preflight's status.
+fv_preflight() {
+    local a=$1 kv h; shift
+    export WEKATESTER_LOCK_DIR=$LK/lock
+    for kv in "$@"; do
+        h=${kv%%=*}; mkdir -p "$LK/v/$h"
+        case ${kv#*=} in
+            (FAIL)  printf '#!/bin/sh\necho "fio: cannot load libaio" >&2\nexit 3\n' ;;
+            (EMPTY) printf '#!/bin/sh\nexit 0\n' ;;
+            (*)     printf '#!/bin/sh\necho "%s"\n' "${kv#*=}" ;;
+        esac > "$LK/v/$h/fio"
+        chmod +x "$LK/v/$h/fio"
+        printf '%s\n' "$h" >> "$LK/hosts"
+    done
+    (export WEKATESTER_TARGET_DIR="$LK/tgt"
+     source ./wekatester
+     mapfile -t HOSTS < "$LK/hosts"
+     LOCAL_MODE=0; MASTER=${HOSTS[0]}; FIO_BIN=fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w; ALLOW_FIO_MISMATCH=$a
+     run_host() { printf '%s\n' "$2" >> "$LK/sent.$1"; PATH="$LK/v/$1:$LK/bin:$PATH" bash -c "${2//"$LOCK_DIR"/"$LOCK_DIR.$1"}"; }
+     preflight 2>&1 || exit
+     echo "FIO_VERSION_NOTE=$FIO_VERSION_NOTE"
+     RUN_DIR=$LK/run; mkdir -p "$RUN_DIR"; record_run; cat "$RUN_DIR/settings")
+}
+export -f fv_preflight
+
 # --- sysinfo receive path: a fake sysroot and a closed PATH ---
 # nic_fixture <dir>: <dir>/root holds eth0 (0000:17:00.0, mlx5_core, numa 1,
 # two MSI irqs, the second with no affinity file, AER correctable and

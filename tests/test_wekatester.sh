@@ -1086,6 +1086,63 @@ t_assert "run lock: --break-lock with no group files in the destination still he
     case "$out" in *"No such file"*|*wekatester-group*) echo "$out" >&2; exit 1;; esac
     [ "$(ls -A "$LK/dest")" = keep ] || { ls -A "$LK/dest" >&2; false; }'
 
+# --- one fio version across the hosts: read in preflight's own session ---
+t_assert "--allow-fio-mismatch (long only) sets the override; it defaults off" bash -c '
+    (source ./wekatester; parse_args h1 h2; [ "$ALLOW_FIO_MISMATCH" -eq 0 ]) &&
+    (source ./wekatester; parse_args --allow-fio-mismatch h1 h2; [ "$ALLOW_FIO_MISMATCH" -eq 1 ] && [ "${HOSTS[*]}" = "h1 h2" ])'
+t_assert "fio version: two versions on three hosts stop preflight, each version named with its hosts, in one session per host" bash -c '
+    source ./tests/helpers.sh
+    lock_fixture; out=$(fv_preflight 0 h1=fio-3.28 h2=fio-3.35 h3=fio-3.28) && { echo "passed: $out" >&2; exit 1; }
+    want="ERROR: fio differs across the hosts, 2 versions on 3 hosts, and fio'"'"'s client/server protocol is version-sensitive
+ERROR:   fio-3.28 on 2 host(s): h1 h3
+ERROR:   fio-3.35 on 1 host(s): h2
+ERROR: fio differs across the hosts (2 versions): the run stopped before any fio server started -- install one fio version on every host, or --allow-fio-mismatch runs anyway"
+    diff <(printf "%s\n" "$want") <(printf "%s\n" "$out" | grep "ERROR" | sed "s/^[0-9:]* //") >&2 || exit 1
+    for h in h1 h2 h3; do [ "$(grep -c "fio-version" "$LK/sent.$h")" -eq 1 ] && [ "$(wc -l < "$LK/sent.$h")" -eq 1 ] || { echo "$h: not one session carrying the read" >&2; exit 1; }; done'
+t_assert "fio version: one version everywhere passes and says which" bash -c '
+    source ./tests/helpers.sh
+    lock_fixture; out=$(fv_preflight 0 h1=fio-3.35 h2=fio-3.35 h3=fio-3.35) || { echo "$out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -q "fio version: fio-3.35 on all 3 hosts$" &&
+    printf "%s\n" "$out" | grep -qx "FIO_VERSION_NOTE=fio-3.35 on all 3 hosts" &&
+    ! printf "%s\n" "$out" | grep -q "ERROR\|WARNING\|allow-fio-mismatch" || { echo "$out" >&2; false; }'
+t_assert "fio version: a host whose fio --version fails or prints nothing stops the run, named, --allow-fio-mismatch or not" bash -c '
+    source ./tests/helpers.sh
+    for a in 0 1; do
+        lock_fixture; out=$(fv_preflight $a h1=fio-3.35 h2=FAIL h3=EMPTY h4=fio-3.35) && { echo "allow=$a passed: $out" >&2; exit 1; }
+        case "$out" in *"ERROR: h2: fio --version exited 3: fio: cannot load libaio"*"ERROR: h3: fio --version printed nothing"*"cannot read the fio version on 2 of 4 host(s), so there is nothing to compare"*) ;;
+            *) echo "allow=$a: $out" >&2; exit 1;; esac
+        case "$out" in *h1:*|*h4:*|*"fio differs"*) echo "allow=$a: $out" >&2; exit 1;; esac
+    done'
+t_assert "fio version: --allow-fio-mismatch prints the same grouped table as a WARNING, goes on, and the settings record it" bash -c '
+    source ./tests/helpers.sh
+    lock_fixture; out=$(fv_preflight 1 h1=fio-3.28 h2=fio-3.35 h3=fio-3.28) || { echo "stopped: $out" >&2; exit 1; }
+    case "$out" in *"WARNING: fio differs across the hosts, 2 versions on 3 hosts"*"--allow-fio-mismatch runs anyway"*"WARNING:   fio-3.28 on 2 host(s): h1 h3"*"WARNING:   fio-3.35 on 1 host(s): h2"*) ;; *) echo "$out" >&2; exit 1;; esac
+    case "$out" in *ERROR*) echo "$out" >&2; exit 1;; esac
+    printf "%s\n" "$out" | grep -qx "allow-fio-mismatch	versions differ, run anyway (--allow-fio-mismatch): fio-3.28 on 2 host(s): h1 h3; fio-3.35 on 1 host(s): h2" || { echo "$out" >&2; false; }'
+t_assert "fio version: past eight hosts a version names eight and counts the rest" bash -c '
+    source ./tests/helpers.sh
+    hs=(); for i in $(seq 1 11); do hs+=("h$i=fio-3.35"); done
+    lock_fixture; out=$(fv_preflight 0 "${hs[@]}" g1=fio-3.28) && { echo "passed: $out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -q "ERROR:   fio-3.35 on 11 host(s): h1 h2 h3 h4 h5 h6 h7 h8 (+3 more)$" &&
+    printf "%s\n" "$out" | grep -q "ERROR:   fio-3.28 on 1 host(s): g1$" || { echo "$out" >&2; false; }'
+t_assert "fio version: local mode and a single host read no version and compare nothing" bash -c '
+    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_LOCK_DIR=$LK/lock
+    out=$( (export PATH="$LK/bin:$PATH" WEKATESTER_TARGET_DIR="$LK/tgt"; source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=$LK/bin/fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w
+            run_host() { printf "%s\n" "$2" >> "$LK/sent"; bash -c "$2"; }
+            preflight 2>&1; echo "N=$FIO_VERSION_NOTE") ) || { echo "$out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -qx "N=one host, nothing to compare" || { echo "local: $out" >&2; exit 1; }
+    [ -s "$LK/sent" ] && ! grep -q -- "--version" "$LK/sent" || { echo "local mode read a version, or sent nothing" >&2; exit 1; }
+    # one remote host whose fio prints nothing: nothing to compare, no stop
+    lock_fixture; out=$(fv_preflight 0 h1=EMPTY) || { echo "one host stopped: $out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -qx "FIO_VERSION_NOTE=one host, nothing to compare" &&
+    [ -s "$LK/sent.h1" ] && ! grep -q -- "--version" "$LK/sent.h1" || { echo "one host: $out" >&2; false; }'
+t_assert "fio version: a dry run runs the check (preflight, before the dry-run branch) and its report prints the result" bash -c '
+    sed -n "/^preflight() {/,/^}/p" ./wekatester | grep -q "^    check_fio_versions$" &&
+    sed -n "/^main() {/,/^}/p" ./wekatester | awk "/^    preflight$/ {p = NR} /DRY_RUN\" -eq 1/ {d = NR} END {exit !(p && d > p)}" || { echo "check not on the dry-run path" >&2; exit 1; }
+    out=$(source ./wekatester; HOSTS=(h1 h2); MASTER=h1; JOBFILES=(); FIO_VERSION_NOTE="fio-3.35 on all 2 hosts"; dry_run_report 2>&1)
+    printf "%s\n" "$out" | grep -q "fio version: fio-3.35 on all 2 hosts$" || { echo "$out" >&2; false; }'
+
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
 # operator to remount forcedirect then points away from the real fault, which
 # for a bare run is usually that -d defaults to a /mnt/weka that does not exist.
@@ -7564,7 +7621,7 @@ t_assert "help: every parsed option appears in -h as its own token" bash -c '
     miss=""
     for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -v -h \
              --output --engine --password --targets --duration --unlink \
-             --auto --ignore-capacity --any-fs --identity --version --help; do
+             --auto --ignore-capacity --any-fs --allow-fio-mismatch --identity --version --help; do
         printf "%s\n" "$h" | grep -qE -- "(^|[[:space:][(])${o}([^-A-Za-z0-9]|$)" ||
             miss="$miss $o"
     done

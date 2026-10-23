@@ -42,6 +42,10 @@ record_run() {
     printf 'version\t%s\nworkload\t%s\nauto\t%s\ncal-seconds\t%s\nmaster\t%s\nhosts\t%s\n' \
         "$VERSION" "$WORKLOAD" "${AUTO_LEVEL:--}" "$q" "$MASTER" "${HOSTS[*]}" > "$RUN_DIR/settings" \
         || log "WARNING: could not record the run settings in $RUN_DIR/settings" >&2
+    # the override, only when given: what the version check found
+    [ "$ALLOW_FIO_MISMATCH" -eq 0 ] \
+        || printf 'allow-fio-mismatch\t%s\n' "${FIO_VERSION_NOTE:-not checked}" >> "$RUN_DIR/settings" \
+        || log "WARNING: could not record --allow-fio-mismatch in $RUN_DIR/settings" >&2
 }
 
 # Per-host system context, one file per item under sysinfo/<host>/ (README,
@@ -344,6 +348,7 @@ dry_run_report() {
     fi
     log "workload source: $JOBFILE_SRC"
     log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
+    log "fio version: ${FIO_VERSION_NOTE:-not checked}"
     [ "$ANY_FS" -eq 0 ] || log "destination: the filesystem-type check was off (--any-fs); the WARNING above names what -d is on"
     for job in "${JOBFILES[@]}"; do
         echo

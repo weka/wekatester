@@ -59,27 +59,39 @@ lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
 
 # Every host reachable over ssh with $FIO_BIN, checked in parallel, every
 # failure reported. Each check opens the host ControlMaster for the run, and
-# takes the run lock.
+# takes the run lock. With two hosts or more the same session first prints
+# fio --version as "fio-version <rc> <first line>", for check_fio_versions.
+FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
         log "checking $FIO_BIN on the local host..."
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc held=0 line
+    local pids=() failed=() host i rc held=0 line l got fv=""
     [ -n "$LOCK_TOKEN" ] || lock_token
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
     load_host_dirs
+    [ ${#HOSTS[@]} -lt 2 ] \
+        || fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
+    FIO_VERSIONS=()
     for i in "${!HOSTS[@]}"; do
-        run_host "${HOSTS[$i]}" "dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
+        run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
     done
     for i in "${!HOSTS[@]}"; do
         host=${HOSTS[$i]}
         wait "${pids[$i]}"
         rc=$?
-        line=""; [ ! -s "$WORK_DIR/lock/$i" ] || IFS= read -r line < "$WORK_DIR/lock/$i" || :
+        # the lock's line is the first one that is not the version's
+        line=""; got=0
+        while IFS= read -r l || [ -n "$l" ]; do
+            case $l in
+                ("fio-version "*) [ -n "${FIO_VERSIONS[$i]+set}" ] || FIO_VERSIONS[$i]=${l#fio-version } ;;
+                (*) [ "$got" -eq 1 ] || { line=$l; got=1; } ;;
+            esac
+        done < "$WORK_DIR/lock/$i"
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
@@ -105,6 +117,65 @@ preflight() {
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
     debug "preflight passed on all hosts"
+    check_fio_versions
+}
+
+# fio's client/server protocol is version-sensitive (README, Caveats): every
+# host's fio --version must print one first line. A failed or empty one
+# stops the run; differing versions do too, unless --allow-fio-mismatch
+# (a warning). FIO_VERSION_NOTE says what was found.
+FIO_VERSION_NOTE=""
+check_fio_versions() {
+    if [ ${#HOSTS[@]} -lt 2 ]; then
+        FIO_VERSION_NOTE="one host, nothing to compare"
+        debug "fio version: $FIO_VERSION_NOTE"
+        return 0
+    fi
+    local i k v rc bad=() vers=() cnt=() who=() rows=() why
+    for i in "${!HOSTS[@]}"; do
+        if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
+            bad+=("${HOSTS[$i]}: no fio --version line came back from its preflight session"); continue
+        fi
+        v=${FIO_VERSIONS[$i]}; rc=${v%% *}; v=${v#"$rc"}; v=${v# }
+        if [ "$rc" != 0 ]; then
+            bad+=("${HOSTS[$i]}: $FIO_BIN --version exited $rc${v:+: $v}"); continue
+        elif [ -z "$v" ]; then
+            bad+=("${HOSTS[$i]}: $FIO_BIN --version printed nothing"); continue
+        fi
+        # few distinct versions: a scan, never the version as an array key
+        for ((k = 0; k < ${#vers[@]}; k++)); do [ "${vers[$k]}" != "$v" ] || break; done
+        [ "$k" -lt ${#vers[@]} ] || { vers[$k]=$v; cnt[$k]=0; who[$k]=""; }
+        cnt[$k]=$((cnt[$k] + 1))
+        [ "${cnt[$k]}" -gt 8 ] || who[$k]+=${who[$k]:+ }${HOSTS[$i]}
+    done
+    for k in "${!vers[@]}"; do
+        rows[$k]="${vers[$k]} on ${cnt[$k]} host(s): ${who[$k]}"
+        [ "${cnt[$k]}" -le 8 ] || rows[$k]+=" (+$((cnt[$k] - 8)) more)"
+    done
+    if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
+        FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
+        log "fio version: $FIO_VERSION_NOTE"
+        return 0
+    fi
+    why="fio differs across the hosts, ${#vers[@]} versions on ${#HOSTS[@]} hosts, and fio's client/server protocol is version-sensitive"
+    if [ ${#bad[@]} -eq 0 ] && [ "$ALLOW_FIO_MISMATCH" -eq 1 ]; then
+        warn_prerun "$why; --allow-fio-mismatch runs anyway, so a failure may read confusingly"
+        FIO_VERSION_NOTE="versions differ, run anyway (--allow-fio-mismatch):"
+        for k in "${!rows[@]}"; do
+            warn_prerun "  ${rows[$k]}"
+            FIO_VERSION_NOTE+=" ${rows[$k]};"
+        done
+        FIO_VERSION_NOTE=${FIO_VERSION_NOTE%;}
+        return 0
+    fi
+    for k in "${!bad[@]}"; do log "ERROR: ${bad[$k]}" >&2; done
+    if [ ${#vers[@]} -gt 1 ]; then
+        log "ERROR: $why" >&2
+        for k in "${!rows[@]}"; do log "ERROR:   ${rows[$k]}" >&2; done
+    fi
+    [ ${#bad[@]} -eq 0 ] \
+        || die "cannot read the fio version on ${#bad[@]} of ${#HOSTS[@]} host(s), so there is nothing to compare: the run stopped before any fio server started"
+    die "fio differs across the hosts (${#vers[@]} versions): the run stopped before any fio server started -- install one fio version on every host, or --allow-fio-mismatch runs anyway"
 }
 
 # --- phase 1b: mount mode verification ----------------------------------------

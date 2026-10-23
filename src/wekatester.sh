@@ -85,6 +85,7 @@ AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
+ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
 
 #@include sh/base.sh
 
@@ -93,6 +94,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
                   [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [--allow-fio-mismatch]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -154,6 +156,10 @@ attaching is the way to pass a value that starts with a dash.
                           any filesystem, a local disk included, and a
                           missing -d is created anywhere; the run log says
                           the check was off and what -d is on
+  --allow-fio-mismatch    run on when fio --version differs across the
+                          hosts: each version and its hosts print as a
+                          WARNING and the bundle's settings record it (a
+                          host whose fio --version fails still stops the run)
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -386,6 +392,7 @@ parse_args() {
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             --break-lock) BREAK_LOCK=1; shift ;;
             --any-fs) ANY_FS=1; shift ;;
+            --allow-fio-mismatch) ALLOW_FIO_MISMATCH=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
