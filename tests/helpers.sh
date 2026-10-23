@@ -561,3 +561,61 @@ bound_capture() {
      if [ "$what" = sysinfo ]; then snapshot_sysinfo; else snapshot_pressure "$what"; fi; echo "carried on") > "$d/console" 2>&1
 }
 export -f nic_fixture nic_virtio nic_sysinfo nic_pressure bound_capture
+
+# --- -s synopsis: run bundles to read back ---
+# summ_job <file> <report> <rw> <nj> <qd> <nr|-> <bs> [floor]: a staged jobfile
+summ_job() {
+    { [ -z "${8:-}" ] || printf '# wekatester-floor: %s at numjobs=iodepth=nrfiles=1 on every client, staged by wekatester\n' "$8"
+      printf '# report %s\n[global]\nioengine=libaio\ndirectory=/mnt/weka/wt\nnumjobs=%s\n' "$2" "$4"
+      [ "$6" = - ] || printf 'nrfiles=%s\n' "$6"
+      printf '[fio-createfiles-00]\ncreate_only=1\n[job]\nrw=%s\nbs=%s\niodepth=%s\n' "$3" "$7" "$5"; } > "$1"
+}
+# summ_weka <file> <version|->: weka local ps for one client container, or
+# no weka CLI
+summ_weka() {
+    if [ "$2" = - ]; then echo "weka: not available" > "$1"; return; fi
+    printf '%-11s%-14s%-9s%-8s%-12s%-6s%-6s%-9s%-13s%s\n' CONTAINER "CONTAINER ID" STATE STATUS UPTIME PID PORT VERSION "VALID LEASE" "LAST FAILURE" \
+        client 12 Running Ready 0:08:10h 10807 14000 "$2" True "" > "$1"
+}
+# summ_bundle_fixture <dir> <old|cal|plain>: <dir>/20261023-141002/, a run
+# bundle's tree. old: before cmdline/settings/fs-groups (2 hosts); cal: -a
+# cal with two shapes (h1 h2 rep h1, h3 rep h3); plain: 3 hosts, h3 runs
+# its bandwidth job at nj 8. Every host: fio-3.36 and weka 4.4.2 (cal's h3:
+# no weka CLI), /mnt/weka on wekafs, results for 011-bw and 021-lat.
+summ_bundle_fixture() {
+    local b=$1/20261023-141002 h hosts nj
+    case $2 in (old) hosts="h1 h2" ;; (*) hosts="h1 h2 h3" ;; esac
+    mkdir -p "$b"
+    for h in $hosts; do
+        mkdir -p "$b/sysinfo/$h" "$b/fio-jobfiles/$h"
+        echo fio-3.36 > "$b/sysinfo/$h/fio"
+        summ_weka "$b/sysinfo/$h/weka" 4.4.2
+        printf '/dev/sda1 / ext4 rw 0 0\nbackend/default /mnt/weka wekafs rw,relatime 0 0\n' > "$b/sysinfo/$h/mounts"
+        printf '%s sha256=abc\n[l]\ncreate_only=1\ndirectory=/mnt/weka/wt\n' "# wekatester-layout: generated" > "$b/fio-jobfiles/$h/000-wekatester-layout.job"
+        nj=4; [ "$2:$h" != plain:h3 ] || nj=8
+        [ "$2:$h" != cal:h3 ] || nj=2
+        summ_job "$b/fio-jobfiles/$h/011-bw.job" bandwidth read "$nj" 2 1 1Mi
+        summ_job "$b/fio-jobfiles/$h/021-lat-1job.job" "latency iops" randread 1 1 1 4k 021-lat.job
+        summ_job "$b/fio-jobfiles/$h/021-lat.job" "latency iops" randread 16 1 - 4k
+    done
+    fio_json_single_fixture "$b/results_011-bw.json"
+    fio_json_fixture "$b/results_021-lat.json"
+    printf '14:10:03 starting test run for job 011-bw.job on h1 with 2 workers:\n' > "$b/wekatester.log"
+    [ "$2" != old ] || return 0
+    printf './wekatester %s-w default h1 h2 h3\n' "$([ "$2" = cal ] && echo "-a cal ")" > "$b/cmdline"
+    printf 'version\t2026-10-11\nworkload\tdefault\nauto\t%s\ncal-seconds\t%s\nmaster\th1\nhosts\th1 h2 h3\n' \
+        "$([ "$2" = cal ] && echo cal || echo -)" "$([ "$2" = cal ] && echo 30 || echo -)" > "$b/settings"
+    printf 'h1 1\nh2 1\nh3 1\n' > "$b/fs-groups"
+    [ "$2" = cal ] || return 0
+    summ_weka "$b/sysinfo/h3/weka" -
+    mkdir -p "$b/cal"
+    printf '1\th1\t26\t0-31\t0-63\t50000000000\tio_uring,libaio\t-\t0\t-\t-\th1 h2\n2\th3\t12\t0-15\t0-31\t0\tlibaio\t-\t0\t-\t-\th3\n' > "$b/cal/shapes"
+    printf '%s\n' "shape 1 of 2: 2 host(s), calibrated on h1 -- Example CPU, 64 cpus, 512 GiB, weka NICs ens1 ens2: 2 x mlx5_core [0x15b3:0x101d] 200 Gb/s -> line rate 46.57 GiB/s" \
+        "  cores: N=26" "  hosts: h1 h2" \
+        "shape 2 of 2: 1 host(s), calibrated on h3 -- Example CPU, 32 cpus, 256 GiB, weka NICs: no line rate" "  cores: N=12" "  hosts: h3" > "$b/cal/shapes.txt"
+}
+# summ_out <dir> [option...]: the bundle tarred and -s run on it, every line
+summ_out() {
+    tar -czf "$1/b.tgz" -C "$1" 20261023-141002 && ./wekatester "${@:2}" -s "$1/b.tgz" 2>&1
+}
+export -f summ_job summ_weka summ_bundle_fixture summ_out fio_json_fixture fio_json_single_fixture

@@ -117,7 +117,8 @@ attaching is the way to pass a value that starts with a dash.
                  the calibration scratch files, which are otherwise kept
                  so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
-                 bundle .tgz, straight from the archive -- and exit
+                 bundle .tgz, straight from the archive, after a synopsis
+                 of the run (README, Output) -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
   --version      display version number and exit
   -h, --help     show this help and exit
@@ -679,6 +680,28 @@ Any run can be re-summarized later with `-s` — point it at the bundle (no extr
 
 ```
 ./wekatester -s results/20260808-231119.tgz
+```
+
+On a bundle, `-s` opens with a synopsis of the run, read only from what the bundle holds: `cmdline`, `settings` and `fs-groups`, each host's `sysinfo/` (`fio`, `weka`, `mounts`), `cal/shapes` and `shapes.txt`, and the staged jobfiles under `fio-jobfiles/`, which are what actually ran. Then come the per-job summaries, unchanged. With `-a`, each client shape shows its representative and the parameters its staged jobs ran, one line per job: the test type and direction (`bw`, `iops`, `lat`, or `lat1m` for the 1MiB latency test, `job` for a jobfile without a `# report` directive; `1job` marks the one-job latency twin), then `numjobs`, `iodepth`, `nrfiles` and `bs` from the job's measured sections. Without `-a`, there is one line per distinct parameter set, with the number of hosts that ran it. A knob the jobfile leaves unset shows `-`, where fio's own default applies. Anything the bundle does not hold says `not recorded`, never a guess. Bundles made before `cmdline`, `settings` and `fs-groups` existed show those fields as `not recorded`, and the master is read from the log instead. `-s` on a single `.json` prints only its summary.
+
+```
+run      2026-10-23 14:10:02 (bundle 20261023-141002.tgz)
+version  wekatester 2026-10-11, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
+command  ./wekatester -a cal -w default h1 h2 h3
+clients  3 (master h1), 2 shapes, 1 filesystem group
+workload default; -a cal (30 s cells); dest /mnt/weka/wt (wekafs)
+
+shape 1: 2 hosts, rep h1, N=26, line rate 400 Gb/s
+  Example CPU, 64 cpus, 512 GiB, weka NICs ens1 ens2: 2 x mlx5_core [0x15b3:0x101d] 200 Gb/s -> line rate 46.57 GiB/s
+  engine libaio
+  bw-read          nj 4     qd 2     nr 1     bs 1Mi     011-bw
+  lat-read 1job    nj 1     qd 1     nr 1     bs 4k      021-lat-1job
+  lat-read         nj 16    qd 1     nr -     bs 4k      021-lat
+shape 2: 1 host, rep h3, N=12, line rate unknown
+  ...
+
+==== 011-bw ====
+    read bandwidth: 2.00 GiB/s
 ```
 
 # Caveats

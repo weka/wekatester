@@ -1826,6 +1826,89 @@ t_assert "-s on a bundle with no results files errors" bash -c '
         *) echo "$out" >&2; false;;
     esac'
 
+# --- -s synopsis: the bundle's own record of the run, ahead of its jobs ---
+t_assert "-s synopsis: an -a bundle shows each shape's representative and the parameters its staged jobs ran" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" cal
+    out=$(summ_out "$d") || { echo "$out" >&2; exit 1; }
+    hdr=$(printf "%s\n" "$out" | awk "/^==== /{exit} {print}")
+    exp=$(cat <<"X"
+run      2026-10-23 14:10:02 (bundle b.tgz)
+version  wekatester 2026-10-11, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
+command  ./wekatester -a cal -w default h1 h2 h3
+clients  3 (master h1), 2 shapes, 1 filesystem group
+workload default; -a cal (30 s cells); dest /mnt/weka/wt (wekafs)
+
+shape 1: 2 hosts, rep h1, N=26, line rate 400 Gb/s
+  Example CPU, 64 cpus, 512 GiB, weka NICs ens1 ens2: 2 x mlx5_core [0x15b3:0x101d] 200 Gb/s -> line rate 46.57 GiB/s
+  engine libaio
+  bw-read          nj 4     qd 2     nr 1     bs 1Mi     011-bw
+  lat-read 1job    nj 1     qd 1     nr 1     bs 4k      021-lat-1job
+  lat-read         nj 16    qd 1     nr -     bs 4k      021-lat
+shape 2: 1 host, rep h3, N=12, line rate unknown
+  Example CPU, 32 cpus, 256 GiB, weka NICs: no line rate
+  engine libaio
+  bw-read          nj 2     qd 2     nr 1     bs 1Mi     011-bw
+  lat-read 1job    nj 1     qd 1     nr 1     bs 4k      021-lat-1job
+  lat-read         nj 16    qd 1     nr -     bs 4k      021-lat
+X
+)
+    [ "$hdr" = "$exp" ] || { printf "%s\n" "$out" >&2; exit 1; }
+    case "$out" in *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*"==== 021-lat ===="*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "-s synopsis: a run without -a shows one line per distinct parameter set, with its host count" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain
+    out=$(summ_out "$d") || { echo "$out" >&2; exit 1; }
+    hdr=$(printf "%s\n" "$out" | awk "/^==== /{exit} {print}")
+    exp=$(cat <<"X"
+run      2026-10-23 14:10:02 (bundle b.tgz)
+version  wekatester 2026-10-11, fio 3.36, weka 4.4.2
+command  ./wekatester -w default h1 h2 h3
+clients  3 (master h1), no shapes (no -a), 1 filesystem group
+workload default; no -a; dest /mnt/weka/wt (wekafs)
+
+parameters: the staged jobs per host (3 hosts)
+  engine libaio
+  bw-read          nj 4     qd 2     nr 1     bs 1Mi     011-bw         2 hosts: h1 h2
+  bw-read          nj 8     qd 2     nr 1     bs 1Mi     011-bw         1 host: h3
+  lat-read 1job    nj 1     qd 1     nr 1     bs 4k      021-lat-1job   all 3 hosts
+  lat-read         nj 16    qd 1     nr -     bs 4k      021-lat        all 3 hosts
+X
+)
+    [ "$hdr" = "$exp" ] || { printf "%s\n" "$out" >&2; false; }'
+t_assert "-s synopsis: an older bundle says what it does not record, and reads the master from the log" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" old
+    out=$(summ_out "$d") || { echo "$out" >&2; exit 1; }
+    hdr=$(printf "%s\n" "$out" | sed -n 1,5p)
+    exp=$(cat <<"X"
+run      2026-10-23 14:10:02 (bundle b.tgz)
+version  wekatester not recorded, fio 3.36, weka 4.4.2
+command  not recorded
+clients  2 (master h1), shapes not recorded, filesystem groups not recorded
+workload not recorded; -a not recorded; dest /mnt/weka/wt (wekafs)
+X
+)
+    [ "$hdr" = "$exp" ] || { printf "%s\n" "$out" >&2; false; }'
+t_assert "-s synopsis: a bundle missing sysinfo, jobfiles and log says not recorded, never a guess" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" old
+    b=$d/20261023-141002; rm -rf "$b/sysinfo" "$b/fio-jobfiles" "$b/wekatester.log"
+    out=$(summ_out "$d") || { echo "$out" >&2; exit 1; }
+    hdr=$(printf "%s\n" "$out" | awk "/^==== /{exit} {print}")
+    exp=$(cat <<"X"
+run      2026-10-23 14:10:02 (bundle b.tgz)
+version  wekatester not recorded, fio not recorded, weka not recorded
+command  not recorded
+clients  0 (master not recorded), shapes not recorded, filesystem groups not recorded
+workload not recorded; -a not recorded; dest not recorded
+
+parameters: the staged jobs per host (0 hosts)
+  staged jobfiles: none in the bundle
+X
+)
+    [ "$hdr" = "$exp" ] || { printf "%s\n" "$out" >&2; false; }'
+t_assert "-s synopsis: a single results .json keeps today's output, no synopsis" bash -c '
+    d=$(mktemp -d); fio_json_single_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1) || { echo "$out" >&2; exit 1; }
+    [ "$(printf "%s\n" "$out" | head -1)" = "    read bandwidth: 2.00 GiB/s" ] || { echo "$out" >&2; false; }'
+
 # --- every value-taking option works attached, detached, and =-attached ---
 t_assert "parse: attached values work for -d -w -f -s -i" bash -c '
     (source ./wekatester; parse_args -d/x -wsmoke -f/opt/fio -iubuntu:/k h1

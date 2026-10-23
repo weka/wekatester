@@ -627,7 +627,13 @@ summarize_report() {   # summarize_report <path> <items> <expected>
     if [ -s "$path" ] && list=$(tar -tf "$path" 2>&1) && [ -n "$list" ]; then
         tmp=$(mktemp -d "${TMPDIR:-/tmp}/wt.summ.XXXXXX") || return 1
         tar -xf "$path" -C "$tmp" 2> "$tmp/tar.err" || { echo "cannot extract $path" >&2; rm -rf "${tmp:?}"; return 1; }
-        local f job skip results
+        local f job skip results e rds=()
+        for e in "$tmp"/*; do [ ! -d "$e" ] || rds+=("$e"); done
+        if [ ${#rds[@]} -eq 1 ]; then
+            summary_header "${rds[0]}" "${path##*/}" || echo "(no synopsis: it could not be read from $path)"
+        else
+            printf '(no synopsis: %s holds %d top-level directories, where a run bundle has one)\n\n' "$path" ${#rds[@]}
+        fi
         # layout results are barriers: the reserved names, plus any bundled
         # jobfile with the layout marker (/dev/null keeps awk off stdin without
         # one)
@@ -645,6 +651,24 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         rm -rf "${tmp:?}"; return 0
     fi
     summ_one "$path" "$path" "$items" "$expected" file
+}
+
+# A bundle's synopsis ahead of its jobs (README, Output), from its records
+# alone: one awk over every host; a piece the bundle lacks says so.
+summary_header() {   # summary_header <run-dir> <bundle-name>
+    local rd=$1 lists rc=0 e
+    lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.hdr.XXXXXX") || return 1
+    : > "$lists/jobs"
+    if [ -d "$rd/fio-jobfiles" ]; then
+        find "$rd/fio-jobfiles" -mindepth 2 -maxdepth 2 -name '*.job' -type f | LC_ALL=C sort \
+            | LC_ALL=C awk -F/ '{print $(NF - 1) "\t" $0}' > "$lists/jobs" || rc=1
+    fi
+    for e in "$rd"/sysinfo/* "$rd"/fio-jobfiles/*; do [ ! -d "$e" ] || printf '%s\n' "${e##*/}"; done \
+        | LC_ALL=C sort -u > "$lists/hosts" || rc=1
+    [ "$rc" -ne 0 ] || awkrun '
+        #@awk summ_header' "$rd" "$2" "$lists/jobs" "$lists/hosts" "$UNLINK_JOB" || rc=1
+    rm -rf "${lists:?}"
+    return "$rc"
 }
 
 # summ_one <file> <label> <items> <expected> <file|bundle>. File mode: an error

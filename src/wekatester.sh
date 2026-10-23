@@ -186,7 +186,8 @@ attaching is the way to pass a value that starts with a dash.
                  the calibration scratch files, which are otherwise kept
                  so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
-                 bundle .tgz, straight from the archive -- and exit
+                 bundle .tgz, straight from the archive, after a synopsis
+                 of the run (README, Output) -- and exit
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
   --version      display version number and exit
   -h, --help     show this help and exit
