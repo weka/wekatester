@@ -208,8 +208,8 @@ The levels differ only in how wide the bandwidth and IOPS searches go:
 - `-a brutal` — the same search with every early stop disabled (see below).
 
 At every level the ioengine is chosen by measurement, latency runs at N jobs
-over the nrfiles ladder with the one-job test beside it, a setting leads only
-when 3% better (the leader rule), and the answers are recorded in
+over the nrfiles ladder with the one-job test beside it, the best reading
+wins and a tie goes to the heavier setting (the pick), and the answers are recorded in
 `hostlist.csv`, where they pin the next calibration (see What lands in the
 host file). The answer to "why these numbers" becomes "measured on your
 clients against this cluster."
@@ -337,20 +337,21 @@ engine.
 and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
 for bandwidth (`CAL_BW_QD_LADDER`) and 1–512 for IOPS (`CAL_IOPS_QD_LADDER`) —
 run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs in a
-row that fail to take the lead (see the leader rule). N → 2N → 4N is only
+row that fail to beat the best before them by 3% (`CAL_SHAPE_THR`, the stop
+rule). N → 2N → 4N is only
 two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
 (below).
 
 - **Bandwidth** walks numjobs 1, 2, 4 … N/2, N. The first rung at 95% of line
   rate is the answer. If none reaches it, 2N and 4N walk iodepth for every
   nrfiles, and again the first cell at 95% is the answer. If nothing reaches
-  line rate, or line rate is unknown, the leader rule below decides. A reading
+  line rate, or line rate is unknown, the pick below decides. A reading
   more than 5% *above* line rate means line rate is not this client's ceiling,
-  and the leader rule decides then too.
+  and the pick decides then too.
 - **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
-  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at that count's
-  winning iodepth and one step deeper. The leader rule decides. With libaio,
-  every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
+  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at the last iodepth
+  that beat the best before it by 3% and one step deeper. The pick decides.
+  With libaio, every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
   by default), so the probe reads the room left on every client, and a
   bandwidth or IOPS cell past the room of the shape's tightest member is not
   run, at any job count: the log says where the job or queue ladder stopped
@@ -368,18 +369,16 @@ two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
   fewer files. Numjobs is not searched: the one-job twin is the other end of
   the comparison. With `-b` the 1 MiB latency test gets the same search.
 
-**The leader rule** (bandwidth and IOPS, every level). Under `cal` the top
-three cells (`CAL_CONFIRM`) first get a second reading, under `brutal` the top
-five; `safe` and `max` measure each job count once. Contention only subtracts,
-so a second chance can raise a cell and never lower it, and the best reading
-is what a cell is credited with. Then the cells are walked lightest first,
-and a cell takes the lead only when it is at least 3%
-(`CAL_SHAPE_THR`) better than the leader. Under `cal` the walk follows the
-order the ladders measured the cells, which is close to lightest first.
-`brutal` measures nrfiles outer and iodepth inner, so its walk sorts the
-cells by outstanding IO (numjobs × iodepth), then fewer jobs, the shallower
-queue and fewer files. The last leader is the answer, so
-a deeper or wider setting has to earn its place by a clear margin.
+**The pick** (bandwidth and IOPS, every level). Under `cal` the top three
+cells (`CAL_CONFIRM`) first get a second reading, under `brutal` the top five;
+`safe` and `max` measure each job count once. Contention only subtracts, so a
+second chance can raise a cell and never lower it, and the best reading is
+what a cell is credited with. Then the best reading wins, and an exact tie goes
+to the heavier cell: more outstanding IO (numjobs × iodepth), then more jobs,
+the deeper queue and more files. There is no threshold in the pick, so a
+heavier cell 1% ahead of a lighter one wins; the 3% of `CAL_SHAPE_THR` only
+decides when a ladder stops (Frank, 2026-10-23). The order the cells were
+measured in does not matter, so `cal` and `brutal` pick alike.
 
 Every write cell is followed by `CAL_SETTLE` (10s), so the next cell does not
 start inside the previous one's destage backlog. The first field grids showed
@@ -396,7 +395,7 @@ run at iodepth 1 only.
 `-a brutal` runs the same search with every early stop disabled: every
 combination of job count, iodepth and nrfiles the ladders define is measured,
 and the top five cells get a second reading (`BRUTAL_CONFIRM`). Bandwidth takes
-the leader instead of the first rung at line rate. With the default ladders that
+the pick instead of the first rung at line rate. With the default ladders that
 is at most about 67 IOPS cells, 40 bandwidth cells and 3 latency cells per
 direction: some 220 per shape for a set with all six tests, or a little over
 two hours at 30s cells with the write settles. Use `cal` for the answer

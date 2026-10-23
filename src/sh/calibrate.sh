@@ -154,9 +154,10 @@ CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
 CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # the engine tie band: engines whose reading
                          # is within this percent of the best are tied, and the
                          # tie goes to ENGINE_ORDER
-CAL_SHAPE_THR=${CAL_SHAPE_THR:-3}   # THE LEADER RULE (Frank, 2026-10-05): a cell
-                         # takes the lead only when this percent better (bw and
-                         # iops, every level); latency has no threshold
+CAL_SHAPE_THR=${CAL_SHAPE_THR:-3}   # THE STOP RULE: a rung makes progress only when
+                         # this percent better than the best so far (cal ladders,
+                         # bw and iops). The pick has no threshold: the best
+                         # reading wins, ties go heavier (Frank, 2026-10-23)
 CAL_STOP_BELOW=${CAL_STOP_BELOW:-2}   # consecutive rungs without progress that
                          # end a ladder (cal only; brutal measures every rung)
 CAL_CONFIRM=${CAL_CONFIRM:-3}   # before a peak is picked, the top cells get a

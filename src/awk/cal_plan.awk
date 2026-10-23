@@ -27,10 +27,10 @@ function cell(phase, k, rt) {
     exit 0
 }
 function finish(k, msg) { printf "done %d %d %d %s\n", kj(k), kq(k), kr(k), msg; exit 0 }
-# The leader rule (Frank, 2026-10-05): a reading takes the lead only
-# when it is at least THR percent better than the leader.
+# The stop rule (Frank, 2026-10-05, kept 2026-10-23): a rung makes
+# progress only when at least THR percent better than the best so far.
 function ahead(v, lead) { return lead <= 0 || v >= lead * (1 + THR / 100) }
-function plateau(V, n,    top, miss, i) {   # STOP consecutive rungs failed to take the lead
+function plateau(V, n,    top, miss, i) {   # STOP consecutive rungs made no progress
     top = 0; miss = 0
     for (i = 1; i <= n; i++) {
         if (ahead(V[i], top)) { top = V[i]; miss = 0 }
@@ -38,11 +38,11 @@ function plateau(V, n,    top, miss, i) {   # STOP consecutive rungs failed to t
     }
     return 0
 }
-# Walk the cells in the order the ladder measured them; a cell takes
-# the lead only when it beats the leader by THR percent.
-function leader(KS, n, decision,    lead, i) {
+# The depth whose nrfiles rungs run: the stop rule's walk in ladder
+# order, so the cells measured stay as they were (Frank, 2026-10-23).
+function ladder_lead(KS, n,    lead, i) {
     lead = ""
-    for (i = 1; i <= n; i++) if (lead == "" || ahead(best(KS[i], decision), best(lead, decision))) lead = KS[i]
+    for (i = 1; i <= n; i++) if (lead == "" || ahead(best(KS[i], 1), best(lead, 1))) lead = KS[i]
     return lead
 }
 # Least outstanding IO, then fewer jobs, shallower queue, ladder nrfiles.
@@ -54,31 +54,33 @@ function lighter(a, b,    x, y) {
     if ((x = (kr(a) != NRT)) != (y = (kr(b) != NRT))) return x < y
     return kr(a) < kr(b)
 }
+# The pick (Frank, 2026-10-23): the best reading wins, ties go heavier.
+# No threshold, so the order the cells were measured in does not matter.
+function leader(KS, n, decision,    lead, i, x, y) {
+    lead = ""
+    for (i = 1; i <= n; i++) {
+        if (lead != "" && ((x = best(KS[i], decision)) < (y = best(lead, decision)) || (x == y && !lighter(lead, KS[i])))) continue
+        lead = KS[i]
+    }
+    return lead
+}
 # Confirm order: best reading, then the lighter. Does a sort before b?
 function before(a, b,    x, y) {
     if ((x = best(a, 1)) != (y = best(b, 1))) return x > y
     return lighter(a, b)
 }
-# KS into I, a stable insertion sort: by confirm order, or lightest first
-function order(KS, n, I, confirm,    i, j, t) {
+# KS into I in confirm order, a stable insertion sort
+function order(KS, n, I,    i, j, t) {
     for (i = 1; i <= n; i++) {
         t = KS[i]
-        for (j = i - 1; j >= 1 && (confirm ? before(t, I[j]) : lighter(t, I[j])); j--) I[j + 1] = I[j]
+        for (j = i - 1; j >= 1 && before(t, I[j]); j--) I[j + 1] = I[j]
         I[j + 1] = t
     }
 }
-# cal's ladders measure about lightest first, and its walk keeps that
-# order; brutal measures nrfiles outer, iodepth inner, so its walk sorts
-# the cells lightest first, choosing as cal does (Frank, 2026-10-11).
-function walk(KS, n, decision,    I) {
-    if (!EXH) return leader(KS, n, decision)
-    order(KS, n, I, 0)
-    return leader(I, n, decision)
-}
 function confirm_then_pick(KS, n,    I, i) {
-    order(KS, n, I, 1)
+    order(KS, n, I)
     for (i = 1; i <= n && i <= CONFIRM; i++) if (nreads(I[i]) < 2) cell("confirm", I[i])
-    return walk(KS, n, 0)
+    return leader(KS, n, 0)
 }
 function human(v) { return ctype == "bw" ? sprintf("%.2f GiB/s", v / 1073741824) : commas(v) " IOPS" }
 function geo(k) { return sprintf("numjobs=%d iodepth=%d nrfiles=%d", kj(k), kq(k), kr(k)) }
@@ -132,7 +134,7 @@ BEGIN {
     for (v in U1) BW_LOW[++nbl] = v + 0
     sort_arr(BW_LOW, nbl, 1)
     # 2N and 4N both run, guards allowing: a ladder stops after STOP rungs
-    # in a row fail to lead, and N -> 2N -> 4N has only two (Frank, 2026-10-11)
+    # in a row make no progress, and N -> 2N -> 4N has only two (Frank, 2026-10-11)
     nhigh = 2; HIGH[1] = 2 * N; HIGH[2] = 4 * N
     nil = 0; IOPS_LOW[++nil] = N2; if (N != N2) IOPS_LOW[++nil] = N
     nfx = 0; FIXED_NJ[++nfx] = N2; if (N != N2) FIXED_NJ[++nfx] = N; FIXED_NJ[++nfx] = 2 * N
@@ -177,7 +179,7 @@ BEGIN {
 
     if (FIXED && (ctype == "bw" || ctype == "iops")) {
         # safe and max: N/2, N, 2N at one iodepth and nrfiles, every rung,
-        # the leader wins; a sync engine at qd1
+        # the best reading wins, ties go heavier; a sync engine at qd1
         qd = PQD ? PQD : sync ? 1 : (("fq" in K) && K["fq"] ~ /^[0-9]+$/) ? K["fq"] + 0 : 1
         nr = PNR ? PNR : (("fn" in K) && K["fn"] ~ /^[0-9]+$/) ? K["fn"] + 0 : 1
         nk = 0
@@ -191,7 +193,7 @@ BEGIN {
         k = confirm_then_pick(KS, nk)
         js = ""
         for (i = 1; i <= nk; i++) js = js (i > 1 ? ", " : "") kj(KS[i])
-        finish(k, sprintf("%s -> %s%s (-a %s: numjobs %s at iodepth %d nrfiles %d, the leader by %g%%; %s)%s", geo(k), reading(k), ctype == "bw" ? of_line(k) : "", LVL, js, qd, nr, THR, where(kj(k)), note()))
+        finish(k, sprintf("%s -> %s%s (-a %s: numjobs %s at iodepth %d nrfiles %d, the best reading wins, ties go heavier; %s)%s", geo(k), reading(k), ctype == "bw" ? of_line(k) : "", LVL, js, qd, nr, where(kj(k)), note()))
     }
 
     if (ctype == "bw") {
@@ -240,7 +242,7 @@ BEGIN {
         for (i = 1; i <= n2; i++) KS[++nk] = D2[i]
         if (!nk) none_fit()
         k = confirm_then_pick(KS, nk)
-        why = EXH ? sprintf("the leader of every rung measured, by %g%%", THR) : target ? sprintf("never reached %g%% of line rate; the leader by %g%%", LINE, THR) : sprintf("the leader by %g%%", THR)
+        why = (EXH ? "every rung measured; " : target ? sprintf("never reached %g%% of line rate; ", LINE) : "") "the best reading wins, ties go heavier"
         finish(k, sprintf("%s -> %s%s (%s, %s)%s", geo(k), reading(k), of_line(k), why, where(kj(k)), note()))
     }
 
@@ -269,10 +271,10 @@ BEGIN {
                 }
             }
             if (!nm) break   # a guard (memory or aio room) stopped this job count before its first cell
-            top = leader(MINE, nm, 1)
+            top = ladder_lead(MINE, nm)
             if (!EXH)
                 for (r = 1; r <= nnrx; r++) {
-                    # the leader depth, and twice it within the ladder
+                    # the depth the stop rule led with, and twice it within the ladder
                     q1 = kq(top); q2 = q1 * 2 < IOPSQD[niq] ? q1 * 2 : IOPSQD[niq]
                     nq = 0; split("", QS); QS[++nq] = q1 < q2 ? q1 : q2; if (q1 != q2) QS[++nq] = q1 < q2 ? q2 : q1
                     for (q = 1; q <= nq; q++) {
@@ -282,7 +284,7 @@ BEGIN {
                         POOL[++np] = k; MINE[++nm] = k
                     }
                 }
-            top = walk(MINE, nm, 1)
+            top = leader(MINE, nm, 1)
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d nrfiles %d", nj, human(best(top, 1)), kq(top), kr(top))
         }
         if (!np) none_fit()
