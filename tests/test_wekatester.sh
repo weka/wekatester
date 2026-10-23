@@ -5449,10 +5449,10 @@ t_assert "cal_plan iops: N/2 and N at qd1, then 2N and 4N walk the queue ladder,
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(plan_sim "$d" iops read io_uring 16 0 0)
     case "$out" in
-        "done 64 4 1 numjobs=64 iodepth=4 nrfiles=1 -> 1,000,000 IOPS (8 jobs 160,000 IOPS at iodepth 1, 16 jobs 320,000 IOPS at iodepth 1, 32 jobs 1,000,000 IOPS at iodepth 8 nrfiles 1, 64 jobs 1,000,000 IOPS at iodepth 4 nrfiles 1; siblings in)") true;;
+        "done 64 8 4 numjobs=64 iodepth=8 nrfiles=4 -> 1,000,000 IOPS (8 jobs 160,000 IOPS at iodepth 1, 16 jobs 320,000 IOPS at iodepth 1, 32 jobs 1,000,000 IOPS at iodepth 16 nrfiles 4, 64 jobs 1,000,000 IOPS at iodepth 8 nrfiles 4; siblings in)") true;;
         *) echo "$out" >&2; false;;
     esac &&
-    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 1;numjobs 16 1 1;iodepth 32 1 1;iodepth 32 2 1;iodepth 32 4 1;iodepth 32 8 1;nrfiles 32 2 2;nrfiles 32 4 2;nrfiles 32 2 4;nrfiles 32 4 4;iodepth 64 1 1;iodepth 64 2 1;iodepth 64 4 1;nrfiles 64 1 2;nrfiles 64 2 2;nrfiles 64 1 4;nrfiles 64 2 4;confirm 32 2 1;confirm 32 2 2;confirm 32 2 4;" ] ||
+    [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 1;numjobs 16 1 1;iodepth 32 1 1;iodepth 32 2 1;iodepth 32 4 1;iodepth 32 8 1;nrfiles 32 8 2;nrfiles 32 16 2;nrfiles 32 8 4;nrfiles 32 16 4;iodepth 64 1 1;iodepth 64 2 1;iodepth 64 4 1;nrfiles 64 4 2;nrfiles 64 8 2;nrfiles 64 4 4;nrfiles 64 8 4;confirm 32 2 1;confirm 64 1 1;confirm 32 4 1;" ] ||
         { cat "$d/asked" >&2; false; }'
 t_assert "cal_plan iops: no queue or file ladder at or below N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -5466,7 +5466,7 @@ t_assert "cal_plan iops: a file count that wins is recorded" bash -c '
 t_assert "cal_plan iops: 4N runs though 2N did not beat N" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     out=$(CAL_SIM_IOPSCAP=100000 plan_sim "$d" iops read io_uring 16 0 0)
-    case "$out" in "done 64 4 1 "*"32 jobs 100,000 IOPS at iodepth 4 nrfiles 1, 64 jobs 100,000 IOPS at iodepth 4 nrfiles 1; siblings in)") true;; *) echo "$out" >&2; false;; esac &&
+    case "$out" in "done 64 8 4 "*"32 jobs 100,000 IOPS at iodepth 8 nrfiles 4, 64 jobs 100,000 IOPS at iodepth 8 nrfiles 4; siblings in)") true;; *) echo "$out" >&2; false;; esac &&
     grep -q "^iodepth 64 1 1$" "$d/asked"'
 t_assert "cal_plan iops: a sync engine keeps iodepth at 1 and still walks the job counts and files" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -5547,7 +5547,7 @@ t_assert "cal_plan safe and max: no threshold -- a heavier rung 1% ahead wins, a
             done
         done
     done'
-t_assert "cal_plan cal: the 3% stop rule and the cells it runs are unchanged; only the pick moves to the best reading" bash -c '
+t_assert "cal_plan cal: the 3% stop rule still ends a ladder; the pick is the best reading" bash -c '
     d=$(mktemp -d)
     # 32 jobs: iodepth 2 and 4 are each under 3% past iodepth 1, so the
     # ladder stops after 4 and 64 jobs come next; the best reading, 32 x 4, wins
@@ -5558,6 +5558,16 @@ t_assert "cal_plan cal: the 3% stop rule and the cells it runs are unchanged; on
     printf "iodepth io_uring 64 1 1 30 100000\niodepth io_uring 64 2 1 30 101000\niodepth io_uring 64 4 1 30 101500\n" >> "$d/h"
     a=$(source ./wekatester; cal_plan next iops read io_uring 16 0 0 "$d/h" $k)
     case "$a" in "done 32 4 1 "*"32 jobs 102,900 IOPS at iodepth 4 nrfiles 1, 64 jobs 101,500 IOPS at iodepth 4 nrfiles 1;"*) true;; *) echo "done: $a" >&2; false;; esac'
+t_assert "cal_plan cal: the nrfiles rungs run at the iodepth the pick chooses, not the shallower one the 3% walk led with" bash -c '
+    d=$(mktemp -d)
+    # 32 jobs: iodepth 4 reads best but never led by 3%; files 2 go to 4 and 8
+    k="$K nrc=1,2 iopsqd=1,2,4,8 confirm=0"
+    printf "numjobs io_uring 8 1 1 30 50000\nnumjobs io_uring 16 1 1 30 60000\niodepth io_uring 32 1 1 30 100000\niodepth io_uring 32 2 1 30 102000\niodepth io_uring 32 4 1 30 102900\n" > "$d/h"
+    a=$(source ./wekatester; cal_plan next iops read io_uring 16 0 0 "$d/h" $k)
+    [ "$a" = "cell nrfiles 32 4 2 30" ] || { echo "first: $a" >&2; exit 1; }
+    printf "nrfiles io_uring 32 4 2 30 101000\n" >> "$d/h"
+    a=$(source ./wekatester; cal_plan next iops read io_uring 16 0 0 "$d/h" $k)
+    [ "$a" = "cell nrfiles 32 8 2 30" ] || { echo "second: $a" >&2; false; }'
 t_assert "cal_plan budget: the most cells a search can take" bash -c '
     a=$(source ./wekatester; cal_plan budget bw read x 16 0 0 /dev/null $K)
     b=$(source ./wekatester; cal_plan budget lat read x 16 0 0 /dev/null $K)
@@ -6304,10 +6314,10 @@ t_assert "calibrate: each shape is measured solo on its first host, the answer l
     [ "$(grep "^h1 " "$d/cal.results" | cut -d" " -f2-)" = "$(grep "^h2 " "$d/cal.results" | cut -d" " -f2-)" ] &&
     # h1 (8 cpus, weka on 7, the OS on 0-1): N=5, so bandwidth reaches line
     # rate only at 2N with the siblings in, iops is flat at its cap from 2N
-    # and the tie goes heaviest (4N iodepth 16), latency runs at N; h3 (16
+    # and the tie goes heaviest (4N iodepth 32, 4 files), latency runs at N; h3 (16
     # cpus): N=13, bandwidth and iops flat at the cap from N, ties to 4N
-    grep -qx "h1 io_uring 2 1 5120M 10 2 1 5120M 10 1 1 5120M 5 1 1 5120M 5 16 1 5120M 20 16 1 5120M 20 - - - - - - - -" "$d/cal.results" &&
-    grep -qx "h3 io_uring 4 4 1280M 52 4 4 1280M 52 1 1 5120M 13 1 1 5120M 13 4 1 5120M 52 4 1 5120M 52 - - - - - - - -" "$d/cal.results" &&
+    grep -qx "h1 io_uring 2 1 5120M 10 2 1 5120M 10 1 1 5120M 5 1 1 5120M 5 32 4 1280M 20 32 4 1280M 20 - - - - - - - -" "$d/cal.results" &&
+    grep -qx "h3 io_uring 4 4 1280M 52 4 4 1280M 52 1 1 5120M 13 1 1 5120M 13 8 4 1280M 52 8 4 1280M 52 - - - - - - - -" "$d/cal.results" &&
     # the engine and the tuples reach targets.final, which staging reads
     t=$(awk -F"\t" "\$1==\"h2\" {print \$3, \$6, \$9, \$14, \$17}" "$d/targets.final") &&
     [ "$t" = "io_uring 10 2 5 1" ] &&

@@ -350,8 +350,8 @@ two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
   more than 5% *above* line rate means line rate is not this client's ceiling,
   and the pick decides then too.
 - **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
-  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at the last iodepth
-  that beat the best before it by 3% and one step deeper. The pick decides.
+  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at the iodepth the
+  pick (below) chooses from that ladder and one step deeper. The pick decides.
   With libaio, every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
   by default), so the probe reads the room left on every client, and a
   bandwidth or IOPS cell past the room of the shape's tightest member is not

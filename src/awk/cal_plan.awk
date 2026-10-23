@@ -38,13 +38,6 @@ function plateau(V, n,    top, miss, i) {   # STOP consecutive rungs made no pro
     }
     return 0
 }
-# The depth whose nrfiles rungs run: the stop rule's walk in ladder
-# order, so the cells measured stay as they were (Frank, 2026-10-23).
-function ladder_lead(KS, n,    lead, i) {
-    lead = ""
-    for (i = 1; i <= n; i++) if (lead == "" || ahead(best(KS[i], 1), best(lead, 1))) lead = KS[i]
-    return lead
-}
 # Least outstanding IO, then fewer jobs, shallower queue, ladder nrfiles.
 # Is a lighter than b?
 function lighter(a, b,    x, y) {
@@ -271,10 +264,11 @@ BEGIN {
                 }
             }
             if (!nm) break   # a guard (memory or aio room) stopped this job count before its first cell
-            top = ladder_lead(MINE, nm)
+            # the nrfiles rungs run at the depth the pick would choose
+            # (Frank, 2026-10-23), and twice it within the ladder
+            top = leader(MINE, nm, 1)
             if (!EXH)
                 for (r = 1; r <= nnrx; r++) {
-                    # the depth the stop rule led with, and twice it within the ladder
                     q1 = kq(top); q2 = q1 * 2 < IOPSQD[niq] ? q1 * 2 : IOPSQD[niq]
                     nq = 0; split("", QS); QS[++nq] = q1 < q2 ? q1 : q2; if (q1 != q2) QS[++nq] = q1 < q2 ? q2 : q1
                     for (q = 1; q <= nq; q++) {
