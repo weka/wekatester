@@ -7094,6 +7094,30 @@ t_assert "pressure counters: no nstat reads /proc/net raw, no ethtool says so" b
     diff <(printf "%s\n" "not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead" "Tcp: RetransSegs" "Tcp: 7" \
         "not available: /proc/net/netstat not readable") "$f/tcp-start" >&2 &&
     [ "$(cat "$f/ethtool-S-eth0-start")" = "not available: ethtool not installed" ]'
+# virtio: the netdev's device is not a PCI function (Frank, 2026-10-23)
+t_assert "sysinfo NIC: a virtio NIC reads NUMA, PCIe link and IRQs from its PCI parent, labelled; with no PCI ancestor it says so" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" && nic_virtio "$d" || exit 1
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1; L=" pci_parent=0000:00:06.0"; P=/sys/devices/pci0000:00/0000:00:06.0; v=/sys/class/net/eth2/device
+    [ "$(cat "$f/nics")" = "eth0 eth1 eth2" ] && ! grep -q pci_parent "$f/nic-eth0" && grep -qx "numa_node 1" "$f/nic-eth0" || { cat "$f/nics" "$f/nic-eth0"; exit 1; } >&2
+    diff <(printf "%s\n" "bus virtio1" "driver virtio_net" "numa_node 0$L" \
+        "current_link_speed 8.0_GT/s_PCIe$L" "current_link_width 4$L" "max_link_speed 8.0_GT/s_PCIe$L" \
+        "max_link_width not available: $P/max_link_width not readable$L" "msi_irqs 2$L" "irq_cpus 40:0-1 41:-$L") <(head -n 9 "$f/nic-eth1") >&2 &&
+    diff <(printf "%s\n" "bus virtio2" "driver virtio_net" \
+        "pci_parent not available: $v is not a PCI function and no device above it is" \
+        "numa_node not available: $v/numa_node not readable" \
+        "current_link_speed not available: $v/current_link_speed not readable" \
+        "current_link_width not available: $v/current_link_width not readable" \
+        "max_link_speed not available: $v/max_link_speed not readable" \
+        "max_link_width not available: $v/max_link_width not readable" \
+        "msi_irqs not available: $v/msi_irqs not readable" "irq_cpus not available: no msi_irqs" "--- ethtool -g") <(head -n 11 "$f/nic-eth2") >&2'
+t_assert "pressure counters: a virtio NIC reads AER from its PCI parent, labelled; with no PCI ancestor it says so" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" && nic_virtio "$d" || exit 1
+    nic_pressure "$d" start "$(date +%s)"; f=$d/out/sysinfo/h1; L=" pci_parent=0000:00:06.0"; P=/sys/devices/pci0000:00/0000:00:06.0
+    diff <(printf "%s\n" "--- aer_dev_correctable$L" "TOTAL_ERR_COR 0" "--- aer_dev_nonfatal$L" "not available: $P/aer_dev_nonfatal not readable" \
+        "--- aer_dev_fatal$L" "not available: $P/aer_dev_fatal not readable") "$f/aer-eth1-start" >&2 &&
+    [ "$(head -n 1 "$f/aer-eth2-start")" = "pci_parent not available: /sys/class/net/eth2/device is not a PCI function and no device above it is" ] &&
+    grep -qx "not available: /sys/class/net/eth2/device/aer_dev_fatal not readable" "$f/aer-eth2-start" &&
+    grep -qx "TOTAL_ERR_COR 3" "$f/aer-eth0-start" && ! grep -q pci_parent "$f/aer-eth0-start" || { cat "$f"/aer-eth*-start; exit 1; } >&2'
 t_assert "kernel log: dmesg windowed from the run start by the uptime, at end only" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
     nic_pressure "$d" end "$(( $(date +%s) - 100 ))"; k=$d/out/sysinfo/h1/kernel-log-end

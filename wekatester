@@ -7101,8 +7101,10 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
 # Remote helpers for the sysinfo and pressure strings: _nc runs a tool
 # bounded (_T seconds, 10), _rd reads a file, _ln names a link's target,
 # _nlist sets _nl to the netdevs with a device link (the probe's choice),
-# _priv finds the first passwordless escalator (the probe's order), once.
-# WEKATESTER_SYSROOT is for the suite only.
+# _pci sets _pd to the device whose PCI values a netdev reads: its own, or
+# for one that is not a PCI function (virtio) the nearest PCI ancestor (_pb,
+# - when none; _pl labels its values). _priv finds the first passwordless
+# escalator (the probe's order), once. WEKATESTER_SYSROOT is for the suite.
 remote_helpers_cmd() {
     printf '%s' '_sr=${WEKATESTER_SYSROOT:-}
     _nc() {
@@ -7118,6 +7120,17 @@ remote_helpers_cmd() {
     _ln() { if [ -e "$_sr$1" ] && _y=$(readlink -f "$_sr$1"); then echo "${_y##*/}"; else echo "not available: $1 links nowhere"; fi; }
     _nlist() { _nl=; for _d in "$_sr"/sys/class/net/*; do [ -e "$_d/device" ] || continue; _nl="$_nl ${_d##*/}"; done; }
     _nlsay() { if [ -n "$_nl" ]; then echo "${_nl# }"; else echo "not available: no netdev in /sys/class/net has a device link"; fi; }
+    _pci() {
+        _pd=/sys/class/net/$1/device; _pb=; _pl=
+        [ -e "$_sr$_pd/subsystem" ] && _y=$(readlink -f "$_sr$_pd/subsystem") && [ "${_y##*/}" != pci ] || return 0
+        _y=$(readlink -f "$_sr$_pd") || return 0
+        _z=; [ -z "$_sr" ] || _z=$(readlink -f "$_sr") || return 0
+        while _y=${_y%/*}; [ -n "$_y" ] && [ "${_y##*/}" != devices ]; do
+            [ -e "$_y/subsystem" ] && _w=$(readlink -f "$_y/subsystem") && [ "${_w##*/}" = pci ] || continue
+            _pb=${_y##*/}; _pd=${_y#"$_z"}; _pl=" pci_parent=$_pb"; return 0
+        done
+        _pb=-
+    }
     _ps=0; _pv=
     _priv() {
         if [ $_ps -eq 0 ]; then
@@ -7160,9 +7173,11 @@ sysinfo_nic_cmd() {
     for _n in $_nl; do
         _v=/sys/class/net/$_n/device
         echo "=== WEKATESTER_SYSINFO nic-$_n ==="
-        echo "bus $(_ln $_v)"; echo "driver $(_ln $_v/driver)"; echo "numa_node $(_rd $_v/numa_node)"
+        echo "bus $(_ln $_v)"; echo "driver $(_ln $_v/driver)"
+        _pci "$_n"; [ "$_pb" != - ] || echo "pci_parent not available: $_v is not a PCI function and no device above it is"
+        _v=$_pd; echo "numa_node $(_rd $_v/numa_node)$_pl"
         for _a in current_link_speed current_link_width max_link_speed max_link_width; do
-            if _y=$(_rd $_v/$_a); then _y=${_y// /_}; fi; echo "$_a $_y"
+            if _y=$(_rd $_v/$_a); then _y=${_y// /_}; fi; echo "$_a $_y$_pl"
         done
         if [ -d "$_sr$_v/msi_irqs" ]; then
             _c=0; _q=
@@ -7170,8 +7185,8 @@ sysinfo_nic_cmd() {
                 [ -e "$_i" ] || continue; _i=${_i##*/}; _c=$((_c + 1))
                 _y=$(_rd /proc/irq/$_i/smp_affinity_list) || _y=-; _q="$_q $_i:$_y"
             done
-            echo "msi_irqs $_c"; echo "irq_cpus${_q:- -}"
-        else echo "msi_irqs not available: $_v/msi_irqs not readable"; echo "irq_cpus not available: no msi_irqs"; fi
+            echo "msi_irqs $_c$_pl"; echo "irq_cpus${_q:- -}$_pl"
+        else echo "msi_irqs not available: $_v/msi_irqs not readable$_pl"; echo "irq_cpus not available: no msi_irqs$_pl"; fi
         for _a in -g -l -c -a; do echo "--- ethtool $_a"; _nc ethtool $_a "$_n"; done
         echo "--- mlnx_qos -i"
         if _x=$(_nc mlnx_qos -i "$_n") || ! _m=$(command -v mlnx_qos) || [ "$(id -u)" = 0 ]; then printf "%s\n" "$_x"; continue; fi
@@ -7214,7 +7229,8 @@ pressure_counters_cmd() {
     for _dv in $_nl; do
         echo "=== WEKATESTER_SYSINFO ethtool-S-$_dv ==="; _nc ethtool -S "$_dv"
         echo "=== WEKATESTER_SYSINFO aer-$_dv ==="
-        for _a in correctable nonfatal fatal; do echo "--- aer_dev_$_a"; _rd /sys/class/net/$_dv/device/aer_dev_$_a; done
+        _pci "$_dv"; [ "$_pb" != - ] || echo "pci_parent not available: /sys/class/net/$_dv/device is not a PCI function and no device above it is"
+        for _a in correctable nonfatal fatal; do echo "--- aer_dev_$_a$_pl"; _rd $_pd/aer_dev_$_a; done
     done; true'
 }
 

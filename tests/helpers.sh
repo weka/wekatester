@@ -512,6 +512,22 @@ nic_fixture() {
         c=$(type -P "$t") || { echo "no $t on this host" >&2; return 1; }; ln -s "$c" "$d/bin/$t"
     done
 }
+# nic_virtio <dir>: adds to a nic_fixture eth1, a virtio device (virtio1)
+# under PCI function 0000:00:06.0 (numa 0, link 8.0 GT/s x4 but no
+# max_link_width, irqs 40 and 41, the second with no affinity file, AER
+# correctable), and eth2, a virtio device (virtio2) on a platform device,
+# with no PCI ancestor. Every device, eth0's too, gets its subsystem link.
+nic_virtio() {
+    local r=$1/root p=$1/root/sys/devices/pci0000:00/0000:00:06.0 m=$1/root/sys/devices/platform/a003e00.virtio_mmio b
+    mkdir -p "$p/virtio1" "$p/msi_irqs" "$m/virtio2" "$r/sys/class/net/eth1" "$r/sys/class/net/eth2" "$r/proc/irq/40" \
+        "$r/sys/bus/pci" "$r/sys/bus/platform" "$r/sys/bus/virtio/drivers/virtio_net"
+    for b in "$r/sys/devices/pci0000:00/0000:17:00.0:pci" "$p:pci" "$p/virtio1:virtio" "$m:platform" "$m/virtio2:virtio"; do ln -s "$r/sys/bus/${b##*:}" "${b%:*}/subsystem"; done
+    ln -s "$r/sys/bus/virtio/drivers/virtio_net" "$p/virtio1/driver"; ln -s "$r/sys/bus/virtio/drivers/virtio_net" "$m/virtio2/driver"
+    ln -s "$p/virtio1" "$r/sys/class/net/eth1/device"; ln -s "$m/virtio2" "$r/sys/class/net/eth2/device"
+    printf '0\n' > "$p/numa_node"; printf '8.0 GT/s PCIe\n' > "$p/current_link_speed"; printf '4\n' > "$p/current_link_width"
+    printf '8.0 GT/s PCIe\n' > "$p/max_link_speed"; : > "$p/msi_irqs/40"; : > "$p/msi_irqs/41"
+    printf '0-1\n' > "$r/proc/irq/40/smp_affinity_list"; printf 'TOTAL_ERR_COR 0\n' > "$p/aer_dev_correctable"
+}
 # nic_sysinfo <dir>: snapshot_sysinfo for one host h1, its string run by bash
 # against the fixture; the split lands in <dir>/out/sysinfo/h1.
 nic_sysinfo() {
@@ -544,4 +560,4 @@ bound_capture() {
      LOCAL_MODE=0; SSH_OPTS=; AUTH_DIR=; PATH=$d/ctl:$PATH
      if [ "$what" = sysinfo ]; then snapshot_sysinfo; else snapshot_pressure "$what"; fi; echo "carried on") > "$d/console" 2>&1
 }
-export -f nic_fixture nic_sysinfo nic_pressure bound_capture
+export -f nic_fixture nic_virtio nic_sysinfo nic_pressure bound_capture
