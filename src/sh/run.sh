@@ -269,10 +269,28 @@ kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
     fi; true'
 }
 
+# A daemonized fio server logs only to syslog: journalctl -t fio from the run
+# start (_ks, _kring: after kernel_log_cmd), the last 2000 lines, under the
+# escalator for a non-root login, which sees only its own entries.
+fio_server_log_cmd() {
+    printf '%s' 'echo "=== WEKATESTER_SYSINFO fio-server-log ==="
+    if ! _o=$(command -v journalctl); then echo "not available: journalctl not installed, so this host keeps no journal to read"
+    else
+        _fw=journalctl
+        if [ "$(id -u)" = 0 ]; then :
+        elif _priv; then _fw="$_pv journalctl"
+        else echo "# read as a non-root user and no passwordless escalator works: only this user'"'"'s entries show, a root fio server'"'"'s are missing"; fi
+        echo "# $_fw -t fio --since @$_ks (the run start): every fio that logged in the window, not only this run'"'"'s"
+        _x=$(_T=60 _nc $_fw -q -t fio --no-pager -o short-iso --since "@$_ks")
+        if [ -n "$_x" ]; then printf "%s\n" "$_x" | _kring ""; else echo "(no fio server log line in the window)"; fi
+    fi; true'
+}
+
 # PSI and load at start and again at teardown, the counters above at both,
-# plus the run window's kernel log and sar slice (when sysstat keeps one).
+# plus the run window's kernel log and sar slice (when sysstat keeps one);
+# fio-log adds the fio server log (a failed run's teardown).
 PRESSURE_END_DONE=0
-snapshot_pressure() {   # snapshot_pressure <start|end>
+snapshot_pressure() {   # snapshot_pressure <start|end> [fio-log]
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     local label=$1 cmd
     cmd='for f in cpu io memory; do
@@ -286,6 +304,8 @@ $(pressure_counters_cmd)"
     if [ "$label" = end ] && [ -n "$RUN_EPOCH" ]; then
         cmd="$cmd
 $(kernel_log_cmd "$RUN_EPOCH")"
+        [ "${2:-}" != fio-log ] || cmd="$cmd
+$(fio_server_log_cmd)"
         # the run window's sar slice, in each worker's own time zone; a run
         # that started on an earlier worker day gets today from 00:00:00
         # (sar reads one day's file)

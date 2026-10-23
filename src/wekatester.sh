@@ -501,7 +501,7 @@ main() {
     # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
     # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
     # finalizes the bundle after it so the log holds the teardown.
-    trap 'rc=$?; cleanup; finalize_run_dir; exit $rc' EXIT
+    trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     # After the traps (half-established masters still get torn down), before

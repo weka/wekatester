@@ -537,14 +537,14 @@ nic_sysinfo() {
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
      snapshot_sysinfo) >>"$WT_ASIDE" 2>&1
 }
-# nic_pressure <dir> <start|end> <run-start-epoch>: snapshot_pressure the same
-# way, into <dir>/out/sysinfo/h1/<item>-<label>.
+# nic_pressure <dir> <start|end> <run-start-epoch> [fio-log]: snapshot_pressure
+# the same way, into <dir>/out/sysinfo/h1/<item>-<label>.
 nic_pressure() {
     mkdir -p "$1/w" "$1/out"
     (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; RUN_EPOCH=$3; FIO_BIN=fio
      fx=$1; bash=$(type -P bash)
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
-     snapshot_pressure "$2") >>"$WT_ASIDE" 2>&1
+     snapshot_pressure "$2" ${4:+"$4"}) >>"$WT_ASIDE" 2>&1
 }
 # bound_capture <dir> <sysinfo|start|end> <host>...: the real run_host, over
 # a fake ssh in <dir>/ctl that runs each host's string under bash against the

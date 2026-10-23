@@ -7413,6 +7413,53 @@ t_assert "kernel log: the last 2000 lines are kept and the drop is said; an over
     nic_pressure "$d" end "$(( $(date +%s) - 100 ))"
     [ "$(tail -n 1 "$k")" = "(no kernel log line in the window)" ] || { cat "$k"; exit 1; } >&2'
 
+# --- the fio server log, read at a failed run's teardown (issue #18, Frank, 2026-10-23) ---
+# A daemonized fio server logs only to syslog: its bind failure sits in the
+# journal while the port check sees a dead port.
+t_assert "fio server log: a failed run's teardown reads journalctl -t fio from the run start under the escalator; start and a clean end have none" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    printf "#!/bin/sh\ncase \"\$*\" in (*\"-t fio\"*) ;; (*) echo \"journalctl \$*\"; exit 0;; esac\nif [ -n \"\$WT_UNDER\" ]; then echo \"\$*\"; cat \"%s/fio.log\"; else echo \"user-only line\"; fi\n" "$d" > "$d/bin/journalctl"
+    printf "#!/bin/sh\necho \"sudo \$*\" >> \"%s/esc\"\nshift\nWT_UNDER=sudo exec \"\$@\"\n" "$d" > "$d/bin/sudo"
+    printf "%s\n" "2026-10-23T21:17:06+0000 h1 fio[2541056]: fio: bind: Cannot assign requested address" > "$d/fio.log"
+    E=$(( $(date +%s) - 100 )); f=$d/out/sysinfo/h1
+    nic_pressure "$d" start "$E"; nic_pressure "$d" end "$E"
+    [ ! -e "$f/fio-server-log-start" ] && [ ! -e "$f/fio-server-log-end" ] && [ -e "$f/kernel-log-end" ] || { ls "$f"; exit 1; } >&2
+    rm -rf "$d/out"; nic_pressure "$d" end "$E" fio-log
+    diff <(printf "%s\n" "# sudo -n journalctl -t fio --since @$E (the run start): every fio that logged in the window, not only this run'"'"'s" \
+        "-q -t fio --no-pager -o short-iso --since @$E" "2026-10-23T21:17:06+0000 h1 fio[2541056]: fio: bind: Cannot assign requested address") "$f/fio-server-log-end" >&2 &&
+    grep -q "^sudo -n journalctl -q -t fio" "$d/esc"'
+t_assert "fio server log: root reads it directly, a non-root login with no escalator says what it misses, an empty window says so" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    printf "#!/bin/sh\ncase \"\$*\" in (*\"-t fio\"*) cat \"%s/fio.log\";; (*) echo \"journalctl \$*\";; esac\n" "$d" > "$d/bin/journalctl"
+    printf "%s\n" "2026-10-23T21:16:26+0000 h1 fio[2540986]: fio: server listening on 0.0.0.0,8765" > "$d/fio.log"
+    E=$(( $(date +%s) - 100 )); f=$d/out/sysinfo/h1; H="# journalctl -t fio --since @$E (the run start): every fio that logged in the window, not only this run'"'"'s"
+    nic_pressure "$d" end "$E" fio-log
+    diff <(printf "%s\n" "# read as a non-root user and no passwordless escalator works: only this user'"'"'s entries show, a root fio server'"'"'s are missing" "$H" \
+        "2026-10-23T21:16:26+0000 h1 fio[2540986]: fio: server listening on 0.0.0.0,8765") "$f/fio-server-log-end" >&2 || exit 1
+    printf "#!/bin/sh\necho 0\n" > "$d/bin/id"; : > "$d/fio.log"; rm -rf "$d/out" "$d/esc"; nic_pressure "$d" end "$E" fio-log
+    diff <(printf "%s\n" "$H" "(no fio server log line in the window)") "$f/fio-server-log-end" >&2 && [ ! -e "$d/esc" ]'
+t_assert "fio server log: a host without journalctl says not available and reads nothing else" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    rm "$d/bin/journalctl"; mkdir -p "$d/root/var/log"; echo "Oct 23 h1 fio[1]: fio: bind: x" > "$d/root/var/log/syslog"
+    nic_pressure "$d" end "$(( $(date +%s) - 100 ))" fio-log; f=$d/out/sysinfo/h1/fio-server-log-end
+    [ "$(cat "$f")" = "not available: journalctl not installed, so this host keeps no journal to read" ] || { cat "$f"; exit 1; } >&2'
+t_assert "fio server log: only a failed run reads it at teardown, and one that stopped before the servers started says it has none" bash -c '
+    d=$(mktemp -d)
+    grep -q "trap '\''rc=\$?; RUN_RC=\$rc; cleanup; " ./wekatester || { echo "the EXIT trap does not hand cleanup the status" >&2; exit 1; }
+    t() {   # t <tag> <RUN_RC> <FIO_STARTED>: cleanup, its end capture string in end.<tag>
+        (source ./wekatester
+         WORK_DIR=$d/work; RUN_DIR=$d/run; mkdir -p "$WORK_DIR" "$RUN_DIR"
+         HOSTS=(h1); TARGET_DIR=/dev/shm/x; RUN_EPOCH=1; RUN_RC=$2; FIO_STARTED=$3; T=$1
+         run_host() { case "$2" in (*WEKATESTER_SYSINFO*) printf "%s\n" "$2" > "$d/end.$T";; esac; }
+         cleanup) > "$d/console.$1" 2>&1
+    }
+    t failed 1 1; t clean 0 1; t early 1 0
+    grep -q "WEKATESTER_SYSINFO fio-server-log" "$d/end.failed" &&
+    grep -q "WEKATESTER_SYSINFO kernel-log" "$d/end.clean" && ! grep -q fio-server-log "$d/end.clean" &&
+    grep -q "WEKATESTER_SYSINFO kernel-log" "$d/end.early" && ! grep -q fio-server-log "$d/end.early" &&
+    grep -q "note: no fio server log to read: the run stopped before the fio servers started" "$d/console.early" &&
+    ! grep -q "fio server log" "$d/console.failed" "$d/console.clean" || { tail -n +1 "$d"/console.* "$d"/end.*; exit 1; } >&2'
+
 # --- whole-host bound on the sysinfo and pressure sessions (Frank, 2026-10-23) ---
 t_assert "session bound: a host past WEKATESTER_SYSINFO_TIMEOUT is cut off and says where, the others finish, the run carries on" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d/h1" && nic_fixture "$d/h2" || exit 1

@@ -2,6 +2,9 @@
 # Daemons are tracked by pidfile only, never pkill by name: the host may run
 # fio jobs that are not ours.
 FIO_STARTED=0
+# The run's exit status, set by the EXIT trap: only a failed run reads the
+# fio server log at teardown.
+RUN_RC=0
 
 # Kill the pidfile daemon and wait until every process of ours is gone (TERM
 # up to 3s, then KILL). fio --server forks a child per connection, so the
@@ -166,7 +169,7 @@ PORTEOF
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED
     local -A grm=()
     [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
@@ -192,7 +195,13 @@ cleanup() {
     # which close only at the end of this function.
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
-        snapshot_pressure end
+        if [ "$RUN_RC" -eq 0 ]; then snapshot_pressure end
+        elif [ "$fio_ran" -eq 1 ]; then snapshot_pressure end fio-log
+        else
+            [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] \
+                || log "note: no fio server log to read: the run stopped before the fio servers started"
+            snapshot_pressure end
+        fi
     fi
     # the locks last, held through the capture so no other run lands in its
     # slice; with this run's group file when collect_fs_groups has not removed

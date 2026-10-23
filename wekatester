@@ -4351,6 +4351,9 @@ verify_mount_mode() {
 # Daemons are tracked by pidfile only, never pkill by name: the host may run
 # fio jobs that are not ours.
 FIO_STARTED=0
+# The run's exit status, set by the EXIT trap: only a failed run reads the
+# fio server log at teardown.
+RUN_RC=0
 
 # Kill the pidfile daemon and wait until every process of ours is gone (TERM
 # up to 3s, then KILL). fio --server forks a child per connection, so the
@@ -4515,7 +4518,7 @@ PORTEOF
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED
     local -A grm=()
     [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
@@ -4541,7 +4544,13 @@ cleanup() {
     # which close only at the end of this function.
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
-        snapshot_pressure end
+        if [ "$RUN_RC" -eq 0 ]; then snapshot_pressure end
+        elif [ "$fio_ran" -eq 1 ]; then snapshot_pressure end fio-log
+        else
+            [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] \
+                || log "note: no fio server log to read: the run stopped before the fio servers started"
+            snapshot_pressure end
+        fi
     fi
     # the locks last, held through the capture so no other run lands in its
     # slice; with this run's group file when collect_fs_groups has not removed
@@ -7281,10 +7290,28 @@ kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
     fi; true'
 }
 
+# A daemonized fio server logs only to syslog: journalctl -t fio from the run
+# start (_ks, _kring: after kernel_log_cmd), the last 2000 lines, under the
+# escalator for a non-root login, which sees only its own entries.
+fio_server_log_cmd() {
+    printf '%s' 'echo "=== WEKATESTER_SYSINFO fio-server-log ==="
+    if ! _o=$(command -v journalctl); then echo "not available: journalctl not installed, so this host keeps no journal to read"
+    else
+        _fw=journalctl
+        if [ "$(id -u)" = 0 ]; then :
+        elif _priv; then _fw="$_pv journalctl"
+        else echo "# read as a non-root user and no passwordless escalator works: only this user'"'"'s entries show, a root fio server'"'"'s are missing"; fi
+        echo "# $_fw -t fio --since @$_ks (the run start): every fio that logged in the window, not only this run'"'"'s"
+        _x=$(_T=60 _nc $_fw -q -t fio --no-pager -o short-iso --since "@$_ks")
+        if [ -n "$_x" ]; then printf "%s\n" "$_x" | _kring ""; else echo "(no fio server log line in the window)"; fi
+    fi; true'
+}
+
 # PSI and load at start and again at teardown, the counters above at both,
-# plus the run window's kernel log and sar slice (when sysstat keeps one).
+# plus the run window's kernel log and sar slice (when sysstat keeps one);
+# fio-log adds the fio server log (a failed run's teardown).
 PRESSURE_END_DONE=0
-snapshot_pressure() {   # snapshot_pressure <start|end>
+snapshot_pressure() {   # snapshot_pressure <start|end> [fio-log]
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     local label=$1 cmd
     cmd='for f in cpu io memory; do
@@ -7298,6 +7325,8 @@ $(pressure_counters_cmd)"
     if [ "$label" = end ] && [ -n "$RUN_EPOCH" ]; then
         cmd="$cmd
 $(kernel_log_cmd "$RUN_EPOCH")"
+        [ "${2:-}" != fio-log ] || cmd="$cmd
+$(fio_server_log_cmd)"
         # the run window's sar slice, in each worker's own time zone; a run
         # that started on an earlier worker day gets today from 00:00:00
         # (sar reads one day's file)
@@ -8394,7 +8423,7 @@ main() {
     # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
     # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
     # finalizes the bundle after it so the log holds the teardown.
-    trap 'rc=$?; cleanup; finalize_run_dir; exit $rc' EXIT
+    trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     # After the traps (half-established masters still get torn down), before
