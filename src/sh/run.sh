@@ -689,7 +689,7 @@ bundle_hosts() {   # bundle_hosts <run-dir>
 # -s -v: per host and NIC, the counters that rose between the start and
 # end captures (README, Output). Lowercase ERE: the names -v lists (-vv
 # lists every one that rose; AER always).
-SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|backlog|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
+SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
 summary_counters() {   # summary_counters <run-dir>
     local rd=$1 lists h side f rc=0
     lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.ctr.XXXXXX") || return 1

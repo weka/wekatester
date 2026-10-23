@@ -33,6 +33,7 @@ function compare(label, kind, sp, ep,    ns, ne, nm, d, nr, nd, nshow, k, DN, OR
     if (sp == "" || ep == "") { out("  " label ": at the " (sp == "" ? "end" : "start") " only, so no delta"); flagged = 1; return }
     ns = load(kind, sp); split("", S); for (nm in C) S[nm] = C[nm]; ws = WHY
     ne = load(kind, ep)
+    if (!ns && !ne) { out("  " label ": not available (" (ws != "" ? ws : "no counters") ")"); flagged = 1; return }
     if (!ns || !ne) { out("  " label ": no counters at the " (!ns ? "start" : "end") " (" ((!ns ? ws : WHY) != "" ? (!ns ? ws : WHY) : "empty") ")"); flagged = 1; return }
     nr = 0; nd = 0; nshow = 0; nord = 0
     for (nm in C) {
@@ -44,7 +45,8 @@ function compare(label, kind, sp, ep,    ns, ne, nm, d, nr, nd, nshow, k, DN, OR
     }
     sort_arr(ORD, nord, 0); sort_arr(DN, nd, 0)
     SUMM = SUMM (SUMM == "" ? "" : "; ") label " " nr_counters(ne) ", " commas(nr) " rose"
-    if (!nord && !nd) return
+    # a quiet source still gets its line, shown when another flags the host
+    if (!nord && !nd) { out("  " label ": " nr_counters(ne) ", " commas(nr) " rose; none match SUMMARY_COUNTER_RE, none went down"); return }
     flagged = 1
     out("  " label ": " nr_counters(ne) ", " commas(nr) " rose" (verbose > 1 || kind == "aer" ? "" : "; " commas(nord) " of them match SUMMARY_COUNTER_RE") (nord ? ":" : ""))
     for (k = 1; k <= nord; k++) out(sprintf("    %-40s +%s", ORD[k], commas(C[ORD[k]] - S[ORD[k]])))

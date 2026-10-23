@@ -7928,8 +7928,9 @@ summary_header() {   # summary_header <run-dir> <bundle-name>
             # versions: fio and weka per host from sysinfo
             FO[0] = 0; WO[0] = 0
             for (i = 1; i <= nh; i++) {
-                v = first_line(rd "/sysinfo/" HOST[i] "/fio"); sub(/^fio-/, "", v)
-                tally(FB, FO, v == -1 ? "not recorded" : v == "" || v ~ /^not available/ ? "not available" : v)
+                # fio --version prints fio-<version>; anything else is its failure
+                v = first_line(rd "/sysinfo/" HOST[i] "/fio")
+                tally(FB, FO, v == -1 ? "not recorded" : v ~ /^fio-/ ? substr(v, 5) : "not available")
                 tally(WB, WO, weka_version(rd "/sysinfo/" HOST[i] "/weka"))
             }
             print "version  wekatester " (("version" in SET) ? SET["version"] : "not recorded") ", fio " (nh ? tallied(FB, FO) : "not recorded") ", " (nh ? tallied(WB, WO) : "weka not recorded")
@@ -8023,7 +8024,7 @@ bundle_hosts() {   # bundle_hosts <run-dir>
 # -s -v: per host and NIC, the counters that rose between the start and
 # end captures (README, Output). Lowercase ERE: the names -v lists (-vv
 # lists every one that rose; AER always).
-SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|backlog|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
+SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
 summary_counters() {   # summary_counters <run-dir>
     local rd=$1 lists h side f rc=0
     lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.ctr.XXXXXX") || return 1
@@ -8072,6 +8073,7 @@ summary_counters() {   # summary_counters <run-dir>
             if (sp == "" || ep == "") { out("  " label ": at the " (sp == "" ? "end" : "start") " only, so no delta"); flagged = 1; return }
             ns = load(kind, sp); split("", S); for (nm in C) S[nm] = C[nm]; ws = WHY
             ne = load(kind, ep)
+            if (!ns && !ne) { out("  " label ": not available (" (ws != "" ? ws : "no counters") ")"); flagged = 1; return }
             if (!ns || !ne) { out("  " label ": no counters at the " (!ns ? "start" : "end") " (" ((!ns ? ws : WHY) != "" ? (!ns ? ws : WHY) : "empty") ")"); flagged = 1; return }
             nr = 0; nd = 0; nshow = 0; nord = 0
             for (nm in C) {
@@ -8083,7 +8085,8 @@ summary_counters() {   # summary_counters <run-dir>
             }
             sort_arr(ORD, nord, 0); sort_arr(DN, nd, 0)
             SUMM = SUMM (SUMM == "" ? "" : "; ") label " " nr_counters(ne) ", " commas(nr) " rose"
-            if (!nord && !nd) return
+            # a quiet source still gets its line, shown when another flags the host
+            if (!nord && !nd) { out("  " label ": " nr_counters(ne) ", " commas(nr) " rose; none match SUMMARY_COUNTER_RE, none went down"); return }
             flagged = 1
             out("  " label ": " nr_counters(ne) ", " commas(nr) " rose" (verbose > 1 || kind == "aer" ? "" : "; " commas(nord) " of them match SUMMARY_COUNTER_RE") (nord ? ":" : ""))
             for (k = 1; k <= nord; k++) out(sprintf("    %-40s +%s", ORD[k], commas(C[ORD[k]] - S[ORD[k]])))

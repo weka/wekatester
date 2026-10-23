@@ -111,8 +111,9 @@ BEGIN {
     # versions: fio and weka per host from sysinfo
     FO[0] = 0; WO[0] = 0
     for (i = 1; i <= nh; i++) {
-        v = first_line(rd "/sysinfo/" HOST[i] "/fio"); sub(/^fio-/, "", v)
-        tally(FB, FO, v == -1 ? "not recorded" : v == "" || v ~ /^not available/ ? "not available" : v)
+        # fio --version prints fio-<version>; anything else is its failure
+        v = first_line(rd "/sysinfo/" HOST[i] "/fio")
+        tally(FB, FO, v == -1 ? "not recorded" : v ~ /^fio-/ ? substr(v, 5) : "not available")
         tally(WB, WO, weka_version(rd "/sysinfo/" HOST[i] "/weka"))
     }
     print "version  wekatester " (("version" in SET) ? SET["version"] : "not recorded") ", fio " (nh ? tallied(FB, FO) : "not recorded") ", " (nh ? tallied(WB, WO) : "weka not recorded")

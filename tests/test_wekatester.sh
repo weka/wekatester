@@ -1926,6 +1926,22 @@ X
     [ "$sec" = "$exp" ] || { printf "%s\n" "$out" >&2; exit 1; }
     plain=$(summ_out "$d") || { echo "$plain" >&2; exit 1; }
     case "$plain" in *"==== counters"*) echo "counters without -v" >&2; false;; esac'
+t_assert "-s -v counters: a flagged host still lists its quiet NICs; a NIC without AER says not available; a missing fio is not a version" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_counters_fixture "$d"
+    s=$d/20261023-141002/sysinfo
+    printf "NIC statistics:\n     rx_packets: 1\n" > "$s/h1/ethtool-S-eth2-start"
+    printf "NIC statistics:\n     rx_packets: 9\n" > "$s/h1/ethtool-S-eth2-end"
+    for e in start end; do printf -- "--- aer_dev_correctable\nnot available: /sys/class/net/eth0/device/aer_dev_correctable not readable\n" > "$s/h2/aer-eth0-$e"; done
+    printf "bash: line 18: fio: command not found\nnot available\n" > "$s/h3/fio"
+    out=$(summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    case "$out" in
+        *"version  wekatester 2026-10-11, fio 3.36 (2 hosts), not available (1 host), weka 4.4.2"*) ;;
+        *) echo "$out" >&2; exit 1;;
+    esac
+    case "$out" in
+        *"  eth1: at the end only, so no delta"*"  eth2: 1 counter, 1 rose; none match SUMMARY_COUNTER_RE, none went down"*"h2"*"  eth0: 2 counters, 1 rose; none match SUMMARY_COUNTER_RE, none went down"*"  eth0 aer: not available (not available: /sys/class/net/eth0/device/aer_dev_correctable not readable)"*"h3: not recorded"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 t_assert "-s -vv counters: every counter that rose, traffic included" bash -c '
     d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_counters_fixture "$d"
     out=$(summ_out "$d" -vv) || { echo "$out" >&2; exit 1; }
