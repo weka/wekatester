@@ -322,9 +322,10 @@ both partitions safe.
 10s) run once per test type and per candidate engine, meaning whichever of
 io_uring, libaio and psync passed its test job. Bandwidth runs at N jobs and
 queue depth 1, IOPS at N jobs and queue depth 16, and latency at one job and
-queue depth 1. Each type's best reading wins, or its lowest latency. A tie
-inside the band goes to io_uring, then libaio, then psync. The type winners
-are tallied into **one engine per shape**, because the host file carries one
+queue depth 1. Each type's best reading wins, or its lowest latency, with no
+band; an exact tie goes to io_uring, then libaio, then psync. The type winners
+are tallied into **one engine per shape** (the engine that won the most types;
+a tie goes by the same order), because the host file carries one
 engine per host, and every search then runs on that engine. An engine pinned
 by `-e` or by the host file is used as it is; `-g` re-chooses a host-file
 engine.

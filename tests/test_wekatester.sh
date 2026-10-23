@@ -6114,6 +6114,20 @@ t_assert "cal_engine_pick: per-type winners, ties to io_uring, the tally picks t
     printf "lat io_uring 100\nlat psync 95\n" > "$d/f" &&
     b=$(source ./wekatester; cal_engine_pick "$d/f") &&
     case "$b" in "psync lat: io_uring 100.0 us, psync 95.0 us -> psync") true;; *) echo "b=$b" >&2; false;; esac'
+# Frank, 2026-10-23: no band; the best reading wins, an exact tie by ENGINE_ORDER
+t_assert "cal_engine_pick: the best reading wins with no band -- 1% ahead is enough, for latency too" bash -c '
+    d=$(mktemp -d)
+    printf "bw io_uring 990\nbw libaio 1000\niops io_uring 1000\niops psync 1001\nlat io_uring 100\nlat libaio 99.5\n" > "$d/e"
+    a=$(source ./wekatester; cal_engine_pick "$d/e")
+    case "$a" in "libaio bw: "*"-> libaio; iops: "*"-> psync; lat: "*"-> libaio") true;; *) echo "a=$a" >&2; false;; esac'
+t_assert "cal_engine_pick: an exact tie goes by ENGINE_ORDER, in a type and in the tally" bash -c '
+    d=$(mktemp -d)
+    printf "bw psync 1000\nbw libaio 1000\niops psync 900\niops libaio 900\niops io_uring 800\nlat psync 90\nlat libaio 95\n" > "$d/e"
+    a=$(source ./wekatester; cal_engine_pick "$d/e")
+    case "$a" in "libaio bw: "*"-> libaio; iops: "*"-> libaio; lat: "*"-> psync") true;; *) echo "a=$a" >&2; false;; esac &&
+    printf "bw psync 1000\nbw libaio 900\niops libaio 1000\niops psync 900\n" > "$d/f" &&
+    b=$(source ./wekatester; cal_engine_pick "$d/f") &&
+    case "$b" in "libaio bw: "*"-> psync; iops: "*"-> libaio") true;; *) echo "b=$b" >&2; false;; esac'
 t_assert "cal_shape_run: engine cells on a pinned 32-job x 64-file shape seed it first (review #17)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

@@ -1,5 +1,4 @@
 BEGIN {
-    band = ARGV[2] + 0
     if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cal_engine_pick: cannot read " ARGV[1])
     for (i = 1; i <= n; i++) {
         if (pysplit(L[i], F) < 3) continue
@@ -20,9 +19,9 @@ BEGIN {
             e = C[t, i]; v = V[t, i]
             show = show (i > 1 ? ", " : "") (t == "lat" ? sprintf("%s %.1f us", e, v) : t == "bw" ? sprintf("%s %.2f GiB/s", e, v / 1073741824) : e " " commas(v))
             r = (e in RANK) ? RANK[e] : no
-            # the best is always inside its own band, whatever rounding
-            # says (band 100)
-            if ((v == ext || (t == "lat" ? v <= ext * (2 - band / 100) : v >= ext * band / 100)) && (win == "" || r < wr)) { win = e; wr = r }
+            # the best reading wins, an exact tie going by ENGINE_ORDER
+            # (Frank, 2026-10-23)
+            if (v == ext && (win == "" || r < wr)) { win = e; wr = r }
         }
         if (!(win in TALLY)) TORD[++nt] = win
         TALLY[win]++

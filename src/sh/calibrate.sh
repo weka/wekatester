@@ -151,9 +151,6 @@ CAL_MAX_BW_NR=${CAL_MAX_BW_NR:-4}
 CAL_MAX_IOPS_QD=${CAL_MAX_IOPS_QD:-32}
 CAL_MAX_IOPS_NR=${CAL_MAX_IOPS_NR:-2}
 CAL_LINE_PCT=${CAL_LINE_PCT:-95}   # bandwidth: line rate counts as reached here
-CAL_KNEE_PCT=${CAL_KNEE_PCT:-98.5}   # the engine tie band: engines whose reading
-                         # is within this percent of the best are tied, and the
-                         # tie goes to ENGINE_ORDER
 CAL_SHAPE_THR=${CAL_SHAPE_THR:-3}   # THE STOP RULE: a rung makes progress only when
                          # this percent better than the best so far (cal ladders,
                          # bw and iops). The pick has no threshold: the best
@@ -499,11 +496,11 @@ cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine
     #@awk cal_plan' "$@"
 }
 
-# Per type the best reading wins (lowest for latency), a tie inside
-# CAL_KNEE_PCT going to ENGINE_ORDER; pick_engine settles the tally the same
-# way. Prints "<engine> <what each type said>".
+# Per type the best reading wins (lowest for latency), an exact tie going
+# to ENGINE_ORDER; pick_engine settles the tally the same way: the most
+# type wins, a tie by ENGINE_ORDER. Prints "<engine> <what each type said>".
 cal_engine_pick() {   # cal_engine_pick <engine-cells-file>
-    awkrun '#@awk cal_engine_pick' "$1" "$CAL_KNEE_PCT"
+    awkrun '#@awk cal_engine_pick' "$1"
 }
 
 # Run one cell solo on <rep>; the reading lands in cal/reading. Never inside
