@@ -60,6 +60,10 @@ t_assert "--ignore-capacity sets the override" bash -c '
     [ "$IGNORE_CAPACITY" -eq 1 ] && [ "${HOSTS[*]}" = "h1" ]'
 t_assert "capacity override defaults off" bash -c '
     source ./wekatester; parse_args -a h1; [ "$IGNORE_CAPACITY" -eq 0 ]'
+t_assert "--any-fs (any case) turns the filesystem-type check off; it defaults on" bash -c '
+    (source ./wekatester; parse_args h1; [ "$ANY_FS" -eq 0 ]) &&
+    (source ./wekatester; parse_args --any-fs h1; [ "$ANY_FS" -eq 1 ] && [ "${HOSTS[*]}" = "h1" ]) &&
+    (source ./wekatester; parse_args --ANY-FS h1; [ "$ANY_FS" -eq 1 ])'
 
 # --- parse_args: case-insensitive option names ---
 # Only the option NAME is normalized. Values and attached arguments keep the
@@ -136,13 +140,15 @@ t_assert "wekafs forcedirect ok"   test "$(c 'weka0 /mnt/weka wekafs rw,relatime
 t_assert "wekafs writecache fails" test "$(c 'weka0 /mnt/weka wekafs rw,relatime,writecache,readahead_kb=32768 0 0')" = "fail writecache"
 t_assert "wekafs readcache fails"  test "$(c 'weka0 /mnt/weka wekafs rw,readcache 0 0')" = "fail readcache"
 t_assert "wekafs unknown mode"     test "$(c 'weka0 /mnt/weka wekafs rw,relatime 0 0')" = "fail unknown"
-t_assert "nfs is a network filesystem" test "$(c 'srv:/x /mnt/weka nfs4 rw,noatime 0 0')" = "network"
-t_assert "lustre is a network filesystem" test "$(c '10.0.0.1@o2ib:/fs /mnt/weka lustre rw,flock 0 0')" = "network"
-t_assert "xfs is local"            test "$(c '/dev/sda1 /mnt/weka xfs rw,noatime 0 0')" = "local xfs"
-t_assert "tmpfs is local"          test "$(c 'tmpfs /mnt/weka tmpfs rw,nosuid 0 0')" = "local tmpfs"
-t_assert "an unnamed type is not network" test "$(c '')" = "local "
-t_assert "WEKATESTER_NETWORK_FSTYPES adds a network type" test "$(WEKATESTER_NETWORK_FSTYPES=fuse.myfs c 'myfs /mnt/weka fuse.myfs rw 0 0')" = "network"
-t_assert "only the type and options fields count: a source or mount point named wekafs or forcedirect does not" test "$(c 'wekafs /mnt/forcedirect xfs rw,noatime 0 0')" = "local xfs"
+t_assert "nfs is not wekafs: other, with its type" test "$(c 'srv:/x /mnt/weka nfs4 rw,noatime 0 0')" = "other nfs4"
+t_assert "lustre is not wekafs: other, with its type" test "$(c '10.0.0.1@o2ib:/fs /mnt/weka lustre rw,flock 0 0')" = "other lustre"
+t_assert "xfs is other"            test "$(c '/dev/sda1 /mnt/weka xfs rw,noatime 0 0')" = "other xfs"
+t_assert "tmpfs is other"          test "$(c 'tmpfs /mnt/weka tmpfs rw,nosuid 0 0')" = "other tmpfs"
+t_assert "an unnamed type is other" test "$(c '')" = "other "
+t_assert "WEKATESTER_NETWORK_FSTYPES is gone: a type it names is still other, and no list is left" bash -c '
+    [ "$(export WEKATESTER_NETWORK_FSTYPES=fuse.myfs; source ./wekatester; classify_mount_line_v "myfs /mnt/weka fuse.myfs rw 0 0"; echo "$MOUNT_VERDICT")" = "other fuse.myfs" ] &&
+    ! grep -q NETWORK_FSTYPES ./wekatester'
+t_assert "only the type and options fields count: a source or mount point named wekafs or forcedirect does not" test "$(c 'wekafs /mnt/forcedirect xfs rw,noatime 0 0')" = "other xfs"
 
 # --- usable cores (probe_cores): an unbindable cpu is not usable ---
 # cores_facts: "n ... | phys | all | reserved"; all is every thread fio gets
@@ -4551,20 +4557,48 @@ t_assert "mount guard: a mode failure skips the probe and keeps the remount advi
         *"must be mounted with forcedirect; remount"*) true;;
         *) echo "$err" >&2; false;;
     esac'
-t_assert "mount guard: a -d on a local filesystem is refused before anything is written; on another network filesystem it passes with the probe" bash -c '
-    err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/weka
-            run_host() { case "$2" in (t=*) echo "/dev/sda1 /mnt/weka xfs rw,noatime 0 0";; (p=*) echo PROBED >&2;; (*) return 0;; esac; }
-            verify_mount_mode) 2>&1 >>$WT_ASIDE ) && { echo "a local -d passed: $err" >&2; exit 1; }
-    case "$err" in *PROBED*) echo "probed a local disk: $err" >&2; exit 1;; esac
-    case "$err" in
-        *"localhost: /mnt/weka is on xfs, not a network filesystem -- wekatester never writes to a local disk"*"writes only to weka or another network filesystem -- nothing was written"*) ;;
-        *) echo "$err" >&2; exit 1;;
-    esac
+# wekafs only (Frank, 2026-10-23): every other type is refused, naming it
+# and --any-fs, before anything is written or probed.
+mg_type() {   # mg_type <fstype> [ANY_FS]: verify_mount_mode on a -d of that type
     (source ./wekatester
-     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/data
-     run_host() { case "$2" in t=*) echo "srv:/data /data nfs4 rw,noatime 0 0";; *) return 0;; esac; }
-     verify_mount_mode)'
+     LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/data; ANY_FS=${2:-0}; FT=$1
+     run_host() { case "$2" in (t=*) echo "src /data $FT rw,noatime 0 0";; (p=*) echo PROBED >&2;; (*) return 0;; esac; }
+     verify_mount_mode && echo "rc=0 kept=${#PRERUN_WARNINGS[@]}") 2>&1
+}
+export -f mg_type
+t_assert "mount guard: a -d on nfs is refused without --any-fs, naming the type and the flag, before anything is probed" bash -c '
+    out=$(mg_type nfs4)
+    case "$out" in *rc=0*|*PROBED*) echo "nfs passed or was probed: $out" >&2; exit 1;; esac
+    case "$out" in
+        *"localhost: /data is on nfs4, not wekafs"*"--any-fs"*"checks for wekafs only, and --any-fs turns that check off -- nothing was written"*) ;;
+        *) echo "$out" >&2; exit 1;;
+    esac'
+t_assert "mount guard: a -d on a local filesystem is refused without --any-fs, naming the type and the flag" bash -c '
+    out=$(mg_type xfs)
+    case "$out" in *rc=0*|*PROBED*) echo "xfs passed or was probed: $out" >&2; exit 1;; esac
+    case "$out" in
+        *"localhost: /data is on xfs, not wekafs"*"--any-fs"*"nothing was written"*) ;;
+        *) echo "$out" >&2; exit 1;;
+    esac'
+t_assert "mount guard: --any-fs accepts nfs and a local disk, probes them, and keeps a WARNING naming the type for the run log" bash -c '
+    for ft in nfs4 xfs; do
+        out=$(mg_type "$ft" 1)
+        case "$out" in
+            *"WARNING: localhost: the destination is on $ft; the filesystem-type check is off (--any-fs)"*) ;;
+            *) echo "$ft: $out" >&2; exit 1;;
+        esac
+        case "$out" in *PROBED*"rc=0 kept=1"*) ;; *) echo "$ft: $out" >&2; exit 1;; esac
+    done'
+t_assert "mount guard: the --any-fs WARNING lands in the run log, one line per type" bash -c '
+    d=$(mktemp -d); : > "$d/wekatester.log"
+    (source ./wekatester
+     LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/data; ANY_FS=1
+     run_host() { case "$1:$2" in (h3:t=*) echo "/dev/sda1 /data xfs rw 0 0";; (*:t=*) echo "srv:/data /data nfs4 rw 0 0";; (*) return 0;; esac; }
+     verify_mount_mode; RUN_DIR=$d; replay_prerun_warnings) >>$WT_ASIDE 2>&1
+    [ "$(grep -c "filesystem-type check is off" "$d/wekatester.log")" -eq 2 ] &&
+    grep -q "WARNING (before the run log opened): the destination is on nfs4 on 2 of 3 hosts (h1 h2); the filesystem-type check is off (--any-fs)" "$d/wekatester.log" &&
+    grep -q "WARNING (before the run log opened): h3: the destination is on xfs; the filesystem-type check is off (--any-fs)" "$d/wekatester.log" ||
+        { cat "$d/wekatester.log" >&2; false; }'
 
 # -r turns the forcedirect stop into a warning. The write probe still runs
 # (a cached mount that is unwritable is still a zero-IO run), and the warning
@@ -4629,7 +4663,7 @@ t_assert "mount guard: -r keeps the writability stop on a cached mount" bash -c 
 t_assert "mount recheck: the mount check classifies and records each host's full /proc/mounts line and its cksum from one session, with no findmnt FSTYPE,OPTIONS" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
-     LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka; WORK_DIR=$d
+     LOCAL_MODE=0; HOSTS=(h1 h2 h3); DIRECTORY=/mnt/weka; WORK_DIR=$d; ANY_FS=1
      run_host() { f=no; t=no; p=no
          case "$2" in (*FSTYPE*) f=yes;; esac
          case "$2" in (*"-o TARGET"*) t=yes;; esac
@@ -4778,7 +4812,7 @@ EOF
     out=$(try "$W" "$X" "$d/stack" "$d/wA")
     case "$out" in
         *rc=0*) echo "hidden wekafs over a visible xfs passed: $out" >&2; exit 1;;
-        *"localhost: $d/stack is on xfs, not a network filesystem"*) ;;
+        *"localhost: $d/stack is on xfs, not wekafs"*) ;;
         *) echo "A: $out" >&2; exit 1;;
     esac
     out=$(try "$X" "$W" "$d/stack" "$d/wB")
@@ -4788,7 +4822,7 @@ EOF
     [ ! -e "$d/stack/wt" ] || { echo "created under a visible xfs: $out" >&2; exit 1; }
     case "$out" in
         *rc=0*) echo "C passed: $out" >&2; exit 1;;
-        *"$d/stack/wt does not exist, and $d/stack is on xfs, not a network filesystem"*) ;;
+        *"$d/stack/wt does not exist, and $d/stack is on xfs, not wekafs"*) ;;
         *) echo "C: $out" >&2; exit 1;;
     esac
     out=$(try "$X" "$W" "$d/stack/wt" "$d/wD")
@@ -4895,7 +4929,7 @@ t_assert "prompts: an untimed question whose yes changes something takes a y -- 
         (*)         return 0;; esac; }
     out=$(printf "\n" | { verify_mount_mode; } 2>&1) && { echo "Enter went ahead: $out" >&2; exit 1; }
     case "$out" in *MKDIR*) echo "Enter created: $out" >&2; false;; *) true;; esac'
-t_assert "mount guard: missing -d whose parent is not wekafs is never created, even under -r -- a local parent is refused, a network one left to the operator" bash -c '
+t_assert "mount guard: missing -d whose parent is not wekafs is never created without --any-fs, even under -r -- local and nfs parents alike are refused by type" bash -c '
     try() { (source ./wekatester
              LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/mnt/wkea; FAST_TRACK=1; PARENT=$1
              run_host() { case "$2" in
@@ -4904,17 +4938,29 @@ t_assert "mount guard: missing -d whose parent is not wekafs is never created, e
                  (*"mkdir -p --"*) echo MKDIR >&2;;
                  (*)         return 1;; esac; }
              verify_mount_mode) 2>&1 >>$WT_ASIDE; }
-    err=$(try xfs) && { echo "passed under a local parent: $err" >&2; exit 1; }
-    case "$err" in *MKDIR*) echo "created under a local parent: $err" >&2; exit 1;; esac
-    case "$err" in
-        *"/mnt/wkea does not exist, and /mnt is on xfs, not a network filesystem -- wekatester never writes to a local disk"*"nothing was written"*) ;;
-        *) echo "$err" >&2; exit 1;;
-    esac
-    err=$(try nfs4) && { echo "passed under an nfs parent: $err" >&2; exit 1; }
-    case "$err" in *MKDIR*) echo "created under a non-wekafs parent: $err" >&2; exit 1;; esac
-    case "$err" in
-        *"/mnt/wkea does not exist, and /mnt is not a wekafs mount -- create it yourself"*"-d names the right directory"*) true;;
-        *) echo "$err" >&2; false;;
+    for p in xfs nfs4; do
+        err=$(try "$p") && { echo "passed under a $p parent: $err" >&2; exit 1; }
+        case "$err" in *MKDIR*) echo "created under a $p parent: $err" >&2; exit 1;; esac
+        case "$err" in
+            *"/mnt/wkea does not exist, and /mnt is on $p, not wekafs -- check that weka is mounted on this host"*"--any-fs"*"nothing was written"*) ;;
+            *) echo "$p: $err" >&2; exit 1;;
+        esac
+    done'
+t_assert "mount guard: --any-fs creates a missing -d under a non-wekafs parent, with no wekafs re-check, then probes it" bash -c '
+    out=$( (export WEKATESTER_PROMPT_TTY=/dev/null
+            source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); DIRECTORY=/scratch/wt; FAST_TRACK=1; ANY_FS=1
+            run_host() { case "$2" in
+                (t=*)       return 1;;
+                ("[ ! -e"*) printf "/scratch\n/dev/sda1 /scratch xfs rw,relatime 0 0\n";;
+                ("mkdir -p -- '"'"'/scratch/wt'"'"'") echo MKDIR >&2;;
+                (*"mkdir -p --"*) echo "GUARDED: $2" >&2; return 4;;
+                (p=*)       echo PROBED >&2;;
+                (*)         return 1;; esac; }
+            verify_mount_mode && echo rc=0) 2>&1 )
+    case "$out" in
+        *"WARNING: localhost: the destination is on xfs; the filesystem-type check is off (--any-fs)"*"/scratch/wt does not exist; /scratch is on xfs (--any-fs)"*"creating it (unattended)"*MKDIR*PROBED*"created /scratch/wt"*rc=0*) true;;
+        *) echo "$out" >&2; false;;
     esac'
 t_assert "mount guard: missing -d under a cached-mode parent stops without -r and creates nothing" bash -c '
     err=$( (source ./wekatester
@@ -4976,6 +5022,13 @@ t_assert "mount guard: the create snippet makes the destination only while its n
     grep -qx -- "-T $tmp -n -o TARGET" "$stub/asked" || { cat "$stub/asked" >&2; exit 1; }
     printf "%s\n" "weka0 $tmp wekafs rw,forcedirect 0 0" > "$stub/mounts"
     PATH="$stub:$PATH" bash -c "$cmd" && [ -d "$tmp/a/b" ]'
+t_assert "mount guard: under --any-fs the create snippet is a plain mkdir -p, so a missing -d under an xfs parent is created" bash -c '
+    tmp=$(mktemp -d); stub=$(mktemp -d)
+    printf "#!/bin/sh\necho \"%s\"\n" "$tmp" > "$stub/findmnt"; chmod +x "$stub/findmnt"
+    cmd=$(source ./wekatester; ANY_FS=1; create_dest_cmd "$tmp/a/b")
+    cmd=${cmd//\/proc\/mounts/$stub/mounts}
+    printf "%s\n" "/dev/sda1 $tmp xfs rw,noatime 0 0" > "$stub/mounts"
+    PATH="$stub:$PATH" bash -c "$cmd" && [ -d "$tmp/a/b" ] || { echo "not created: $cmd" >&2; false; }'
 t_assert "mount guard: a parent that stops being wekafs before the create leaves nothing created, probed or written, and says why" bash -c '
     err=$( (export WEKATESTER_PROMPT_TTY=/dev/null
             source ./wekatester
@@ -7088,7 +7141,7 @@ t_assert "help: every parsed option appears in -h as its own token" bash -c '
     miss=""
     for o in -d -w -f -s -o -e -p -t -x -r -n -g -u -a -i -v -h \
              --output --engine --password --targets --duration --unlink \
-             --auto --ignore-capacity --identity --version --help; do
+             --auto --ignore-capacity --any-fs --identity --version --help; do
         printf "%s\n" "$h" | grep -qE -- "(^|[[:space:][(])${o}([^-A-Za-z0-9]|$)" ||
             miss="$miss $o"
     done

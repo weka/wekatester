@@ -22,7 +22,7 @@ wekatester uses fio's native client/server mode:
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s] [--break-lock]
+                  [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -37,8 +37,9 @@ or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
   -d, --directory dir     target directory on the workers for test files
-                          (default: /mnt/weka); created on request when it
-                          is missing under a wekafs mount
+                          (default: /mnt/weka); must be on wekafs (see
+                          --any-fs); created on request when it is missing
+                          under a wekafs mount
   -w, --workload set      workload definition directory, a subdir of
                           fio-jobfiles (default: default)
   -f, --fio-bin path      fio binary on the workers (default: /usr/bin/fio);
@@ -79,6 +80,10 @@ attaching is the way to pass a value that starts with a dash.
                           host: kill wekatester's own fio there, clear its
                           files and take the lock (fio it did not start still
                           stops the run)
+  --any-fs                turn the filesystem-type check off: -d may be on
+                          any filesystem, a local disk included, and a
+                          missing -d is created anywhere; the run log says
+                          the check was off and what -d is on
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -96,7 +101,8 @@ attaching is the way to pass a value that starts with a dash.
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
-  -r             fast track: no prompts -- create whatever is needed and run;
+  -r             fast track: no prompts -- create whatever is needed (a
+                 missing -d only under wekafs, anywhere with --any-fs) and run;
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
@@ -172,7 +178,7 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 # Prompts, fast track and dry runs
 The host file and the workload set are prepared before a run: wekatester opens no editors. A few prompts remain, for things a run would otherwise create or risk: a missing host file (`-t`), a missing destination directory, a workload that does not fit, and the `-p` passwords. They read the terminal directly, so they work fine under `... | tee run.log`.
 
-- `-r` — fast track: no prompts; whatever is needed (the layout, a missing destination directory under a wekafs mount) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so. A destination mount that changes before the measured run is still a stop (Caveats).
+- `-r` — fast track: no prompts; whatever is needed (the layout, a missing destination directory under a wekafs mount, or anywhere with `--any-fs`) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so. A destination mount that changes before the measured run is still a stop (Caveats).
 - `-n` — dry run: everything is resolved, generated and staged, then every staged jobfile's contents and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and the ioengines are proven with small one-file fio jobs: with `-a`, `-t` or `-e`, and when an ioengine is discovered (see `-e`), so the staged variants show the engine the run would use. The pinning check runs too, so a dry run stops where the real run would.
 - `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too): a set's own layout job, edited or not, gives way to one generated for this run, staged like any generated layout (re-derived per host under `-a`). The source directory is never changed.
 
@@ -679,10 +685,10 @@ Any run can be re-summarized later with `-s` — point it at the bundle (no extr
 - TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts, and it refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors). The check is one ssh session to the coordinator that probes every worker in parallel from inside it — one session per worker would pile N sessions onto the coordinator's single multiplexed connection, and sshd's `MaxSessions` (default 10) and `MaxStartups` then refuse the rest, which read as firewalls (seen at 111 workers: 39 false "cannot reach").
 - The per-host min/max spread in the summary only appears with 2 or more workers. A run with no host at all is local mode, not an error.
 - Local mode still needs fio on the local host, `/dev/shm`, and fio's port 8765 reachable on loopback — the same phases run, they just run against this machine. wekatester itself runs only on a Linux controller (the mount guard uses `findmnt`, staging uses `/dev/shm`) and refuses to start elsewhere; `-s`, which only reads a run bundle, works anywhere.
-- `-d` must be on wekafs or another network filesystem (NFS, SMB, Lustre, GPFS, BeeGFS, Ceph, GlusterFS, Panasas and the like): wekatester never writes to a local disk, and refuses a destination on any other filesystem type before anything is written. That also catches an unmounted weka, whose mount point is then an empty directory on the root disk. `WEKATESTER_NETWORK_FSTYPES` adds network types the built-in list lacks (space-separated filesystem type names, as the third field of /proc/mounts gives them).
+- `-d` must be on wekafs: wekatester refuses a destination on any other filesystem type (NFS, Lustre, a local disk, ...) before anything is written, naming the type it found. That also catches an unmounted weka, whose mount point is then an empty directory on the root disk. `--any-fs` turns this filesystem-type check off, so wekatester can test any filesystem, a local disk included: the run log then carries a `WARNING` naming the type `-d` is on (one line per type, naming the hosts unless it is all of them), so the bundle says the check was off. Every other destination check still runs: writability, the capacity check, the mount-line recheck below, and on wekafs the `forcedirect` check.
 - If `-d` is a wekafs mount it must be mounted with `forcedirect`; wekatester refuses to run otherwise. fio's `direct=1` alone does not keep the wekafs client cache fully out of the IO path. Under `-r` this is a warning rather than a stop — the numbers then include client-cache effects, and the run log says so.
 - The destination mount that passed the check is the one the run measures: the destination mount's /proc/mounts line, hashed; any change stops the run. In one session, the check finds the mount point holding `-d` with `findmnt -T` and reads its /proc/mounts line (the last line for that mount point, since a mount stacked on the same point is the visible one; the kernel's `\040`-style escapes are decoded first). That one line is what the check classifies (its third field is the filesystem type, its fourth the options), what it keeps with its `cksum`, and what fio writes to: on a stacked mount `findmnt` lists the hidden mount first, and judging that one would pass a local disk stacked over weka. A destination wekatester creates gets the line of the mount it was created on, classified the same way. A host with no such line stops the check. Right before the first measured job, after calibration and the layout, every host reads that line again in one parallel round, and the hashes are compared. Any change to the line (source, mount point, filesystem type, any option, or the dump/pass fields), or a host that cannot read it, stops the run with each such host's old and new line, `-r` included. A dry run (`-n`) ends before the measured run and skips this check.
-- If `-d` does not exist yet, wekatester offers to create it (once, for every worker that lacks it) — but only when the nearest existing parent is a wekafs mount. Without `-r` that takes a terminal and a `y`; with `-r` or `-n` it is a 5-second prompt defaulting to create, or created outright when there is no terminal. A missing directory anywhere else is a hard stop: with wekafs not mounted, the parent is the root filesystem, and a mistyped `-d` created there would benchmark the boot disk. Each host checks its nearest existing parent again in the same session, right before its `mkdir -p` (the type in that parent's /proc/mounts line must still be wekafs): a weka client that restarted while the prompt waited leaves the mount point on the root disk, and that host then creates nothing.
+- If `-d` does not exist yet, wekatester offers to create it (once, for every worker that lacks it) — but only when the nearest existing parent is a wekafs mount (anywhere under `--any-fs`, below). Without `-r` that takes a terminal and a `y`; with `-r` or `-n` it is a 5-second prompt defaulting to create, or created outright when there is no terminal. Without `--any-fs`, a missing directory anywhere else is a hard stop: with wekafs not mounted, the parent is the root filesystem, and a mistyped `-d` created there would benchmark the boot disk. Each host checks its nearest existing parent again in the same session, right before its `mkdir -p` (the type in that parent's /proc/mounts line must still be wekafs): a weka client that restarted while the prompt waited leaves the mount point on the root disk, and that host then creates nothing. With `--any-fs` the parent may be on any filesystem, and neither parent check runs: the missing `-d` is created with a plain `mkdir -p` after the same question, wherever it is, so a mistyped `-d` is created where it points.
 - The target directory must be writable by the login user on every worker — fio creates its data files there. wekatester probes this before running (one dotfile, created and removed) because fio's client mode reports a worker-side permission failure so quietly that the run would otherwise "succeed" with zero IO. A root-owned mount root is the usual cause; a one-time `chmod` of the root on any host persists in the shared filesystem. A directory wekatester creates is owned by the login user, so it passes this probe by construction.
 - `fio --client` exits 0 even when jobs fail on the workers, so wekatester reads success out of the results themselves: a job whose stats carry an error, or a measured job that moved zero bytes, aborts the run and names the host — it will not print a summary of zeros.
 - The fio coordinator takes every worker on its command line (one `--client=<host> <jobfile>` pair per worker), and the coordinator's shell receives that as a single argument, which Linux caps at 128 KiB (`MAX_ARG_STRLEN`). That is roughly 1,100 workers with 25-character names, or 700 with 60-character FQDNs. wekatester measures the line before anything starts on the hosts (pricing the longest job name the set can stage), again at staging with the real names, and stops with a clear message (a dry run reports it too); past that size, run the fleet as two or more host lists.

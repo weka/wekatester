@@ -107,13 +107,12 @@ preflight() {
 }
 
 # --- phase 1b: mount mode verification ----------------------------------------
-# wekafs must be forcedirect (direct=1 alone leaves the client cache in the
-# path); anything else must be a network filesystem, never a local disk,
-# which is also what an unmounted weka mount point is.
-NETWORK_FSTYPES="nfs nfs4 cifs smb3 smbfs lustre gpfs beegfs ceph fuse.ceph fuse.ceph-fuse glusterfs fuse.glusterfs panfs pvfs2 orangefs ocfs2 gfs2 afs cvfs quobyte fuse.quobyte fuse.daos fuse.juicefs fuse.mfs ${WEKATESTER_NETWORK_FSTYPES:-}"
+# -d must be wekafs, mounted forcedirect (direct=1 alone leaves the client
+# cache in the path); any other type, an unmounted weka's root-disk mount
+# point included, is refused unless --any-fs turns the type check off.
 
-# ok, "fail <mode>", network, or "local <type>", left in MOUNT_VERDICT, from
-# a /proc/mounts line: its 3rd field is the type, its 4th the options.
+# ok, "fail <mode>", or "other <type>", left in MOUNT_VERDICT, from a
+# /proc/mounts line: its 3rd field is the type, its 4th the options.
 classify_mount_line_v() {   # classify_mount_line_v <proc-mounts-line> -> MOUNT_VERDICT
     local fstype="" opts=""
     read -r _ _ fstype opts _ <<<"$1"
@@ -125,11 +124,7 @@ classify_mount_line_v() {   # classify_mount_line_v <proc-mounts-line> -> MOUNT_
             *)               MOUNT_VERDICT="fail unknown" ;;
         esac
     else
-        case " $NETWORK_FSTYPES " in
-            (*" $fstype "*) MOUNT_VERDICT=network ;;
-            (*)             MOUNT_VERDICT="local $fstype" ;;
-        esac
-        [ -n "$fstype" ] || MOUNT_VERDICT="local "
+        MOUNT_VERDICT="other $fstype"
     fi
 }
 
@@ -197,7 +192,12 @@ check_mounts_unchanged() {
 # wekafs in this same session: a weka client that restarted since the check
 # leaves a root-disk mount point. Exit 4: not wekafs now. The type is the 3rd
 # field of the parent's /proc/mounts line, the line the check classified.
+# --any-fs: a plain mkdir -p.
 create_dest_cmd() {   # create_dest_cmd <dir>
+    if [ "$ANY_FS" -eq 1 ]; then
+        printf '%s' "mkdir -p -- '$1'"
+        return 0
+    fi
     mount_line_cmd_v '"$p"'
     printf '%s' "p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$($MOUNT_LINE_CMD | awk '{print \$3}')\" = wekafs ] || exit 4; mkdir -p -- '$1'"
 }
@@ -318,16 +318,17 @@ confirm_create_dirs() {   # confirm_create_dirs <count>
 
 # All workers: -d must not be a cached-mode wekafs mount, and must be writable
 # by the login user (fio reports a worker EACCES so quietly the run "succeeds"
-# with zero IO). A missing -d is created only under a wekafs mount, after one
-# question (README, Caveats).
+# with zero IO). A missing -d is created only under a wekafs mount (anywhere
+# under --any-fs), after one question (README, Caveats).
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
     # one name per run, so two runs sharing a destination never read each
     # other's group lines (collect_fs_groups)
     [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
-    local host line verdict failed=() mode_fail=0 write_fail=0 local_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
-    local missing=() missing_dirs=() missing_parents=() procs=()
-    local cached_hosts=() cached_modes=() mode who n
+    local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
+    local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
+    local cached_hosts=() cached_modes=() mode who n anyfs_hosts=() anyfs_types=() off
+    local -A said=()
     # Three fan-outs: every host gets the same commands in the same order and
     # the messages come back in host order, as a serial walk produced them;
     # only the waiting overlaps. Per-host output goes to files under the work
@@ -380,35 +381,34 @@ verify_mount_mode() {
         fi
         classify_mount_line_v "${procs[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
-            ok)   ;;
-            network)
-                  if [ -n "$anc" ]; then
-                      msgs[$i]="$host: $hd does not exist, and $anc is not a wekafs mount -- create it yourself, or check that -d names the right directory"
+            ok)   ft=wekafs ;;
+            other*)
+                  ft=${verdict#other }; [ -n "$ft" ] || ft="a filesystem with no type in its /proc/mounts line"
+                  if [ "$ANY_FS" -eq 0 ]; then
+                      # refused before anything is written; an unmounted
+                      # weka leaves its mount point on the root disk
+                      type_fail=1
+                      if [ -n "$anc" ]; then
+                          msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not wekafs -- check that weka is mounted on this host and that -d names a directory on it; --any-fs tests a filesystem other than wekafs"
+                      else
+                          msgs[$i]="$host: $hd is on $ft, not wekafs -- check that weka is mounted there on this host; --any-fs tests a filesystem other than wekafs"
+                      fi
                       continue
-                  fi
-                  debug "$host: $hd is on a network filesystem, not wekafs; the weka mount guard does not apply" ;;
-            local*)
-                  # refused before anything is written: a local disk is never a target
-                  local_fail=1
-                  ft=${verdict#local }; [ -n "$ft" ] || ft="a filesystem with no type in its /proc/mounts line"
-                  if [ -n "$anc" ]; then
-                      msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka is mounted on this host and that -d names a directory on it"
-                  else
-                      msgs[$i]="$host: $hd is on $ft, not a network filesystem -- wekatester never writes to a local disk: check that weka (or another network filesystem) is mounted there on this host"
-                  fi
-                  continue ;;
+                  fi ;;
             fail*) if [ "$FAST_TRACK" -eq 1 ]; then
                        # said once per MODE after the loop: 111 identical
                        # lines is noise, not information (field fleet D, 2026-09-09)
-                       cached_hosts+=("$host"); cached_modes+=("${verdict#fail }")
+                       cached_hosts+=("$host"); cached_modes+=("${verdict#fail }"); ft=wekafs
                    else
                        msgs[$i]="$host: wekafs mounted ${verdict#fail } (need forcedirect)"
                        mode_fail=1
                        continue
                    fi ;;
         esac
+        # said once per type after the loop, like -r's warning
+        [ "$ANY_FS" -eq 0 ] || { anyfs_hosts+=("$host"); anyfs_types+=("$ft"); }
         if [ -n "$anc" ]; then
-            missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc")
+            missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc"); missing_types+=("$ft")
             continue   # created below, once the operator agrees, then probed
         fi
         probe[$i]=1
@@ -447,6 +447,24 @@ verify_mount_mode() {
             fi
         done
     fi
+    # --any-fs: the run log says the type check was off and what -d is on,
+    # one line per type, in host order
+    off="the filesystem-type check is off (--any-fs): wekatester checks for wekafs only"
+    for ft in "${anyfs_types[@]}"; do
+        [ -z "${said[$ft]+set}" ] || continue
+        said[$ft]=1; who=""; n=0
+        for i in "${!anyfs_hosts[@]}"; do
+            [ "${anyfs_types[$i]}" = "$ft" ] || continue
+            who="$who${who:+ }${anyfs_hosts[$i]}"; n=$((n + 1))
+        done
+        if [ "$n" -eq 1 ]; then
+            warn_prerun "$who: the destination is on $ft; $off"
+        elif [ "$n" -eq ${#HOSTS[@]} ]; then
+            warn_prerun "the destination is on $ft on all $n hosts; $off"
+        else
+            warn_prerun "the destination is on $ft on $n of ${#HOSTS[@]} hosts ($who); $off"
+        fi
+    done
     # Missing destinations are created only when nothing else is wrong: no
     # mutation on a run that is about to stop anyway.
     if [ ${#missing[@]} -gt 0 ]; then
@@ -456,7 +474,9 @@ verify_mount_mode() {
             done
         else
             for i in "${!missing[@]}"; do
-                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is a wekafs mount"
+                ft=${missing_types[$i]}
+                if [ "$ft" = wekafs ]; then ft="a wekafs mount"; else ft="on $ft (--any-fs)"; fi
+                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is $ft"
             done
             confirm_create_dirs "${#missing[@]}"
             # one fan-out, each host its mkdir and then its write probe
@@ -494,8 +514,8 @@ verify_mount_mode() {
         # failed everywhere, -d most likely does not exist.
         [ "$mode_fail" -eq 0 ] || \
             die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
-        [ "$local_fail" -eq 0 ] || \
-            die "a destination is on a local filesystem; wekatester writes only to weka or another network filesystem -- nothing was written"
+        [ "$type_fail" -eq 0 ] || \
+            die "a destination is not on wekafs; wekatester checks for wekafs only, and --any-fs turns that check off -- nothing was written"
         [ "$gone_fail" -eq 0 ] || \
             die "the weka mount above a missing destination went away before it was created; nothing was created on a local disk -- check the weka client and re-run"
         [ "$write_fail" -eq 0 ] || \

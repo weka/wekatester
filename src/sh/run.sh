@@ -275,6 +275,7 @@ dry_run_report() {
     fi
     log "workload source: $JOBFILE_SRC"
     log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
+    [ "$ANY_FS" -eq 0 ] || log "destination: the filesystem-type check was off (--any-fs); the WARNING above names what -d is on"
     for job in "${JOBFILES[@]}"; do
         echo
         echo "==== $job (staged variant for $MASTER) ===="

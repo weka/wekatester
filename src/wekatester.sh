@@ -82,6 +82,7 @@ LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
+ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 
 #@include sh/base.sh
 
@@ -89,7 +90,7 @@ usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s] [--break-lock]
+                  [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -104,8 +105,9 @@ or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
   -d, --directory dir     target directory on the workers for test files
-                          (default: $DIRECTORY); created on request when it
-                          is missing under a wekafs mount
+                          (default: $DIRECTORY); must be on wekafs (see
+                          --any-fs); created on request when it is missing
+                          under a wekafs mount
   -w, --workload set      workload definition directory, a subdir of
                           fio-jobfiles (default: $WORKLOAD)
   -f, --fio-bin path      fio binary on the workers (default: $FIO_BIN);
@@ -146,6 +148,10 @@ attaching is the way to pass a value that starts with a dash.
                           host: kill wekatester's own fio there, clear its
                           files and take the lock (fio it did not start still
                           stops the run)
+  --any-fs                turn the filesystem-type check off: -d may be on
+                          any filesystem, a local disk included, and a
+                          missing -d is created anywhere; the run log says
+                          the check was off and what -d is on
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
@@ -163,7 +169,8 @@ attaching is the way to pass a value that starts with a dash.
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
-  -r             fast track: no prompts -- create whatever is needed and run;
+  -r             fast track: no prompts -- create whatever is needed (a
+                 missing -d only under wekafs, anywhere with --any-fs) and run;
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
   -n             dry run: create/generate, print the files and the run details;
@@ -374,6 +381,7 @@ parse_args() {
                 shift ;;
             --ignore-capacity) IGNORE_CAPACITY=1; shift ;;
             --break-lock) BREAK_LOCK=1; shift ;;
+            --any-fs) ANY_FS=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
