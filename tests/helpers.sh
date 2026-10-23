@@ -614,8 +614,29 @@ summ_bundle_fixture() {
         "  cores: N=26" "  hosts: h1 h2" \
         "shape 2 of 2: 1 host(s), calibrated on h3 -- Example CPU, 32 cpus, 256 GiB, weka NICs: no line rate" "  cores: N=12" "  hosts: h3" > "$b/cal/shapes.txt"
 }
+# summ_counters_fixture <dir>: start/end counters in the plain bundle. h1:
+# nstat, TcpRetransSegs and TcpInSegs rise, the gauge TcpCurrEstab falls;
+# eth0's rx_discards_phy rises past 2^31, rx_packets rises,
+# rx_out_of_buffer falls (a reset), AER correctable 3 -> 5; eth1 only at
+# the end. h2: /proc/net/snmp format, only traffic rises. h3: none.
+summ_counters_fixture() {
+    local s=$1/20261023-141002/sysinfo
+    printf 'eth0\n' > "$s/h1/nics-start"; printf 'eth0 eth1\n' > "$s/h1/nics-end"
+    printf '#kernel\nTcpInSegs 1000 0.0\nTcpRetransSegs 10 0.0\nTcpCurrEstab 9 0.0\n' > "$s/h1/tcp-start"
+    printf '#kernel\nTcpInSegs 900000 0.0\nTcpRetransSegs 1244 0.0\nTcpCurrEstab 2 0.0\n' > "$s/h1/tcp-end"
+    printf 'NIC statistics:\n     rx_packets: 100\n     rx_discards_phy: 5000000000\n     rx_out_of_buffer: 77\n' > "$s/h1/ethtool-S-eth0-start"
+    printf 'NIC statistics:\n     rx_packets: 90000\n     rx_discards_phy: 8000000000\n     rx_out_of_buffer: 4\n' > "$s/h1/ethtool-S-eth0-end"
+    printf 'NIC statistics:\n     rx_packets: 5\n' > "$s/h1/ethtool-S-eth1-end"
+    printf -- '--- aer_dev_correctable\nRxErr 0\nTOTAL_ERR_COR 3\n--- aer_dev_fatal\nnot available: /sys/class/net/eth0/device/aer_dev_fatal not readable\n' > "$s/h1/aer-eth0-start"
+    printf -- '--- aer_dev_correctable\nRxErr 0\nTOTAL_ERR_COR 5\n--- aer_dev_fatal\nnot available: /sys/class/net/eth0/device/aer_dev_fatal not readable\n' > "$s/h1/aer-eth0-end"
+    printf 'eth0\n' > "$s/h2/nics-start"; printf 'eth0\n' > "$s/h2/nics-end"
+    printf 'not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead\nTcp: RtoAlgorithm InSegs RetransSegs CurrEstab\nTcp: 1 50 7 3\n' > "$s/h2/tcp-start"
+    printf 'not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead\nTcp: RtoAlgorithm InSegs RetransSegs CurrEstab\nTcp: 1 70 7 1\n' > "$s/h2/tcp-end"
+    printf 'NIC statistics:\n     rx_packets: 100\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-start"
+    printf 'NIC statistics:\n     rx_packets: 200\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-end"
+}
 # summ_out <dir> [option...]: the bundle tarred and -s run on it, every line
 summ_out() {
     tar -czf "$1/b.tgz" -C "$1" 20261023-141002 && ./wekatester "${@:2}" -s "$1/b.tgz" 2>&1
 }
-export -f summ_job summ_weka summ_bundle_fixture summ_out fio_json_fixture fio_json_single_fixture
+export -f summ_job summ_weka summ_bundle_fixture summ_counters_fixture summ_out fio_json_fixture fio_json_single_fixture

@@ -7783,14 +7783,19 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
             | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
-        [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; rm -rf "${tmp:?}"; return 1; }
-        while IFS= read -r f; do
+        [ -z "$results" ] || while IFS= read -r f; do
             job=${f##*/}; job=${job#results_}; job=${job%.json}
             case "$skip" in *" $job "*) continue ;; esac
             echo "==== $job ===="
             summ_one "$f" "${f##*/}" "$items" "" bundle
         done <<<"$results"
-        rm -rf "${tmp:?}"; return 0
+        # -v: the hosts over the run, a stopped run's included
+        if [ "$VERBOSITY" -ge 1 ] && [ ${#rds[@]} -eq 1 ]; then
+            summary_counters "${rds[0]}" || printf '(counters: they could not be read from %s)\n\n' "$path"
+        fi
+        rm -rf "${tmp:?}"
+        [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; return 1; }
+        return 0
     fi
     summ_one "$path" "$path" "$items" "$expected" file
 }
@@ -8000,6 +8005,131 @@ summary_header() {   # summary_header <run-dir> <bundle-name>
             }
             print ""
         }' "$rd" "$2" "$lists/jobs" "$lists/hosts" "$UNLINK_JOB" || rc=1
+    rm -rf "${lists:?}"
+    return "$rc"
+}
+
+# A bundle's hosts: the recorded order, then any other it has a sysinfo/
+# or fio-jobfiles/ directory for.
+bundle_hosts() {   # bundle_hosts <run-dir>
+    local e
+    { [ ! -f "$1/settings" ] || LC_ALL=C awk -F'\t' '$1 == "hosts" { n = split($2, H, " "); for (i = 1; i <= n; i++) print H[i] }' "$1/settings"
+      for e in "$1"/sysinfo/* "$1"/fio-jobfiles/*; do [ ! -d "$e" ] || printf '%s\n' "${e##*/}"; done | LC_ALL=C sort -u
+    } | LC_ALL=C awk '!($0 in s) { s[$0] = 1; print }'
+}
+
+# -s -v: per host and NIC, the counters that rose between the start and
+# end captures (README, Output). Lowercase ERE: the names -v lists (-vv
+# lists every one that rose; AER always).
+SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|backlog|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
+summary_counters() {   # summary_counters <run-dir>
+    local rd=$1 lists h side f rc=0
+    lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.ctr.XXXXXX") || return 1
+    bundle_hosts "$rd" > "$lists/hosts" || rc=1
+    while IFS= read -r h; do
+        for side in start end; do
+            for f in "$rd/sysinfo/$h/nics-$side" "$rd/sysinfo/$h/tcp-$side" "$rd/sysinfo/$h"/ethtool-S-*-"$side" "$rd/sysinfo/$h"/aer-*-"$side"; do
+                [ ! -f "$f" ] || printf '%s\t%s\t%s\n' "$h" "$side" "$f"
+            done
+        done
+    done < "$lists/hosts" > "$lists/files"
+    echo "==== counters over the run: what rose from start to end, per host and NIC ===="
+    [ "$rc" -ne 0 ] || awkrun '
+        # One capture into C[name] = value (digits only); returns the count, and
+        # WHY the first "not available" or "(... exited N)" line when it holds none
+        function load(kind, path,    L, n, i, F, m, k, pre, sect, nm, v, c) {
+            split("", C); c = 0; WHY = ""
+            if ((n = readlines(path, L)) < 0) { WHY = "unreadable"; return 0 }
+            sect = ""
+            for (i = 1; i <= n; i++) {
+                if (L[i] ~ /^not available/ || L[i] ~ /^\(.* exited [0-9]+\)$/) { if (WHY == "") WHY = L[i]; continue }
+                if (kind == "tcp") {
+                    m = split(L[i], F, " ")
+                    if (m < 2 || substr(F[1], 1, 1) == "#") continue
+                    if (F[1] ~ /:$/) {
+                        # /proc/net/snmp and netstat: a header line, then its values
+                        pre = substr(F[1], 1, length(F[1]) - 1)
+                        if (F[2] !~ /^-?[0-9]+$/) { HN[pre] = m; for (k = 2; k <= m; k++) HDR[pre, k] = F[k]; continue }
+                        for (k = 2; k <= m && k <= HN[pre]; k++) if (F[k] ~ /^[0-9]+$/ && !((pre HDR[pre, k]) in GAUGE)) { C[pre HDR[pre, k]] = F[k]; c++ }
+                    } else if (F[2] ~ /^[0-9]+$/ && !(F[1] in GAUGE)) { C[F[1]] = F[2]; c++ }   # nstat: name value rate
+                } else if (kind == "aer") {
+                    if (L[i] ~ /^--- aer_dev_/) { sect = substr(L[i], 13); continue }
+                    if (split(L[i], F, " ") == 2 && F[2] ~ /^[0-9]+$/) { C[sect "." F[1]] = F[2]; c++ }
+                } else if (match(L[i], /: *[0-9]+[ \t]*$/)) {
+                    # ethtool -S: "     name: value"
+                    nm = strip(substr(L[i], 1, RSTART - 1)); v = substr(L[i], RSTART + 1); gsub(/[ \t]/, "", v)
+                    if (nm != "") { C[nm] = v; c++ }
+                }
+            }
+            return c
+        }
+        function out(line) { O[++no] = line }
+        function nr_counters(n) { return commas(n) (n == 1 ? " counter" : " counters") }
+        # one source of one host: what rose, what went down, against the start
+        function compare(label, kind, sp, ep,    ns, ne, nm, d, nr, nd, nshow, k, DN, ORD, nord) {
+            if (sp == "" || ep == "") { out("  " label ": at the " (sp == "" ? "end" : "start") " only, so no delta"); flagged = 1; return }
+            ns = load(kind, sp); split("", S); for (nm in C) S[nm] = C[nm]; ws = WHY
+            ne = load(kind, ep)
+            if (!ns || !ne) { out("  " label ": no counters at the " (!ns ? "start" : "end") " (" ((!ns ? ws : WHY) != "" ? (!ns ? ws : WHY) : "empty") ")"); flagged = 1; return }
+            nr = 0; nd = 0; nshow = 0; nord = 0
+            for (nm in C) {
+                if (!(nm in S)) continue
+                if (C[nm] + 0 > S[nm] + 0) {
+                    nr++
+                    if (verbose > 1 || kind == "aer" || tolower(nm) ~ show_re) ORD[++nord] = nm
+                } else if (C[nm] + 0 < S[nm] + 0) DN[++nd] = nm
+            }
+            sort_arr(ORD, nord, 0); sort_arr(DN, nd, 0)
+            SUMM = SUMM (SUMM == "" ? "" : "; ") label " " nr_counters(ne) ", " commas(nr) " rose"
+            if (!nord && !nd) return
+            flagged = 1
+            out("  " label ": " nr_counters(ne) ", " commas(nr) " rose" (verbose > 1 || kind == "aer" ? "" : "; " commas(nord) " of them match SUMMARY_COUNTER_RE") (nord ? ":" : ""))
+            for (k = 1; k <= nord; k++) out(sprintf("    %-40s +%s", ORD[k], commas(C[ORD[k]] - S[ORD[k]])))
+            if (nd) {
+                d = ""
+                for (k = 1; k <= nd && k <= 5; k++) d = d (k > 1 ? ", " : "") DN[k] " " commas(S[DN[k]]) " -> " commas(C[DN[k]])
+                out("    " commas(nd) " went down, a reset, not counted: " d (nd > 5 ? " (+" (nd - 5) " more)" : ""))
+            }
+        }
+        BEGIN {
+            fl = ARGV[1]; hl = ARGV[2]; verbose = ARGV[3] + 0; show_re = ARGV[4]
+            # gauges in /proc/net/snmp: they fall as well as rise
+            split("TcpCurrEstab TcpMaxConn TcpRtoAlgorithm TcpRtoMin TcpRtoMax IpForwarding IpDefaultTTL", F, " ")
+            for (k in F) GAUGE[F[k]] = 1
+            nl = readlines(fl, FL)
+            nh = readlines(hl, HL)
+            i = 1
+            for (hi = 1; hi <= nh; hi++) {
+                h = HL[hi]; split("", P); split("", DEVS); nd = 0; no = 0; flagged = 0; SUMM = ""; any = 0
+                for (; i <= nl && index(FL[i], h "\t") == 1; i++) {
+                    split(FL[i], F, "\t"); any = 1
+                    it = F[3]; sub(/.*\//, "", it); sub(/-(start|end)$/, "", it)
+                    if (it == "nics" || it == "tcp") key = it
+                    else if (index(it, "ethtool-S-") == 1) { dev = substr(it, 11); key = "eth:" dev }
+                    else if (index(it, "aer-") == 1) { dev = substr(it, 5); key = "aer:" dev }
+                    else continue
+                    if (key ~ /^(eth|aer):/ && !(dev in DEVS)) { DEVS[dev] = 1; DL[++nd] = dev }
+                    P[key, F[2]] = F[3]
+                }
+                if (!any) { print h ": not recorded (no counter captures in sysinfo/" h ")"; continue }
+                if (("tcp", "start") in P || ("tcp", "end") in P) compare("tcp", "tcp", P["tcp", "start"], P["tcp", "end"])
+                else { out("  tcp: not recorded"); flagged = 1 }
+                sort_arr(DL, nd, 0)
+                for (k = 1; k <= nd; k++) {
+                    dev = DL[k]
+                    if (("eth:" dev, "start") in P || ("eth:" dev, "end") in P) compare(dev, "eth", P["eth:" dev, "start"], P["eth:" dev, "end"])
+                    if (("aer:" dev, "start") in P || ("aer:" dev, "end") in P) compare(dev " aer", "aer", P["aer:" dev, "start"], P["aer:" dev, "end"])
+                }
+                if (!nd) {
+                    v = ""; m = readlines(P["nics", "start"] != "" ? P["nics", "start"] : P["nics", "end"], L)
+                    out("  NICs: none captured" (m > 0 && L[1] != "" ? " (" L[1] ")" : "")); flagged = 1
+                }
+                if (!flagged) { print h ": nothing to flag, none matching SUMMARY_COUNTER_RE rose and none went down (" SUMM ")"; continue }
+                print h
+                for (k = 1; k <= no; k++) print O[k]
+            }
+        }' "$lists/files" "$lists/hosts" "$VERBOSITY" "$SUMMARY_COUNTER_RE" || rc=1
+    echo
     rm -rf "${lists:?}"
     return "$rc"
 }

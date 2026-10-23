@@ -704,6 +704,23 @@ shape 2: 1 host, rep h3, N=12, line rate unknown
     read bandwidth: 2.00 GiB/s
 ```
 
+`-s -v` adds what the hosts went through over the run, after the job summaries. **Counters:** per host and NIC, the counters that rose between the `-start` and `-end` captures in `sysinfo/<host>/`: TCP/IP (`tcp`, the nstat or `/proc/net` format), each NIC's `ethtool -S` and its PCIe AER counts. `-v` lists the ones whose name (lowercased) matches `SUMMARY_COUNTER_RE` (drops, discards, errors, retransmits, pauses, timeouts, overflows and the like; set it in the environment to change it) and counts the rest; every AER counter that rose is listed. `-vv` lists every counter that rose. A counter that went down was reset (a driver reload or a reboot), so it is named with both values and never counted as a delta. The TCP gauges (`TcpCurrEstab` and the fixed `Tcp`/`Ip` settings) are skipped. A NIC captured on only one side is named, and a host with nothing to flag says so on one line. Values past 2^53 (a byte counter after weeks at line rate) lose their last digits to awk's doubles.
+
+```
+==== counters over the run: what rose from start to end, per host and NIC ====
+h1
+  tcp: 2 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    TcpRetransSegs                           +1,234
+  eth0: 3 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    rx_discards_phy                          +3,000,000,000
+    1 went down, a reset, not counted: rx_out_of_buffer 77 -> 4
+  eth0 aer: 2 counters, 1 rose:
+    correctable.TOTAL_ERR_COR                +2
+  eth1: at the end only, so no delta
+h2: nothing to flag, none matching SUMMARY_COUNTER_RE rose and none went down (tcp 2 counters, 1 rose; eth0 2 counters, 1 rose)
+h3: not recorded (no counter captures in sysinfo/h3)
+```
+
 # Caveats
 - fio's client/server protocol is version-sensitive. Keep fio versions consistent across the workers and the coordinator host, or connections may fail in confusing ways.
 - TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts, and it refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors). The check is one ssh session to the coordinator that probes every worker in parallel from inside it — one session per worker would pile N sessions onto the coordinator's single multiplexed connection, and sshd's `MaxSessions` (default 10) and `MaxStartups` then refuse the rest, which read as firewalls (seen at 111 workers: 39 false "cannot reach").

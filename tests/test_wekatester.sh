@@ -1904,6 +1904,36 @@ parameters: the staged jobs per host (0 hosts)
 X
 )
     [ "$hdr" = "$exp" ] || { printf "%s\n" "$out" >&2; false; }'
+t_assert "-s -v counters: what rose per host and NIC; a reset is flagged, never counted; a NIC on one side is named" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_counters_fixture "$d"
+    out=$(summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    sec=$(printf "%s\n" "$out" | sed -n "/^==== counters/,\$p")
+    exp=$(cat <<"X"
+==== counters over the run: what rose from start to end, per host and NIC ====
+h1
+  tcp: 2 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    TcpRetransSegs                           +1,234
+  eth0: 3 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    rx_discards_phy                          +3,000,000,000
+    1 went down, a reset, not counted: rx_out_of_buffer 77 -> 4
+  eth0 aer: 2 counters, 1 rose:
+    correctable.TOTAL_ERR_COR                +2
+  eth1: at the end only, so no delta
+h2: nothing to flag, none matching SUMMARY_COUNTER_RE rose and none went down (tcp 2 counters, 1 rose; eth0 2 counters, 1 rose)
+h3: not recorded (no counter captures in sysinfo/h3)
+X
+)
+    [ "$sec" = "$exp" ] || { printf "%s\n" "$out" >&2; exit 1; }
+    plain=$(summ_out "$d") || { echo "$plain" >&2; exit 1; }
+    case "$plain" in *"==== counters"*) echo "counters without -v" >&2; false;; esac'
+t_assert "-s -vv counters: every counter that rose, traffic included" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_counters_fixture "$d"
+    out=$(summ_out "$d" -vv) || { echo "$out" >&2; exit 1; }
+    sec=$(printf "%s\n" "$out" | sed -n "/^==== counters/,\$p")
+    case "$sec" in
+        *"  tcp: 2 counters, 2 rose:"*"TcpInSegs "*"+899,000"*"TcpRetransSegs "*"rx_discards_phy "*"rx_packets "*"+89,900"*"h2"*"  tcp: 2 counters, 1 rose:"*"TcpInSegs "*"+20"*) true;;
+        *) printf "%s\n" "$out" >&2; false;;
+    esac'
 t_assert "-s synopsis: a single results .json keeps today's output, no synopsis" bash -c '
     d=$(mktemp -d); fio_json_single_fixture "$d/r.json"
     out=$(./wekatester -s "$d/r.json" 2>&1) || { echo "$out" >&2; exit 1; }

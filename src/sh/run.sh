@@ -641,14 +641,19 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
             | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
-        [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; rm -rf "${tmp:?}"; return 1; }
-        while IFS= read -r f; do
+        [ -z "$results" ] || while IFS= read -r f; do
             job=${f##*/}; job=${job#results_}; job=${job%.json}
             case "$skip" in *" $job "*) continue ;; esac
             echo "==== $job ===="
             summ_one "$f" "${f##*/}" "$items" "" bundle
         done <<<"$results"
-        rm -rf "${tmp:?}"; return 0
+        # -v: the hosts over the run, a stopped run's included
+        if [ "$VERBOSITY" -ge 1 ] && [ ${#rds[@]} -eq 1 ]; then
+            summary_counters "${rds[0]}" || printf '(counters: they could not be read from %s)\n\n' "$path"
+        fi
+        rm -rf "${tmp:?}"
+        [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; return 1; }
+        return 0
     fi
     summ_one "$path" "$path" "$items" "$expected" file
 }
@@ -667,6 +672,38 @@ summary_header() {   # summary_header <run-dir> <bundle-name>
         | LC_ALL=C sort -u > "$lists/hosts" || rc=1
     [ "$rc" -ne 0 ] || awkrun '
         #@awk summ_header' "$rd" "$2" "$lists/jobs" "$lists/hosts" "$UNLINK_JOB" || rc=1
+    rm -rf "${lists:?}"
+    return "$rc"
+}
+
+# A bundle's hosts: the recorded order, then any other it has a sysinfo/
+# or fio-jobfiles/ directory for.
+bundle_hosts() {   # bundle_hosts <run-dir>
+    local e
+    { [ ! -f "$1/settings" ] || LC_ALL=C awk -F'\t' '$1 == "hosts" { n = split($2, H, " "); for (i = 1; i <= n; i++) print H[i] }' "$1/settings"
+      for e in "$1"/sysinfo/* "$1"/fio-jobfiles/*; do [ ! -d "$e" ] || printf '%s\n' "${e##*/}"; done | LC_ALL=C sort -u
+    } | LC_ALL=C awk '!($0 in s) { s[$0] = 1; print }'
+}
+
+# -s -v: per host and NIC, the counters that rose between the start and
+# end captures (README, Output). Lowercase ERE: the names -v lists (-vv
+# lists every one that rose; AER always).
+SUMMARY_COUNTER_RE=${SUMMARY_COUNTER_RE:-err|drop|discard|retrans|lost|loss|timeout|pause|fail|abort|reset|overflow|overrun|underrun|miss|fifo|crc|bad|prune|collapse|backlog|ofo|zerowindow|memorypressure|out_of_buffer|outofbuffer|nobuf|no_buf|stall|congest|ecn|spuriousrto|undersize|oversize|jabber|fragment|symbol}
+summary_counters() {   # summary_counters <run-dir>
+    local rd=$1 lists h side f rc=0
+    lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.ctr.XXXXXX") || return 1
+    bundle_hosts "$rd" > "$lists/hosts" || rc=1
+    while IFS= read -r h; do
+        for side in start end; do
+            for f in "$rd/sysinfo/$h/nics-$side" "$rd/sysinfo/$h/tcp-$side" "$rd/sysinfo/$h"/ethtool-S-*-"$side" "$rd/sysinfo/$h"/aer-*-"$side"; do
+                [ ! -f "$f" ] || printf '%s\t%s\t%s\n' "$h" "$side" "$f"
+            done
+        done
+    done < "$lists/hosts" > "$lists/files"
+    echo "==== counters over the run: what rose from start to end, per host and NIC ===="
+    [ "$rc" -ne 0 ] || awkrun '
+        #@awk summ_counters' "$lists/files" "$lists/hosts" "$VERBOSITY" "$SUMMARY_COUNTER_RE" || rc=1
+    echo
     rm -rf "${lists:?}"
     return "$rc"
 }
