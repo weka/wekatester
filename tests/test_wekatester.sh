@@ -4147,10 +4147,11 @@ t_assert "pinning: a spaced list overlapping weka trims it and says so" bash -c 
     out=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); AUTH_DIR=$d/auth; check_cpu_pinning) 2>&1 ) || { echo "$out" >&2; exit 1; }
     case "$out" in (*"requested cpus (8-10,12) overlap weka'\''s dedicated cores (9); executing on the remainder (8,10,12)"*) true;; (*) echo "$out" >&2; exit 1;; esac &&
     [ "$(cat "$d/auth/h1.cpus")" = "8,10,12" ]'
-# The postmortem for a seed whose jobs did not run: fio --client exits 0 and
-# the daemonized server keeps the rejection text, so cal_evidence asks the
-# host fio to re-parse the jobfile -- a dirty parse is surfaced verbatim, a
-# clean one says the death was at setup, and both land in the bundle.
+# The postmortem for a seed whose jobs did not run: a server-side rejection
+# reaches the coordinator as "<host> ..." lines (fio 3.28 exits 1), and
+# cal_evidence also asks the host fio to re-parse the jobfile -- a dirty parse
+# is surfaced verbatim, a clean one says the death was at setup, and both land
+# in the bundle.
 t_assert "cal_evidence: a failed seed asks the host fio why (dirty and clean parse)" bash -c '
     d=$(mktemp -d); r=$(mktemp -d); mkdir -p "$d/cal/h1" "$r"
     echo "{}" > "$d/cal/res-seed.json"

@@ -40,9 +40,10 @@ cal_scratch_dirs() {   # cal_scratch_dirs <host> <sep> <fmt> <nj> <maxfilenum>
     awkrun '#@awk cal_scratch_dirs' "$1" "$2" "$3" "$4" "$5"
 }
 
-# fio --client exits 0 on a server-side jobfile rejection and the server
-# stderr is gone, so ask the host fio to re-parse the jobfile: a dirty parse
-# names the bad option, a clean one means the jobs died at setup.
+# A server-side jobfile rejection reaches the coordinator as "<host> ..."
+# lines ahead of the JSON (fio 3.28 exits 1). The host fio re-parses the
+# jobfile to tell the cases apart: a dirty parse names the bad option, a
+# clean one means the jobs died at setup.
 fio_parse_postmortem() {   # fio_parse_postmortem <what> <host> <remote-jobfile> <outfile>
     local what=$1 host=$2 jf=$3 outf=$4 l
     if run_host "$host" "'$FIO_BIN' --parse-only '$jf'" > "$outf" 2>&1; then
