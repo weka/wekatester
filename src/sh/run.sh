@@ -66,27 +66,56 @@ $(sysinfo_nic_cmd)"
     split_sysinfo "$WORK_DIR/sysinfo." ""
 }
 
-# The receive path, in the same session: host knobs, then nic-<dev> per
-# netdev with a device link (the probe's choice; Weka's own NICs are known
-# only after the probe). Each tool bounded; anything missing says why.
+# Remote helpers for the sysinfo and pressure strings: _nc runs a tool
+# bounded (_T seconds, 10), _rd reads a file, _ln names a link's target,
+# _nlist sets _nl to the netdevs with a device link (the probe's choice),
+# _priv finds the first passwordless escalator (the probe's order), once.
 # WEKATESTER_SYSROOT is for the suite only.
-sysinfo_nic_cmd() {
-    # mlnx_qos may need root: a non-root failure is retried once under the
-    # first passwordless escalator (the probe's order), swept once per host.
+remote_helpers_cmd() {
     printf '%s' '_sr=${WEKATESTER_SYSROOT:-}
     _nc() {
         if ! _o=$(command -v "$1"); then echo "not available: $1 not installed"; return 1; fi
-        _t=; if _o=$(command -v timeout); then _t="timeout 10"; fi
+        _t=; if _o=$(command -v timeout); then _t="timeout ${_T:-10}"; fi
         _x=$($_t "$@" 2>&1); _rc=$?
         [ -z "$_x" ] || printf "%s\n" "$_x"
-        if [ -n "$_t" ] && [ $_rc -eq 124 ]; then echo "not available: $1 timed out after 10 s"
+        if [ -n "$_t" ] && [ $_rc -eq 124 ]; then echo "not available: $1 timed out after ${_T:-10} s"
         elif [ $_rc -ne 0 ]; then echo "($1 exited $_rc)"; fi
         return $_rc
     }
     _rd() { if [ -r "$_sr$1" ]; then cat "$_sr$1"; else echo "not available: $1 not readable"; return 1; fi; }
     _ln() { if [ -e "$_sr$1" ] && _y=$(readlink -f "$_sr$1"); then echo "${_y##*/}"; else echo "not available: $1 links nowhere"; fi; }
+    _nlist() { _nl=; for _d in "$_sr"/sys/class/net/*; do [ -e "$_d/device" ] || continue; _nl="$_nl ${_d##*/}"; done; }
+    _nlsay() { if [ -n "$_nl" ]; then echo "${_nl# }"; else echo "not available: no netdev in /sys/class/net has a device link"; fi; }
+    _ps=0; _pv=
+    _priv() {
+        if [ $_ps -eq 0 ]; then
+            _ps=1
+            for _pc in "dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n"; do
+                _o=$(command -v "${_pc%% *}") || continue
+                if _o=$(timeout 5 $_pc true </dev/null 2>&1); then _pv=$_pc; break; fi
+            done
+        fi
+        [ -n "$_pv" ]
+    }
+'
+}
+
+# The receive path, in the same session: host knobs, then nic-<dev> per
+# netdev with a device link (Weka's own NICs are known only after the
+# probe). Each tool bounded; anything missing says why.
+sysinfo_nic_cmd() {
+    # mlnx_qos may need root: a non-root failure is retried once under the
+    # escalator.
+    remote_helpers_cmd
+    printf '%s' '_nlist
     echo "=== WEKATESTER_SYSINFO sysctl ==="
     for _k in net/core/netdev_max_backlog net/ipv4/tcp_rmem; do echo "${_k//\//.} $(_rd /proc/sys/$_k)"; done
+    for _c in all default $_nl; do
+        for _k in rp_filter arp_filter arp_ignore arp_announce; do echo "net.ipv4.conf.$_c.$_k $(_rd /proc/sys/net/ipv4/conf/$_c/$_k)"; done
+    done
+    echo "=== WEKATESTER_SYSINFO chrony ==="
+    if _o=$(command -v chronyc); then _nc chronyc tracking
+    else echo "not available: chronyc not installed; timedatectl instead"; _nc timedatectl status; fi
     echo "=== WEKATESTER_SYSINFO cpu-governor ==="
     if [ -r "$_sr/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" ]; then
         cat "$_sr"/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>&1 | sort | uniq -c
@@ -95,10 +124,7 @@ sysinfo_nic_cmd() {
     if ! _o=$(command -v pgrep); then echo "not available: pgrep not installed"
     elif _o=$(pgrep -x irqbalance); then echo running
     else _rc=$?; if [ $_rc -eq 1 ]; then echo "not running"; else echo "not available: pgrep exited $_rc"; fi; fi
-    _nl=; for _d in "$_sr"/sys/class/net/*; do [ -e "$_d/device" ] || continue; _nl="$_nl ${_d##*/}"; done
-    echo "=== WEKATESTER_SYSINFO nics ==="
-    if [ -n "$_nl" ]; then echo "${_nl# }"; else echo "not available: no netdev in /sys/class/net has a device link"; fi
-    _sw=0; _pv=
+    echo "=== WEKATESTER_SYSINFO nics ==="; _nlsay
     for _n in $_nl; do
         _v=/sys/class/net/$_n/device
         echo "=== WEKATESTER_SYSINFO nic-$_n ==="
@@ -117,15 +143,8 @@ sysinfo_nic_cmd() {
         for _a in -g -l -c -a; do echo "--- ethtool $_a"; _nc ethtool $_a "$_n"; done
         echo "--- mlnx_qos -i"
         if _x=$(_nc mlnx_qos -i "$_n") || ! _m=$(command -v mlnx_qos) || [ "$(id -u)" = 0 ]; then printf "%s\n" "$_x"; continue; fi
-        if [ $_sw -eq 0 ]; then
-            _sw=1
-            for _pc in "dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n"; do
-                _o=$(command -v "${_pc%% *}") || continue
-                if _o=$(timeout 5 $_pc true </dev/null 2>&1); then _pv=$_pc; break; fi
-            done
-        fi
         printf "%s\n" "$_x"
-        if [ -n "$_pv" ]; then echo "--- mlnx_qos -i, again under $_pv"; _nc $_pv "$_m" -i "$_n"
+        if _priv; then echo "--- mlnx_qos -i, again under $_pv"; _nc $_pv "$_m" -i "$_n"
         else echo "not available: mlnx_qos failed as a non-root user and no passwordless escalator works"; fi
     done; true'
 }
@@ -148,8 +167,54 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
         #@awk split_sysinfo' "${files[@]}" && rm -f -- "${files[@]}"
 }
 
-# PSI and load at start and again at teardown, plus the sar slice covering the
-# run when sysstat keeps one.
+# Counters taken at both ends of the run, raw (the delta is the reader's):
+# TCP/IP (nstat -asz, which leaves nstat's history alone, else /proc/net),
+# and per device-backed netdev ethtool -S and the PCIe AER totals.
+pressure_counters_cmd() {
+    remote_helpers_cmd
+    printf '%s' '_nlist
+    echo "=== WEKATESTER_SYSINFO nics ==="; _nlsay
+    echo "=== WEKATESTER_SYSINFO tcp ==="
+    if _o=$(command -v nstat); then _nc nstat -asz
+    else echo "not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead"; _rd /proc/net/snmp; _rd /proc/net/netstat; fi
+    for _dv in $_nl; do
+        echo "=== WEKATESTER_SYSINFO ethtool-S-$_dv ==="; _nc ethtool -S "$_dv"
+        echo "=== WEKATESTER_SYSINFO aer-$_dv ==="
+        for _a in correctable nonfatal fatal; do echo "--- aer_dev_$_a"; _rd /sys/class/net/$_dv/device/aer_dev_$_a; done
+    done; true'
+}
+
+# The kernel log from the run start (the host's own clock), the last 2000
+# lines: dmesg windowed by /proc/uptime, under the escalator when
+# dmesg_restrict refuses a non-root user; else journalctl -k --since.
+kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
+    printf '_ks=%s\n' "$1"
+    printf '%s' '_kring() { awk -v s="$1" -v m=2000 '\''
+        s != "" && match($0, /^\[ *[0-9]+\.[0-9]+\]/) { t = substr($0, 2, RLENGTH - 2) + 0; on = (t >= s + 0) }
+        s == "" || on { L[n++ % m] = $0 }
+        END { if (!n) print "(no kernel log line in the window)"; i = n > m ? n - m : 0; if (i) print "(" i " earlier lines dropped: the last " m " kept)"; for (; i < n; i++) print L[i % m] }'\''; }
+    echo "=== WEKATESTER_SYSINFO kernel-log ==="
+    _kr=; _kw=
+    if [ -r "$_sr/proc/uptime" ]; then read -r _up _o < "$_sr/proc/uptime"; _kr=$(( _ks - $(date +%s) + ${_up%.*} - 1 )); fi
+    if [ -z "$_kr" ]; then echo "not available: /proc/uptime not readable, so dmesg cannot be windowed"
+    elif _x=$(_nc dmesg); then _kw=dmesg
+    else
+        printf "%s\n" "$_x"
+        if [ "$(id -u)" = 0 ]; then :
+        elif ! _priv; then echo "not available: dmesg failed as a non-root user and no passwordless escalator works"
+        elif _x=$(_nc $_pv dmesg); then _kw="dmesg under $_pv"
+        else printf "%s\n" "$_x"; fi
+    fi
+    if [ -n "$_kw" ]; then
+        echo "# $_kw, from $_kr s after boot (the run start)"; printf "%s\n" "$_x" | _kring "$_kr"
+    else
+        echo "# journalctl -k --since @$_ks (the run start)"
+        _x=$(_T=60 _nc journalctl -k --no-pager -o short-iso --since "@$_ks"); printf "%s\n" "$_x" | _kring ""
+    fi; true'
+}
+
+# PSI and load at start and again at teardown, the counters above at both,
+# plus the run window's kernel log and sar slice (when sysstat keeps one).
 PRESSURE_END_DONE=0
 snapshot_pressure() {   # snapshot_pressure <start|end>
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
@@ -160,7 +225,11 @@ snapshot_pressure() {   # snapshot_pressure <start|end>
     done
     echo "=== WEKATESTER_SYSINFO loadavg ==="
     if [ -r /proc/loadavg ]; then cat /proc/loadavg; else echo "not available"; fi'
+    cmd="$cmd
+$(pressure_counters_cmd)"
     if [ "$label" = end ] && [ -n "$RUN_EPOCH" ]; then
+        cmd="$cmd
+$(kernel_log_cmd "$RUN_EPOCH")"
         # the run window's sar slice, in each worker's own time zone; a run
         # that started on an earlier worker day gets today from 00:00:00
         # (sar reads one day's file)

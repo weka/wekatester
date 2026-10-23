@@ -6950,7 +6950,7 @@ t_assert "sysinfo NIC: a device-backed netdev gets nic-<dev> (PCIe, NUMA, IRQs, 
         "--- ethtool -g" "ethtool -g eth0" "--- ethtool -l" "ethtool -l eth0" \
         "--- ethtool -c" "ethtool -c eth0" "--- ethtool -a" "ethtool -a eth0" \
         "--- mlnx_qos -i" "mlnx_qos -i eth0") "$f/nic-eth0" >&2 || exit 1
-    diff <(printf "net.core.netdev_max_backlog 1000\nnet.ipv4.tcp_rmem 4096\t131072\t6291456\n") "$f/sysctl" >&2 &&
+    diff <(printf "net.core.netdev_max_backlog 1000\nnet.ipv4.tcp_rmem 4096\t131072\t6291456\n") <(head -n 2 "$f/sysctl") >&2 &&
     grep -qE "^ *2 performance\$" "$f/cpu-governor" && [ "$(cat "$f/irqbalance")" = running ] && [ ! -e "$d/esc" ] ||
         { cat "$f/cpu-governor" "$f/irqbalance"; exit 1; } >&2'
 t_assert "sysinfo NIC: no ethtool, mlnx_qos or pgrep on the worker says so per item" bash -c '
@@ -7011,6 +7011,67 @@ t_assert "sysinfo NIC: mlnx_qos failing with no working escalator says so; as ro
     nic_sysinfo "$r"; n=$r/out/sysinfo/h1/nic-eth0
     diff <(printf "%s\n" "--- mlnx_qos -i" "Operation not permitted" "(mlnx_qos exited 1)") <(sed -n "/^--- mlnx_qos/,\$p" "$n") >&2 &&
     [ ! -e "$r/esc" ]'
+t_assert "sysinfo NIC: rp_filter and arp_* for all, default and each NIC, unreadable ones said; chronyc tracking" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1; c=/proc/sys/net/ipv4/conf
+    grep -qx "net.ipv4.conf.all.rp_filter 1" "$f/sysctl" && grep -qx "net.ipv4.conf.eth0.rp_filter 2" "$f/sysctl" &&
+    grep -qx "net.ipv4.conf.eth0.arp_ignore 1" "$f/sysctl" &&
+    grep -qx "net.ipv4.conf.default.rp_filter not available: $c/default/rp_filter not readable" "$f/sysctl" &&
+    grep -qx "net.ipv4.conf.eth0.arp_announce not available: $c/eth0/arp_announce not readable" "$f/sysctl" &&
+    [ "$(grep -c "^net.ipv4.conf\." "$f/sysctl")" = 12 ] && [ "$(cat "$f/chrony")" = "chronyc tracking" ] ||
+        { cat "$f/sysctl" "$f/chrony"; exit 1; } >&2
+    rm "$d/bin/chronyc"; rm -rf "$d/out"; nic_sysinfo "$d"
+    diff <(printf "%s\n" "not available: chronyc not installed; timedatectl instead" "not available: timedatectl not installed") "$f/chrony" >&2'
+t_assert "pressure counters: start and end each keep tcp (nstat -asz), ethtool -S and AER per NIC, raw" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    E=$(( $(date +%s) - 100 )); nic_pressure "$d" start "$E"; nic_pressure "$d" end "$E"; f=$d/out/sysinfo/h1
+    for s in start end; do
+        [ "$(cat "$f/nics-$s")" = eth0 ] && [ "$(cat "$f/tcp-$s")" = "nstat -asz" ] &&
+        [ "$(cat "$f/ethtool-S-eth0-$s")" = "ethtool -S eth0" ] &&
+        diff <(printf "%s\n" "--- aer_dev_correctable" "RxErr 0" "TOTAL_ERR_COR 3" "--- aer_dev_nonfatal" "TOTAL_ERR_NONFATAL 0" \
+            "--- aer_dev_fatal" "not available: /sys/class/net/eth0/device/aer_dev_fatal not readable") "$f/aer-eth0-$s" >&2 ||
+            { echo "side $s:"; ls "$f"; exit 1; } >&2
+    done
+    [ ! -e "$f/kernel-log-start" ] && [ -e "$f/kernel-log-end" ] && [ ! -e "$f/ethtool-S-lo-start" ]'
+t_assert "pressure counters: no nstat reads /proc/net raw, no ethtool says so" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    rm "$d/bin/nstat" "$d/bin/ethtool"; mkdir -p "$d/root/proc/net"
+    printf "Tcp: RetransSegs\nTcp: 7\n" > "$d/root/proc/net/snmp"
+    nic_pressure "$d" start "$(date +%s)"; f=$d/out/sysinfo/h1
+    diff <(printf "%s\n" "not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead" "Tcp: RetransSegs" "Tcp: 7" \
+        "not available: /proc/net/netstat not readable") "$f/tcp-start" >&2 &&
+    [ "$(cat "$f/ethtool-S-eth0-start")" = "not available: ethtool not installed" ]'
+t_assert "kernel log: dmesg windowed from the run start by the uptime, at end only" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    nic_pressure "$d" end "$(( $(date +%s) - 100 ))"; k=$d/out/sysinfo/h1/kernel-log-end
+    head -n 1 "$k" | grep -qE "^# dmesg, from 89[89] s after boot \(the run start\)\$" &&
+    diff <(printf "%s\n" "[  950.000000] in the run" "no stamp, still in" "[  990.500000] late in the run") <(tail -n +2 "$k") >&2 &&
+    [ ! -e "$d/esc" ] || { cat "$k"; exit 1; } >&2'
+t_assert "kernel log: dmesg refused as non-root is read under the escalator" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    printf "#!/bin/sh\nif [ -n \"\$WT_UNDER\" ]; then cat \"%s/dmesg.out\"; else echo \"dmesg: read kernel buffer failed: Operation not permitted\"; exit 1; fi\n" "$d" > "$d/bin/dmesg"
+    printf "#!/bin/sh\necho \"sudo \$*\" >> \"%s/esc\"\nshift\nWT_UNDER=sudo exec \"\$@\"\n" "$d" > "$d/bin/sudo"
+    nic_pressure "$d" end "$(( $(date +%s) - 100 ))"; k=$d/out/sysinfo/h1/kernel-log-end
+    diff <(printf "%s\n" "dmesg: read kernel buffer failed: Operation not permitted" "(dmesg exited 1)") <(head -n 2 "$k") >&2 &&
+    sed -n 3p "$k" | grep -qE "^# dmesg under sudo -n, from 89[89] s after boot" &&
+    [ "$(tail -n 1 "$k")" = "[  990.500000] late in the run" ] && ! grep -q "before the run" "$k" ||
+        { cat "$k"; exit 1; } >&2'
+t_assert "kernel log: dmesg refused and no escalator falls back to journalctl -k --since the run start" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    printf "#!/bin/sh\necho \"dmesg: read kernel buffer failed: Operation not permitted\"; exit 1\n" > "$d/bin/dmesg"
+    E=$(( $(date +%s) - 100 )); nic_pressure "$d" end "$E"
+    diff <(printf "%s\n" "dmesg: read kernel buffer failed: Operation not permitted" "(dmesg exited 1)" \
+        "not available: dmesg failed as a non-root user and no passwordless escalator works" \
+        "# journalctl -k --since @$E (the run start)" "journalctl -k --no-pager -o short-iso --since @$E") "$d/out/sysinfo/h1/kernel-log-end" >&2'
+t_assert "kernel log: the last 2000 lines are kept and the drop is said; an empty window is said" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    for i in $(seq 1 2500); do echo "[  950.000000] line $i"; done > "$d/dmesg.out"
+    nic_pressure "$d" end "$(( $(date +%s) - 100 ))"; k=$d/out/sysinfo/h1/kernel-log-end
+    [ "$(sed -n 2p "$k")" = "(500 earlier lines dropped: the last 2000 kept)" ] && [ "$(sed -n 3p "$k")" = "[  950.000000] line 501" ] &&
+    [ "$(tail -n 1 "$k")" = "[  950.000000] line 2500" ] && [ "$(wc -l < "$k")" -eq 2002 ] || { head -n 3 "$k"; exit 1; } >&2
+    printf "[  100.000000] long before\n" > "$d/dmesg.out"; rm -rf "$d/out"
+    nic_pressure "$d" end "$(( $(date +%s) - 100 ))"
+    [ "$(tail -n 1 "$k")" = "(no kernel log line in the window)" ] || { cat "$k"; exit 1; } >&2'
 
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,

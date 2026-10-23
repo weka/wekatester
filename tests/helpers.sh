@@ -466,11 +466,13 @@ export -f lock_fixture
 
 # --- sysinfo receive path: a fake sysroot and a closed PATH ---
 # nic_fixture <dir>: <dir>/root holds eth0 (0000:17:00.0, mlx5_core, numa 1,
-# two MSI irqs, the second with no affinity file), lo with no device, the two
-# sysctls and two cpus' governors. <dir>/bin is the whole PATH: cat, sort,
-# uniq, readlink, true, and stubs: ethtool and mlnx_qos echo their arguments, pgrep
-# finds irqbalance, id says uid 1000, timeout just runs, and every escalator
-# logs to <dir>/esc and fails.
+# two MSI irqs, the second with no affinity file, AER correctable and
+# nonfatal but no fatal), lo with no device, sysctls (some conf ones left
+# out), two cpus' governors and an uptime of 1000 s. <dir>/bin is the whole
+# PATH: cat, sort, uniq, readlink, true, date, awk, and stubs: ethtool,
+# mlnx_qos, nstat, chronyc and journalctl echo their arguments, dmesg prints
+# <dir>/dmesg.out, pgrep finds irqbalance, id says uid 1000, timeout just
+# runs, and every escalator logs to <dir>/esc and fails.
 nic_fixture() {
     local d=$1 r=$1/root p=/sys/devices/pci0000:00/0000:17:00.0 c t
     mkdir -p "$d/bin" "$r$p/msi_irqs" "$r/sys/class/net/eth0" "$r/sys/class/net/lo" \
@@ -486,6 +488,16 @@ nic_fixture() {
     printf '1000\n' > "$r/proc/sys/net/core/netdev_max_backlog"
     printf '4096\t131072\t6291456\n' > "$r/proc/sys/net/ipv4/tcp_rmem"
     for c in 0 1; do printf 'performance\n' > "$r/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor"; done
+    printf 'RxErr 0\nTOTAL_ERR_COR 3\n' > "$r$p/aer_dev_correctable"; printf 'TOTAL_ERR_NONFATAL 0\n' > "$r$p/aer_dev_nonfatal"
+    mkdir -p "$r/proc/sys/net/ipv4/conf/all" "$r/proc/sys/net/ipv4/conf/eth0"
+    printf '1\n' > "$r/proc/sys/net/ipv4/conf/all/rp_filter"; printf '2\n' > "$r/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    printf '1\n' > "$r/proc/sys/net/ipv4/conf/eth0/arp_ignore"
+    printf '1000.00 4000.00\n' > "$r/proc/uptime"
+    printf '[  500.000000] before the run\n[  950.000000] in the run\nno stamp, still in\n[  990.500000] late in the run\n' > "$d/dmesg.out"
+    printf '#!/bin/sh\ncat "%s/dmesg.out"\n' "$d" > "$d/bin/dmesg"
+    printf '#!/bin/sh\necho "journalctl $*"\n' > "$d/bin/journalctl"
+    printf '#!/bin/sh\necho "nstat $*"\n' > "$d/bin/nstat"
+    printf '#!/bin/sh\necho "chronyc $*"\n' > "$d/bin/chronyc"
     printf '#!/bin/sh\necho "ethtool $*"\n' > "$d/bin/ethtool"
     printf '#!/bin/sh\necho "mlnx_qos $*"\n' > "$d/bin/mlnx_qos"
     printf '#!/bin/sh\necho 4321\n' > "$d/bin/pgrep"
@@ -496,7 +508,7 @@ nic_fixture() {
     done
     chmod +x "$d/bin"/*
     # linked after the chmod, which would follow them to the real tools
-    for t in cat sort uniq readlink true; do
+    for t in cat sort uniq readlink true date awk; do
         c=$(type -P "$t") || { echo "no $t on this host" >&2; return 1; }; ln -s "$c" "$d/bin/$t"
     done
 }
@@ -509,4 +521,13 @@ nic_sysinfo() {
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
      snapshot_sysinfo) >>"$WT_ASIDE" 2>&1
 }
-export -f nic_fixture nic_sysinfo
+# nic_pressure <dir> <start|end> <run-start-epoch>: snapshot_pressure the same
+# way, into <dir>/out/sysinfo/h1/<item>-<label>.
+nic_pressure() {
+    mkdir -p "$1/w" "$1/out"
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; RUN_EPOCH=$3; FIO_BIN=fio
+     fx=$1; bash=$(type -P bash)
+     run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
+     snapshot_pressure "$2") >>"$WT_ASIDE" 2>&1
+}
+export -f nic_fixture nic_sysinfo nic_pressure
