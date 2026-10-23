@@ -4188,6 +4188,21 @@ t_assert "server launch: priv pins via taskset but fio drops to the login user" 
     grep -q "WEKATESTER_FIO_AS=root; sudo -n taskset -c 4-7 '\''fio'\'' --server" "$d/launch.h1" &&
     grep -q "LAUNCH\[h2\]" "$d/launch.h2" && ! grep -q taskset "$d/launch.h2" &&
     grep -q "taskset -c 8-9 '\''fio'\''" "$d/launch.h3" && ! grep -q runuser "$d/launch.h3"'
+# What the launch prints before fio forks reaches the log tagged with its
+# host, and stays out of the stdout the root NOTE reads (issue #18).
+t_assert "server launch: a launch error is tagged with its host, the run stops naming it, and stdout stays the NOTE's alone" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/auth"
+    err=$( (source ./wekatester
+            WORK_DIR=$d; AUTH_DIR=$d/auth; HOSTS=(h1 h2); FIO_BIN=fio; FIO_PIDFILE=/dev/shm/x.pid; WEKATESTER_SETTLE=0
+            run_host() { if [ "$1" = h1 ]; then echo "fio: pidfile /dev/shm/x.pid exists and server appears alive" >&2; return 1; fi
+                         echo WEKATESTER_FIO_AS=root; echo "taskset: a warning" >&2; }
+            start_fio_servers) 2>&1 >>$WT_ASIDE ); rc=$?
+    [ "$rc" -ne 0 ] &&
+    case "$err" in
+        (*" h1: fio: pidfile /dev/shm/x.pid exists and server appears alive"*" h2: taskset: a warning"*"NOTE: h2: fio runs as root"*"failed to start fio server on: h1") true;;
+        (*) echo "$err" >&2; false;;
+    esac &&
+    ! grep -q "taskset: a warning" "$d/launch.h2" || { echo "launch.h2: $(cat "$d/launch.h2")" >&2; false; }'
 t_assert "server launch, run for real: with runuser fio drops to the login user, without it fio runs as root" bash -c '
     d=$(mktemp -d); b=$d/bin; mkdir -p "$b" "$d/auth"
     printf "sudo -n\n" > "$d/auth/h1.priv"; printf "4-7\n" > "$d/auth/h1.cpus"

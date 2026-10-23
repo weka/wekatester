@@ -4383,7 +4383,7 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch base
+    local pids=() failed=() host i priv cpus launch base line
     for host in "${HOSTS[@]}"; do
         priv=""; cpus=""
         [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
@@ -4401,12 +4401,20 @@ start_fio_servers() {
             launch="$priv $launch"
         fi
         kill_fio_cmd_v "$priv"
-        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" &
+        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
         pids+=($!)
     done
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
+    done
+    # what a launch printed before fio forked (a live pidfile, a refused
+    # runuser), each line tagged with its host
+    for host in "${HOSTS[@]}"; do
+        [ -s "$WORK_DIR/launch.$host.err" ] || continue
+        while IFS= read -r line; do
+            log "$host: $line" >&2
+        done < "$WORK_DIR/launch.$host.err"
     done
     # one grep for the fleet: the launches that reported a root fio
     local roots
