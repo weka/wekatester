@@ -4500,7 +4500,7 @@ check_coordinator_limits() {
 # (10) and MaxStartups, and 39 of 111 probes read as firewalls.
 verify_fio_ports() {
     log "verifying fio port $FIO_PORT reachability from $MASTER..."
-    local out rc failed=() host hint line
+    local out rc failed=() host line
     out=$(run_host "$MASTER" "$(port_probe_cmd "${HOSTS[@]}")"); rc=$?
     case "$out" in
         (*DONE*) ;;   # the session ran to its end; FAIL lines, not rc, carry the verdict
@@ -4512,17 +4512,46 @@ verify_fio_ports() {
 $out
 PORTEOF
     if [ ${#failed[@]} -gt 0 ]; then
-        # On loopback the usual culprit is the name resolving to ::1 while fio
-        # listens on IPv4, not a firewall.
-        hint="(host firewall?)"
-        [ "$LOCAL_MODE" -eq 0 ] || \
-            hint="(loopback resolution? fio binds IPv4 -- check that localhost resolves to 127.0.0.1)"
+        # no guess here: the teardown reads each one's fio server log
         for host in "${failed[@]}"; do
-            log "ERROR: $MASTER cannot reach $host:$FIO_PORT $hint" >&2
+            log "ERROR: $MASTER cannot reach $host:$FIO_PORT" >&2
         done
-        die "fio port check failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
+        PORT_FAILED=("${failed[@]}")
+        die "fio port check failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting; the fio server log of each follows the teardown"
     fi
     debug "fio port reachable on all hosts"
+}
+
+# Each host the port check failed, from the teardown's fio server log (no
+# session of its own): its lines in place of a guess. A log holding only
+# "listening" lines explains nothing, so the reachability hint stays.
+PORT_FAILED=()
+port_fail_report() {
+    [ ${#PORT_FAILED[@]} -gt 0 ] || return 0
+    local host f lines l hint="(host firewall?)"
+    # On loopback the usual culprit is the name resolving to ::1 while fio
+    # listens on IPv4, not a firewall.
+    [ "$LOCAL_MODE" -eq 0 ] || \
+        hint="(loopback resolution? fio binds IPv4 -- check that localhost resolves to 127.0.0.1)"
+    for host in "${PORT_FAILED[@]}"; do
+        f=$RUN_DIR/sysinfo/$host/fio-server-log-end
+        if [ ! -s "$f" ]; then
+            log "ERROR: $host:$FIO_PORT unreachable, and no fio server log was captured there $hint" >&2
+            continue
+        fi
+        lines=$(awk '/ fio\[[0-9]+\]: / && !/: server listening on /' "$f" | tail -n 10)
+        if [ -n "$lines" ]; then
+            log "ERROR: $host:$FIO_PORT unreachable; its fio server log says (sysinfo/$host/fio-server-log-end):" >&2
+            while IFS= read -r l; do
+                log "ERROR: $host:   $l" >&2
+            done <<< "$lines"
+        elif l=$(grep -m 1 '^not available' "$f"); then
+            log "ERROR: $host:$FIO_PORT unreachable, and its fio server log could not be read ($l) $hint" >&2
+        else
+            log "ERROR: $host:$FIO_PORT unreachable, and its fio server log shows nothing that explains it (sysinfo/$host/fio-server-log-end) $hint" >&2
+        fi
+    done
+    PORT_FAILED=()
 }
 
 cleanup() {
@@ -4559,6 +4588,7 @@ cleanup() {
                 || log "note: no fio server log to read: the run stopped before the fio servers started"
             snapshot_pressure end
         fi
+        port_fail_report
     fi
     # the locks last, held through the capture so no other run lands in its
     # slice; with this run's group file when collect_fs_groups has not removed

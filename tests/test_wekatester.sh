@@ -1118,25 +1118,70 @@ t_assert "mount guard: one real mode failure outweighs a findmnt failure" bash -
         *) echo "$err" >&2; false;;
     esac'
 
-# On loopback a firewall is not the plausible cause; ::1-vs-IPv4 is.
-t_assert "port check: local mode blames loopback resolution, not a firewall" bash -c '
+# The port check guesses nothing: the teardown reads each failed host's fio
+# server log, and its lines replace the firewall guess (issue #18).
+t_assert "port check: a failed host is named without a guess and kept for the teardown report" bash -c '
     err=$( (source ./wekatester
-            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost
-            run_host() { echo "FAIL localhost"; echo DONE; }
-            verify_fio_ports) 2>&1 >>$WT_ASIDE )
-    case "$err" in
-        *"cannot reach localhost:8765 (loopback resolution?"*) true;;
-        *) echo "$err" >&2; false;;
-    esac'
-t_assert "port check: remote mode still blames the firewall" bash -c '
-    err=$( (source ./wekatester
-            LOCAL_MODE=0; HOSTS=(vega-2); MASTER=vega-1
+            LOCAL_MODE=0; HOSTS=(vega-1 vega-2); MASTER=vega-1
             run_host() { echo "FAIL vega-2"; echo DONE; }
+            trap "echo \"kept: \${PORT_FAILED[*]}\" >&2" EXIT
             verify_fio_ports) 2>&1 >>$WT_ASIDE )
     case "$err" in
-        *"vega-1 cannot reach vega-2:8765 (host firewall?)"*) true;;
+        *"vega-1 cannot reach vega-2:8765"*"failed on 1 of 2 host(s), exiting; the fio server log of each follows the teardown"*"kept: vega-2") true;;
         *) echo "$err" >&2; false;;
+    esac &&
+    case "$err" in *firewall*|*loopback*) echo "guessed: $err" >&2; false;; *) true;; esac'
+t_assert "port check report: the unreachable host's fio server log lines replace the firewall guess" bash -c '
+    r=$(mktemp -d); mkdir -p "$r/sysinfo/h2"
+    printf "%s\n" "# journalctl -t fio --since @1 (the run start): every fio that logged in the window, not only this run'"'"'s" \
+        "2026-10-23T21:17:06+0000 h2 fio[2541055]: fio: server listening on 192.0.2.1,8765" \
+        "2026-10-23T21:17:06+0000 h2 fio[2541056]: fio: bind: Cannot assign requested address" \
+        "2026-10-23T21:17:06+0000 h2 fio[2541056]: fio: failed with IPv4 192.0.2.1" > "$r/sysinfo/h2/fio-server-log-end"
+    err=$( (source ./wekatester; LOCAL_MODE=0; RUN_DIR=$r; PORT_FAILED=(h2); port_fail_report) 2>&1 >>$WT_ASIDE )
+    case "$err" in
+        (*"ERROR: h2:8765 unreachable; its fio server log says (sysinfo/h2/fio-server-log-end):"*"ERROR: h2:   2026-10-23T21:17:06+0000 h2 fio[2541056]: fio: bind: Cannot assign requested address"*"ERROR: h2:   "*"fio: failed with IPv4 192.0.2.1") true;;
+        (*) echo "$err" >&2; false;;
+    esac &&
+    case "$err" in *firewall*|*"listening on"*|*"# journalctl"*) echo "guessed or echoed noise: $err" >&2; false;; *) true;; esac'
+# On loopback a firewall is not the plausible cause; ::1-vs-IPv4 is.
+t_assert "port check report: a log with nothing that explains it keeps the hint (firewall remote, loopback local) and says the log showed nothing" bash -c '
+    r=$(mktemp -d); mkdir -p "$r/sysinfo/vega-2" "$r/sysinfo/localhost"
+    for h in vega-2 localhost; do
+        printf "%s\n" "# journalctl -t fio --since @1 (the run start): x" "2026-10-23T21:16:26+0000 $h fio[7]: fio: server listening on 0.0.0.0,8765" > "$r/sysinfo/$h/fio-server-log-end"
+    done
+    err=$( (source ./wekatester; LOCAL_MODE=0; RUN_DIR=$r; PORT_FAILED=(vega-2); port_fail_report) 2>&1 >>$WT_ASIDE )
+    case "$err" in
+        (*"vega-2:8765 unreachable, and its fio server log shows nothing that explains it (sysinfo/vega-2/fio-server-log-end) (host firewall?)") true;;
+        (*) echo "remote: $err" >&2; exit 1;;
+    esac
+    err=$( (source ./wekatester; LOCAL_MODE=1; RUN_DIR=$r; PORT_FAILED=(localhost); port_fail_report) 2>&1 >>$WT_ASIDE )
+    case "$err" in
+        (*"localhost:8765 unreachable, and its fio server log shows nothing that explains it"*"(loopback resolution? fio binds IPv4"*) true;;
+        (*) echo "local: $err" >&2; false;;
     esac'
+t_assert "port check report: a host with no journal says its log could not be read, one with no capture says none was captured" bash -c '
+    r=$(mktemp -d); mkdir -p "$r/sysinfo/h2"
+    echo "not available: journalctl not installed, so this host keeps no journal to read" > "$r/sysinfo/h2/fio-server-log-end"
+    err=$( (source ./wekatester; LOCAL_MODE=0; RUN_DIR=$r; PORT_FAILED=(h2 h3); port_fail_report) 2>&1 >>$WT_ASIDE )
+    case "$err" in
+        (*"h2:8765 unreachable, and its fio server log could not be read (not available: journalctl not installed, so this host keeps no journal to read) (host firewall?)"*"h3:8765 unreachable, and no fio server log was captured there (host firewall?)") true;;
+        (*) echo "$err" >&2; false;;
+    esac'
+t_assert "port check report: a failed check's teardown prints it from the end capture, with no session of its own" bash -c '
+    d=$(mktemp -d)
+    err=$( (source ./wekatester
+            WORK_DIR=$d/work; RUN_DIR=$d/run; mkdir -p "$WORK_DIR" "$RUN_DIR"
+            HOSTS=(h1 h2); TARGET_DIR=/dev/shm/x; RUN_EPOCH=1; RUN_RC=1; FIO_STARTED=1; LOCAL_MODE=0; PORT_FAILED=(h2)
+            run_host() { echo "$1" >> "$d/sessions"
+                case "$2" in (*"WEKATESTER_SYSINFO fio-server-log"*)
+                    printf "%s\n" "=== WEKATESTER_SYSINFO fio-server-log ===" "2026-10-23T21:17:06+0000 $1 fio[9]: fio: bind: Cannot assign requested address";; esac; }
+            cleanup) 2>&1 >>$WT_ASIDE )
+    [ "$(wc -l < "$d/sessions")" -eq 4 ] || { echo "sessions: $(cat "$d/sessions")" >&2; exit 1; }
+    case "$err" in
+        (*"ERROR: h2:   2026-10-23T21:17:06+0000 h2 fio[9]: fio: bind: Cannot assign requested address"*) true;;
+        (*) echo "$err" >&2; false;;
+    esac &&
+    case "$err" in *"h1:8765"*|*firewall*) echo "reported a reachable host or guessed: $err" >&2; false;; *) true;; esac'
 # 111 workers, one master: one ssh session per worker piled 111 sessions onto
 # the master'"'"'s multiplexed connection, sshd refused past MaxSessions, and 39
 # probes that never ran were reported as firewalls (field fleet D, 2026-09-09). The
