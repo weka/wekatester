@@ -1,5 +1,5 @@
 # wekatester
-Performance test weka clusters (or any network/parallel filesystem) with distributed fio.
+Performance test weka clusters (or any filesystem, with `--any-fs`) with distributed fio.
 
 wekatester is a single bash script; it reads fio's results with awk. There is nothing to install: it needs only a Linux machine to run it from with bash 4.4 or later, awk and an OpenSSH client, plus fio on the workers. The workers are Linux hosts reachable by ssh — or, with no server on the command line, the local host itself, in which case the OpenSSH client is not needed either.
 
@@ -29,7 +29,7 @@ usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
        wekatester -s results.json
        wekatester --version
 
-Basic performance test of a network/parallel filesystem (distributed fio).
+Basic performance test of wekafs, or any filesystem with --any-fs (distributed fio).
 
 Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
 give them are not (-Wmyset names myset, never MYSET). A value may be attached
