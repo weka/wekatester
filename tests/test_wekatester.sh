@@ -7148,6 +7148,14 @@ t_assert "cal_namespace: grid-addressable formats unify, the rest fall back to t
     [ "$a" = "unified \$filenum/\$jobnum" ] || { echo "set: $a" >&2; exit 1; }
     [ "$b" = "scratch \$jobnum.\$filenum" ] || { echo "flat: $b" >&2; exit 1; }
     [ "$c" = "scratch \$jobnum.\$filenum" ] || { echo "named: $c" >&2; false; }'
+# A set may ship its own layout job without the generated marker (README):
+# named as the layout job, it never chooses the calibration namespace.
+t_assert "cal_namespace: an unmarked layout job by its reserved name is skipped" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/set"
+    printf "[global]\nfallocate=none\n[l]\nfilename_format=x.\$jobnum.\$filenum\ncreate_only=1\n" > "$d/set/000-wekatester-layout.job"
+    printf "# report iops\n[global]\n[a]\nrw=randread\n" > "$d/set/031-a.job"
+    a=$( (source ./wekatester; cal_namespace "$d/set") )
+    [ "$a" = "scratch \$jobnum.\$filenum" ] || { echo "set: $a" >&2; false; }'
 # (This test once called the function with its pre-<sep> arity and asserted
 # on separate lines, so a Python traceback and an empty result still counted
 # as a pass: the LAST line's status is the bash -c status. Chained now.)
