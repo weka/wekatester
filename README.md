@@ -154,6 +154,8 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a`, and takes 0.1 to 100000 Gb/s. `-a safe`, `-a max` and `-a brutal` measure every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency values still pin their knobs.
 
+`-x/--duration secs` — run every measured job for this many seconds (`time_based`), whatever its jobfile says. A burn-in or soak is one such run with long jobs: `-x 86400` runs each test in the set for 24 hours, one after another. There is no repeat mode. The end capture keeps the last 2000 lines of each host's kernel log, so on a multi-day run the start of the window may be cut (the file says so).
+
 `-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
 
 # Workloads
