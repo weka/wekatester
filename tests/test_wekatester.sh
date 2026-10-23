@@ -7130,6 +7130,38 @@ t_assert "kernel log: the last 2000 lines are kept and the drop is said; an over
     nic_pressure "$d" end "$(( $(date +%s) - 100 ))"
     [ "$(tail -n 1 "$k")" = "(no kernel log line in the window)" ] || { cat "$k"; exit 1; } >&2'
 
+# --- whole-host bound on the sysinfo and pressure sessions (Frank, 2026-10-23) ---
+t_assert "session bound: a host past WEKATESTER_SYSINFO_TIMEOUT is cut off and says where, the others finish, the run carries on" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d/h1" && nic_fixture "$d/h2" || exit 1
+    s=$(type -P sleep); tag=$$$RANDOM
+    printf "#!/bin/sh\ncase \"\$1\" in -g) exec %s 6.%s ;; esac\necho \"ethtool \$*\"\n" "$s" "$tag" > "$d/h1/bin/ethtool"
+    SECONDS=0; WEKATESTER_SYSINFO_TIMEOUT=2 bound_capture "$d" sysinfo h1 h2; took=$SECONDS
+    f=$d/out/sysinfo; c=$d/console
+    grep -q "WARNING: system info on h1 cut off after 2 s (WEKATESTER_SYSINFO_TIMEOUT); the partial capture is kept\$" "$c" &&
+    ! grep -q "WARNING.*h2" "$c" && [ "$(tail -n 1 "$c")" = "carried on" ] && [ "$took" -lt 6 ] || { echo "took $took s"; cat "$c"; exit 1; } >&2
+    [ "$(cat "$f/h1/session-timeout")" = "system info cut off after 2 s (WEKATESTER_SYSINFO_TIMEOUT)" ] &&
+    diff <(printf "%s\n" "--- ethtool -g" "not available: the session was cut off here, after 2 s (WEKATESTER_SYSINFO_TIMEOUT)") <(tail -n 2 "$f/h1/nic-eth0") >&2 &&
+    [ -s "$f/h1/sysctl" ] && [ ! -e "$f/h2/session-timeout" ] && [ "$(tail -n 1 "$f/h2/nic-eth0")" = "mlnx_qos -i eth0" ] ||
+        { ls "$f/h1" "$f/h2"; cat "$f/h1/nic-eth0"; exit 1; } >&2
+    if pgrep -f "sleep 6\.$tag" >>$WT_ASIDE; then echo "the cut-off session left its tool running" >&2; exit 1; fi'
+t_assert "session bound: a pressure session past the bound keeps its partial capture and its own session-timeout item" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d/h1" || exit 1
+    printf "#!/bin/sh\nexec %s 6\n" "$(type -P sleep)" > "$d/h1/bin/dmesg"
+    WEKATESTER_SYSINFO_TIMEOUT=2 bound_capture "$d" end h1; f=$d/out/sysinfo/h1; c=$d/console
+    grep -q "WARNING: pressure (end) on h1 cut off after 2 s (WEKATESTER_SYSINFO_TIMEOUT); the partial capture is kept\$" "$c" &&
+    [ "$(tail -n 1 "$c")" = "carried on" ] && [ "$(cat "$f/session-timeout-end")" = "pressure (end) cut off after 2 s (WEKATESTER_SYSINFO_TIMEOUT)" ] &&
+    [ "$(cat "$f/kernel-log-end")" = "not available: the session was cut off here, after 2 s (WEKATESTER_SYSINFO_TIMEOUT)" ] &&
+    [ "$(cat "$f/tcp-end")" = "nstat -asz" ] && [ ! -e "$f/sar-end" ] || { ls "$f"; cat "$c"; exit 1; } >&2'
+t_assert "session bound: WEKATESTER_SYSINFO_TIMEOUT that is not a whole number of seconds above 0 stops the run before it starts" bash -c '
+    source ./tests/helpers.sh; uname_fixture Linux
+    for v in abc 0 -5 1.5; do
+        err=$(WEKATESTER_SYSINFO_TIMEOUT=$v ./wekatester h1 2>&1 >>$WT_ASIDE) && { echo "ran with $v" >&2; exit 1; }
+        case "$err" in
+            *"WEKATESTER_SYSINFO_TIMEOUT must be a whole number of seconds above 0, not '\''$v'\''"*) ;;
+            *) echo "[$v] $err" >&2; exit 1;;
+        esac
+    done'
+
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,
 # which is how -x/--duration shipped undocumented in the synopsis.

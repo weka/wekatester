@@ -31,7 +31,7 @@ start_run_log() {
 # Per-host system context, one file per item under sysinfo/<host>/ (README,
 # Output). A missing tool or file records "not available".
 snapshot_sysinfo() {
-    local host i pids=() hs=() cmd
+    local cmd
     cmd='for it in cmdline mounts meminfo isolated os-release uname uptime df ip lscpu lspci numactl free; do
         echo "=== WEKATESTER_SYSINFO $it ==="
         case $it in
@@ -56,14 +56,36 @@ snapshot_sysinfo() {
         if _o=\$(command -v weka); then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
     cmd="$cmd
 $(sysinfo_nic_cmd)"
+    capture_hosts "system info" "$WORK_DIR/sysinfo." "$cmd"
+    split_sysinfo "$WORK_DIR/sysinfo." ""
+}
+
+# One session per host in parallel, each bounded as a whole at
+# WEKATESTER_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
+# capture, which says where it stopped plus a session-timeout item.
+capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
+    local host i rc o f pids=() hs=() t=${WEKATESTER_SYSINFO_TIMEOUT:-300}
+    if ! o=$(command -v timeout); then
+        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WEKATESTER_SYSINFO_TIMEOUT)" >&2
+        t=
+    fi
     for host in "${HOSTS[@]}"; do
-        ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
+        ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
         pids+=($!); hs+=("$host")
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || log "WARNING: could not capture system info on ${hs[$i]}" >&2
+        wait "${pids[$i]}" && continue
+        rc=$?
+        if [ -z "$t" ] || { [ $rc -ne 124 ] && [ $rc -ne 137 ]; }; then
+            log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
+        fi
+        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WEKATESTER_SYSINFO_TIMEOUT); the partial capture is kept" >&2
+        f=$2${hs[$i]}
+        # a cut can land mid-line: the marker must start one
+        [ ! -s "$f" ] || [ -z "$(tail -c 1 "$f")" ] || echo >> "$f"
+        printf 'not available: the session was cut off here, after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n' \
+            "$t" "$1" "$t" >> "$f"
     done
-    split_sysinfo "$WORK_DIR/sysinfo." ""
 }
 
 # Remote helpers for the sysinfo and pressure strings: _nc runs a tool
@@ -220,7 +242,7 @@ kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
 PRESSURE_END_DONE=0
 snapshot_pressure() {   # snapshot_pressure <start|end>
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    local label=$1 host i pids=() hs=() cmd
+    local label=$1 cmd
     cmd='for f in cpu io memory; do
         echo "=== WEKATESTER_SYSINFO pressure-$f ==="
         if [ -r "/proc/pressure/$f" ]; then cat "/proc/pressure/$f"; else echo "not available"; fi
@@ -243,13 +265,7 @@ $(kernel_log_cmd "$RUN_EPOCH")"
         sar -A -s \"\$_s\" -e \"\${_n#* }\" 2>&1 || true
     else echo 'sar: not available'; fi"
     fi
-    for host in "${HOSTS[@]}"; do
-        ( run_host "$host" "$cmd" > "$WORK_DIR/pressure.$label.$host" ) &
-        pids+=($!); hs+=("$host")
-    done
-    for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || log "WARNING: could not capture pressure ($label) on ${hs[$i]}" >&2
-    done
+    capture_hosts "pressure ($label)" "$WORK_DIR/pressure.$label." "$cmd"
     split_sysinfo "$WORK_DIR/pressure.$label." "-$label"
 }
 

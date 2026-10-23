@@ -474,6 +474,9 @@ main() {
     [ "$(uname -s)" = Linux ] \
         || die "wekatester runs on a Linux controller, not $(uname -s); -s summarizes a run bundle anywhere"
     resolve_local_mode
+    case ${WEKATESTER_SYSINFO_TIMEOUT:-300} in
+        (*[!0-9]*|0*) die "WEKATESTER_SYSINFO_TIMEOUT must be a whole number of seconds above 0, not '$WEKATESTER_SYSINFO_TIMEOUT'" ;;
+    esac
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
 

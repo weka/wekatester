@@ -51,12 +51,17 @@ host_ssh_opts() {   # host_ssh_opts <host>
     printf '%s' "$HOST_SSH_OPTS"
 }
 
+# RUN_HOST_TIMEOUT=<s> bounds the whole session with timeout(1), which
+# signals only its own process group: exit 124 (137 when TERM was ignored)
+# means the bound fired.
 run_host() {   # run_host <host> <command-string>
+    local b=()
+    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(timeout -k 5 "$RUN_HOST_TIMEOUT")
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        bash -c "$2" </dev/null
+        "${b[@]}" bash -c "$2" </dev/null
     else
         host_ssh_opts_v "$1"
-        ssh -n $SSH_OPTS $HOST_SSH_OPTS "$1" "$2"
+        "${b[@]}" ssh -n $SSH_OPTS $HOST_SSH_OPTS "$1" "$2"
     fi
 }
 

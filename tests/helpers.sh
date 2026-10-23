@@ -530,4 +530,18 @@ nic_pressure() {
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
      snapshot_pressure "$2") >>"$WT_ASIDE" 2>&1
 }
-export -f nic_fixture nic_sysinfo nic_pressure
+# bound_capture <dir> <sysinfo|start|end> <host>...: the real run_host, over
+# a fake ssh in <dir>/ctl that runs each host's string under bash against the
+# nic_fixture <dir>/<host>; the controller's own timeout bounds each session.
+# Everything printed, then "carried on", lands in <dir>/console.
+bound_capture() {
+    local d=$1 what=$2 bash; shift 2; bash=$(type -P bash)
+    mkdir -p "$d/ctl" "$d/w" "$d/out"
+    printf '#!%s\nh=${@: -2:1}\nPATH=%s/$h/bin WEKATESTER_SYSROOT=%s/$h/root exec %s -c "${@: -1}"\n' \
+        "$bash" "$d" "$d" "$bash" > "$d/ctl/ssh"
+    chmod +x "$d/ctl/ssh"
+    (source ./wekatester; HOSTS=("$@"); WORK_DIR=$d/w; RUN_DIR=$d/out; RUN_EPOCH=$(( $(date +%s) - 100 )); FIO_BIN=fio
+     LOCAL_MODE=0; SSH_OPTS=; AUTH_DIR=; PATH=$d/ctl:$PATH
+     if [ "$what" = sysinfo ]; then snapshot_sysinfo; else snapshot_pressure "$what"; fi; echo "carried on") > "$d/console" 2>&1
+}
+export -f nic_fixture nic_sysinfo nic_pressure bound_capture
