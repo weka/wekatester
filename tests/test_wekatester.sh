@@ -6939,6 +6939,79 @@ t_assert "pressure sar: no sar on the worker says so" bash -c '
     printf "%s\n" "$out" | command grep -qx "sar: not available" ||
         { printf "%s\n" "$out"; exit 1; } >&2'
 
+# --- sysinfo receive path: nic-<dev> per device-backed netdev, host knobs ---
+t_assert "sysinfo NIC: a device-backed netdev gets nic-<dev> (PCIe, NUMA, IRQs, ethtool -g/-l/-c/-a, mlnx_qos) and the host knobs land" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1
+    [ "$(cat "$f/nics")" = eth0 ] && [ ! -e "$f/nic-lo" ] || { echo "nics: $(cat "$f/nics")" >&2; exit 1; }
+    diff <(printf "%s\n" "bus 0000:17:00.0" "driver mlx5_core" "numa_node 1" \
+        "current_link_speed 16.0_GT/s_PCIe" "current_link_width 8" "max_link_speed 16.0_GT/s_PCIe" "max_link_width 16" \
+        "msi_irqs 2" "irq_cpus 101:4 102:-" \
+        "--- ethtool -g" "ethtool -g eth0" "--- ethtool -l" "ethtool -l eth0" \
+        "--- ethtool -c" "ethtool -c eth0" "--- ethtool -a" "ethtool -a eth0" \
+        "--- mlnx_qos -i" "mlnx_qos -i eth0") "$f/nic-eth0" >&2 || exit 1
+    diff <(printf "net.core.netdev_max_backlog 1000\nnet.ipv4.tcp_rmem 4096\t131072\t6291456\n") "$f/sysctl" >&2 &&
+    grep -qE "^ *2 performance\$" "$f/cpu-governor" && [ "$(cat "$f/irqbalance")" = running ] && [ ! -e "$d/esc" ] ||
+        { cat "$f/cpu-governor" "$f/irqbalance"; exit 1; } >&2'
+t_assert "sysinfo NIC: no ethtool, mlnx_qos or pgrep on the worker says so per item" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    rm -f "$d/bin/ethtool" "$d/bin/mlnx_qos" "$d/bin/pgrep"
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1
+    [ "$(grep -cx "not available: ethtool not installed" "$f/nic-eth0")" = 4 ] &&
+    grep -A1 -x -- "--- mlnx_qos -i" "$f/nic-eth0" | grep -qx "not available: mlnx_qos not installed" &&
+    [ "$(cat "$f/irqbalance")" = "not available: pgrep not installed" ] && [ ! -e "$d/esc" ] ||
+        { cat "$f/nic-eth0" "$f/irqbalance"; exit 1; } >&2'
+t_assert "sysinfo NIC: an unreadable value or a silent tool failure is recorded, never blank" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    p=$d/root/sys/devices/pci0000:00/0000:17:00.0
+    rm -rf "$p/numa_node" "$p/current_link_speed" "$p/driver" "$p/msi_irqs" \
+        "$d/root/proc/sys/net/ipv4/tcp_rmem" "$d/root/sys/devices/system/cpu/cpu0/cpufreq"
+    printf "#!/bin/sh\ncase \"\$1\" in -a) exit 94 ;; esac\necho \"ethtool \$*\"\n" > "$d/bin/ethtool"
+    printf "#!/bin/sh\nexit 1\n" > "$d/bin/pgrep"
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1; n=$f/nic-eth0; v=/sys/class/net/eth0/device
+    grep -qx "numa_node not available: $v/numa_node not readable" "$n" &&
+    grep -qx "current_link_speed not available: $v/current_link_speed not readable" "$n" &&
+    grep -qx "current_link_width 8" "$n" &&
+    grep -qx "driver not available: $v/driver links nowhere" "$n" &&
+    grep -qx "msi_irqs not available: $v/msi_irqs not readable" "$n" && grep -qx "irq_cpus not available: no msi_irqs" "$n" &&
+    grep -A1 -x -- "--- ethtool -a" "$n" | grep -qx "(ethtool exited 94)" &&
+    grep -qx "net.ipv4.tcp_rmem not available: /proc/sys/net/ipv4/tcp_rmem not readable" "$f/sysctl" &&
+    grep -qx "net.core.netdev_max_backlog 1000" "$f/sysctl" &&
+    [ "$(cat "$f/cpu-governor")" = "not available: /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor not readable" ] &&
+    [ "$(cat "$f/irqbalance")" = "not running" ] ||
+        { cat "$n" "$f/sysctl" "$f/cpu-governor" "$f/irqbalance"; exit 1; } >&2'
+t_assert "sysinfo NIC: no device-backed netdev says so in nics, and no nic- file" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    rm -rf "$d/root/sys/class/net/eth0"
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1
+    set -- "$f"/nic-*
+    [ "$(cat "$f/nics")" = "not available: no netdev in /sys/class/net has a device link" ] && [ ! -e "$1" ] ||
+        { ls "$f"; cat "$f/nics"; exit 1; } >&2'
+t_assert "sysinfo NIC: mlnx_qos failing as non-root is retried under the first escalator that works, swept once per host" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    mkdir "$d/root/sys/class/net/eth1"; ln -s "$d/root/sys/devices/pci0000:00/0000:17:00.0" "$d/root/sys/class/net/eth1/device"
+    printf "#!/bin/sh\nif [ -n \"\$WT_UNDER\" ]; then echo \"PFC under \$WT_UNDER\"; else echo \"Operation not permitted\"; exit 1; fi\n" > "$d/bin/mlnx_qos"
+    printf "#!/bin/sh\necho \"sudo \$*\" >> \"%s/esc\"\nshift\nWT_UNDER=sudo exec \"\$@\"\n" "$d" > "$d/bin/sudo"
+    nic_sysinfo "$d"; f=$d/out/sysinfo/h1
+    for n in eth0 eth1; do
+        diff <(printf "%s\n" "--- mlnx_qos -i" "Operation not permitted" "(mlnx_qos exited 1)" \
+            "--- mlnx_qos -i, again under sudo -n" "PFC under sudo") <(sed -n "/^--- mlnx_qos/,\$p" "$f/nic-$n") >&2 || exit 1
+    done
+    [ "$(grep -cx "sudo -n true" "$d/esc")" = 1 ] && [ "$(grep -c "^sudo -n .*/mlnx_qos -i eth" "$d/esc")" = 2 ] ||
+        { cat "$d/esc"; exit 1; } >&2'
+t_assert "sysinfo NIC: mlnx_qos failing with no working escalator says so; as root it is not retried" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d" || exit 1
+    printf "#!/bin/sh\necho \"Operation not permitted\"; exit 1\n" > "$d/bin/mlnx_qos"
+    nic_sysinfo "$d"; n=$d/out/sysinfo/h1/nic-eth0
+    tail -n 1 "$n" | grep -qx "not available: mlnx_qos failed as a non-root user and no passwordless escalator works" &&
+    grep -qx "(mlnx_qos exited 1)" "$n" && grep -qx "sudo -n true" "$d/esc" ||
+        { cat "$n" "$d/esc"; exit 1; } >&2
+    r=$(mktemp -d); nic_fixture "$r" || exit 1
+    cp "$d/bin/mlnx_qos" "$r/bin/mlnx_qos"; printf "#!/bin/sh\necho 0\n" > "$r/bin/id"
+    nic_sysinfo "$r"; n=$r/out/sysinfo/h1/nic-eth0
+    diff <(printf "%s\n" "--- mlnx_qos -i" "Operation not permitted" "(mlnx_qos exited 1)") <(sed -n "/^--- mlnx_qos/,\$p" "$n") >&2 &&
+    [ ! -e "$r/esc" ]'
+
 # --- -h documents every option the parser accepts ---
 # Drift here is silent: an option added to parse_args works but is invisible,
 # which is how -x/--duration shipped undocumented in the synopsis.

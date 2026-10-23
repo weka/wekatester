@@ -7031,6 +7031,8 @@ snapshot_sysinfo() {
         '$FIO_BIN' --version 2>&1 || echo 'not available'; \
         echo '=== WEKATESTER_SYSINFO weka ==='; \
         if _o=\$(command -v weka); then weka local ps 2>&1 || true; else echo 'weka: not available'; fi"
+    cmd="$cmd
+$(sysinfo_nic_cmd)"
     for host in "${HOSTS[@]}"; do
         ( run_host "$host" "$cmd" > "$WORK_DIR/sysinfo.$host" ) &
         pids+=($!); hs+=("$host")
@@ -7039,6 +7041,70 @@ snapshot_sysinfo() {
         wait "${pids[$i]}" || log "WARNING: could not capture system info on ${hs[$i]}" >&2
     done
     split_sysinfo "$WORK_DIR/sysinfo." ""
+}
+
+# The receive path, in the same session: host knobs, then nic-<dev> per
+# netdev with a device link (the probe's choice; Weka's own NICs are known
+# only after the probe). Each tool bounded; anything missing says why.
+# WEKATESTER_SYSROOT is for the suite only.
+sysinfo_nic_cmd() {
+    # mlnx_qos may need root: a non-root failure is retried once under the
+    # first passwordless escalator (the probe's order), swept once per host.
+    printf '%s' '_sr=${WEKATESTER_SYSROOT:-}
+    _nc() {
+        if ! _o=$(command -v "$1"); then echo "not available: $1 not installed"; return 1; fi
+        _t=; if _o=$(command -v timeout); then _t="timeout 10"; fi
+        _x=$($_t "$@" 2>&1); _rc=$?
+        [ -z "$_x" ] || printf "%s\n" "$_x"
+        if [ -n "$_t" ] && [ $_rc -eq 124 ]; then echo "not available: $1 timed out after 10 s"
+        elif [ $_rc -ne 0 ]; then echo "($1 exited $_rc)"; fi
+        return $_rc
+    }
+    _rd() { if [ -r "$_sr$1" ]; then cat "$_sr$1"; else echo "not available: $1 not readable"; return 1; fi; }
+    _ln() { if [ -e "$_sr$1" ] && _y=$(readlink -f "$_sr$1"); then echo "${_y##*/}"; else echo "not available: $1 links nowhere"; fi; }
+    echo "=== WEKATESTER_SYSINFO sysctl ==="
+    for _k in net/core/netdev_max_backlog net/ipv4/tcp_rmem; do echo "${_k//\//.} $(_rd /proc/sys/$_k)"; done
+    echo "=== WEKATESTER_SYSINFO cpu-governor ==="
+    if [ -r "$_sr/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" ]; then
+        cat "$_sr"/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>&1 | sort | uniq -c
+    else echo "not available: /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor not readable"; fi
+    echo "=== WEKATESTER_SYSINFO irqbalance ==="
+    if ! _o=$(command -v pgrep); then echo "not available: pgrep not installed"
+    elif _o=$(pgrep -x irqbalance); then echo running
+    else _rc=$?; if [ $_rc -eq 1 ]; then echo "not running"; else echo "not available: pgrep exited $_rc"; fi; fi
+    _nl=; for _d in "$_sr"/sys/class/net/*; do [ -e "$_d/device" ] || continue; _nl="$_nl ${_d##*/}"; done
+    echo "=== WEKATESTER_SYSINFO nics ==="
+    if [ -n "$_nl" ]; then echo "${_nl# }"; else echo "not available: no netdev in /sys/class/net has a device link"; fi
+    _sw=0; _pv=
+    for _n in $_nl; do
+        _v=/sys/class/net/$_n/device
+        echo "=== WEKATESTER_SYSINFO nic-$_n ==="
+        echo "bus $(_ln $_v)"; echo "driver $(_ln $_v/driver)"; echo "numa_node $(_rd $_v/numa_node)"
+        for _a in current_link_speed current_link_width max_link_speed max_link_width; do
+            if _y=$(_rd $_v/$_a); then _y=${_y// /_}; fi; echo "$_a $_y"
+        done
+        if [ -d "$_sr$_v/msi_irqs" ]; then
+            _c=0; _q=
+            for _i in "$_sr$_v"/msi_irqs/*; do
+                [ -e "$_i" ] || continue; _i=${_i##*/}; _c=$((_c + 1))
+                _y=$(_rd /proc/irq/$_i/smp_affinity_list) || _y=-; _q="$_q $_i:$_y"
+            done
+            echo "msi_irqs $_c"; echo "irq_cpus${_q:- -}"
+        else echo "msi_irqs not available: $_v/msi_irqs not readable"; echo "irq_cpus not available: no msi_irqs"; fi
+        for _a in -g -l -c -a; do echo "--- ethtool $_a"; _nc ethtool $_a "$_n"; done
+        echo "--- mlnx_qos -i"
+        if _x=$(_nc mlnx_qos -i "$_n") || ! _m=$(command -v mlnx_qos) || [ "$(id -u)" = 0 ]; then printf "%s\n" "$_x"; continue; fi
+        if [ $_sw -eq 0 ]; then
+            _sw=1
+            for _pc in "dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n"; do
+                _o=$(command -v "${_pc%% *}") || continue
+                if _o=$(timeout 5 $_pc true </dev/null 2>&1); then _pv=$_pc; break; fi
+            done
+        fi
+        printf "%s\n" "$_x"
+        if [ -n "$_pv" ]; then echo "--- mlnx_qos -i, again under $_pv"; _nc $_pv "$_m" -i "$_n"
+        else echo "not available: mlnx_qos failed as a non-root user and no passwordless escalator works"; fi
+    done; true'
 }
 
 # "=== WEKATESTER_SYSINFO <item> ===" sections into

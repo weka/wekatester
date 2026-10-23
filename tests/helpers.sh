@@ -463,3 +463,50 @@ EOF
     chmod +x "$LK/bin"/*
 }
 export -f lock_fixture
+
+# --- sysinfo receive path: a fake sysroot and a closed PATH ---
+# nic_fixture <dir>: <dir>/root holds eth0 (0000:17:00.0, mlx5_core, numa 1,
+# two MSI irqs, the second with no affinity file), lo with no device, the two
+# sysctls and two cpus' governors. <dir>/bin is the whole PATH: cat, sort,
+# uniq, readlink, true, and stubs: ethtool and mlnx_qos echo their arguments, pgrep
+# finds irqbalance, id says uid 1000, timeout just runs, and every escalator
+# logs to <dir>/esc and fails.
+nic_fixture() {
+    local d=$1 r=$1/root p=/sys/devices/pci0000:00/0000:17:00.0 c t
+    mkdir -p "$d/bin" "$r$p/msi_irqs" "$r/sys/class/net/eth0" "$r/sys/class/net/lo" \
+        "$r/sys/bus/pci/drivers/mlx5_core" "$r/proc/irq/101" "$r/proc/sys/net/core" "$r/proc/sys/net/ipv4" \
+        "$r/sys/devices/system/cpu/cpu0/cpufreq" "$r/sys/devices/system/cpu/cpu1/cpufreq"
+    ln -s "$r$p" "$r/sys/class/net/eth0/device"
+    ln -s "$r/sys/bus/pci/drivers/mlx5_core" "$r$p/driver"
+    printf '1\n' > "$r$p/numa_node"
+    printf '16.0 GT/s PCIe\n' > "$r$p/current_link_speed"; printf '8\n' > "$r$p/current_link_width"
+    printf '16.0 GT/s PCIe\n' > "$r$p/max_link_speed"; printf '16\n' > "$r$p/max_link_width"
+    : > "$r$p/msi_irqs/101"; : > "$r$p/msi_irqs/102"
+    printf '4\n' > "$r/proc/irq/101/smp_affinity_list"
+    printf '1000\n' > "$r/proc/sys/net/core/netdev_max_backlog"
+    printf '4096\t131072\t6291456\n' > "$r/proc/sys/net/ipv4/tcp_rmem"
+    for c in 0 1; do printf 'performance\n' > "$r/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor"; done
+    printf '#!/bin/sh\necho "ethtool $*"\n' > "$d/bin/ethtool"
+    printf '#!/bin/sh\necho "mlnx_qos $*"\n' > "$d/bin/mlnx_qos"
+    printf '#!/bin/sh\necho 4321\n' > "$d/bin/pgrep"
+    printf '#!/bin/sh\necho 1000\n' > "$d/bin/id"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    for t in dzdo pbrun sesu pmrun doas ksu sudo; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$t" "$d" > "$d/bin/$t"
+    done
+    chmod +x "$d/bin"/*
+    # linked after the chmod, which would follow them to the real tools
+    for t in cat sort uniq readlink true; do
+        c=$(type -P "$t") || { echo "no $t on this host" >&2; return 1; }; ln -s "$c" "$d/bin/$t"
+    done
+}
+# nic_sysinfo <dir>: snapshot_sysinfo for one host h1, its string run by bash
+# against the fixture; the split lands in <dir>/out/sysinfo/h1.
+nic_sysinfo() {
+    mkdir -p "$1/w" "$1/out"
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; FIO_BIN=fio
+     fx=$1; bash=$(type -P bash)
+     run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
+     snapshot_sysinfo) >>"$WT_ASIDE" 2>&1
+}
+export -f nic_fixture nic_sysinfo
