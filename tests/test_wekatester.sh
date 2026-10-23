@@ -1330,7 +1330,7 @@ t_assert "confirm_timed: timeout yields the stated default" bash -c '
     (source ./wekatester; PROMPT_IN_FD=0; PROMPT_OUT_FD=1
      confirm_timed 1 yes "q?" < <(sleep 2) >>$WT_ASIDE)'
 t_assert "require_interactive dies without a terminal" bash -c '
-    out=$( (source ./wekatester; WEKATESTER_PROMPT_TTY=/dev/null PROMPT_TTY=/dev/null
+    out=$( (source ./wekatester; PROMPT_TTY=/dev/null
             require_interactive "-p") 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && case "$out" in *"-p needs a terminal"*) true;; *) echo "$out" >&2; false;; esac'
 
@@ -3239,9 +3239,8 @@ t_assert "capacity: swept bytes are credited against the requirement" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     d=$(mktemp -d)
     printf "42949672960" > "$FIX/probe/h1.laidout"
-    out=$( (source ./wekatester
+    out=$( (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
         WORK_DIR=$FIX; HOSTS=(h1); IGNORE_CAPACITY=0
-        WEKATESTER_PROMPT_TTY=/dev/null
         auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 >>$WT_ASIDE 2>&1
         run_host() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 209715200 0 209715200 1%% /mnt/weka\n"; }
         check_capacity) 2>&1 )
