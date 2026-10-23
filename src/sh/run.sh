@@ -650,6 +650,7 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         # -v: the hosts over the run, a stopped run's included
         if [ "$VERBOSITY" -ge 1 ] && [ ${#rds[@]} -eq 1 ]; then
             summary_counters "${rds[0]}" || printf '(counters: they could not be read from %s)\n\n' "$path"
+            summary_health "${rds[0]}" || printf '(host health: it could not be read from %s)\n\n' "$path"
         fi
         rm -rf "${tmp:?}"
         [ -n "$results" ] || { echo "$path: no results_*.json files in the bundle" >&2; return 1; }
@@ -703,6 +704,40 @@ summary_counters() {   # summary_counters <run-dir>
     echo "==== counters over the run: what rose from start to end, per host and NIC ===="
     [ "$rc" -ne 0 ] || awkrun '
         #@awk summ_counters' "$lists/files" "$lists/hosts" "$VERBOSITY" "$SUMMARY_COUNTER_RE" || rc=1
+    echo
+    rm -rf "${lists:?}"
+    return "$rc"
+}
+
+# -s -v: per host, what the captures say went wrong around the run (README,
+# Output). Thresholds: PSI "some avg10" in percent (io at the start only:
+# a benchmark is io pressure by design), 1-minute load per cpu at the start,
+# clock offset in ms; the kernel-log ERE is matched lowercased.
+SUMMARY_PSI_CPU=${SUMMARY_PSI_CPU:-5}
+SUMMARY_PSI_MEMORY=${SUMMARY_PSI_MEMORY:-1}
+SUMMARY_PSI_IO=${SUMMARY_PSI_IO:-10}
+SUMMARY_LOAD_PER_CPU=${SUMMARY_LOAD_PER_CPU:-0.75}
+SUMMARY_CLOCK_MS=${SUMMARY_CLOCK_MS:-100}
+SUMMARY_KLOG_RE=${SUMMARY_KLOG_RE:-link is down|link is up|link down|link up|nic link|carrier lost|tx timeout|transmit queue [0-9]+ timed out|netdev watchdog|mlx5.*(err|fail|timeout|health)|(ice|i40e|bnxt|ixgbe|ena|mlx4|igb)[ _].*(err|fail|reset|timeout)|hung_task|blocked for more than|soft lockup|hard lockup|rcu.*stall|aer:|pcie bus error|out of memory|oom-kill|oom_reaper|invoked oom-killer|call trace}
+SUMMARY_KLOG_LINES=${SUMMARY_KLOG_LINES:-5}
+summary_health() {   # summary_health <run-dir>
+    local rd=$1 lists h f k v rc=0
+    for k in SUMMARY_PSI_CPU SUMMARY_PSI_MEMORY SUMMARY_PSI_IO SUMMARY_LOAD_PER_CPU SUMMARY_CLOCK_MS SUMMARY_KLOG_LINES; do
+        v=${!k}
+        case $v in (""|*[!0-9.]*|*.*.*|.) echo "(host health: $k must be a number, not '$v')"; echo; return 0 ;; esac
+    done
+    lists=$(mktemp -d "${TMPDIR:-/tmp}/wt.hlt.XXXXXX") || return 1
+    bundle_hosts "$rd" > "$lists/hosts" || rc=1
+    while IFS= read -r h; do
+        for f in pressure-cpu-start pressure-cpu-end pressure-memory-start pressure-memory-end pressure-io-start \
+                 loadavg-start lscpu kernel-log-end chrony; do
+            [ ! -f "$rd/sysinfo/$h/$f" ] || printf '%s\t%s\t%s\n' "$h" "$f" "$rd/sysinfo/$h/$f"
+        done
+    done < "$lists/hosts" > "$lists/files"
+    echo "==== host health: pressure, load, kernel log and clock around the run ===="
+    [ "$rc" -ne 0 ] || awkrun '
+        #@awk summ_health' "$lists/files" "$lists/hosts" "$SUMMARY_PSI_CPU" "$SUMMARY_PSI_IO" "$SUMMARY_PSI_MEMORY" \
+            "$SUMMARY_LOAD_PER_CPU" "$SUMMARY_CLOCK_MS" "$SUMMARY_KLOG_RE" "$SUMMARY_KLOG_LINES" || rc=1
     echo
     rm -rf "${lists:?}"
     return "$rc"

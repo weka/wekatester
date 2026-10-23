@@ -187,7 +187,8 @@ attaching is the way to pass a value that starts with a dash.
                  so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive, after a synopsis
-                 of the run (README, Output) -- and exit
+                 of the run (README, Output) -- and exit; with -v, also
+                 the counters that rose and each host's health flags
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
   --version      display version number and exit
   -h, --help     show this help and exit

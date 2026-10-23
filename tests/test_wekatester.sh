@@ -1907,7 +1907,7 @@ X
 t_assert "-s -v counters: what rose per host and NIC; a reset is flagged, never counted; a NIC on one side is named" bash -c '
     d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_counters_fixture "$d"
     out=$(summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
-    sec=$(printf "%s\n" "$out" | sed -n "/^==== counters/,\$p")
+    sec=$(printf "%s\n" "$out" | awk "/^==== counters/ {on = 1} /^==== host health/ {exit} on")
     exp=$(cat <<"X"
 ==== counters over the run: what rose from start to end, per host and NIC ====
 h1
@@ -1933,6 +1933,53 @@ t_assert "-s -vv counters: every counter that rose, traffic included" bash -c '
     case "$sec" in
         *"  tcp: 2 counters, 2 rose:"*"TcpInSegs "*"+899,000"*"TcpRetransSegs "*"rx_discards_phy "*"rx_packets "*"+89,900"*"h2"*"  tcp: 2 counters, 1 rose:"*"TcpInSegs "*"+20"*) true;;
         *) printf "%s\n" "$out" >&2; false;;
+    esac'
+t_assert "-s -v health: each flag shows the value that tripped it; a clean host says so on one line; gaps are named" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_health_fixture "$d"
+    out=$(summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    sec=$(printf "%s\n" "$out" | sed -n "/^==== host health/,\$p")
+    exp=$(cat <<"X"
+==== host health: pressure, load, kernel log and clock around the run ====
+h1
+  cpu pressure at the end: some avg10 12.50% (over SUMMARY_PSI_CPU 5)
+  load at the start: 14.00 on 16 cpus = 0.88 per cpu (over SUMMARY_LOAD_PER_CPU 0.75)
+  kernel log: 6 of 7 lines in the run window match SUMMARY_KLOG_RE:
+    [  950.000000] mlx5_core 0000:17:00.0 eth0: Link down
+    [  951.000000] mlx5_core 0000:17:00.0 eth0: Link up
+    [  952.000000] NETDEV WATCHDOG: eth0 (mlx5_core): transmit queue 3 timed out
+    [  953.000000] INFO: task kworker/3:1:123 blocked for more than 120 seconds.
+    [  954.000000] pcieport 0000:00:01.0: AER: Corrected error received: 0000:17:00.0
+    (+1 more; SUMMARY_KLOG_LINES shows 5)
+  clock: 250.0 ms off NTP time (over SUMMARY_CLOCK_MS 100)
+h2: nothing to flag (cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start, kernel log 0 lines, clock 0.01 ms off)
+h3
+  kernel log: this host booted during the run
+  clock: not synchronised to NTP
+  not recorded: cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start
+X
+)
+    [ "$sec" = "$exp" ] || { printf "%s\n" "$out" >&2; exit 1; }'
+t_assert "-s -v health: the thresholds and the pattern are settings; a bad number is named, not used" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" plain; summ_health_fixture "$d"
+    out=$(SUMMARY_PSI_CPU=20 SUMMARY_LOAD_PER_CPU=1 SUMMARY_CLOCK_MS=300 SUMMARY_KLOG_RE="out of memory" SUMMARY_KLOG_LINES=1 summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    sec=$(printf "%s\n" "$out" | sed -n "/^==== host health/,/^h2/p")
+    exp=$(cat <<"X"
+==== host health: pressure, load, kernel log and clock around the run ====
+h1
+  kernel log: 1 of 7 lines in the run window match SUMMARY_KLOG_RE:
+    [  956.000000] Out of memory: Killed process 4242 (fio)
+h2: nothing to flag (cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start, kernel log 0 lines, clock 0.01 ms off)
+X
+)
+    [ "$sec" = "$exp" ] || { printf "%s\n" "$out" >&2; exit 1; }
+    out=$(SUMMARY_PSI_CPU=lots summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    case "$out" in *"(host health: SUMMARY_PSI_CPU must be a number, not '\''lots'\'')"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "-s -v on an older bundle: counters and health say not recorded per host" bash -c '
+    d=$(mktemp -d); summ_bundle_fixture "$d" old
+    out=$(summ_out "$d" -v) || { echo "$out" >&2; exit 1; }
+    case "$out" in
+        *"==== counters"*"h1: not recorded (no counter captures in sysinfo/h1)"*"h2: not recorded"*"==== host health"*"h1: not recorded (no pressure, load, kernel log or clock capture in sysinfo/h1)"*"h2: not recorded"*) true;;
+        *) echo "$out" >&2; false;;
     esac'
 t_assert "-s synopsis: a single results .json keeps today's output, no synopsis" bash -c '
     d=$(mktemp -d); fio_json_single_fixture "$d/r.json"

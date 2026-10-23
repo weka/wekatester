@@ -635,8 +635,33 @@ summ_counters_fixture() {
     printf 'NIC statistics:\n     rx_packets: 100\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-start"
     printf 'NIC statistics:\n     rx_packets: 200\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-end"
 }
+# summ_health_fixture <dir>: health captures in the plain bundle. h1 trips
+# everything: cpu PSI 12.5 at the end, load 14 on 16 cpus, six kernel-log
+# hits of seven lines, a clock 250 ms slow. h2 is clean, its kernel log
+# window empty. h3: no pressure or load capture, a kernel log with no hit
+# but a boot inside the run, timedatectl saying not synchronized.
+summ_health_fixture() {
+    local s=$1/20261023-141002/sysinfo h
+    for h in h1 h2; do
+        for f in cpu memory io; do printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > "$s/$h/pressure-$f-start"; done
+        cp "$s/$h/pressure-cpu-start" "$s/$h/pressure-cpu-end"; cp "$s/$h/pressure-memory-start" "$s/$h/pressure-memory-end"
+        printf 'Architecture:                    x86_64\nCPU(s):                          16\nOn-line CPU(s) list:             0-15\n' > "$s/$h/lscpu"
+    done
+    printf 'some avg10=12.50 avg60=3.00 avg300=1.00 total=99\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > "$s/h1/pressure-cpu-end"
+    printf '14.00 3.00 1.00 2/300 1234\n' > "$s/h1/loadavg-start"; printf '0.50 0.40 0.30 1/300 1234\n' > "$s/h2/loadavg-start"
+    printf '%s\n' "# dmesg, from 900 s after boot (the run start)" "[  950.000000] mlx5_core 0000:17:00.0 eth0: Link down" \
+        "[  951.000000] mlx5_core 0000:17:00.0 eth0: Link up" "[  952.000000] NETDEV WATCHDOG: eth0 (mlx5_core): transmit queue 3 timed out" \
+        "[  953.000000] INFO: task kworker/3:1:123 blocked for more than 120 seconds." "[  954.000000] pcieport 0000:00:01.0: AER: Corrected error received: 0000:17:00.0" \
+        "[  955.000000] systemd[1]: Started Session 4." "[  956.000000] Out of memory: Killed process 4242 (fio)" > "$s/h1/kernel-log-end"
+    printf '%s\n' "# dmesg, from 900 s after boot (the run start)" "(no kernel log line in the window)" > "$s/h2/kernel-log-end"
+    printf '%s\n' "# dmesg, from -20 s after boot (the run start)" "(this host booted after the run start: dmesg holds nothing from before the boot)" \
+        "[    1.000000] Linux version 5.15.0" "[    2.000000] systemd[1]: Started Journal." > "$s/h3/kernel-log-end"
+    printf 'Reference ID    : C0A80001 (ntp1)\nSystem time     : 0.250000000 seconds slow of NTP time\nLeap status     : Normal\n' > "$s/h1/chrony"
+    printf 'Reference ID    : C0A80001 (ntp1)\nSystem time     : 0.000012000 seconds fast of NTP time\nLeap status     : Normal\n' > "$s/h2/chrony"
+    printf 'not available: chronyc not installed; timedatectl instead\n               Local time: Fri 2026-10-23 14:10:02 UTC\nSystem clock synchronized: no\n              NTP service: inactive\n' > "$s/h3/chrony"
+}
 # summ_out <dir> [option...]: the bundle tarred and -s run on it, every line
 summ_out() {
     tar -czf "$1/b.tgz" -C "$1" 20261023-141002 && ./wekatester "${@:2}" -s "$1/b.tgz" 2>&1
 }
-export -f summ_job summ_weka summ_bundle_fixture summ_counters_fixture summ_out fio_json_fixture fio_json_single_fixture
+export -f summ_job summ_weka summ_bundle_fixture summ_counters_fixture summ_health_fixture summ_out fio_json_fixture fio_json_single_fixture

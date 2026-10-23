@@ -118,7 +118,8 @@ attaching is the way to pass a value that starts with a dash.
                  so the next calibration can reuse them
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive, after a synopsis
-                 of the run (README, Output) -- and exit
+                 of the run (README, Output) -- and exit; with -v, also
+                 the counters that rose and each host's health flags
   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
   --version      display version number and exit
   -h, --help     show this help and exit
@@ -719,6 +720,37 @@ h1
   eth1: at the end only, so no delta
 h2: nothing to flag, none matching SUMMARY_COUNTER_RE rose and none went down (tcp 2 counters, 1 rose; eth0 2 counters, 1 rose)
 h3: not recorded (no counter captures in sysinfo/h3)
+```
+
+**Host health:** per host, a flag for each capture that crossed its setting, showing the value that tripped it. Each setting can be changed in the environment:
+
+| Setting | Default | Checks |
+|---|---|---|
+| `SUMMARY_PSI_CPU` | 5 | cpu PSI `some avg10` (%), at the start and at the end |
+| `SUMMARY_PSI_MEMORY` | 1 | memory PSI `some avg10` (%), at the start and at the end |
+| `SUMMARY_PSI_IO` | 10 | io PSI `some avg10` (%), at the start only: a benchmark is io pressure by design |
+| `SUMMARY_LOAD_PER_CPU` | 0.75 | the 1-minute load at the start, per cpu (`lscpu`); the end load is the run's own |
+| `SUMMARY_CLOCK_MS` | 100 | the clock offset `chronyc tracking` reports (ms); not synchronised is flagged too, and `timedatectl` gives only that |
+| `SUMMARY_KLOG_RE` | link down/up, NIC watchdog and transmit timeouts, NIC driver errors, hung and blocked tasks, lockups and RCU stalls, AER, OOM, call traces | kernel-log lines in the run window (lowercased ERE) |
+| `SUMMARY_KLOG_LINES` | 5 | how many matching lines are shown per host; the rest are counted |
+
+A boot inside the run window and a kernel ring that wrapped are flagged too. A host with nothing to flag says so on one line and names what it checked. A capture the bundle lacks is listed under `not recorded`, so a check that could not run never looks clean.
+
+```
+==== host health: pressure, load, kernel log and clock around the run ====
+h1
+  cpu pressure at the end: some avg10 12.50% (over SUMMARY_PSI_CPU 5)
+  load at the start: 14.00 on 16 cpus = 0.88 per cpu (over SUMMARY_LOAD_PER_CPU 0.75)
+  kernel log: 6 of 7 lines in the run window match SUMMARY_KLOG_RE:
+    [  950.000000] mlx5_core 0000:17:00.0 eth0: Link down
+    ...
+    (+1 more; SUMMARY_KLOG_LINES shows 5)
+  clock: 250.0 ms off NTP time (over SUMMARY_CLOCK_MS 100)
+h2: nothing to flag (cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start, kernel log 0 lines, clock 0.01 ms off)
+h3
+  kernel log: this host booted during the run
+  clock: not synchronised to NTP
+  not recorded: cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start
 ```
 
 # Caveats
