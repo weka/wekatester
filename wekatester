@@ -1884,6 +1884,72 @@ cal_required() {   # cal_required <setdir> [bulk 0|1]
     }' "${2:-0}" "${files[@]}"
 }
 
+# The write seed's density, decided once from the set (README, Seeding):
+# CAL_DENSE_WRITE 0 seeds the unified write grid sparse, by truncate. The
+# scratch keeps reads and writes on one set, so it is always dense.
+CAL_DENSE_WRITE=1
+cal_write_seed() {   # cal_write_seed <set-dir>; unified only
+    local f files=() v LC_ALL=C
+    for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
+    v=$(awkrun '# A job section'\''s own key else [global]'\''s, rw= and readwrite= one key; ""
+    # for none (fio then reads)
+    function sec_rw(KV, s,    v) {
+        if ((s, "rw") in KV) return KV[s, "rw"]
+        if ((s, "readwrite") in KV) return KV[s, "readwrite"]
+        if (("g", "rw") in KV) return KV["g", "rw"]
+        return (("g", "readwrite") in KV) ? KV["g", "readwrite"] : ""
+    }
+    # why section s is not one pure sequential write, "" when it is: rw=write
+    # without a ":<n>" skip, no random share, no verify read-back, no zone skip
+    function not_seq(KV, s,    v) {
+        v = tolower(strip(sec_rw(KV, s)))
+        if (v != "write") return "rw=" (v == "" ? " (fio reads)" : v)
+        v = strip(ini_get(KV, s, "percentage_random", "0"))
+        if (v !~ /^0(,0)*$/) return "percentage_random=" v
+        v = strip(ini_get(KV, s, "percentage_sequential", "100"))
+        if (v !~ /^100(,100)*$/) return "percentage_sequential=" v
+        v = tolower(strip(ini_get(KV, s, "verify", "0")))
+        if (v != "0" && v != "none") return "verify=" v " reads it back"
+        v = strip(ini_get(KV, s, "zoneskip", "0"))
+        if (v !~ /^0+[a-zA-Z]*$/) return "zoneskip=" v
+        return ""
+    }
+    # Unified -a: may the write grid <host>.<fmt> (ARGV[1]) be seeded sparse?
+    # Only when every job writing it is a pure sequential write and no
+    # calibration cell writes it at random (README, Seeding). Prints "sparse",
+    # else "dense <why>".
+    BEGIN {
+        fmt = ARGV[1]
+        for (a = 2; a < ARGC; a++) {
+            f = ARGV[a]; sub(/.*\//, "", f)
+            if ((n = readlines(ARGV[a], L)) < 0) awk_fail("cannot read " ARGV[a])
+            if (f == layout_job() || is_layout_marked(L, n)) continue
+            file_directions(L, n, D)
+            # a read-only jobfile reads the shared set (stage_hosts)
+            if (!("write" in D) && ("read" in D)) continue
+            if ("write" in D) {
+                if (report_has(L, n, "latency")) { print "dense " f ": its latency write search writes at random"; exit }
+                if (report_has(L, n, "iops")) { print "dense " f ": its iops write search writes at random"; exit }
+            }
+            nsec = job_sections(L, n, SN, KV, J)
+            for (x = 1; x <= nsec; x++) {
+                s = J[x]
+                if (replace_all(sec_value(L, n, KV, s, "filename_format", ""), "$jobname", sec_jobname(L, n, SN, s, f)) != fmt) continue
+                if ((why = not_seq(KV, s)) != "") { print "dense " f (s == "g" ? "" : " [" SN[s] "]") ": " why; exit }
+            }
+        }
+        print "sparse"
+    }' "$CAL_FMT" ${files[@]+"${files[@]}"}) \
+        || die "cannot classify the write grid of $1"
+    if [ "$v" = sparse ]; then
+        CAL_DENSE_WRITE=0
+        log "cal: write seed: sparse, by truncate (every job writing <host>.$CAL_FMT is a pure sequential write)"
+    else
+        CAL_DENSE_WRITE=1
+        log "cal: write seed: dense (${v#dense })"
+    fi
+}
+
 # Calibration measures on the workload own files when filename_format can
 # address the grid ($filenum and $jobnum, no $jobname, which would resolve to
 # the cal section name), else in a private scratch. One dataset then serves
@@ -2336,12 +2402,20 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     # One session for the listing and df. No error suppression on find: without
     # GNU -printf it must fail loudly, or every run re-seeds everything. Only
     # the names the seed can ask for: a shared destination holds every
-    # member's write set.
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+    # member's write set. A sparse write seed is coreutils truncate, no fio
+    # feature: the same session says whether the host has it.
+    local tq=""
+    [ "$dense" != 0 ] || [ "$unified" -eq 0 ] || [ "$wnj" -eq 0 ] \
+        || tq="; if ! _o=\$(command -v truncate); then echo WEKATESTER_NO_TRUNCATE; fi"
+    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'$tq" \
         > "$WORK_DIR/cal/$host/scratch.raw" \
         || die "$host: cannot inspect the calibration dataset or its free space"
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
     awk 'f {print; exit} /^WEKATESTER_DF$/ {f = 1}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/dfline"
+    if [ -n "$tq" ] && grep -qx WEKATESTER_NO_TRUNCATE "$WORK_DIR/cal/$host/scratch.raw"; then
+        dense=1
+        log "cal: $host: truncate is not installed there, so its write grid $hname$sep$fmt is seeded dense" >&2
+    fi
     # fio never mkdirs. A flat shape needs nothing beyond the dataset root; a
     # subdirectory shape needs its directories before a file lands in them.
     maxf=$rnr; [ "$wnr" -le "$maxf" ] || maxf=$wnr
@@ -3366,8 +3440,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     CAL_REP_ALL=$allc
     # the shape's aio room (cal_shapes: its tightest member's), for cal_search
     CAL_REP_AIO=$aio
-    CAL_DENSE_WRITE=0
-    mkdir -p "$sdir" "$WORK_DIR/cal/$rep" || die "cannot create $sdir"
+    mkdir -p "$sdir""$WORK_DIR/cal/$rep" || die "cannot create $sdir"
     rm -f "$WORK_DIR/cal/$rep/seeded.read" "$WORK_DIR/cal/$rep/seeded.write"
     while read -r type dirn; do
         [ -n "$type" ] || continue
@@ -3385,7 +3458,6 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
-        case "$type $dirn" in ("iops write"|"lat write"|"lat1m write") CAL_DENSE_WRITE=1 ;; esac
     done <<SLOTEOF
 $ladders
 SLOTEOF
@@ -3772,8 +3844,9 @@ calibrate() {
         done
         CAL_NS_DIR=""; CAL_SEP="."
         log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
+        cal_write_seed "$capdir"
     else
-        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
+        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."; CAL_DENSE_WRITE=1
         log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
     fi
     mkdir -p "$WORK_DIR/cal"

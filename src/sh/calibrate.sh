@@ -18,6 +18,24 @@ cal_required() {   # cal_required <setdir> [bulk 0|1]
     awkrun '#@awk cal_required' "${2:-0}" "${files[@]}"
 }
 
+# The write seed's density, decided once from the set (README, Seeding):
+# CAL_DENSE_WRITE 0 seeds the unified write grid sparse, by truncate. The
+# scratch keeps reads and writes on one set, so it is always dense.
+CAL_DENSE_WRITE=1
+cal_write_seed() {   # cal_write_seed <set-dir>; unified only
+    local f files=() v LC_ALL=C
+    for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
+    v=$(awkrun '#@awk cal_write_seed' "$CAL_FMT" ${files[@]+"${files[@]}"}) \
+        || die "cannot classify the write grid of $1"
+    if [ "$v" = sparse ]; then
+        CAL_DENSE_WRITE=0
+        log "cal: write seed: sparse, by truncate (every job writing <host>.$CAL_FMT is a pure sequential write)"
+    else
+        CAL_DENSE_WRITE=1
+        log "cal: write seed: dense (${v#dense })"
+    fi
+}
+
 # Calibration measures on the workload own files when filename_format can
 # address the grid ($filenum and $jobnum, no $jobname, which would resolve to
 # the cal section name), else in a private scratch. One dataset then serves
@@ -345,12 +363,20 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     # One session for the listing and df. No error suppression on find: without
     # GNU -printf it must fail loudly, or every run re-seeds everything. Only
     # the names the seed can ask for: a shared destination holds every
-    # member's write set.
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+    # member's write set. A sparse write seed is coreutils truncate, no fio
+    # feature: the same session says whether the host has it.
+    local tq=""
+    [ "$dense" != 0 ] || [ "$unified" -eq 0 ] || [ "$wnj" -eq 0 ] \
+        || tq="; if ! _o=\$(command -v truncate); then echo WEKATESTER_NO_TRUNCATE; fi"
+    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'$tq" \
         > "$WORK_DIR/cal/$host/scratch.raw" \
         || die "$host: cannot inspect the calibration dataset or its free space"
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
     awk 'f {print; exit} /^WEKATESTER_DF$/ {f = 1}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/dfline"
+    if [ -n "$tq" ] && grep -qx WEKATESTER_NO_TRUNCATE "$WORK_DIR/cal/$host/scratch.raw"; then
+        dense=1
+        log "cal: $host: truncate is not installed there, so its write grid $hname$sep$fmt is seeded dense" >&2
+    fi
     # fio never mkdirs. A flat shape needs nothing beyond the dataset root; a
     # subdirectory shape needs its directories before a file lands in them.
     maxf=$rnr; [ "$wnr" -le "$maxf" ] || maxf=$wnr
@@ -610,8 +636,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     CAL_REP_ALL=$allc
     # the shape's aio room (cal_shapes: its tightest member's), for cal_search
     CAL_REP_AIO=$aio
-    CAL_DENSE_WRITE=0
-    mkdir -p "$sdir" "$WORK_DIR/cal/$rep" || die "cannot create $sdir"
+    mkdir -p "$sdir""$WORK_DIR/cal/$rep" || die "cannot create $sdir"
     rm -f "$WORK_DIR/cal/$rep/seeded.read" "$WORK_DIR/cal/$rep/seeded.write"
     while read -r type dirn; do
         [ -n "$type" ] || continue
@@ -629,7 +654,6 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
-        case "$type $dirn" in ("iops write"|"lat write"|"lat1m write") CAL_DENSE_WRITE=1 ;; esac
     done <<SLOTEOF
 $ladders
 SLOTEOF
@@ -884,8 +908,9 @@ calibrate() {
         done
         CAL_NS_DIR=""; CAL_SEP="."
         log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
+        cal_write_seed "$capdir"
     else
-        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
+        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."; CAL_DENSE_WRITE=1
         log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
     fi
     mkdir -p "$WORK_DIR/cal"

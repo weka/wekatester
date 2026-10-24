@@ -6638,6 +6638,54 @@ t_assert "calibrate: a 4k-random write search forces the dense write seed" bash 
     grep -A2 -x "filename=h1.1/0" "$f" | grep -qx "filesize=2560M" &&
     grep -A2 -x "filename=h1.2/0:h1.3/0" "$f" | grep -qx "filesize=1280M" &&
     [ ! -s "$d/cal/h1/truncate.list" ] || { cat "$f" >&2; false; }'
+# The seed's density came from the search kinds alone: a bandwidth-only
+# rw=rw job read holes and a bandwidth randwrite filled them at random.
+t_assert "calibrate: the write seed is sparse only when every job writing the grid is a pure sequential write" bash -c '
+    source ./tests/helpers.sh
+    one() {   # one <sparse|dense> <012-w.job body>: one calibration of that set
+        local d out got
+        d=$(mktemp -d); cal_sim_fixture "$d" h1
+        printf "%b" "$2" > "$d/set/012-w.job"
+        out=$( (source ./wekatester
+         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+         copy_to_master() { :; }
+         run_host() { cal_sim_host "$@"; }
+         calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; return 1; }
+        if grep -q "truncate -s" "$d/simlog"; then got=sparse; else got=dense; fi
+        [ "$got" = "$1" ] || { printf "want %s, got %s for:\n%b\n%s\n" "$1" "$got" "$2" "$out" >&2; return 1; }
+        LAST=$out
+    }
+    h="# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n"
+    one sparse "${h}[a]\nrw=write\n" &&
+    case "$LAST" in *"cal: write seed: sparse, by truncate (every job writing <host>.\$filenum/\$jobnum is a pure sequential write)"*) true;;
+        *) printf "%s\n" "$LAST" >&2; false;; esac &&
+    one dense "${h}[a]\nrw=rw\n" &&
+    one dense "${h}[a]\nrw=randwrite\n" &&
+    case "$LAST" in *"cal: write seed: dense (012-w.job [a]: rw=randwrite)"*) true;;
+        *) printf "%s\n" "$LAST" >&2; false;; esac &&
+    one dense "${h}[a]\nrw=write:4k\n" &&
+    one dense "${h}[a]\nrw=write\npercentage_random=10\n" &&
+    one dense "${h}[a]\nrw=write\nverify=crc32c\n" &&
+    one dense "${h}[r]\nrw=read\n[a]\nrw=write\n" &&
+    # another format is another grid: its random writer leaves this one alone
+    one sparse "${h}[a]\nrw=write\n[b]\nfilename_format=other.\$jobnum\nrw=randwrite\n"'
+t_assert "calibrate: a host without truncate gets the dense write seed, and the log says so" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-w.job"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; case "$2" in (*"command -v truncate"*) echo WEKATESTER_NO_TRUNCATE;; esac; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    ! grep -q "truncate -s" "$d/simlog" &&
+    grep -q "filename=h1.0/0" "$d/cal/h1/cal-seed-write.job" &&
+    case "$out" in *"cal: h1: truncate is not installed there, so its write grid h1.\$filenum/\$jobnum is seeded dense"*) true;;
+        *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "calibrate: every write cell settles, read cells never do" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
