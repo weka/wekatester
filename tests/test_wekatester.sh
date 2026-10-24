@@ -1349,7 +1349,7 @@ t_assert "local staging lands per-host variants under the staging dir" bash -c '
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >>$WT_ASIDE || exit 1
+     stage_jobfiles && push_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     test -f "$v" && grep -q "^directory=/mnt/weka$" "$v" &&
     test -f "$d/target/localhost/022-smoke-writeiops.job"'
@@ -2915,7 +2915,7 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; UNLINK=1
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles
+     stage_jobfiles && push_jobfiles
      [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >>$WT_ASIDE || exit 1
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
@@ -2968,7 +2968,7 @@ t_assert "-e stamps every staged variant, the generated layout included" bash -c
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; ENGINE=xyzeng
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >>$WT_ASIDE || exit 1
+     stage_jobfiles && push_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     grep -q "^ioengine=xyzeng$" "$v" && ! grep -q "^ioengine=libaio$" "$v" &&
     grep -q "^ioengine=xyzeng$" "$d/target/localhost/000-wekatester-layout.job"'
@@ -3169,7 +3169,7 @@ t_assert "stamping: staged variants and the generated layout carry it end to end
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >>$WT_ASIDE || exit 1
+     stage_jobfiles && push_jobfiles) >>$WT_ASIDE || exit 1
     # the staging path keeps the ADDRESS; the data-file prefix is the NAME
     v="$d/target/localhost/011-smoke-readbw.job"
     r="$d/target/localhost/000-wekatester-layout.job"
@@ -3509,7 +3509,9 @@ t_assert "run_jobs: a failed layout's postmortem prints in host order when the h
         *"h3:   fio: bad option xyz"*"ERROR: layout 000-wekatester-layout.job failed -- the files were not created"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "sweep: deviants deleted per namespace, matching bytes credited (capped)" bash -c '
+# The sweep deleted every file short of its size, so an interrupted layout
+# started that file over; now it lists sizes and the layout extends.
+t_assert "sweep: one listing per namespace into the host's sizes file, nothing deleted" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DIRECTORY=/mnt/weka; DRY_RUN=0
@@ -3529,12 +3531,13 @@ numjobs=2"
      printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
      printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
      JOBFILES=(000-wekatester-layout.job)
-     run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo 1073741824; echo 536870912; }
-     sweep_layout_grid)
-    grep -qF -- "{ find \"/mnt/weka\" -maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +1073741823c -print -o -delete \); }" "$d/oplog" &&
-    grep -qF -- "{ find \"/mnt/weka\" -maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +536870911c -print -o -delete \); }" "$d/oplog" &&
-    [ "$(cat "$d/probe/h1.laidout")" = "1610612736" ]'
-t_assert "sweep: same-format sections cannot delete each other (exact singleton indices, size floors)" bash -c '
+     run_host() { echo "SWEEP[$1]: $2" >> "$d/oplog"; echo "1073741824 /mnt/weka/h1.0/0"; }
+     sweep_layout_grid) >>$WT_ASIDE 2>&1
+    cat "$d/oplog" >>$WT_ASIDE
+    grep -qF -- "SWEEP[h1]: find \"/mnt/weka\" -maxdepth 2 -type f -path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" -printf '"'"'%s %p\\n'"'"' && find \"/mnt/weka\" -maxdepth 1 -type f -path \"/mnt/weka/h1.wt.*.0\" ! -path \"/mnt/weka/.wekatester-cal/*\" -printf '"'"'%s %p\\n'"'"'" "$d/oplog" &&
+    ! grep -q -- "-delete\|rm -f" "$d/oplog" &&
+    [ "$(cat "$d/probe/h1.sizes")" = "1073741824 /mnt/weka/h1.0/0" ]'
+t_assert "sweep: same-format sections list from exact singleton indices (no walk over the other sections)" bash -c '
     d=$(mktemp -d)
     (source ./wekatester
      WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DIRECTORY=/mnt/weka; DRY_RUN=0
@@ -3553,50 +3556,119 @@ numjobs=44"
      printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
      printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
      JOBFILES=(000-wekatester-layout.job)
-     run_host() { echo "SWEEP: $2" >> "$d/oplog"; echo 0; echo 0; }
-     sweep_layout_grid)
-    grep -qF -- "if [ -d \"/mnt/weka/h1.0\" ]; then find \"/mnt/weka/h1.0\" -maxdepth 1 -type f -path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c -print -o -delete \); fi" "$d/oplog" &&
-    ! grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +10737418239c" "$d/oplog" &&
-    grep -qF -- "-path \"/mnt/weka/h1.*/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" \( -size +1073741823c -print -o -delete \)" "$d/oplog"'
+     run_host() { echo "SWEEP: $2" >> "$d/oplog"; }
+     sweep_layout_grid) >>$WT_ASIDE 2>&1
+    cat "$d/oplog" >>$WT_ASIDE
+    grep -qF -- "if [ -d \"/mnt/weka/h1.0\" ]; then find \"/mnt/weka/h1.0\" -maxdepth 1 -type f -path \"/mnt/weka/h1.0/*\" ! -path \"/mnt/weka/.wekatester-cal/*\" -printf '"'"'%s %p\\n'"'"'; fi" "$d/oplog" &&
+    [ "$(grep -o -- "-path \"/mnt/weka/h1.\*/\*\"" "$d/oplog" | wc -l)" -eq 1 ]'
 # Run for real: with -d <dir>/ the joined pattern held "//", find printed one
-# slash, and the sweep credited nothing and deleted no short file.
-t_assert "sweep: a trailing-slash -d still credits the laid-out files and deletes the short ones (find run for real)" bash -c '
+# slash, and the sweep credited nothing. Short files were deleted and laid
+# out whole by a create_only pass that ftruncates to full size first.
+t_assert "stage_layout_writes: a trailing-slash -d; short files are kept and extended, complete and larger ones reused, the bytes present credited (find run for real)" bash -c '
     d=$(mktemp -d); t=$d/dest
     mkdir -p "$t/h1.0" "$t/h1.1"
     mk() { head -c "$2" /dev/zero > "$t/$1"; }
-    mk h1.wt.0.0 1024; mk h1.wt.1.0 100; mk h1.0/0 2048; mk h1.1/0 2048; mk h1.1/1 10
+    # flat 12K: complete, short on its 4K block, missing; nested 8K: larger,
+    # short off its 8K block (rewritten from 0), complete, missing
+    mk h1.wt.0.0 12288; mk h1.wt.1.0 4096; mk h1.0/0 16384; mk h1.0/1 1000; mk h1.1/0 8192
     out=$( (source ./wekatester
      parse_args -d "$t/" h1
-     WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=0
+     WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=0; RUN_DIR=$d/run; mkdir -p "$RUN_DIR"
      mkdir -p "$d/jobs/h1" "$SET_DIR"
      lay="# wekatester-layout: generated sha256=abc
 [global]
 directory=$t
 fallocate=none
+ioengine=psync
+unique_filename=0
 [flat]
+create_only=1
 filename_format=h1.wt.\$jobnum.\$filenum
-filesize=1K
-numjobs=2
+filesize=12K
+numjobs=3
 [nested]
+create_only=1
 filename_format=h1.\$filenum/\$jobnum
-filesize=2K
+filesize=8K
 nrfiles=2
 numjobs=2"
      printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
      printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { bash -c "$2"; }
-     sweep_layout_grid) 2>&1 ) || { echo "$out" >&2; exit 1; }
+     sweep_layout_grid && stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
     left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
-    [ "$(cat "$d/probe/h1.laidout")" = 5120 ] && [ "$left" = "./h1.0/0 ./h1.1/0 ./h1.wt.0.0 " ] ||
-        { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; false; }'
+    # present: 12K + 4K + 0 + 8K (of 16K) + 1000 + 8K + 0
+    [ "$(cat "$d/probe/h1.laidout")" = 33768 ] && [ "$left" = "./h1.0/0 ./h1.0/1 ./h1.1/0 ./h1.wt.0.0 ./h1.wt.1.0 " ] ||
+        { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; exit 1; }
+    want="# wekatester-layout: generated as a dense write
+# Staged per run from the layout grid, after the sweep: every file missing
+# or short of its size is written sequentially from its end, so a stopped
+# layout leaves a short file, never a full-size one with a hole (README).
+[global]
+directory=$t
+fallocate=none
+ioengine=psync
+unique_filename=0
+group_reporting=1
+
+[lay-1-8192-w1]
+rw=write
+bs=8192
+direct=1
+create_on_open=1
+file_append=0
+numjobs=1
+nrfiles=1
+filesize=8192
+filename=h1.0/1
+
+[lay-1-8192-a2]
+rw=write
+bs=8192
+direct=1
+create_on_open=1
+file_append=1
+numjobs=1
+nrfiles=1
+filesize=8192
+filename=h1.1/1
+
+[lay-1-12288-a3]
+rw=write
+bs=4096
+direct=1
+create_on_open=1
+file_append=1
+numjobs=1
+nrfiles=1
+filesize=12288
+filename=h1.wt.1.0
+
+[lay-2-12288-a4]
+rw=write
+bs=4096
+direct=1
+create_on_open=1
+file_append=1
+numjobs=1
+nrfiles=1
+filesize=12288
+filename=h1.wt.2.0"
+    [ "$(cat "$d/jobs/h1/000-wekatester-layout.job")" = "$want" ] ||
+        { diff <(printf "%s\n" "$want") "$d/jobs/h1/000-wekatester-layout.job" >&2; exit 1; }
+    # the grid is kept for the directory pass and the capacity check
+    grep -qx "filename_format=h1.\$filenum/\$jobnum" "$d/grid/h1/000-wekatester-layout.job" &&
+    grep -qx "layout	4 file(s), 36864 bytes to write on 1 host(s)" "$d/run/settings" &&
+    case "$out" in *"layout: h1: 4 file(s) missing or short, 0.0 GiB to write (3 reused)"*) true;;
+        *) echo "$out" >&2; false;; esac'
 # A truncate-seeded file is full size and holds nothing: the sweep credited
 # it as laid out, so the capacity check under-priced what the run writes.
 t_assert "sweep: calibration's truncate-seeded files earn no credit and are removed for the layout to write (find run for real)" bash -c '
     d=$(mktemp -d); t=$d/dest
     mkdir -p "$t/h1.0" "$t/h1.1" "$d/cal/h1"
-    truncate -s 2048 "$t/h1.0/0"; truncate -s 2048 "$t/h1.0/1"
-    head -c 2048 /dev/zero > "$t/h1.1/0"
+    truncate -s 4096 "$t/h1.0/0"; truncate -s 4096 "$t/h1.0/1"
+    head -c 4096 /dev/zero > "$t/h1.1/0"
     # two seed calls recorded h1.0/0: counted once
     printf "h1.0/0 1\nh1.0/1 1\nh1.0/0 1\n" > "$d/cal/h1/truncated"
     out=$( (source ./wekatester
@@ -3609,19 +3681,155 @@ directory=$t
 fallocate=none
 [nested]
 filename_format=h1.\$filenum/\$jobnum
-filesize=2K
+filesize=4K
 nrfiles=2
 numjobs=2"
      printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
      printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
      JOBFILES=(000-wekatester-layout.job)
      run_host() { bash -c "$2"; }
-     sweep_layout_grid) 2>&1 ) || { echo "$out" >&2; exit 1; }
+     sweep_layout_grid && stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
     left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
-    [ "$(cat "$d/probe/h1.laidout")" = 2048 ] && [ "$left" = "./h1.1/0 " ] ||
+    [ "$(cat "$d/probe/h1.laidout")" = 4096 ] && [ "$left" = "./h1.1/0 " ] ||
         { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; exit 1; }
+    # written dense from empty by the layout, with the missing file
+    grep -qx "filename=h1.0/0" "$d/jobs/h1/000-wekatester-layout.job" &&
+    grep -qx "filename=h1.0/1:h1.1/1" "$d/jobs/h1/000-wekatester-layout.job" || { cat "$d/jobs/h1/000-wekatester-layout.job" >&2; exit 1; }
     case "$out" in *"sweep: h1: removed the 2 calibration file(s) seeded sparse; the layout writes them dense"*) true;;
         *) echo "$out" >&2; false;; esac'
+# Overlapping grids were chained with wait_for so no file was laid out twice
+# at once; each file now sits in exactly one section, at its largest size.
+t_assert "stage_layout_writes: overlapping grids write each file once at its largest size, 16 to a section, colons escaped" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1
+     mkdir -p "$d/jobs/h1" "$SET_DIR" "$d/probe"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/w
+[a]
+create_only=1
+filename_format=h1.\$filenum/\$jobnum
+filesize=8K
+nrfiles=20
+numjobs=1
+[b]
+wait_for=a
+create_only=1
+filename_format=h1.\$filenum/\$jobnum
+filesize=16K
+numjobs=2
+[c]
+create_only=1
+filename_format=h1:c.\$jobnum
+filesize=4K"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     : > "$d/probe/h1.sizes"
+     JOBFILES=(000-wekatester-layout.job)
+     stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    l=$d/jobs/h1/000-wekatester-layout.job
+    f=$(grep "^filename=" "$l" | tr "\n" "|")
+    want="filename=h1\:c.0|filename=h1.1/0:h1.2/0:h1.3/0:h1.4/0:h1.5/0:h1.6/0:h1.7/0:h1.8/0:h1.9/0:h1.10/0:h1.11/0:h1.12/0:h1.13/0:h1.14/0:h1.15/0:h1.16/0|filename=h1.17/0:h1.18/0:h1.19/0|filename=h1.0/0|filename=h1.0/1|"
+    [ "$f" = "$want" ] || { printf "got  %s\nwant %s\n" "$f" "$want" >&2; cat "$l" >&2; exit 1; }
+    # h1.0/0 is in both grids: written once, at 16K
+    grep -A9 -x "\[lay-0-16384-a4\]" "$l" | grep -qx "filesize=16384" &&
+    grep -A9 -x "\[lay-0-8192-a2\]" "$l" | grep -qx "nrfiles=16" &&
+    ! grep -q "^wait_for=\|^create_only" "$l" &&
+    case "$out" in *"layout: h1: 22 file(s) missing or short, 0.0 GiB to write (0 reused)"*) true;;
+        *) echo "$out" >&2; false;; esac'
+t_assert "stage_layout_writes: a namespace the sweep cannot size keeps its create_only sections, wait_for chain and all, earns no credit, and says so" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1
+     mkdir -p "$d/jobs/h1" "$SET_DIR" "$d/probe"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/w
+[l1]
+create_only=1
+filename_format=h1.\$clientuid.\$jobnum
+filesize=4K
+numjobs=2
+[l2]
+wait_for=l1
+create_only=1
+filename_format=h1.\$clientuid.\$jobnum
+filesize=8K
+[l3]
+create_only=1
+filename_format=h1.odd.\$jobnum
+filesize=1000
+[l4]
+create_only=1
+filename_format=h1.ok.\$jobnum
+filesize=4K
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "4096 /w/h1.ok.0\n4096 /w/h1.odd.0\n" > "$d/probe/h1.sizes"
+     JOBFILES=(000-wekatester-layout.job)
+     stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    l=$d/jobs/h1/000-wekatester-layout.job
+    tail -n 16 "$l" > "$d/kept"
+    printf "[l1]\ncreate_only=1\nfilename_format=h1.\$clientuid.\$jobnum\nfilesize=4K\nnumjobs=2\n\n[l2]\nwait_for=l1\ncreate_only=1\nfilename_format=h1.\$clientuid.\$jobnum\nfilesize=8K\n\n[l3]\ncreate_only=1\nfilename_format=h1.odd.\$jobnum\nfilesize=1000\n" > "$d/want"
+    cmp "$d/kept" "$d/want" >>$WT_ASIDE || { diff "$d/want" "$d/kept" >&2; exit 1; }
+    # only the complete h1.ok.0 counts; h1.ok.1 is the one file written
+    [ "$(cat "$d/probe/h1.laidout")" = 4096 ] && grep -qx "filename=h1.ok.1" "$l" &&
+    case "$out" in *"WARNING: h1: 3 layout section(s) the sweep cannot size stay create_only"*) true;;
+        *) echo "$out" >&2; false;; esac'
+t_assert "stage_layout_writes: a set's own layout job is staged as written; only its credit counts" bash -c '
+    d=$(mktemp -d)
+    lay="[global]
+directory=/w
+[mine]
+create_only=1
+filename_format=h1.\$jobnum
+filesize=4K
+numjobs=2"
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1; LAYOUT_OWN=1; RUN_DIR=$d/run
+     mkdir -p "$d/jobs/h1" "$SET_DIR" "$d/probe" "$RUN_DIR"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     printf "4096 /w/h1.0\n" > "$d/probe/h1.sizes"
+     JOBFILES=(000-wekatester-layout.job)
+     stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    [ "$(cat "$d/jobs/h1/000-wekatester-layout.job")" = "$lay" ] && [ "$(cat "$d/probe/h1.laidout")" = 4096 ] &&
+    [ ! -s "$d/run/settings" ] || { echo "$out" >&2; cat "$d/jobs/h1/000-wekatester-layout.job" >&2; false; }'
+t_assert "run_jobs: a staged layout with nothing to write runs no fio and says so" bash -c '
+    d=$(mktemp -d); : > "$d/oplog"
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1 h2); MASTER=h1
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$d/jobs/h1" "$d/jobs/h2" "$SET_DIR" "$RUN_DIR"
+     printf "%s\n[global]\ndirectory=/mnt/weka\ngroup_reporting=1\n" "$LAYOUT_WRITE_MARKER" | tee "$d/jobs/h1/000-wekatester-layout.job" > "$d/jobs/h2/000-wekatester-layout.job"
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { echo "RUN: $2" >> "$d/oplog"; }
+     run_jobs) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    ! grep -q "000-wekatester-layout.job" "$d/oplog" &&
+    case "$out" in *"layout: nothing to write (files reused)"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "main: the layout is staged from the sweep, before the capacity check and the push; a dry run stages it too" bash -c '
+    body=$(source ./wekatester; declare -f main)
+    case "$body" in
+        *"stage_jobfiles;"*"sweep_layout_grid;"*"stage_layout_writes;"*"check_capacity"*"dry_run_report;"*"exit 0;"*"stage_jobfiles;"*"sweep_layout_grid;"*"stage_layout_writes;"*"check_capacity;"*"push_jobfiles;"*"run_jobs;"*) true;;
+        *) echo "$body" >&2; false;;
+    esac &&
+    ! declare -f stage_jobfiles | grep -q copy_to_master'
+t_assert "-u: the unlink job is derived from the layout grid and the layout staging leaves it alone" bash -c '
+    source ./tests/helpers.sh; no_ssh_fixture
+    d=$(mktemp -d)
+    (WEKATESTER_TARGET_DIR="$d/target"
+     source ./wekatester
+     LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""; DRY_RUN=1
+     WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; UNLINK=1
+     WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
+     stage_jobfiles && cp "$WORK_DIR/jobs/localhost/999-wekatester-unlink.job" "$d/before" &&
+     run_host() { :; } && sweep_layout_grid && stage_layout_writes) >>$WT_ASIDE 2>&1 || exit 1
+    u="$d/work/jobs/localhost/999-wekatester-unlink.job"; l="$d/work/jobs/localhost/000-wekatester-layout.job"
+    cmp "$d/before" "$u" && grep -q "^unlink=1$" "$u" && grep -q "^create_only=1$" "$u" && grep -q "^filename_format=" "$u" &&
+    grep -q "^filename=" "$l" && grep -q "^file_append=1$" "$l" || { cat "$u" "$l" >&2; false; }'
 # An old-format tuple (fs/nr/qd, no nj) is re-measured, and fill mode keeps
 # its fields: a mix nobody measured, which the writeback would make permanent.
 # The file cannot say whether the operator wrote it, so the run warns.
@@ -3670,16 +3878,30 @@ t_assert "apply_cal_results: --line-rate lets the measured bandwidth tuples repl
     a=$(awk -F"\t" "\$1==\"h1\" {print \$3, \$9, \$13, \$25, \$29, \$6}" "$d/targets.final")
     # bw_r is replaced (qd 4, nj 2); the engine and iops_r_qd keep the file values
     [ "$a" = "psync 4 2 64 16 2" ] || { echo "a=$a" >&2; false; }'
-t_assert "sweep: dry runs never mutate (no run_host at all)" bash -c '
+# A dry run skipped the sweep, so it could not say what the layout writes.
+t_assert "sweep: a dry run only lists, and stages the layout it would write" bash -c '
     d=$(mktemp -d)
-    (source ./wekatester
-     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1
-     mkdir -p "$SET_DIR"
-     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); MASTER=h1; DRY_RUN=1; DIRECTORY=/mnt/weka; ANY_FS=0
+     mkdir -p "$SET_DIR" "$d/jobs/h1"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=/mnt/weka
+[l]
+create_only=1
+filename_format=h1.\$jobnum
+filesize=1M
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
      JOBFILES=(000-wekatester-layout.job)
-     run_host() { echo TOUCHED >> "$d/oplog"; }
-     sweep_layout_grid)
-    [ ! -f "$d/oplog" ]'
+     run_host() { echo "RUN: $2" >> "$d/oplog"; echo "1048576 /mnt/weka/h1.0"; }
+     sweep_layout_grid && stage_layout_writes && dry_run_report) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    cat "$d/oplog" >>$WT_ASIDE
+    [ "$(wc -l < "$d/oplog")" -eq 1 ] && grep -q "^RUN: find .*-printf" "$d/oplog" && ! grep -q -- "-delete\|rm " "$d/oplog" &&
+    grep -qx "filename=h1.1" "$d/jobs/h1/000-wekatester-layout.job" &&
+    case "$out" in *"layout: h1: 1 file(s) missing or short, 0.0 GiB to write (1 reused)"*"layout: would write 0.0 GiB across the hosts"*"filename=h1.1"*) true;;
+        *) echo "$out" >&2; false;; esac'
 t_assert "capacity: swept bytes are credited against the requirement" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     d=$(mktemp -d)
@@ -3691,6 +3913,21 @@ t_assert "capacity: swept bytes are credited against the requirement" bash -c '
         check_capacity) 2>&1 )
     case "$out" in
         *"already laid out"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+# The staged layout is the run's write of what is missing: pricing it would
+# count only the missing files, less the credit for the present ones again.
+t_assert "capacity: the layout is priced from the grid the sweep kept, not the staged write of what is missing" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/grid/h1" "$d/probe"
+    printf "%s\n[global]\ndirectory=/w\n[lay-0-1-a1]\nrw=write\nnumjobs=1\nnrfiles=1\nfilesize=1G\nfilename=h1.7\n" "# wekatester-layout: generated as a dense write" > "$d/jobs/h1/000-wekatester-layout.job"
+    printf "# wekatester-layout: generated sha256=abc\n[global]\ndirectory=/w\n[l]\ncreate_only=1\nfilename_format=h1.\$jobnum\nfilesize=1G\nnumjobs=8\n" > "$d/grid/h1/000-wekatester-layout.job"
+    printf "7516192768\n" > "$d/probe/h1.laidout"
+    out=$( (source ./wekatester
+        WORK_DIR=$d; HOSTS=(h1); IGNORE_CAPACITY=0
+        run_host() { printf "Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 209715200 0 209715200 1%% /w\n"; }
+        check_capacity) 2>&1 )
+    case "$out" in
+        *"capacity: h1 needs ~1.0GiB (~7.0GiB already laid out)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
 
@@ -7398,7 +7635,7 @@ t_assert "-x stamps runtime+time_based on measured variants, never the layout" b
      LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; AUTO_LEVEL=""
      WORK_DIR="$d/work"; DIRECTORY=/mnt/weka; DURATION=77
      WORKLOAD=smoke; mkdir -p "$WORK_DIR/jobs"
-     stage_jobfiles) >>$WT_ASIDE || exit 1
+     stage_jobfiles && push_jobfiles) >>$WT_ASIDE || exit 1
     v="$d/target/localhost/011-smoke-readbw.job"
     l="$d/target/localhost/000-wekatester-layout.job"
     grep -q "^runtime=77$" "$v" && grep -q "^time_based=1$" "$v" &&

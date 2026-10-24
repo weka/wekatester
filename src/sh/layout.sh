@@ -40,6 +40,10 @@ check_capacity() {   # check_capacity [preview]
 # for every client, so it is a cross-client barrier (README, Workloads).
 LAYOUT_JOB="000-wekatester-layout.job"
 LAYOUT_MARKER="# wekatester-layout: generated"
+# The first line of the run's layout once the sweep has staged it as a
+# dense write (stage_layout_writes); still a layout by its marker.
+LAYOUT_WRITE_MARKER="$LAYOUT_MARKER as a dense write"
+LAYOUT_OWN=0   # 1: the set ships its own layout job, staged as written
 
 # A layout job is recognized by its reserved name or its marker line, so a
 # renamed copy in a custom set is still treated as layout.

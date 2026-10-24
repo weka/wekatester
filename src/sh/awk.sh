@@ -31,6 +31,7 @@ function geom_slots() { return \"$GEOM_SLOTS\" }
 function geom_names() { return \"$GEOM_NAMES\" }
 function layout_job() { return \"$LAYOUT_JOB\" }
 function layout_marker() { return \"$LAYOUT_MARKER\" }
+function layout_write_marker() { return \"$LAYOUT_WRITE_MARKER\" }
 function floor_marker() { return \"$FLOOR_MARKER\" }
 function engine_order() { return \"$ENGINE_ORDER\" }
 function line_rate_slots() { return \"$LINE_RATE_SLOTS\" }

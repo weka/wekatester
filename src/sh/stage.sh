@@ -310,6 +310,7 @@ stage_jobfiles() {
         floors=$(stage_floor_twins "$SET_DIR") || die "cannot stage the one-job latency tests"
         [ -z "$floors" ] || log "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
     fi
+    LAYOUT_OWN=$has_layout
     if [ "$has_layout" -eq 0 ]; then
         generate_layout "$JOBFILE_SRC" "$SET_DIR" || die "layout generation failed"
     fi
@@ -351,8 +352,11 @@ stage_jobfiles() {
     stamp_unique_names
     [ "$UNLINK" -eq 0 ] || stage_unlink_variants
     check_client_cmdline
+}
 
-    # A dry run inspects the staged variants without touching the master.
+# After the sweep has staged the run's layout (stage_layout_writes): the
+# variants go to the master in one transfer. A dry run touches no master.
+push_jobfiles() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     run_host "$MASTER" "rm -rf '$TARGET_DIR' && mkdir -p '$TARGET_DIR'" \
         || die "cannot create $TARGET_DIR on $MASTER"

@@ -547,7 +547,10 @@ main() {
         collect_fs_groups
         cal_preflight
         stage_jobfiles
-        sweep_layout_grid   # self-gated: a dry run never mutates
+        # a listing, which changes nothing: the dry run says what the
+        # layout would write
+        sweep_layout_grid
+        stage_layout_writes
         # under -a the staged sizes are the jobfiles' own until calibration
         # runs: a preview, not a verdict
         if cal_mode; then check_capacity preview; else check_capacity; fi
@@ -584,8 +587,12 @@ main() {
     verify_fio_ports
     calibrate
     stage_jobfiles
+    # the layout job's content is the sweep's answer: staged after it, pushed
+    # once it is final
     sweep_layout_grid
+    stage_layout_writes
     check_capacity
+    push_jobfiles
     writeback_targets
     snapshot_jobfiles
     check_mounts_unchanged

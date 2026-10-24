@@ -350,6 +350,11 @@ dry_run_report() {
     log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
     log "fio version: ${FIO_VERSION_NOTE:-not checked}"
     [ "$ANY_FS" -eq 0 ] || log "destination: the filesystem-type check was off (--any-fs); the WARNING above names what -d is on"
+    if [ "$LAYOUT_WRITE_BYTES" = 0 ]; then
+        log "layout: nothing to write (files reused)"
+    elif [ -n "$LAYOUT_WRITE_BYTES" ]; then
+        log "layout: would write $(awk -v b="$LAYOUT_WRITE_BYTES" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') across the hosts, as the staged layout job below says (from the sweep's listing)"
+    fi
     for job in "${JOBFILES[@]}"; do
         echo
         echo "==== $job (staged variant for $MASTER) ===="
@@ -425,10 +430,14 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
 
 # fio does not create the directory tree a filename_format implies
 # (create_on_open never mkdirs; create_only on 3.28 only each job first file
-# dir), so the grid dirs are made here from the staged layout first.
+# dir), so the grid dirs are made here from the staged layout first: the
+# grid the sweep kept (stage_layout_writes), whose formats name them.
 ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
-    local host cmd i pids=() hs=() args=() out="$WORK_DIR/layout-dirs.cmd"
-    for host in "${HOSTS[@]}"; do args+=("$host" "$WORK_DIR/jobs/$host/$1"); done
+    local host cmd i pids=() hs=() args=() out="$WORK_DIR/layout-dirs.cmd" p
+    for host in "${HOSTS[@]}"; do
+        p=$WORK_DIR/grid/$host/$1; [ -f "$p" ] || p=$WORK_DIR/jobs/$host/$1
+        args+=("$host" "$p")
+    done
     # every directory each section filename_format implies, mkdir -p lines of
     # 400 to stay below the ssh packet limit; one awk for the fleet
     awkrun '#@awk ensure_layout_dirs' "${args[@]}" > "$out" || die "cannot derive the layout directory set"
@@ -453,12 +462,12 @@ layout_grid_spec() {
     #@awk layout_grid_spec' "$@"
 }
 
-# Evidence, not markers (README, Workloads): per namespace, delete files whose
-# size deviates from the spec and count the bytes that match, so create_only
-# writes only what is missing. Sound only under fallocate=none. A dry run skips
-# the sweep and prices the full grid.
+# Evidence, not markers (README, Workloads): per host, the size of every file
+# in its layout grid, into probe/<host>.sizes ("<bytes> <path>"); nothing is
+# deleted, so a short file is extended, not rewritten (stage_layout_writes).
+# Calibration's truncate-seeded files go first: full size and no data. A dry
+# run lists too, which changes nothing, so it can say what would be written.
 sweep_layout_grid() {
-    [ "$DRY_RUN" -eq 0 ] || return 0
     local lay=${JOBFILES[0]}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
@@ -476,48 +485,72 @@ sweep_layout_grid() {
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         host=${HOSTS[$i]}
+        : > "$WORK_DIR/probe/$host.sizes"
         [ -s "$WORK_DIR/probe/$host.gridspec" ] || continue
         hd=${HOST_DIRS[$i]}
         cmd=""
         while IFS=$'\t' read -r sz glob depth tot; do
             [ -n "$sz" ] || continue
-            # sufficiency, not equality: only files SMALLER than expected are
-            # deviants (fio uses the first N bytes); the per-section cap bounds
-            # overcredit of a shared oversize file. The kept calibration
-            # scratch is excluded, or a nested glob (*/*) would delete and
-            # credit its files.
-            # Start at the glob's literal directories: from the shared $hd every
-            # host walked every host's grid. One walk prints the files that
-            # count and deletes the deviants.
+            # The kept calibration scratch is excluded: a nested glob (*/*)
+            # would list its files. Start at the glob's literal directories:
+            # from the shared $hd every host walked every host's grid.
             lit=${glob%%[*?[]*}; dep=$depth
+            [ -z "$cmd" ] || cmd="$cmd && "
             case $lit in
                 */*) lit=${lit%/*}; sl=${lit//[!\/]/}; dep=$((depth - ${#sl} - 1))
-                     cmd="$cmd if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
-                *)   lit=""; cmd="$cmd { find \"$hd\"" ;;
+                     cmd="${cmd}if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
+                *)   lit=""; cmd="${cmd}find \"$hd\"" ;;
             esac
-            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" \\( -size +$((sz - 1))c -print -o -delete \\);"
-            [ -z "$lit" ] && cmd="$cmd }" || cmd="$cmd fi"
-            cmd="$cmd | awk -v s=$sz -v t=$tot 'END{v=NR*s; print (v<t)?v:t}'; "
+            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -printf '%s %p\\n'"
+            [ -z "$lit" ] || cmd="$cmd; fi"
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
-        # pipefail: a dead session must fail the sweep, not hand the awk an
-        # empty listing it would total as nothing laid out. Calibration's
-        # truncate-seeded files go first: full size, no data, no credit.
-        ( set -o pipefail
-          sp="$WORK_DIR/cal/$host/truncated"
+        ( sp="$WORK_DIR/cal/$host/truncated"
           if [ -s "$sp" ]; then
               while IFS= read -r rmc; do
                   run_host "$host" "cd '$hd' && $rmc" || exit 1
               done < <(awkrun '#@awk sweep_sparse_rm' "$sp")
               log "sweep: $host: removed the $(awk '!($1 in s) {s[$1]; n++} END {print n + 0}' "$sp") calibration file(s) seeded sparse; the layout writes them dense"
           fi
-          run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
-            > "$WORK_DIR/probe/$host.laidout" ) &
+          # a dead session fails the sweep: an empty listing would read as
+          # nothing laid out
+          run_host "$host" "$cmd" > "$WORK_DIR/probe/$host.sizes" ) &
         pids+=($!); hs+=("$host")
     done
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "layout grid sweep failed on ${hs[$i]}"
     done
+}
+
+# After the sweep, before the capacity check and the push: each host's
+# layout becomes the run's own, a dense sequential write of exactly what is
+# missing (layout_writes); its grid is kept under grid/ for the directory
+# pass and the capacity check. A set's own layout job is staged as written:
+# only its credit is counted. LAYOUT_WRITE_BYTES: the fleet total.
+LAYOUT_WRITE_BYTES=""
+stage_layout_writes() {
+    local lay=${JOBFILES[0]} host dirs=() out h nf by re kept tf=0 tb=0 nh=0 what
+    [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
+    for host in "${HOSTS[@]}"; do dirs+=("$WORK_DIR/grid/$host"); done
+    mkdir -p "${dirs[@]}" || die "cannot create the layout grid dirs under $WORK_DIR/grid"
+    out=$(awkrun '#@awk layout_writes' "$WORK_DIR" "$lay" "$((1 - LAYOUT_OWN))" "${HOSTS[@]}") \
+        || die "cannot stage the layout from the sweep"
+    while IFS=$'\t' read -r h nf by re kept; do
+        [ -n "$h" ] || continue
+        if [ "$nf" -gt 0 ]; then
+            nh=$((nh + 1)); tf=$((tf + nf)); tb=$((tb + by))
+            log "layout: $h: $nf file(s) missing or short, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
+        elif [ "$re" -gt 0 ]; then
+            log "layout: $h: nothing to write ($re file(s) reused)"
+        fi
+        [ "$LAYOUT_OWN" -eq 1 ] || [ "$kept" -eq 0 ] || log "WARNING: $h: $kept layout section(s) the sweep cannot size stay create_only (a size off 4KiB, no filesize, or a format variable wekatester cannot expand): an interrupted layout there can leave full-size files with holes" >&2
+    done <<<"$out"
+    [ "$LAYOUT_OWN" -eq 0 ] || return 0
+    LAYOUT_WRITE_BYTES=$tb
+    if [ "$tf" -eq 0 ]; then what="nothing to write (files reused)"
+    else what="$tf file(s), $tb bytes to write on $nh host(s)"; fi
+    [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] || printf 'layout\t%s\n' "$what" >> "$RUN_DIR/settings" \
+        || log "WARNING: could not record the layout in $RUN_DIR/settings" >&2
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
@@ -583,18 +616,19 @@ run_jobs() {
         # bundle keeps runs apart better than a filename infix ever did.
         outfile="$RUN_DIR/results_${job%.job}.json"
         if is_layout_file "$SET_DIR/$job"; then
-            # The layout job is a barrier: a duration, not a summary. The sweep
-            # already ran at staging, so this create_only pass writes only what
-            # is missing.
+            # The layout job is a barrier. The sweep staged it as a dense
+            # write of only what is missing (a set's own layout job runs as
+            # written).
             ensure_layout_dirs "$job"
             mapfile -t lclients < <(job_clients "$job")
             if [ ${#lclients[@]} -eq 0 ]; then
-                log "layout: nothing to lay out ($job)"
+                if [ "$LAYOUT_OWN" -eq 0 ]; then log "layout: nothing to write (files reused)"
+                else log "layout: nothing to lay out ($job)"; fi
                 echo
                 continue
             fi
             [ ${#lclients[@]} -eq ${#HOSTS[@]} ] \
-                || log "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing of their own to lay out (their group's first host lays out the shared read set)"
+                || log "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
             cmd=$(fio_client_cmd "$job" "${lclients[@]}")
             log "laying out files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS

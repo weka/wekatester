@@ -62,7 +62,12 @@ BEGIN {
             p = JOB[h, j]; job = p; sub(/.*\//, "", job)
             if (job == "000-wekatester-relayout.job" || job == "999-wekatester-unlink.job") continue
             if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)
-            if (job == layout_job() || is_layout_marked(L, n)) { layout += layout_footprint(L, n); continue }
+            if (job == layout_job() || is_layout_marked(L, n)) {
+                # the grid the sweep kept, not the run's write of what is missing
+                if ((gn = readlines(work "/grid/" h "/" job, GL)) >= 0) layout += layout_footprint(GL, gn)
+                else layout += layout_footprint(L, n)
+                continue
+            }
             # Per job section: one filename_format is one set of files, costing
             # its largest section; without one, fio names files after the
             # section, a namespace of its own. Namespaces sum below.
