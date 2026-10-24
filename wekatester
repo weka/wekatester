@@ -7628,7 +7628,7 @@ dry_run_report() {
     if [ "$LAYOUT_WRITE_BYTES" = 0 ]; then
         log "layout: nothing to write (files reused)"
     elif [ -n "$LAYOUT_WRITE_BYTES" ]; then
-        log "layout: would write $(awk -v b="$LAYOUT_WRITE_BYTES" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') across the hosts, as the staged layout job below says (from the sweep's listing)"
+        log "layout: would write $(awk -v b="$LAYOUT_WRITE_BYTES" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') across the hosts, as the staged layout job below says (from the sweep listing)"
     fi
     for job in "${JOBFILES[@]}"; do
         echo
