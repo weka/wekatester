@@ -283,4 +283,10 @@ function job_sections(L, n, SN, KV, J,    ns, s, nj) {
     if (!nj) J[++nj] = "g"
     return nj
 }
+# The name fio files job_sections job s under ($jobname): its section, for
+# "g" the file's last one, else <fname>.
+function sec_jobname(L, n, SN, s, fname,    sec) {
+    if ((sec = s == "g" ? last_section(L, n) : SN[s]) == "") sec = fname
+    return sec
+}
 

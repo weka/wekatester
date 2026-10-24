@@ -980,6 +980,12 @@ function job_sections(L, n, SN, KV, J,    ns, s, nj) {
     if (!nj) J[++nj] = "g"
     return nj
 }
+# The name fio files job_sections job s under ($jobname): its section, for
+# "g" the file's last one, else <fname>.
+function sec_jobname(L, n, SN, s, fname,    sec) {
+    if ((sec = s == "g" ? last_section(L, n) : SN[s]) == "") sec = fname
+    return sec
+}
 
 # --- probe facts (the probe snippet's lines, P[1..np]) ---
 # Cpus on the first "key <list>" line: "-" means tested and empty; 0 when
@@ -1299,10 +1305,13 @@ function lay_add(L, n, fname, where,    SN, KV, J, nsec, x, s, fmt, key, sec, fs
     for (x = 1; x <= nsec; x++) {
         s = J[x]
         # No filename_format: fio names files after the section, so the
-        # layout section takes the measured section name.
-        if ((fmt = sec_value(L, n, KV, s, "filename_format", "")) != "") { key = fmt; sec = "" }
-        else {
-            if ((sec = s == "g" ? last_section(L, n) : SN[s]) == "") sec = fname
+        # layout section takes the measured section name. A format's
+        # $jobname is that name too, spelled out: the layout's own section
+        # name would fill it otherwise.
+        if ((fmt = sec_value(L, n, KV, s, "filename_format", "")) != "") {
+            fmt = replace_all(fmt, "$jobname", sec_jobname(L, n, SN, s, fname)); key = fmt; sec = ""
+        } else {
+            sec = sec_jobname(L, n, SN, s, fname)
             key = "__jobname__:" sec
         }
         fs = sec_value(L, n, KV, s, "filesize", ""); sz = sec_value(L, n, KV, s, "size", ""); sb = -1
@@ -5574,6 +5583,7 @@ check_capacity() {   # check_capacity [preview]
                 for (x = 1; x <= nsec; x++) {
                     s = J[x]
                     if ((ns = sec_value(L, n, KV, s, "filename_format", "")) == "") ns = "__default__:" job (s == "g" ? "" : SUBSEP SN[s])
+                    else ns = replace_all(ns, "$jobname", sec_jobname(L, n, SN, s, job))   # its own files, as the layout names them
                     # a group fleet-shared dataset is priced once, on its first host
                     if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
                     if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }

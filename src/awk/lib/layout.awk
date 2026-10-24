@@ -18,10 +18,13 @@ function lay_add(L, n, fname, where,    SN, KV, J, nsec, x, s, fmt, key, sec, fs
     for (x = 1; x <= nsec; x++) {
         s = J[x]
         # No filename_format: fio names files after the section, so the
-        # layout section takes the measured section name.
-        if ((fmt = sec_value(L, n, KV, s, "filename_format", "")) != "") { key = fmt; sec = "" }
-        else {
-            if ((sec = s == "g" ? last_section(L, n) : SN[s]) == "") sec = fname
+        # layout section takes the measured section name. A format's
+        # $jobname is that name too, spelled out: the layout's own section
+        # name would fill it otherwise.
+        if ((fmt = sec_value(L, n, KV, s, "filename_format", "")) != "") {
+            fmt = replace_all(fmt, "$jobname", sec_jobname(L, n, SN, s, fname)); key = fmt; sec = ""
+        } else {
+            sec = sec_jobname(L, n, SN, s, fname)
             key = "__jobname__:" sec
         }
         fs = sec_value(L, n, KV, s, "filesize", ""); sz = sec_value(L, n, KV, s, "size", ""); sb = -1

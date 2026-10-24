@@ -719,6 +719,13 @@ t_assert "capacity: jobfiles sharing one filename_format take the max" bash -c '
     printf "$j" > "$FIX/src/012-bw2.job"
     out=$( cap safe 0 h1 2>&1 )
     case "$out" in *"capacity: h1 needs ~40.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
+# One $jobname format in two sections is two sets of files: rd.* and rd2.*.
+t_assert "capacity: two sections sharing one jobname format sum, not max" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nfilename_format=\$jobname.\$jobnum.\$filenum\nioengine=libaio\n[rd]\nrw=read\n" > "$FIX/src/011-bw.job"
+    printf "# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\nfilename_format=\$jobname.\$jobnum.\$filenum\nioengine=libaio\n[rd2]\nrw=read\n" > "$FIX/src/012-bw2.job"
+    out=$( cap safe 0 h1 2>&1 )
+    case "$out" in *"capacity: h1 needs ~80.0GiB"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "capacity: size= without filesize counts numjobs x size" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     printf "# report bandwidth\n[global]\nsize=4G\nnrfiles=4\nnumjobs=3\nioengine=libaio\n[j]\nrw=read\n" > "$FIX/src/011-bw.job"
@@ -1659,6 +1666,27 @@ t_assert "generator: dominated geometry is pruned to one section" bash -c '
     (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE
     f="$S/000-wekatester-layout.job"
     [ "$(grep -c "^create_only=1$" "$f")" -eq 1 ] && grep -q "^numjobs=64$" "$f"'
+# fio fills $jobname with the section that runs: a layout section named
+# layout-N would lay out layout-N.* while the job opens rd.*, so the layout
+# spells the measured section's name out.
+t_assert "generator: a jobname format lays out the measured section's own names, set in the section or in [global]" bash -c '
+    for where in sec glob; do
+        S=$(mktemp -d)
+        if [ "$where" = sec ]; then printf "[global]\nfilesize=1G\nnumjobs=2\n[rd]\nrw=read\nfilename_format=\$jobname.\$jobnum.\$filenum\n" > "$S/011-a.job"
+        else printf "[global]\nfilesize=1G\nnumjobs=2\nfilename_format=\$jobname.\$jobnum.\$filenum\n[rd]\nrw=read\n" > "$S/011-a.job"; fi
+        (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE || exit 1
+        f="$S/000-wekatester-layout.job"
+        grep -qx "filename_format=rd.\$jobnum.\$filenum" "$f" && ! grep -q "\$jobname" "$f" || { echo "$where:" >&2; cat "$f" >&2; exit 1; }
+    done'
+t_assert "generator: two sections sharing one jobname format lay out one namespace each" bash -c '
+    S=$(mktemp -d)
+    printf "[global]\nfilesize=1G\nnumjobs=2\nfilename_format=\$jobname.\$jobnum.\$filenum\n[rd]\nrw=read\n" > "$S/011-a.job"
+    printf "[global]\nfilesize=1G\nnumjobs=2\nfilename_format=\$jobname.\$jobnum.\$filenum\n[rd2]\nrw=randread\n" > "$S/012-b.job"
+    (source ./wekatester; generate_layout "$S" "$S") >>$WT_ASIDE || exit 1
+    f="$S/000-wekatester-layout.job"
+    [ "$(grep -c "^create_only=1$" "$f")" -eq 2 ] &&
+    grep -qx "filename_format=rd.\$jobnum.\$filenum" "$f" && grep -qx "filename_format=rd2.\$jobnum.\$filenum" "$f" &&
+    ! grep -q "^wait_for=" "$f" || { cat "$f" >&2; false; }'
 t_assert "capacity: layout union raises required above per-namespace max" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     rm -f "$FIX/src/011-bw.job"
@@ -2857,6 +2885,30 @@ t_assert "staging with -u ships the unlink job to the target, last in run order"
      [ "${JOBFILES[${#JOBFILES[@]}-1]}" = 999-wekatester-unlink.job ]) >>$WT_ASIDE || exit 1
     u="$d/target/localhost/999-wekatester-unlink.job"
     test -f "$u" && grep -q "^unlink=1$" "$u"'
+# A jobname format end to end: what the job opens is what the layout creates,
+# the sweep looks for and -u removes.
+t_assert "staging: a jobname format's layout, unlink job and grid spec all name the job's own files" bash -c '
+    s=$(mktemp -d); d=$(mktemp -d); mkdir -p "$d/jobs"
+    printf "# report bandwidth\n[global]\nfilesize=1M\nnumjobs=2\nnrfiles=2\nioengine=psync\n[rd]\nrw=read\nfilename_format=\$jobname.\$jobnum.\$filenum\n" > "$s/011-rd.job"
+    (source ./wekatester
+     HOSTS=(h1); MASTER=h1; WORK_DIR=$d; DRY_RUN=1; UNLINK=1; ENGINE=""
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/w; SET_DIR_OVERRIDE=$s
+     stage_jobfiles) >>$WT_ASIDE 2>&1 || exit 1
+    l="$d/jobs/h1/000-wekatester-layout.job"; u="$d/jobs/h1/999-wekatester-unlink.job"
+    g=$(source ./wekatester; layout_grid_spec "$l") || exit 1
+    grep -qx "filename_format=h1.\$jobname.\$jobnum.\$filenum" "$d/jobs/h1/011-rd.job" &&
+    grep -qx "filename_format=h1.rd.\$jobnum.\$filenum" "$l" && grep -qx "filename_format=h1.rd.\$jobnum.\$filenum" "$u" &&
+    [ "$(printf "%s\n" "$g" | cut -f2)" = "h1.rd.*.*" ] &&
+    ! grep -q "^filename_format=.*layout-" "$l" "$u" && ! grep -q "\$jobname" "$l" "$u" ||
+        { cat "$l" "$u" >&2; printf "%s\n" "$g" >&2; false; }'
+t_assert "staging: host-file geometry re-derives a jobname format's layout with the job's own names" bash -c '
+    d=$(mktemp -d); s=$(mktemp -d); mkdir -p "$d/jobs"
+    printf "# report bandwidth\n[global]\nfilesize=1G\nnumjobs=1\nfilename_format=\$jobname.\$jobnum.\$filenum\n[rd]\nrw=read\n" > "$s/011-rd.job"
+    { printf "h1\t-\t-\t-\t-\t3\t2G\t2\t4"; for i in $(seq 10 37); do printf "\t-"; done; printf "\n"; } > "$d/targets.final"
+    (source ./wekatester; WORK_DIR=$d; stage_hosts plain "$s" /mnt/w - - h1) >>$WT_ASIDE 2>&1 || exit 1
+    l="$d/jobs/h1/000-wekatester-layout.job"
+    grep -qx "numjobs=3" "$d/jobs/h1/011-rd.job" && grep -qx "numjobs=3" "$l" &&
+    grep -qx "filename_format=rd.\$jobnum.\$filenum" "$l" && ! grep -q "\$jobname" "$l" || { cat "$l" >&2; false; }'
 
 # --- -e/--engine: one engine everywhere ---
 t_assert "parse: -e in all spellings sets the engine; value case kept; -e= dies" bash -c '

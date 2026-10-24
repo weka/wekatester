@@ -70,6 +70,7 @@ BEGIN {
             for (x = 1; x <= nsec; x++) {
                 s = J[x]
                 if ((ns = sec_value(L, n, KV, s, "filename_format", "")) == "") ns = "__default__:" job (s == "g" ? "" : SUBSEP SN[s])
+                else ns = replace_all(ns, "$jobname", sec_jobname(L, n, SN, s, job))   # its own files, as the layout names them
                 # a group fleet-shared dataset is priced once, on its first host
                 if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
                 if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
