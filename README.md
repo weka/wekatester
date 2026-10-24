@@ -228,8 +228,9 @@ anywhere in it makes it a latency test, and nothing else is searched for that
 file. Otherwise `bandwidth` asks for the bandwidth search and `iops` for the
 IOPS search; a file naming both asks for both, stages the bandwidth answer,
 and records the IOPS one in the host file only. A jobfile with no directive is
-not calibrated and runs as written. The direction comes from each job
-section's `rw=` (its own, else `[global]`'s), and a mixed one asks for both.
+not calibrated and runs as written. The direction comes from the job's measured
+sections (a `create_only` one is not measured): each one's `rw=` (its own, else
+`[global]`'s), and a mixed one asks for both.
 
 ### What calibration optimizes
 

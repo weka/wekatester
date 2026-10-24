@@ -857,8 +857,8 @@ function job_bs(L, n,    i, name, injob, glob, last, v) {
     return v == "" ? 4096 : v
 }
 function lat_kind(L, n) { return job_bs(L, n) >= 1048576 ? "lat1m" : "lat" }
-# Directions the job sections exercise into D, [global] rw= as the fallback
-# (rw= or readwrite=); trim-only mixes have none.
+# Directions the measured (non-create_only) job sections exercise into D,
+# [global] rw= as the fallback (rw= or readwrite=); trim-only mixes have none.
 function rw_directions(v, D) {
     v = tolower(v); sub(/:.*/, "", v)   # fio's ":<modifier>" is no direction
     if (v == "read" || v == "randread") D["read"] = 1
@@ -867,19 +867,28 @@ function rw_directions(v, D) {
         D["read"] = 1; D["write"] = 1
     }
 }
-function file_directions(L, n, D,    i, name, ns, cur, glob, RW, v) {
-    split("", D); glob = ""; ns = 0; cur = 0
+function file_directions(L, n, D,    i, name, ns, cur, glob, gco, RW, CO, v, nm) {
+    split("", D); glob = ""; gco = "0"; ns = 0; cur = 0
     for (i = 1; i <= n; i++) {
         if ((name = section_name(L[i])) != "") {
             if (strip(name) == "global") cur = 0
             else { RW[++ns] = ""; cur = ns }
             continue
         }
+        # create_only as job_sections reads it: a bare word or any value
+        # but 0, the section's own else [global]'s
+        if ((v = jf_key(L[i])) == "create_only" || (v == "" && strip(L[i]) == "create_only")) {
+            v = v == "" ? "" : jf_value(L[i])
+            if (cur) CO[cur] = v; else gco = v
+            continue
+        }
         if ((v = key_value(L[i], "rw|readwrite")) == "") continue
         if (cur) RW[cur] = v; else glob = v
     }
-    if (!ns) rw_directions(glob, D)
-    for (i = 1; i <= ns; i++) rw_directions(RW[i] != "" ? RW[i] : glob, D)
+    nm = 0
+    for (i = 1; i <= ns; i++)
+        if (((i in CO) ? CO[i] : gco) == "0") { nm++; rw_directions(RW[i] != "" ? RW[i] : glob, D) }
+    if (!nm) rw_directions(glob, D)
 }
 # A resolved host-file row (resolve_targets' tab-separated output, split
 # into ROW): the 1-based column of a FIELDS key, and its value ("" for "-")

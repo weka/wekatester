@@ -22,6 +22,10 @@ ValueError
 4096 lat - y -
 4096 lat - - -
 2097152 lat1m read write - global
+4096 lat read - readjob
+4096 lat read - readjob
+4096 lat read - r
+4096 lat write - c
 bw read bw_r
 bw write bw_w
 bw read write bw_w

@@ -2599,6 +2599,21 @@ rw=randread
 bs=4k
 [overrides]
 rw=randwrite')" = "iops read|iops write|"
+# A create_only section only lays out: its rw=, inherited or its own, is no
+# direction to calibrate.
+t_assert "cal_required: a create_only section's rw= asks for no search" \
+    test "$(cal_set '# report iops
+[global]
+rw=randwrite
+[create]
+create_only=1
+[readjob]
+rw=randread' '# report bandwidth
+[create]
+create_only
+rw=write
+[readjob]
+rw=read')" = "bw read|iops read|"
 # A prose comment is not a directive (bare "# report" matches nothing either),
 # so such a file is the no-directive case -- not calibrated -- even when the
 # comment names a type a loose parser would take for one.
@@ -4684,7 +4699,8 @@ t_assert "schema: one spelling of the fields, the slot columns and the direction
 # The jobfile rules, held to the answers the python gave them before it went
 # (tests/golden/jobfile-rules.txt), input for input. One answer differs since
 # jf_key: e's "filename_format= y" reads y, as fio reads it (python skipped
-# it for z).
+# it for z). h-k came later: a create_only section's rw= (own or [global]'s)
+# is no direction unless no measured section is left.
 t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind, file_directions, pick_slot and pick_engine give the recorded answers" bash -c '
     d=$(mktemp -d)
     printf "# report latency\n[global]\nbs=4k\nrw=randread\n[lat]\nbs=1M\n" > "$d/a"
@@ -4693,6 +4709,10 @@ t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind
     printf "rw=trim\nbs=x\nfilename_format= y\nfilename_format=z w\n" > "$d/e"
     printf "\n" > "$d/f"
     printf "[a]]\nrw=rw\n[b]x\nbs=2M\n[global]\n" > "$d/g"
+    printf "[global]\nrw=randwrite\n[create]\ncreate_only=1\n[readjob]\nrw=randread\n" > "$d/h"
+    printf "[create]\ncreate_only\nrw=write\n[readjob]\nrw=randread\n" > "$d/i"
+    printf "[global]\ncreate_only=1\nrw=write\n[lay]\n[r]\ncreate_only=0\nrw=read\n" > "$d/j"
+    printf "[global]\nrw=randwrite\n[c]\ncreate_only=1\nrw=read\n" > "$d/k"
     sizes="5G 1.5GiB 4k 4096 512m 1Mi 2MiB 1Gb 1GIB 50%% 1G-2G x .5G 5. 10T 7i 0 3.99k"
     aw=$(source ./wekatester; awkrun "BEGIN {
         n = split(\"$sizes\", Z, \" \")
@@ -4716,7 +4736,7 @@ t_assert "jobfile rules: parse_size, first_value, last_section, job_bs, lat_kind
         T3[\"mmap\"] = 1; T3[\"sync\"] = 1; O3[1] = \"mmap\"; O3[2] = \"sync\"; print pick_engine(T3, O3, 2)
         T4[\"mmap\"] = 2; T4[\"libaio\"] = 2; O4[1] = \"mmap\"; O4[2] = \"libaio\"; print pick_engine(T4, O4, 2)
         print engine_order()
-    }" "$d"/[a-g])
+    }" "$d"/[a-k])
     want=$(cat tests/golden/jobfile-rules.txt) && [ -n "$aw" ] && [ "$aw" = "$want" ] || { printf "want:\n%s\nawk:\n%s\n" "$want" "$aw" >&2; false; }'
 t_assert "jobfile rules: jf_key reads a key as fio does; override_lines replaces by it and finds an indented [global]" bash -c '
     aw=$(source ./wekatester; awkrun "BEGIN {
@@ -7133,6 +7153,16 @@ t_assert "tuner: unified staging sends read-only jobs to the shared dataset" bas
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h1/011-r.job" &&
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h2/011-r.job" &&
     grep -q "^filename_format=\$filenum/\$jobnum$" "$FIX/jobs/h1/012-w.job"'
+# A create_only section only lays out: a [global] rw=write it inherits does not
+# make the read job mixed, so it still reads the shared dataset.
+t_assert "tuner: unified staging reads the shared dataset past a create_only section's inherited rw=" bash -c '
+    source ./tests/helpers.sh; tuner_fixture
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nrw=write\n[create]\ncreate_only=1\n[r]\nrw=read\n" > "$FIX/src/011-r.job"
+    (source ./wekatester
+     WEKATESTER_NS="unified \$filenum/\$jobnum" \
+     auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "" h1 h2) >>$WT_ASIDE 2>&1
+    grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h1/011-r.job" &&
+    grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h2/011-r.job" || { cat "$FIX/jobs/h1/011-r.job" >&2; false; }'
 
 # ONE dataset for calibration and execution: a set whose filename_format can
 # address the grid ($filenum AND $jobnum, no $jobname) is measured on the
