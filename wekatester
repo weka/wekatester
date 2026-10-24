@@ -2627,6 +2627,10 @@ SUBDIREOF
         }' "$tlist")
         [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
             || die "$host: cannot truncate-seed the write set"
+        # every call's list, kept for the run's sweep: these files hold no
+        # data, so they earn no capacity credit and the layout writes them
+        cat "$tlist" >> "$WORK_DIR/cal/$host/truncated" \
+            || die "$host: cannot record the truncate-seeded files"
         log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
     fi
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
@@ -7877,8 +7881,23 @@ sweep_layout_grid() {
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
         # pipefail: a dead session must fail the sweep, not hand the awk an
-        # empty listing it would total as nothing laid out
+        # empty listing it would total as nothing laid out. Calibration's
+        # truncate-seeded files go first: full size, no data, no credit.
         ( set -o pipefail
+          sp="$WORK_DIR/cal/$host/truncated"
+          if [ -s "$sp" ]; then
+              while IFS= read -r rmc; do
+                  run_host "$host" "cd '$hd' && $rmc" || exit 1
+              done < <(awkrun '# The calibration'\''s truncate record ("<name> <MiB>" lines) as rm commands, a
+              # new line only past ~100 KB, under the 128 KiB one remote command may hold
+              {
+                  if (!len) { printf "rm -f --"; len = 8 }
+                  q = " " squote($1); printf "%s", q; len += length(q)
+                  if (len >= 100000) { print ""; len = 0 }
+              }
+              END { if (len) print "" }' "$sp")
+              log "sweep: $host: removed the $(awk '!($1 in s) {s[$1]; n++} END {print n + 0}' "$sp") calibration file(s) seeded sparse; the layout writes them dense"
+          fi
           run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
             > "$WORK_DIR/probe/$host.laidout" ) &
         pids+=($!); hs+=("$host")

@@ -459,6 +459,10 @@ SUBDIREOF
         done < <(awkrun '#@awk cal_seed_rep.truncate' "$tlist")
         [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
             || die "$host: cannot truncate-seed the write set"
+        # every call's list, kept for the run's sweep: these files hold no
+        # data, so they earn no capacity credit and the layout writes them
+        cat "$tlist" >> "$WORK_DIR/cal/$host/truncated" \
+            || die "$host: cannot record the truncate-seeded files"
         log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
     fi
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0

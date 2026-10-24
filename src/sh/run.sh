@@ -501,8 +501,16 @@ sweep_layout_grid() {
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
         # pipefail: a dead session must fail the sweep, not hand the awk an
-        # empty listing it would total as nothing laid out
+        # empty listing it would total as nothing laid out. Calibration's
+        # truncate-seeded files go first: full size, no data, no credit.
         ( set -o pipefail
+          sp="$WORK_DIR/cal/$host/truncated"
+          if [ -s "$sp" ]; then
+              while IFS= read -r rmc; do
+                  run_host "$host" "cd '$hd' && $rmc" || exit 1
+              done < <(awkrun '#@awk sweep_sparse_rm' "$sp")
+              log "sweep: $host: removed the $(awk '!($1 in s) {s[$1]; n++} END {print n + 0}' "$sp") calibration file(s) seeded sparse; the layout writes them dense"
+          fi
           run_host "$host" "$cmd" | awk '{t+=$1} END{print t+0}' \
             > "$WORK_DIR/probe/$host.laidout" ) &
         pids+=($!); hs+=("$host")

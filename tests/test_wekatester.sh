@@ -3590,6 +3590,38 @@ numjobs=2"
     left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
     [ "$(cat "$d/probe/h1.laidout")" = 5120 ] && [ "$left" = "./h1.0/0 ./h1.1/0 ./h1.wt.0.0 " ] ||
         { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; false; }'
+# A truncate-seeded file is full size and holds nothing: the sweep credited
+# it as laid out, so the capacity check under-priced what the run writes.
+t_assert "sweep: calibration's truncate-seeded files earn no credit and are removed for the layout to write (find run for real)" bash -c '
+    d=$(mktemp -d); t=$d/dest
+    mkdir -p "$t/h1.0" "$t/h1.1" "$d/cal/h1"
+    truncate -s 2048 "$t/h1.0/0"; truncate -s 2048 "$t/h1.0/1"
+    head -c 2048 /dev/zero > "$t/h1.1/0"
+    # two seed calls recorded h1.0/0: counted once
+    printf "h1.0/0 1\nh1.0/1 1\nh1.0/0 1\n" > "$d/cal/h1/truncated"
+    out=$( (source ./wekatester
+     parse_args -d "$t" h1
+     WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=0
+     mkdir -p "$d/jobs/h1" "$SET_DIR"
+     lay="# wekatester-layout: generated sha256=abc
+[global]
+directory=$t
+fallocate=none
+[nested]
+filename_format=h1.\$filenum/\$jobnum
+filesize=2K
+nrfiles=2
+numjobs=2"
+     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
+     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { bash -c "$2"; }
+     sweep_layout_grid) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
+    [ "$(cat "$d/probe/h1.laidout")" = 2048 ] && [ "$left" = "./h1.1/0 " ] ||
+        { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; exit 1; }
+    case "$out" in *"sweep: h1: removed the 2 calibration file(s) seeded sparse; the layout writes them dense"*) true;;
+        *) echo "$out" >&2; false;; esac'
 # An old-format tuple (fs/nr/qd, no nj) is re-measured, and fill mode keeps
 # its fields: a mix nobody measured, which the writeback would make permanent.
 # The file cannot say whether the operator wrote it, so the run warns.
@@ -6655,10 +6687,12 @@ t_assert "calibrate: the write seed is sparse only when every job writing the gr
          calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; return 1; }
         if grep -q "truncate -s" "$d/simlog"; then got=sparse; else got=dense; fi
         [ "$got" = "$1" ] || { printf "want %s, got %s for:\n%b\n%s\n" "$1" "$got" "$2" "$out" >&2; return 1; }
-        LAST=$out
+        LAST=$out; LASTD=$d
     }
     h="# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n"
     one sparse "${h}[a]\nrw=write\n" &&
+    # every seed call is recorded for the sweep, the first (1 job) and the widest
+    grep -qx "h1.0/0 5120" "$LASTD/cal/h1/truncated" && grep -q "^h1.3/3 " "$LASTD/cal/h1/truncated" &&
     case "$LAST" in *"cal: write seed: sparse, by truncate (every job writing <host>.\$filenum/\$jobnum is a pure sequential write)"*) true;;
         *) printf "%s\n" "$LAST" >&2; false;; esac &&
     one dense "${h}[a]\nrw=rw\n" &&
