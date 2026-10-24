@@ -184,7 +184,7 @@ Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conv
 
 **File layout is a separate, generated job.** Every run puts a `000-wekatester-layout.job` first. Its grid comes from the set's own jobfiles, one section per distinct geometry in each file namespace (a geometry another one fully covers is dropped), so it names exactly the files the jobs will open — one section of each namespace's largest `numjobs`/`nrfiles`/`filesize` would create the whole cross-product and over-provision the disk — and **all files exist on all machines before any measured test starts** — wekatester runs jobfiles serially and fio's coordinator waits for every client, so that first job is a true cross-client barrier. After the sweep (below), each host's layout becomes the run's own: **a dense sequential write of exactly what is missing**. Every file missing or short of its size is written with `rw=write`, `direct=1`, `create_on_open=1` and `file_append=1`, which fio writes from the file's current end up to its size, in blocks of 1MiB (the largest power of two up to 1MiB that divides the file's size; fio leaves a tail shorter than its block unwritten). A file whose end is off that block is rewritten from offset 0 in place instead; a file at or above its size is left alone, since fio uses its first N bytes. The files are listed by name, grouped by job and size, up to 16 to a section (fio's parser takes 4096 bytes a line), and every section runs at once: each file is in exactly one section, at the largest size any geometry gives it, so nothing needs ordering. Each host writes its own `<host>.` files, and a filesystem group's shared read set is written by the group's first host. A namespace the sweep cannot size (a `$clientuid` format, a section with `size=` but no `filesize=`, or a size that is not a multiple of 4KiB) keeps its `create_only` sections, and the run warns. A workload directory that carries its own layout job keeps it as written (it is never regenerated unless you ask with `-g`, which stages a freshly generated one in its place); every other set gets one generated on the fly, without touching the source directory. The shipped jobfiles still contain their original `create_only` sections — they are harmless no-ops after the layout job has run, and they keep each file usable standalone with plain fio. The layout's write reports like a test (Output).
 
-**Layouts heal incrementally, from evidence.** Before the capacity check, every run sweeps each host's destination: one `find` lists every file of the grid its layout implies, with its size, and nothing is deleted. A short file is extended by the layout, not started over; a geometry change writes just its delta (bumping `nrfiles` 502→510 writes 8 files, not 22TiB); an interrupted layout is finished file by file on the next run; and nothing is trusted that wasn't measured — there are no marker files. The bytes present are **credited against the capacity requirement**. Size is a sufficient test **because the layout writes each file sequentially from its end**, so a layout stopped by a kill, a crash or a full filesystem leaves a short file, never a full-size one with a hole. The `create_only` pass earlier versions ran could not promise that, `fallocate=none` or not: fio sizes a file it lays out with `ftruncate` before writing its data (`extend_file` in fio's filesetup.c), so a stopped layout left a full-size file the sweep credited as complete, and the run then measured reads of nothing. Calibration's sparse seed files (by `truncate`, see Seeding) are full size and hold no data: the sweep removes those exact files, from calibration's own list, so they earn no credit and the layout writes them dense. **The full run after a calibration always writes dense files.** A set's own layout job, and a namespace the sweep cannot size, still runs `create_only`, so an interrupted one can leave full-size files with holes that the next sweep credits: regenerate it with `-g`, or remove its files after an interrupted layout. To force a from-scratch rebuild, remove the files (`-u` on a run, or `rm -rf` the grid).
+**Layouts heal incrementally, from evidence.** Before the capacity check, every run sweeps each host's destination: one `find` lists every file of the grid its layout implies, with its size, and nothing is deleted. A short file is extended by the layout, not started over; a geometry change writes just its delta (bumping `nrfiles` 502→510 writes 8 files, not 22TiB); an interrupted layout is finished file by file on the next run; and nothing is trusted that wasn't measured — there are no marker files. The bytes present are **credited against the capacity requirement**. Size is a sufficient test **because the layout writes each file sequentially from its end**, so a layout stopped by a kill, a crash or a full filesystem leaves a short file, never a full-size one with a hole. The `create_only` pass earlier versions ran could not promise that, `fallocate=none` or not: fio sizes a file it lays out with `ftruncate` before writing its data (`extend_file` in fio's filesetup.c), so a stopped layout left a full-size file the sweep credited as complete, and the run then measured reads of nothing. A set's own layout job, and a namespace the sweep cannot size, still runs `create_only`, so an interrupted one can leave full-size files with holes that the next sweep credits: regenerate it with `-g`, or remove its files after an interrupted layout. To force a from-scratch rebuild, remove the files (`-u` on a run, or `rm -rf` the grid).
 
 # Prompts, fast track and dry runs
 The host file and the workload set are prepared before a run: wekatester opens no editors. A few prompts remain, for things a run would otherwise create or risk: a missing host file (`-t`), a missing destination directory, a workload that does not fit, and the `-p` passwords. They read the terminal directly, so they work fine under `... | tee run.log`.
@@ -455,24 +455,9 @@ jobs will not reproduce is not the test's ceiling. So:
   cells read that group's own set.
 - **Writes use per-client sets** (`<host>.<fmt>`), because concurrent
   cross-client writes to shared files measure lease arbitration, not the
-  client. The write set is seeded sparse, by `truncate`, only where that
-  cannot change what calibration measures: every job section writing it
-  is a pure sequential write (`rw=write`, with no `:<n>` skip, no
-  `percentage_random` or `percentage_sequential` share, no `verify`
-  read-back and no `zoneskip`), and no calibration cell writes it at
-  random. Sequential writes into sparse files measured −0.8% vs dense on
-  field client A, inside the run-to-run band; 4k random writes into holes
-  cost a measured 6.7% on the extent-map insert, and a reader would read
-  holes. So any reader, random writer (`randwrite`, `randrw`,
-  `rw`/`readwrite`, a trim) or skip on the grid, and any iops or latency
-  write search (4k random cells), makes the seed dense. It is decided once
-  per run from the set, logged with the job that made it dense, and has
-  no override. `truncate` is coreutils, not a fio feature: a host without
-  it is seeded dense, and the log says so. The run's sweep removes these
-  files and its layout writes them dense before the first measured job
-  (Workloads). A run stopped after calibration but before its sweep leaves
-  them sparse, and the next run cannot tell them from dense ones: the list
-  of them lives with the run.
+  client. The write set is seeded dense, like the read set: 4k random
+  writes into holes cost a measured 6.7% on the extent-map insert, and a
+  reader would read holes.
 
 Sets whose format cannot express the grid fall back to the private
 `.wekatester-cal` scratch.
@@ -489,12 +474,11 @@ seeded by its whole filesystem group: every member's fio server is idle while
 shapes calibrate one at a time, so each writes a round-robin share of the
 missing files into its own view of the directory. Write sets stay on their
 own client. A file already at or above its size is left alone. Size is
-a sufficient test for the dense seed **because it writes each file
+a sufficient test for the seed **because it writes each file
 sequentially as it creates it** (`rw=write`, `create_on_open=1`,
 `fallocate=none`): a partial create leaves a short file that fails the test,
-never a full-size hollow one that passes it. A sparse seed is full size by
-design; the run's sweep knows its files by name (Workloads). Before a byte is written the seed prints its estimate: the
-dense files and GiB to write, the sparse truncates, and the free space at the
+never a full-size hollow one that passes it. Before a byte is written the seed prints its estimate: the
+files and GiB to write, and the free space at the
 destination with the share the seed will take. A seed that would not fit
 stops there. Before the first cell, calibration also prices everything it
 will write per filesystem — each group's shared read set for its widest
@@ -579,8 +563,7 @@ comments. Auto also warns when workers differ (core counts, weka cores).
 host's own destination filesystem: the staged variants (auto-tuned,
 host-file-shaped, or plain) are what actually run, so their footprint — the
 larger of the per-namespace job footprints and the layout grid's
-per-section total, less the bytes the sweep found present (calibration's
-sparse seed files count as absent) — is compared with that host's `df`
+per-section total, less the bytes the sweep found present — is compared with that host's `df`
 before any fio job starts. Hosts on one weka filesystem draw from one pool, so their needs are
 also added up and checked against it together (a filesystem is known by its
 name and size). Continuing would only march fio into `ENOSPC` partway through and
