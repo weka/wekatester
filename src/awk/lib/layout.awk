@@ -27,12 +27,14 @@ function lay_add(L, n, fname, where,    SN, KV, J, nsec, x, s, fmt, key, sec, fs
             sec = sec_jobname(L, n, SN, s, fname)
             key = "__jobname__:" sec
         }
-        fs = sec_value(L, n, KV, s, "filesize", ""); sz = sec_value(L, n, KV, s, "size", ""); sb = -1
-        # size=50% and the like are not derivable: no size of their own
-        if (fs != "" && (v = parse_size(fs)) != "" && v > sb) sb = v
-        if (sz != "" && (v = parse_size(sz)) != "" && v > sb) sb = v
         nj = py_int(sec_value(L, n, KV, s, "numjobs", "1")); nr = py_int(sec_value(L, n, KV, s, "nrfiles", "1"))
         if (nj == "" || nr == "") awk_fail(where ": numjobs and nrfiles must be numbers")
+        fs = sec_value(L, n, KV, s, "filesize", ""); sz = sec_value(L, n, KV, s, "size", ""); sb = -1
+        # Each file's length as fio sizes it: filesize when given (size is then
+        # an IO cap), else size split over nrfiles. A range or size=50% is not
+        # derivable: no length of its own.
+        if (fs != "") { if ((v = parse_size(fs)) != "") sb = v }
+        else if (sz != "" && (v = parse_size(sz)) != "") sb = nr > 0 ? v / nr : v
         if (!(key in LAY_NS)) { LAY_NS[key] = ++LAY_NNS; LAY_KEY[LAY_NNS] = key; LAY_SEC[LAY_NNS] = sec; LAY_FMT[LAY_NNS] = fmt; LAY_NC[LAY_NNS] = 0 }
         k = LAY_NS[key]
         # a group's members and like sections add the same grid again:

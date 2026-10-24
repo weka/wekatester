@@ -576,6 +576,40 @@ t_assert "layout geometry: two sections of one namespace each get a layout grid;
     want="[layout-1] filename_format=j2/\$jobnum.\$filenum filesize=1G nrfiles=2 numjobs=8 [layout-2] wait_for=layout-1 filename_format=j2/\$jobnum.\$filenum filesize=2G numjobs=2
 capacity: h1 needs ~20.0GiB, has 1024.0GiB available"
     [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+# Pruning compares each file's length as fio sizes it: filesize when given
+# (size is then an IO cap), else size over nrfiles (Bugbot "Layout prune mixes
+# size and filesize", 2026-10-23). lay1 <jobfile printf format>: the generated
+# layout's sections on one line.
+lay1() {
+    local d; d=$(mktemp -d); mkdir -p "$d/set"; printf "$1" > "$d/set/011-x.job"
+    (source ./wekatester; generate_layout "$d/set" "$d/out") >>"$WT_ASIDE" 2>&1 || { echo "generate_layout failed"; return; }
+    awk '/^\[/ { s = $0 != "[global]" } s && NF && !/^(blocksize|create_only)=/' "$d/out/000-wekatester-layout.job" | tr "\n" " " | sed 's/ $//'
+}
+export -f lay1
+L0='[global]\nfilename_format=ns/$jobnum\nioengine=psync\n'
+export L0
+t_assert "layout prune: a large size= IO cap does not hide a larger filesize= job" bash -c '
+    a=$(lay1 "$L0[a]\nrw=read\nfilesize=1M\nsize=64M\n[b]\nrw=read\nfilesize=8M\n")
+    b=$(lay1 "$L0[b]\nrw=read\nfilesize=8M\n[a]\nrw=read\nfilesize=1M\nsize=64M\n")
+    want="[layout-1] filename_format=ns/\$jobnum filesize=8M numjobs=1"
+    [ "$a" = "$want" ] || { echo "a first: $a" >&2; exit 1; }
+    [ "$b" = "$want" ] || { echo "b first: $b" >&2; false; }'
+t_assert "layout prune: size= equal to another job filesize= is not a duplicate of it" bash -c '
+    out=$(lay1 "$L0[a]\nrw=read\nfilesize=1M\nsize=8M\n[b]\nrw=read\nfilesize=8M\n")
+    want="[layout-1] filename_format=ns/\$jobnum filesize=8M numjobs=1"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "layout prune: a size-only job counts its files as size over nrfiles" bash -c '
+    out=$(lay1 "$L0[a]\nrw=read\nnrfiles=8\nsize=64M\n[b]\nrw=read\nnrfiles=8\nfilesize=16M\n")
+    want="[layout-1] filename_format=ns/\$jobnum filesize=16M nrfiles=8 numjobs=1"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "layout prune: a size-only job with larger files still covers a filesize= job" bash -c '
+    out=$(lay1 "$L0[a]\nrw=read\nnrfiles=8\nsize=256M\n[b]\nrw=read\nnrfiles=8\nfilesize=16M\n")
+    want="[layout-1] filename_format=ns/\$jobnum size=256M nrfiles=8 numjobs=1"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
+t_assert "layout prune: filesize= wins over a smaller size= in the same job" bash -c '
+    out=$(lay1 "$L0[a]\nrw=read\nfilesize=8M\nsize=1M\n[b]\nrw=read\nfilesize=4M\n")
+    want="[layout-1] filename_format=ns/\$jobnum filesize=8M numjobs=1"
+    [ "$out" = "$want" ] || { echo "$out" >&2; false; }'
 t_assert "layout geometry: a [global]-only jobfile lays out and prices as before" bash -c '
     out=$(geo plain -)
     want="[bw] filesize=10G numjobs=4
