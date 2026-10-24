@@ -2237,12 +2237,11 @@ t_assert "parse: -a cal and --auto=cal set the level; every level calibrates" ba
 
 t_assert "seed_estimate_line: complete dataset, unknown free space, and the share of free space" bash -c '
     source ./wekatester
-    [ "$(seed_estimate_line 0 0 0 1000 /d)" = "dataset already complete, nothing to write" ] &&
-    [ "$(seed_estimate_line 4 2048 0 "" /d)" = "4 dense file(s) = 2.0 GiB to write, 0 sparse truncate(s); free space at /d unknown" ] &&
-    [ "$(seed_estimate_line 4 2048 6 8192 /d)" = "4 dense file(s) = 2.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (25.0% of it)" ] &&
-    [ "$(seed_estimate_line 0 0 6 8192 /d)" = "0 dense file(s) = 0.0 GiB to write, 6 sparse truncate(s); free 8.0 GiB at /d (0.0% of it)" ] &&
-    [ "$(seed_estimate_line 192 983040 0 402733363 /d)" = "192 dense file(s) = 960.0 GiB to write, 0 sparse truncate(s); free 384.1 TiB at /d (0.2% of it)" ] &&
-    [ "$(seed_estimate_line 4 2097152 0 4194304 /d)" = "4 dense file(s) = 2.0 TiB to write, 0 sparse truncate(s); free 4.0 TiB at /d (50.0% of it)" ]'
+    [ "$(seed_estimate_line 0 0 1000 /d)" = "dataset already complete, nothing to write" ] &&
+    [ "$(seed_estimate_line 4 2048 "" /d)" = "4 file(s) = 2.0 GiB to write; free space at /d unknown" ] &&
+    [ "$(seed_estimate_line 4 2048 8192 /d)" = "4 file(s) = 2.0 GiB to write; free 8.0 GiB at /d (25.0% of it)" ] &&
+    [ "$(seed_estimate_line 192 983040 402733363 /d)" = "192 file(s) = 960.0 GiB to write; free 384.1 TiB at /d (0.2% of it)" ] &&
+    [ "$(seed_estimate_line 4 2097152 4194304 /d)" = "4 file(s) = 2.0 TiB to write; free 4.0 TiB at /d (50.0% of it)" ]'
 
 # A failed rung used to die pointing at /dev/shm/wt.*, wiped on exit (seen
 # live: field client C, brutal bw-write qd=1 nr=1). Evidence goes in the
@@ -2512,9 +2511,8 @@ t_assert "client list: the early check skips what staging skips, a long name wit
     hosts=(); for i in $(seq 1 450); do hosts+=("worker-$i.example.com"); done
     out=$( (source ./wekatester; HOSTS=("${hosts[@]}"); SET_DIR_OVERRIDE=$d/set; TARGET_DIR=/dev/shm/fio-jobfiles
             early_client_cmdline_check) 2>&1 ) || { echo "$out" >&2; exit 1; }'
-# A blank in filename_format: the seed and layout readers cut the name there
-# and the truncate list split it (a b -> truncate -s bM a); refused (Frank,
-# 2026-10-11).
+# A blank in filename_format: the seed and layout readers cut the name there;
+# refused (Frank, 2026-10-11).
 t_assert "staging: a filename_format with a space dies naming the jobfile and the value, before the probe and calibration" bash -c '
     source ./tests/helpers.sh; set_fixture; no_ssh_fixture
     printf "# report iops\n[global]\nfilename_format=a b.\$jobnum.\$filenum\n[io]\nrw=randread\n" > "$SETFIX/041-sp.job"
@@ -3683,41 +3681,6 @@ filename=h1.wt.2.0"
     grep -qx "filename_format=h1.\$filenum/\$jobnum" "$d/grid/h1/000-wekatester-layout.job" &&
     grep -qx "layout	4 file(s), 36864 bytes to write on 1 host(s)" "$d/run/settings" &&
     case "$out" in *"layout: h1: 4 file(s) missing or short, 0.0 GiB to write (3 reused)"*) true;;
-        *) echo "$out" >&2; false;; esac'
-# A truncate-seeded file is full size and holds nothing: the sweep credited
-# it as laid out, so the capacity check under-priced what the run writes.
-t_assert "sweep: calibration's truncate-seeded files earn no credit and are removed for the layout to write (find run for real)" bash -c '
-    d=$(mktemp -d); t=$d/dest
-    mkdir -p "$t/h1.0" "$t/h1.1" "$d/cal/h1"
-    truncate -s 4096 "$t/h1.0/0"; truncate -s 4096 "$t/h1.0/1"
-    head -c 4096 /dev/zero > "$t/h1.1/0"
-    # two seed calls recorded h1.0/0: counted once
-    printf "h1.0/0 1\nh1.0/1 1\nh1.0/0 1\n" > "$d/cal/h1/truncated"
-    out=$( (source ./wekatester
-     parse_args -d "$t" h1
-     WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=0
-     mkdir -p "$d/jobs/h1" "$SET_DIR"
-     lay="# wekatester-layout: generated sha256=abc
-[global]
-directory=$t
-fallocate=none
-[nested]
-filename_format=h1.\$filenum/\$jobnum
-filesize=4K
-nrfiles=2
-numjobs=2"
-     printf "%s\n" "$lay" > "$SET_DIR/000-wekatester-layout.job"
-     printf "%s\n" "$lay" > "$d/jobs/h1/000-wekatester-layout.job"
-     JOBFILES=(000-wekatester-layout.job)
-     run_host() { bash -c "$2"; }
-     sweep_layout_grid && stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
-    left=$(cd "$t" && find . -type f | LC_ALL=C sort | tr "\n" " ")
-    [ "$(cat "$d/probe/h1.laidout")" = 4096 ] && [ "$left" = "./h1.1/0 " ] ||
-        { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; $out" >&2; exit 1; }
-    # written dense from empty by the layout, with the missing file
-    grep -qx "filename=h1.0/0" "$d/jobs/h1/000-wekatester-layout.job" &&
-    grep -qx "filename=h1.0/1:h1.1/1" "$d/jobs/h1/000-wekatester-layout.job" || { cat "$d/jobs/h1/000-wekatester-layout.job" >&2; exit 1; }
-    case "$out" in *"sweep: h1: removed the 2 calibration file(s) seeded sparse; the layout writes them dense"*) true;;
         *) echo "$out" >&2; false;; esac'
 # Overlapping grids were chained with wait_for so no file was laid out twice
 # at once; each file now sits in exactly one section, at its largest size.
@@ -6907,7 +6870,7 @@ t_assert "calibrate: host-file values are the only ones a search tries, measured
     grep "^h1 " "$d/cal.results" | grep -q "^h1 [a-z_]* 4 2 5120M 3 " &&
     case "$out" in *"bw read is pinned by h1"*"host-file row (qd/nr/fs/nj 4/2/5120M/3): only those values are tested"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
-t_assert "calibrate: the shared read seed is split across the filesystem group; writes stay on the representative, bw-only writes truncate" bash -c '
+t_assert "calibrate: the shared read seed is split across the filesystem group; writes stay on the representative" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
@@ -6927,11 +6890,11 @@ t_assert "calibrate: the shared read seed is split across the filesystem group; 
     grep -qx "filename=shared.0/0" "$d/cal/h1/cal-seed-read.job" &&
     grep -qx "filename=shared.0/1" "$d/cal/h2/cal-seed-read.job" &&
     grep cal-seed-read "$d/simlog" | grep -q -- "--client=h1 .*--client=h2 " &&
+    grep cal-seed-write "$d/simlog" | grep -q -- "--client=h1 " &&
     ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h2" &&
-    grep -q "truncate -s 5120M" "$d/simlog" &&
-    case "$out" in *"cal: seed estimate: h1 (shared read set, 1x1 read + 0x0 write jobs x files): 1 dense file(s) = 5.0 GiB to write"*"truncate-seeded 1 write file(s)"*"2x1 read + 0x0 write jobs x files across 2 client(s) of its filesystem group"*) true;;
+    case "$out" in *"cal: seed estimate: h1 (shared read set, 1x1 read + 0x0 write jobs x files): 1 file(s) = 5.0 GiB to write"*"2x1 read + 0x0 write jobs x files across 2 client(s) of its filesystem group"*) true;;
         *) printf "%s\n" "$out" >&2; false;; esac'
-t_assert "calibrate: a 4k-random write search forces the dense write seed" bash -c '
+t_assert "calibrate: a 4k-random write seed has a section per job and size" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
     printf "# report iops\n[global]\nfilename_format=\$filenum/\$jobnum\nbs=4k\n[a]\nrw=randwrite\n" > "$d/set/032-a.job"
@@ -6946,44 +6909,10 @@ t_assert "calibrate: a 4k-random write search forces the dense write seed" bash 
     f=$d/cal/h1/cal-seed-write.job
     grep -A2 -x "filename=h1.0/0" "$f" | grep -qx "filesize=5120M" &&
     grep -A2 -x "filename=h1.1/0" "$f" | grep -qx "filesize=2560M" &&
-    grep -A2 -x "filename=h1.2/0:h1.3/0" "$f" | grep -qx "filesize=1280M" &&
-    [ ! -s "$d/cal/h1/truncate.list" ] || { cat "$f" >&2; false; }'
-# The seed's density came from the search kinds alone: a bandwidth-only
-# rw=rw job read holes and a bandwidth randwrite filled them at random.
-t_assert "calibrate: the write seed is sparse only when every job writing the grid is a pure sequential write" bash -c '
-    source ./tests/helpers.sh
-    one() {   # one <sparse|dense> <012-w.job body>: one calibration of that set
-        local d out got
-        d=$(mktemp -d); cal_sim_fixture "$d" h1
-        printf "%b" "$2" > "$d/set/012-w.job"
-        out=$( (source ./wekatester
-         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1); MASTER=h1; FIO_BIN=fio
-         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
-         copy_to_master() { :; }
-         run_host() { cal_sim_host "$@"; }
-         calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; return 1; }
-        if grep -q "truncate -s" "$d/simlog"; then got=sparse; else got=dense; fi
-        [ "$got" = "$1" ] || { printf "want %s, got %s for:\n%b\n%s\n" "$1" "$got" "$2" "$out" >&2; return 1; }
-        LAST=$out; LASTD=$d
-    }
-    h="# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n"
-    one sparse "${h}[a]\nrw=write\n" &&
-    # every seed call is recorded for the sweep, the first (1 job) and the widest
-    grep -qx "h1.0/0 5120" "$LASTD/cal/h1/truncated" && grep -q "^h1.3/3 " "$LASTD/cal/h1/truncated" &&
-    case "$LAST" in *"cal: write seed: sparse, by truncate (every job writing <host>.\$filenum/\$jobnum is a pure sequential write)"*) true;;
-        *) printf "%s\n" "$LAST" >&2; false;; esac &&
-    one dense "${h}[a]\nrw=rw\n" &&
-    one dense "${h}[a]\nrw=randwrite\n" &&
-    case "$LAST" in *"cal: write seed: dense (012-w.job [a]: rw=randwrite)"*) true;;
-        *) printf "%s\n" "$LAST" >&2; false;; esac &&
-    one dense "${h}[a]\nrw=write:4k\n" &&
-    one dense "${h}[a]\nrw=write\npercentage_random=10\n" &&
-    one dense "${h}[a]\nrw=write\nverify=crc32c\n" &&
-    one dense "${h}[r]\nrw=read\n[a]\nrw=write\n" &&
-    # another format is another grid: its random writer leaves this one alone
-    one sparse "${h}[a]\nrw=write\n[b]\nfilename_format=other.\$jobnum\nrw=randwrite\n"'
-t_assert "calibrate: a host without truncate gets the dense write seed, and the log says so" bash -c '
+    grep -A2 -x "filename=h1.2/0:h1.3/0" "$f" | grep -qx "filesize=1280M" || { cat "$f" >&2; false; }'
+# Frank, 2026-10-24: calibration always seeds dense. A sequential-only write
+# set was seeded sparse, by truncate, and the run had to find those files.
+t_assert "calibrate: a sequential-only write set under -a seeds dense, by fio, never by truncate" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-w.job"
@@ -6992,12 +6921,16 @@ t_assert "calibrate: a host without truncate gets the dense write seed, and the 
      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
      SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
      copy_to_master() { :; }
-     run_host() { cal_sim_host "$@"; case "$2" in (*"command -v truncate"*) echo WEKATESTER_NO_TRUNCATE;; esac; }
+     run_host() { cal_sim_host "$@"; }
      calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
-    ! grep -q "truncate -s" "$d/simlog" &&
-    grep -q "filename=h1.0/0" "$d/cal/h1/cal-seed-write.job" &&
-    case "$out" in *"cal: h1: truncate is not installed there, so its write grid h1.\$filenum/\$jobnum is seeded dense"*) true;;
-        *) printf "%s\n" "$out" >&2; false;; esac'
+    f=$d/cal/h1/cal-seed-write.job
+    ! grep -q truncate "$d/simlog" &&
+    grep cal-seed-write "$d/simlog" | grep -q -- "--client=h1 " &&
+    grep -qx "rw=write" "$f" && grep -qx "create_on_open=1" "$f" &&
+    grep -A2 -x "filename=h1.0/0" "$f" | grep -qx "filesize=5120M" &&
+    case "$out" in *"cal: seed estimate: h1 (write set, 0x0 read + 1x1 write jobs x files): 1 file(s) = 5.0 GiB to write"*) true;;
+        *) printf "%s\n" "$out" >&2; false;; esac &&
+    case "$out" in *sparse*|*truncate*) printf "%s\n" "$out" >&2; false;; *) true;; esac'
 t_assert "calibrate: every write cell settles, read cells never do" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1
@@ -7123,7 +7056,7 @@ t_assert "cal_seed_rep: a wide seed stays far below the fio 4096-job cap, and th
             TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
             copy_to_master() { :; }
             run_host() { cal_sim_host "$@"; }
-            cal_seed_rep h1 104 64 0 0 1 libaio "0-51") 2>&1 )
+            cal_seed_rep h1 104 64 0 0 libaio "0-51") 2>&1 )
     f=$d/cal/h1/cal-seed-read.job
     n=$(grep -c "^\[seed-" "$f")
     # per job: one section each for its 5G, 2.5G and 1.25G files, four for the
@@ -7141,7 +7074,7 @@ t_assert "cal_seed_rep: a seed that does not fit stops before writing a byte" ba
             TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; SIMLOG=$d/simlog; export CAL_SIM_FREE_MIB=10000
             copy_to_master() { :; }
             run_host() { cal_sim_host "$@"; }
-            cal_seed_rep h1 8 2 0 0 1 libaio "") 2>&1 ); rc=$?
+            cal_seed_rep h1 8 2 0 0 libaio "") 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && ! grep -q "cal-seed-" "$d/simlog" &&
     case "$err" in *"h1: the calibration dataset needs 61440MiB and /mnt/weka has 10000MiB free"*) true;; *) echo "$err" >&2; false;; esac'
 t_assert "cal_seed_rep: sufficiency is the only test -- a complete file is never rewritten" bash -c '
@@ -7153,7 +7086,7 @@ t_assert "cal_seed_rep: sufficiency is the only test -- a complete file is never
      run_host() { case "$2" in (*WEKATESTER_DF*)
          printf "h1.cal.0.0 5368709120\nh1.cal.0.1 99\nh1.cal.1.0 6000000000\nWEKATESTER_DF\nwekafs 1 99999999\n"; return 0;; esac
          cal_sim_host "$@"; }
-     cal_seed_rep h1 2 2 0 0 1 libaio "") >>$WT_ASIDE 2>&1
+     cal_seed_rep h1 2 2 0 0 libaio "") >>$WT_ASIDE 2>&1
     f=$d/cal/h1/cal-seed-read.job
     [ "$(grep "^filename=" "$f" | tr "\n" " ")" = "filename=h1.cal.0.1 filename=h1.cal.1.1 " ] &&
     grep -q "^\[seed-1-2560M-0\]$" "$f" || { cat "$f" >&2; false; }'
@@ -7282,11 +7215,11 @@ t_assert "cal_seed_rep: each file is seeded at the largest share a test takes: 2
             TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
             copy_to_master() { :; }
             run_host() { cal_sim_host "$@"; }
-            cal_seed_rep h1 2 4 0 0 1 libaio "") 2>&1 ) || { echo "$out" >&2; exit 1; }
+            cal_seed_rep h1 2 4 0 0 libaio "") 2>&1 ) || { echo "$out" >&2; exit 1; }
     f=$d/cal/h1/cal-seed-read.job
     [ "$(grep -c "^filesize=5120M$" "$f") $(grep -c "^filesize=2560M$" "$f") $(grep -c "^filesize=1280M$" "$f")" = "2 2 2" ] &&
     grep -A2 -x "filename=h1.cal.0.2:h1.cal.0.3" "$f" | grep -qx "filesize=1280M" &&
-    case "$out" in *"8 dense file(s) = 20.0 GiB to write"*) true;; *) echo "$out" >&2; false;; esac'
+    case "$out" in *"8 file(s) = 20.0 GiB to write"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "cal_seed_rep: a listed need past the ladder makes its files at least that big" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/cal"
     # nrfiles 3 pinned: file 2 needs 5120/3 = 1706M, more than the ladder 1280M
@@ -7296,7 +7229,7 @@ t_assert "cal_seed_rep: a listed need past the ladder makes its files at least t
      TARGET_DIR=/dev/shm/x; CAL_SETTLE=0; CAL_NS_DIR=/.wekatester-cal; CAL_SEP=.cal.
      copy_to_master() { :; }
      run_host() { cal_sim_host "$@"; }
-     cal_seed_rep h1 1 4 0 0 1 libaio "") >>$WT_ASIDE 2>&1 || exit 1
+     cal_seed_rep h1 1 4 0 0 libaio "") >>$WT_ASIDE 2>&1 || exit 1
     f=$d/cal/h1/cal-seed-read.job
     grep -A2 -x "filename=h1.cal.0.2" "$f" | grep -qx "filesize=1706M" &&
     grep -A2 -x "filename=h1.cal.0.3" "$f" | grep -qx "filesize=1280M" || { cat "$f" >&2; false; }'

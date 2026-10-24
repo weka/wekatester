@@ -465,8 +465,7 @@ layout_grid_spec() {
 # Evidence, not markers (README, Workloads): per host, the size of every file
 # in its layout grid, into probe/<host>.sizes ("<bytes> <path>"); nothing is
 # deleted, so a short file is extended, not rewritten (stage_layout_writes).
-# Calibration's truncate-seeded files go first: full size and no data. A dry
-# run lists too, which changes nothing, so it can say what would be written.
+# A dry run lists too, which changes nothing, so it can say what would be written.
 sweep_layout_grid() {
     local lay=${JOBFILES[0]}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
@@ -505,16 +504,9 @@ sweep_layout_grid() {
             [ -z "$lit" ] || cmd="$cmd; fi"
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
-        ( sp="$WORK_DIR/cal/$host/truncated"
-          if [ -s "$sp" ]; then
-              while IFS= read -r rmc; do
-                  run_host "$host" "cd '$hd' && $rmc" || exit 1
-              done < <(awkrun '#@awk sweep_sparse_rm' "$sp")
-              log "sweep: $host: removed the $(awk '!($1 in s) {s[$1]; n++} END {print n + 0}' "$sp") calibration file(s) seeded sparse; the layout writes them dense"
-          fi
-          # a dead session fails the sweep: an empty listing would read as
-          # nothing laid out
-          run_host "$host" "$cmd" > "$WORK_DIR/probe/$host.sizes" ) &
+        # a dead session fails the sweep: an empty listing would read as
+        # nothing laid out
+        run_host "$host" "$cmd" > "$WORK_DIR/probe/$host.sizes" &
         pids+=($!); hs+=("$host")
     done
     for i in "${!pids[@]}"; do

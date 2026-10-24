@@ -18,24 +18,6 @@ cal_required() {   # cal_required <setdir> [bulk 0|1]
     awkrun '#@awk cal_required' "${2:-0}" "${files[@]}"
 }
 
-# The write seed's density, decided once from the set (README, Seeding):
-# CAL_DENSE_WRITE 0 seeds the unified write grid sparse, by truncate. The
-# scratch keeps reads and writes on one set, so it is always dense.
-CAL_DENSE_WRITE=1
-cal_write_seed() {   # cal_write_seed <set-dir>; unified only
-    local f files=() v LC_ALL=C
-    for f in "$1"/[0-9]*; do [ -f "$f" ] && files+=("$f"); done
-    v=$(awkrun '#@awk cal_write_seed' "$CAL_FMT" ${files[@]+"${files[@]}"}) \
-        || die "cannot classify the write grid of $1"
-    if [ "$v" = sparse ]; then
-        CAL_DENSE_WRITE=0
-        log "cal: write seed: sparse, by truncate (every job writing <host>.$CAL_FMT is a pure sequential write)"
-    else
-        CAL_DENSE_WRITE=1
-        log "cal: write seed: dense (${v#dense })"
-    fi
-}
-
 # Calibration measures on the workload own files when filename_format can
 # address the grid ($filenum and $jobnum, no $jobname, which would resolve to
 # the cal section name), else in a private scratch. One dataset then serves
@@ -332,12 +314,12 @@ cal_push() {   # cal_push <basename> <host>...
 
 # One line of the pre-seed estimate: what this host's seed will write, and
 # against how much free space. MiB in, prose out.
-seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <ntrunc> <availmib|""> <dir>
-    if [ "$1" -eq 0 ] && [ "$3" -eq 0 ]; then
+seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <availmib|""> <dir>
+    if [ "$1" -eq 0 ]; then
         printf 'dataset already complete, nothing to write'
         return 0
     fi
-    LC_ALL=C awk -v n="$1" -v mib="$2" -v t="$3" -v av="$4" -v d="$5" '
+    LC_ALL=C awk -v n="$1" -v mib="$2" -v av="$3" -v d="$4" '
     #@awk seed_estimate_line'
 }
 
@@ -345,10 +327,10 @@ seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <ntrunc> <availmib
 # write sides apart; a file at or above its size is skipped (fallocate=none
 # makes that sound). Unified: reads use the shared set (README, Seeding).
 # Prints the estimate first; stops if it cannot fit.
-cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-nr> <dense-write 0|1> <engine> <cpus>
-    local host=$1 rnj=$2 rnr=$3 wnj=$4 wnr=$5 dense=$6 eng=$7 cpus=$8
-    local hd root unified=0 want nfiles nmib ntrunc src totkb availmib maxf subdirs sd cmd
-    local tlist tmib tn tchunk wantnj tag job res
+cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-nr> <engine> <cpus>
+    local host=$1 rnj=$2 rnr=$3 wnj=$4 wnr=$5 eng=$6 cpus=$7
+    local hd root unified=0 want nfiles nmib src totkb availmib maxf subdirs sd cmd
+    local wantnj tag job res
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag.json"
@@ -359,24 +341,15 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     [ "${CAL_NS_DIR-unset}" != "" ] || unified=1
     mkdir -p "$WORK_DIR/cal/$host" || die "cannot create $WORK_DIR/cal/$host"
-    rm -f "$WORK_DIR/cal/$host/truncfail"
     # One session for the listing and df. No error suppression on find: without
     # GNU -printf it must fail loudly, or every run re-seeds everything. Only
     # the names the seed can ask for: a shared destination holds every
-    # member's write set. A sparse write seed is coreutils truncate, no fio
-    # feature: the same session says whether the host has it.
-    local tq=""
-    [ "$dense" != 0 ] || [ "$unified" -eq 0 ] || [ "$wnj" -eq 0 ] \
-        || tq="; if ! _o=\$(command -v truncate); then echo WEKATESTER_NO_TRUNCATE; fi"
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'$tq" \
+    # member's write set.
+    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
         > "$WORK_DIR/cal/$host/scratch.raw" \
         || die "$host: cannot inspect the calibration dataset or its free space"
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
     awk 'f {print; exit} /^WEKATESTER_DF$/ {f = 1}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/dfline"
-    if [ -n "$tq" ] && grep -qx WEKATESTER_NO_TRUNCATE "$WORK_DIR/cal/$host/scratch.raw"; then
-        dense=1
-        log "cal: $host: truncate is not installed there, so its write grid $hname$sep$fmt is seeded dense" >&2
-    fi
     # fio never mkdirs. A flat shape needs nothing beyond the dataset root; a
     # subdirectory shape needs its directories before a file lands in them.
     maxf=$rnr; [ "$wnr" -le "$maxf" ] || maxf=$wnr
@@ -405,7 +378,6 @@ SUBDIREOF
         run_host "$host" "$cmd" \
             || die "$host: cannot create the calibration namespace subdirectories"
     fi
-    tlist="$WORK_DIR/cal/$host/truncate.list"
     # Writers: the rep, except the unified read side, which its filesystem
     # group seeds round-robin by file (their fio servers are idle). A member
     # line is "<host> <dir> <cpus> <engine>", the rep first.
@@ -426,11 +398,11 @@ SUBDIREOF
     mkdir -p "${mdirs[@]}" || die "$host: cannot create the seed jobfile directories"
     want=$(awkrun '#@awk cal_seed_rep' "$hname" "$rnj" "$rnr" "$wnj" "$wnr" "$FILESIZE_MIB" \
         "$job" "$WORK_DIR/cal" "$WORK_DIR/cal/$host/scratch.list" \
-        "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" "$dense" \
-        "$tlist" "$CAL_NR $CAL_NR_LADDER" "$members" \
+        "${CAL_FMT:-\$jobnum.\$filenum}" "${CAL_SEP:-.cal.}" "$unified" \
+        "$CAL_NR $CAL_NR_LADDER" "$members" \
         "$WORK_DIR/cal/needs.read.$(group_first "$host")" "$WORK_DIR/cal/needs.write.$host" \
         ) || die "$host: cannot build the calibration seed"
-    read -r nfiles nmib ntrunc <<<"${want%%$'\n'*}"
+    read -r nfiles nmib <<<"${want%%$'\n'*}"
     active=""; [ "$want" = "${want#*$'\n'}" ] || active=${want#*$'\n'}
     read -r src totkb availmib < "$WORK_DIR/cal/$host/dfline" || true
     case "$availmib" in (""|*[!0-9]*) availmib="" ;; esac
@@ -442,28 +414,13 @@ SUBDIREOF
     fi
     set -- $active
     [ "$#" -le 1 ] || by=" across $# client(s) of its filesystem group"
-    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "${ntrunc:-0}" "$availmib" "$hd")"
+    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "$availmib" "$hd")"
     if [ "${nmib:-0}" -gt 0 ]; then
         if [ -z "$availmib" ]; then
             log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2
         elif [ "$nmib" -gt "$availmib" ]; then
             die "$host: the calibration dataset needs ${nmib}MiB and $hd has ${availmib}MiB free; free space under the destination, shrink FILESIZE_MIB, shorten CAL_NR_LADDER, or drop -a $AUTO_LEVEL"
         fi
-    fi
-    if [ "${ntrunc:-0}" -gt 0 ]; then
-        # sparse write canvases by truncate: one session for every size, a
-        # second only past ~100 KB of names (was one per 64 files)
-        while IFS= read -r tchunk; do
-            run_host "$host" "cd '$root' && $tchunk" \
-                || { echo TRUNCFAIL > "$WORK_DIR/cal/$host/truncfail"; break; }
-        done < <(awkrun '#@awk cal_seed_rep.truncate' "$tlist")
-        [ ! -f "$WORK_DIR/cal/$host/truncfail" ] \
-            || die "$host: cannot truncate-seed the write set"
-        # every call's list, kept for the run's sweep: these files hold no
-        # data, so they earn no capacity credit and the layout writes them
-        cat "$tlist" >> "$WORK_DIR/cal/$host/truncated" \
-            || die "$host: cannot record the truncate-seeded files"
-        log "cal: $host: truncate-seeded ${ntrunc} write file(s) (sequential-write-only set)"
     fi
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
     cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
@@ -494,9 +451,9 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
         done < "$cov"
     fi
     if [ "$dirn" = read ]; then
-        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_ALL"
+        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_REP_ALL"
     else
-        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_DENSE_WRITE" "$CAL_SEED_ENG" "$CAL_REP_ALL"
+        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_REP_ALL"
     fi
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
@@ -912,9 +869,8 @@ calibrate() {
         done
         CAL_NS_DIR=""; CAL_SEP="."
         log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
-        cal_write_seed "$capdir"
     else
-        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."; CAL_DENSE_WRITE=1
+        CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
         log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
     fi
     mkdir -p "$WORK_DIR/cal"

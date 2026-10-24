@@ -313,7 +313,7 @@ export -f cal_fake_fio
 
 # A run_host stand-in for calibration runs: the dataset listing answers
 # "empty, plenty of room", a seed succeeds, a cell answers from the model,
-# everything else (mkdir, rm, truncate) succeeds. Every command is appended
+# everything else (mkdir, rm) succeeds. Every command is appended
 # to $SIMLOG when it is set.
 cal_sim_host() {   # cal_sim_host <host> <command>
     local jf h

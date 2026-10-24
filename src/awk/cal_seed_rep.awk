@@ -2,7 +2,7 @@ BEGIN {
     SEED_ANY_JOB = 2 ^ 30; SEED_CHUNK = 16
     host = ARGV[1]; rnj = ARGV[2] + 0; rnr = ARGV[3] + 0; wnj = ARGV[4] + 0; wnr = ARGV[5] + 0
     fsmib = ARGV[6] + 0; job = ARGV[7]; outdir = ARGV[8]; fmt = ARGV[10]; sep = ARGV[11]
-    unified = ARGV[12] == "1"; sparse = unified && ARGV[13] == "0"; tlist = ARGV[14]
+    unified = ARGV[12] == "1"
     # streamed, and only shared. and this host own names: a shared
     # destination lists every member write set too
     while ((r = (getline line < ARGV[9])) > 0)
@@ -11,8 +11,8 @@ BEGIN {
     close(ARGV[9])
     # the nrfiles ladder shares, plus any listed need beyond it: what a
     # host-file value pins past the grid
-    nrd = needs_listed(RN, needs_ladder(RN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[17])
-    nwr = needs_listed(WN, needs_ladder(WN, 0, ARGV[15], fsmib, SEED_ANY_JOB), ARGV[18])
+    nrd = needs_listed(RN, needs_ladder(RN, 0, ARGV[13], fsmib, SEED_ANY_JOB), ARGV[15])
+    nwr = needs_listed(WN, needs_ladder(WN, 0, ARGV[13], fsmib, SEED_ANY_JOB), ARGV[16])
     if (!unified) {
         # the scratch keeps reads and writes on the same files: one size serves both
         for (i = 1; i <= nwr; i++) for (k = 1; k <= 3; k++) RN[nrd + i, k] = WN[i, k]
@@ -21,7 +21,7 @@ BEGIN {
     }
     # what is missing: the read side, then the write side; a file both
     # sides name is seeded once
-    ntodo = 0; nread = 0; nt = 0; tmib = 0
+    ntodo = 0; nread = 0; tmib = 0
     for (j = 0; j < rnj; j++)
         for (f = 0; f < rnr; f++) {
             name = seed_name(unified ? "shared." : host sep, fmt, j, f)
@@ -36,13 +36,10 @@ BEGIN {
             if (!(mib = seed_size(WN, nwr, j, f))) mib = int(fsmib / wnr) > 1 ? int(fsmib / wnr) : 1
             if ((name in SEEN) || ((name in HAVE) && HAVE[name] >= mib * 1048576)) continue
             SEEN[name] = 1
-            if (sparse) { TR[++nt] = name " " mib; continue }
             TJ[++ntodo] = j; TN[ntodo] = name; TM[ntodo] = mib; tmib += mib
         }
-    if (nt) writelines(tlist, TR, nt)
-    else { printf "" > tlist; close(tlist) }
     nm = 0
-    if ((n = readlines(ARGV[16], L)) < 0) awk_fail("cannot read " ARGV[16])
+    if ((n = readlines(ARGV[14], L)) < 0) awk_fail("cannot read " ARGV[14])
     for (i = 1; i <= n; i++) {
         if (strip(L[i]) == "") continue
         if (lsplit(L[i], F, "\t") != 4) awk_fail("a seed member line needs host, dir, cpus and engine: " L[i])
@@ -92,6 +89,6 @@ BEGIN {
         writelines(outdir "/" m "/" job, O, no)
         active = active (active == "" ? "" : " ") m
     }
-    printf "%d %.0f %d\n", ntodo, tmib, nt
+    printf "%d %.0f\n", ntodo, tmib
     print active
 }
