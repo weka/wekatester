@@ -436,8 +436,8 @@ jobs will not reproduce is not the test's ceiling. So:
 `$jobnum` and no `$jobname`. The dataset splits along the read/write line:
 
 - **Reads use one fleet-shared dataset per filesystem group** (`shared.<fmt>`).
-  Every client's read cells and staged read jobs open the *same* files as the
-  rest of its group. That is the realistic fleet workload, and it lets one
+  Every client's read cells and staged read-only jobs (whatever their own
+  `filename_format`) open the *same* files as the rest of its group. That is the realistic fleet workload, and it lets one
   dense set serve any number of clients. The layout job lays it out once per
   group, from the group's first host, for the widest job count any member
   reads it with. The host name `shared` is reserved.

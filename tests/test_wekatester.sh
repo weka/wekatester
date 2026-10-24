@@ -7163,6 +7163,24 @@ t_assert "tuner: unified staging reads the shared dataset past a create_only sec
      auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 "" h1 h2) >>$WT_ASIDE 2>&1
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h1/011-r.job" &&
     grep -q "^filename_format=shared.\$filenum/\$jobnum$" "$FIX/jobs/h2/011-r.job" || { cat "$FIX/jobs/h1/011-r.job" >&2; false; }'
+# Every read-only job of a unified set reads the grid calibration seeded, in
+# the set's format: one with no format of its own, or another one, too. The
+# re-derived layout then lays out that grid, never a $jobname namespace.
+t_assert "tuner: unified staging gives every read-only job the set's shared format, its own missing or different" bash -c '
+    source ./tests/helpers.sh; tuner_fixture; rm -f "$FIX/src/011-bw.job"
+    printf "# report bandwidth\n[global]\nfilesize=1G\nnumjobs=4\nioengine=libaio\n[rd]\nrw=read\n" > "$FIX/src/011-r.job"
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\nnumjobs=4\nioengine=libaio\n[wr]\nrw=write\n" > "$FIX/src/012-w.job"
+    printf "# report iops\n[global]\nfilename_format=\$jobnum.\$filenum\nfilesize=1G\nnumjobs=2\nioengine=libaio\n[rr]\nrw=randread\n" > "$FIX/src/031-r.job"
+    ns=$(source ./wekatester; cal_namespace "$FIX/src") && [ "$ns" = "unified \$filenum/\$jobnum" ] || { echo "namespace: $ns" >&2; exit 1; }
+    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$WT_ASIDE 2>&1 || exit 1
+    (source ./wekatester; WEKATESTER_NS="$ns" auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) >>$WT_ASIDE 2>&1 || exit 1
+    for h in h1 h2; do for f in 011-r.job 031-r.job; do
+        [ "$(grep "^filename_format=" "$FIX/jobs/$h/$f")" = "filename_format=shared.\$filenum/\$jobnum" ] ||
+            { echo "$h/$f:" >&2; cat "$FIX/jobs/$h/$f" >&2; exit 1; }
+    done; done
+    l="$FIX/jobs/h1/000-wekatester-layout.job"
+    grep -qx "filename_format=shared.\$filenum/\$jobnum" "$l" &&
+    ! grep -q "\$jobname" "$FIX"/jobs/h1/* "$FIX"/jobs/h2/* || { cat "$l" >&2; false; }'
 
 # ONE dataset for calibration and execution: a set whose filename_format can
 # address the grid ($filenum AND $jobnum, no $jobname) is measured on the

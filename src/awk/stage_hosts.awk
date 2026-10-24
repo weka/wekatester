@@ -6,7 +6,13 @@ function ceil_div(a, b,    c) { c = int(a / b); return c * b < a ? c + 1 : c }
 BEGIN {
     mode = ARGV[1]; work = ARGV[2]; directory = ARGV[3]; label = ARGV[4]; targets = ARGV[5]
     pristine = ARGV[6] == "1"; nf = ARGV[7] + 0; auto = mode == "auto"
-    ns_unified = auto && index(ENVIRON["WEKATESTER_NS"], "unified") == 1
+    # cal_namespace's line: "unified <fmt>" names the format the read cells
+    # and the seed used
+    ns_unified = 0; ns_fmt = ""
+    if (auto && split(ENVIRON["WEKATESTER_NS"], NSW, " ") && NSW[1] == "unified") {
+        if ((ns_fmt = NSW[2]) == "") awk_fail("WEKATESTER_NS is unified but names no format: " ENVIRON["WEKATESTER_NS"])
+        ns_unified = 1
+    }
     nolat = auto && ENVIRON["WEKATESTER_IOPS_NOLAT"] == "1"
     split("nj fs nr qd", TUPLE, " "); split("numjobs filesize nrfiles iodepth", KNOB, " ")
     # the jobfiles in name order, as the set lists them
@@ -22,7 +28,6 @@ BEGIN {
         KIND[j] = report_has(L, n, "latency") ? lat_kind(L, n) : report_has(L, n, "bandwidth") ? "bw" : report_has(L, n, "iops") ? "iops" : ""
         file_directions(L, n, D); DR[j] = ("read" in D); DW[j] = ("write" in D)
         for (k = 1; k <= 3 && k <= n; k++) if (index(L[k], floor_marker()) == 1) FLOORJ[j] = 1
-        FMT0[j] = first_value(L, n, "filename_format")
     }
     nh = 0
     for (a = 8 + nf; a < ARGC; a++) H[++nh] = ARGV[a]
@@ -196,7 +201,7 @@ function auto_facts(    x, h, np, P, i, F, m, c, S, nodes, WK, ISO, R, PHYS, ALL
 }
 # One job variant for one host under -a, on lines L (directory already
 # set); returns the new line count. Overrides land in the order applied.
-function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no, nrset) {
+function auto_job(j, h, ROW, L, n,    D, kind, floor, slot, q, v, cap, nn, fs, nr, b, nj, i, O, no, nrset) {
     if (LAY[j]) {
         # an edited layout: staged with corrections only
         return override_lines(L, n, "cpus_allowed", CAL[h])
@@ -205,12 +210,11 @@ function auto_job(j, h, ROW, L, n,    D, kind, floor, fmt, slot, q, v, cap, nn, 
     # written
     n = override_lines(L, n, "cpus_allowed", CAL[h])
     job_directions(j, D)
-    if (ns_unified && ("read" in D) && !("write" in D)) {
-        # a read-only job reads the shared set the read cells calibrated
-        # on; stamp_unique_names leaves "shared." formats alone
-        fmt = FMT0[j]
-        n = override_lines(L, n, "filename_format", "shared." (fmt != "" ? fmt : "$jobname.$jobnum.$filenum"))
-    }
+    # a read-only job reads the shared set the read cells calibrated on, in
+    # the set's format whatever its own (the seed, layout and -u removal
+    # name the same files); stamp_unique_names leaves "shared." formats alone
+    if (ns_unified && ("read" in D) && !("write" in D))
+        n = override_lines(L, n, "filename_format", "shared." ns_fmt)
     if (COMMON != "" && MISSING[j]) n = override_lines(L, n, "ioengine", COMMON)
     kind = KIND[j]; floor = FLOORJ[j]
     if (kind != "" && (slot = pick_slot(kind, D, ROW)) != "")
