@@ -640,6 +640,13 @@ run_jobs() {
                 die "layout $job failed -- the files were not created (raw output in $outfile)"
             fi
             log "layout: complete in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
+            if [ "$LAYOUT_OWN" -eq 0 ]; then
+                # a sequential write of what was missing: reported as a test
+                log "layout sequential write ($job), the data the sweep found missing, on ${#lclients[@]} host(s):"
+                summ_one "$outfile" "$outfile" layout "${lclients[*]}" file \
+                    || die "failed to summarize $outfile"
+                continue
+            fi
             echo
             continue
         fi
@@ -702,16 +709,29 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         else
             printf '(no synopsis: %s holds %d top-level directories, where a run bundle has one)\n\n' "$path" ${#rds[@]}
         fi
-        # layout results are barriers: the reserved names, plus any bundled
-        # jobfile with the layout marker (/dev/null keeps awk off stdin without
-        # one)
-        skip=" ${LAYOUT_JOB%.job} 000-wekatester-relayout ${UNLINK_JOB%.job} "
-        skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
-            | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
+        # A layout staged as a dense write reports as a test; any other layout
+        # result is a barrier: the reserved names, plus any bundled jobfile
+        # with the layout marker (/dev/null keeps awk off stdin without one).
+        # "W <job>" names a write layout, "L <job>" another.
+        skip=" 000-wekatester-relayout ${UNLINK_JOB%.job} "; local lay=" " k n
+        while read -r k n; do
+            case $k in (W) lay="$lay$n " ;; (L) skip="$skip$n " ;; esac
+        done < <(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
+            | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" -v w="$LAYOUT_WRITE_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); print (index($0, w) == 1 ? "W " : "L ") p[n] }' /dev/null)
+        case "$lay" in (*" ${LAYOUT_JOB%.job} "*) ;; (*) skip="$skip${LAYOUT_JOB%.job} " ;; esac
+        # a run with every file complete ran no layout and recorded so
+        if [ ${#rds[@]} -eq 1 ] && [ -f "${rds[0]}/settings" ] \
+            && LC_ALL=C awk -F'\t' '$1 == "layout" && $2 == "nothing to write (files reused)" { f = 1 } END { exit !f }' "${rds[0]}/settings"; then
+            echo "layout: nothing to write (files reused)"; echo
+        fi
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
         [ -z "$results" ] || while IFS= read -r f; do
             job=${f##*/}; job=${job#results_}; job=${job%.json}
             case "$skip" in *" $job "*) continue ;; esac
+            case "$lay" in
+                (*" $job "*) echo "==== $job (layout sequential write) ===="
+                             summ_one "$f" "${f##*/}" layout "" bundle; continue ;;
+            esac
             echo "==== $job ===="
             summ_one "$f" "${f##*/}" "$items" "" bundle
         done <<<"$results"

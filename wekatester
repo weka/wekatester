@@ -8162,6 +8162,13 @@ run_jobs() {
                 die "layout $job failed -- the files were not created (raw output in $outfile)"
             fi
             log "layout: complete in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
+            if [ "$LAYOUT_OWN" -eq 0 ]; then
+                # a sequential write of what was missing: reported as a test
+                log "layout sequential write ($job), the data the sweep found missing, on ${#lclients[@]} host(s):"
+                summ_one "$outfile" "$outfile" layout "${lclients[*]}" file \
+                    || die "failed to summarize $outfile"
+                continue
+            fi
             echo
             continue
         fi
@@ -8224,16 +8231,29 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         else
             printf '(no synopsis: %s holds %d top-level directories, where a run bundle has one)\n\n' "$path" ${#rds[@]}
         fi
-        # layout results are barriers: the reserved names, plus any bundled
-        # jobfile with the layout marker (/dev/null keeps awk off stdin without
-        # one)
-        skip=" ${LAYOUT_JOB%.job} 000-wekatester-relayout ${UNLINK_JOB%.job} "
-        skip="$skip$(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
-            | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); printf "%s ", p[n] }' /dev/null) "
+        # A layout staged as a dense write reports as a test; any other layout
+        # result is a barrier: the reserved names, plus any bundled jobfile
+        # with the layout marker (/dev/null keeps awk off stdin without one).
+        # "W <job>" names a write layout, "L <job>" another.
+        skip=" 000-wekatester-relayout ${UNLINK_JOB%.job} "; local lay=" " k n
+        while read -r k n; do
+            case $k in (W) lay="$lay$n " ;; (L) skip="$skip$n " ;; esac
+        done < <(find "$tmp" -path '*/fio-jobfiles/*' -name '*.job' -type f -print0 \
+            | xargs -0 env LC_ALL=C awk -v m="$LAYOUT_MARKER" -v w="$LAYOUT_WRITE_MARKER" 'FNR <= 3 && index($0, m) == 1 && !(FILENAME in d) { d[FILENAME] = 1; n = split(FILENAME, p, "/"); sub(/\.job$/, "", p[n]); print (index($0, w) == 1 ? "W " : "L ") p[n] }' /dev/null)
+        case "$lay" in (*" ${LAYOUT_JOB%.job} "*) ;; (*) skip="$skip${LAYOUT_JOB%.job} " ;; esac
+        # a run with every file complete ran no layout and recorded so
+        if [ ${#rds[@]} -eq 1 ] && [ -f "${rds[0]}/settings" ] \
+            && LC_ALL=C awk -F'\t' '$1 == "layout" && $2 == "nothing to write (files reused)" { f = 1 } END { exit !f }' "${rds[0]}/settings"; then
+            echo "layout: nothing to write (files reused)"; echo
+        fi
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
         [ -z "$results" ] || while IFS= read -r f; do
             job=${f##*/}; job=${job#results_}; job=${job%.json}
             case "$skip" in *" $job "*) continue ;; esac
+            case "$lay" in
+                (*" $job "*) echo "==== $job (layout sequential write) ===="
+                             summ_one "$f" "${f##*/}" layout "" bundle; continue ;;
+            esac
             echo "==== $job ===="
             summ_one "$f" "${f##*/}" "$items" "" bundle
         done <<<"$results"
@@ -8714,6 +8734,8 @@ summ_one() {
                          if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
         function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
                           if (ns >= 1e3) return sprintf("%.1f us", ns / 1e3); return sprintf("%.0f ns", ns) }
+        function fz(n) { if (n >= 2^40) return sprintf("%.2f TiB", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB", n / 2^30)
+                         if (n >= 2^20) return sprintf("%.2f MiB", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB", n / 2^10); return sprintf("%.0f bytes", n) }
         function fi(n,   s, r) { s = sprintf("%.0f", n); r = ""; while (length(s) > 3) { r = "," substr(s, length(s) - 2) r; s = substr(s, 1, length(s) - 3) } return s r "/s" }
         # the FIRST missing value names the error: the direction when absent,
         # else the leaf key
@@ -8729,6 +8751,7 @@ summ_one() {
                 i = last[h]
                 if (m == "bw") x = val(i, "read.bw_bytes") + val(i, "write.bw_bytes")
                 else if (m == "iops") x = val(i, "read.iops") + val(i, "write.iops")
+                else if (m == "written") x = val(i, "write.io_bytes")
                 else x = val(i, substr(m, 5) ".lat_ns.mean")
                 if (first || x < lo || (x == lo && h < loh)) { lo = x; loh = h }
                 if (first || x > hi || (x == hi && h > hih)) { hi = x; hih = h }
@@ -8737,10 +8760,11 @@ summ_one() {
             if (lo == hi) return ""
             if (kind == "bw") return "  (min " fb(lo) " " loh ", max " fb(hi) " " hih ")"
             if (kind == "iops") return "  (min " fi(lo) " " loh ", max " fi(hi) " " hih ")"
+            if (kind == "bytes") return "  (min " fz(lo) " " loh ", max " fz(hi) " " hih ")"
             return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
         }
         # only the leaves val() reads are kept: an entry has ~240
-        BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios", kk, " "); for (j in kk) READS[kk[j]] = 1 }
+        BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios write.io_bytes", kk, " "); for (j in kk) READS[kk[j]] = 1 }
         $1 ~ /^client_stats\.[0-9]+\./ {
             n = split($1, a, "."); i = a[2]; k = a[3]
             for (j = 4; j <= n; j++) k = k "." a[j]
@@ -8777,6 +8801,13 @@ summ_one() {
                 if (nm) { printf "ERR\t%s: no results from %d of %d host(s): %s\n", label, nm, n, miss; exit }
             }
             nl = 0; missing = ""
+            # the layout'\''s sequential write, reported as a test (run_jobs, -s)
+            if (index(items, " layout ")) {
+                w = val(alls, "write.bw_bytes"); z = val(alls, "write.io_bytes")
+                L[++nl] = "write bandwidth: " fb(w)
+                L[++nl] = "average bandwidth: " fb(nh ? w / nh : 0) " per host" spread("bw", "bw")
+                L[++nl] = "written: " fz(z) ", " fz(nh ? z / nh : 0) " per host" spread("written", "bytes")
+            }
             if (index(items, " bandwidth ")) {
                 r = val(alls, "read.bw_bytes"); w = val(alls, "write.bw_bytes")
                 if (r) L[++nl] = "read bandwidth: " fb(r)

@@ -2,6 +2,8 @@ function fb(n) { if (n >= 2^40) return sprintf("%.2f TiB/s", n / 2^40); if (n >=
                  if (n >= 2^20) return sprintf("%.2f MiB/s", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB/s", n / 2^10); return sprintf("%.0f bytes/s", n) }
 function fl(ns) { if (ns >= 1e9) return sprintf("%.1f s", ns / 1e9); if (ns >= 1e6) return sprintf("%.1f ms", ns / 1e6)
                   if (ns >= 1e3) return sprintf("%.1f us", ns / 1e3); return sprintf("%.0f ns", ns) }
+function fz(n) { if (n >= 2^40) return sprintf("%.2f TiB", n / 2^40); if (n >= 2^30) return sprintf("%.2f GiB", n / 2^30)
+                 if (n >= 2^20) return sprintf("%.2f MiB", n / 2^20); if (n >= 2^10) return sprintf("%.2f KiB", n / 2^10); return sprintf("%.0f bytes", n) }
 function fi(n,   s, r) { s = sprintf("%.0f", n); r = ""; while (length(s) > 3) { r = "," substr(s, length(s) - 2) r; s = substr(s, 1, length(s) - 3) } return s r "/s" }
 # the FIRST missing value names the error: the direction when absent,
 # else the leaf key
@@ -17,6 +19,7 @@ function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
         i = last[h]
         if (m == "bw") x = val(i, "read.bw_bytes") + val(i, "write.bw_bytes")
         else if (m == "iops") x = val(i, "read.iops") + val(i, "write.iops")
+        else if (m == "written") x = val(i, "write.io_bytes")
         else x = val(i, substr(m, 5) ".lat_ns.mean")
         if (first || x < lo || (x == lo && h < loh)) { lo = x; loh = h }
         if (first || x > hi || (x == hi && h > hih)) { hi = x; hih = h }
@@ -25,10 +28,11 @@ function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
     if (lo == hi) return ""
     if (kind == "bw") return "  (min " fb(lo) " " loh ", max " fb(hi) " " hih ")"
     if (kind == "iops") return "  (min " fi(lo) " " loh ", max " fi(hi) " " hih ")"
+    if (kind == "bytes") return "  (min " fz(lo) " " loh ", max " fz(hi) " " hih ")"
     return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
 }
 # only the leaves val() reads are kept: an entry has ~240
-BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios", kk, " "); for (j in kk) READS[kk[j]] = 1 }
+BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios write.io_bytes", kk, " "); for (j in kk) READS[kk[j]] = 1 }
 $1 ~ /^client_stats\.[0-9]+\./ {
     n = split($1, a, "."); i = a[2]; k = a[3]
     for (j = 4; j <= n; j++) k = k "." a[j]
@@ -65,6 +69,13 @@ END {
         if (nm) { printf "ERR\t%s: no results from %d of %d host(s): %s\n", label, nm, n, miss; exit }
     }
     nl = 0; missing = ""
+    # the layout's sequential write, reported as a test (run_jobs, -s)
+    if (index(items, " layout ")) {
+        w = val(alls, "write.bw_bytes"); z = val(alls, "write.io_bytes")
+        L[++nl] = "write bandwidth: " fb(w)
+        L[++nl] = "average bandwidth: " fb(nh ? w / nh : 0) " per host" spread("bw", "bw")
+        L[++nl] = "written: " fz(z) ", " fz(nh ? z / nh : 0) " per host" spread("written", "bytes")
+    }
     if (index(items, " bandwidth ")) {
         r = val(alls, "read.bw_bytes"); w = val(alls, "write.bw_bytes")
         if (r) L[++nl] = "read bandwidth: " fb(r)

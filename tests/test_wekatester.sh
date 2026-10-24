@@ -1964,6 +1964,28 @@ t_assert "-s summarizes every job in a bundle, in order, skipping layout results
         *"==== 011-bw ===="*"read bandwidth: 2.00 GiB/s"*"==== 021-mix ===="*"total bandwidth: 7.00 GiB/s"*"==== 030-broken ===="*"no JSON in fio output"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+# The layout is now a sequential write of what was missing: its results are
+# a measurement, reported like a test, run and -s alike.
+t_assert "-s: a layout staged as a dense write reports as the layout's sequential write; a run with nothing to write says so" bash -c '
+    d=$(mktemp -d); b="$d/20260101-000000"; mkdir -p "$b/fio-jobfiles/h1"
+    w() { printf "{ \"jobname\": \"%s\", \"hostname\": \"%s\", \"error\": 0, \"read\": { \"bw_bytes\": 0, \"iops\": 0, \"total_ios\": 0, \"io_bytes\": 0, \"lat_ns\": { \"mean\": 0 } }, \"write\": { \"bw_bytes\": %s, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": %s, \"lat_ns\": { \"mean\": 1 } } }" "$1" "$2" "$3" "$4"; }
+    printf "{ \"client_stats\": [ %s, %s, %s ] }\n" "$(w lay-0 h1 1073741824 10737418240)" "$(w lay-0 h2 2147483648 21474836480)" \
+        "$(w "All clients" "" 3221225472 32212254720)" > "$b/results_000-wekatester-layout.json"
+    printf "# wekatester-layout: generated as a dense write\n[global]\n[lay-0]\nrw=write\nfilename=h1.0\n" > "$b/fio-jobfiles/h1/000-wekatester-layout.job"
+    tar -czf "$d/bundle.tgz" -C "$d" 20260101-000000
+    out=$(./wekatester -s "$d/bundle.tgz") || { echo "$out" >&2; exit 1; }
+    want="==== 000-wekatester-layout (layout sequential write) ====
+    write bandwidth: 3.00 GiB/s
+    average bandwidth: 1.50 GiB/s per host  (min 1.00 GiB/s h1, max 2.00 GiB/s h2)
+    written: 30.00 GiB, 15.00 GiB per host  (min 10.00 GiB h1, max 20.00 GiB h2)"
+    case "$out" in *"$want"*) true;; *) printf "%s\n--- want:\n%s\n" "$out" "$want" >&2; exit 1;; esac
+    # every file complete: no layout ran, and the settings record says so
+    rm "$b/results_000-wekatester-layout.json"
+    printf "{ \"client_stats\": [ %s ] }\n" "$(w bw h1 1073741824 1073741824)" > "$b/results_011-bw.json"
+    printf "version\tx\nlayout\tnothing to write (files reused)\n" > "$b/settings"
+    tar -czf "$d/bundle2.tgz" -C "$d" 20260101-000000
+    out=$(./wekatester -s "$d/bundle2.tgz") || { echo "$out" >&2; exit 1; }
+    case "$out" in *"layout: nothing to write (files reused)"*"==== 011-bw ===="*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "-s: a result in another JSON layout is named; the rest of the bundle still summarizes" bash -c '
     source ./tests/helpers.sh
     d=$(mktemp -d); b="$d/20260101-000000"; mkdir -p "$b"
@@ -3810,6 +3832,25 @@ t_assert "run_jobs: a staged layout with nothing to write runs no fio and says s
      run_jobs) 2>&1 ) || { echo "$out" >&2; exit 1; }
     ! grep -q "000-wekatester-layout.job" "$d/oplog" &&
     case "$out" in *"layout: nothing to write (files reused)"*) true;; *) echo "$out" >&2; false;; esac'
+t_assert "run_jobs: the layout's sequential write prints a block like a test: bandwidth, the host spread and the bytes written" bash -c '
+    d=$(mktemp -d)
+    w() { printf "{ \"jobname\": \"%s\", \"hostname\": \"%s\", \"error\": 0, \"read\": { \"bw_bytes\": 0, \"iops\": 0, \"total_ios\": 0, \"io_bytes\": 0, \"lat_ns\": { \"mean\": 0 } }, \"write\": { \"bw_bytes\": %s, \"iops\": 1, \"total_ios\": 1, \"io_bytes\": %s, \"lat_ns\": { \"mean\": 1 } } }" "$1" "$2" "$3" "$4"; }
+    printf "{ \"client_stats\": [ %s, %s, %s ] }\n" "$(w lay-0 h1 1073741824 10737418240)" "$(w lay-0 h2 2147483648 21474836480)" \
+        "$(w "All clients" "" 3221225472 32212254720)" > "$d/r.json"
+    out=$( (source ./wekatester
+     WORK_DIR=$d; SET_DIR=$d/set; RUN_DIR=$d/out; HOSTS=(h1 h2); MASTER=h1
+     FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka
+     mkdir -p "$d/jobs/h1" "$d/jobs/h2" "$SET_DIR" "$RUN_DIR"
+     for h in h1 h2; do printf "%s\n[global]\n[lay-0]\nrw=write\nfilename=%s.0\n" "$LAYOUT_WRITE_MARKER" "$h" > "$d/jobs/$h/000-wekatester-layout.job"; done
+     printf "# wekatester-layout: generated sha256=abc\n[l]\ncreate_only=1\n" > "$SET_DIR/000-wekatester-layout.job"
+     JOBFILES=(000-wekatester-layout.job)
+     run_host() { cat "$d/r.json"; }
+     run_jobs) 2>&1 ) || { echo "$out" >&2; exit 1; }
+    want="layout sequential write (000-wekatester-layout.job), the data the sweep found missing, on 2 host(s):
+    write bandwidth: 3.00 GiB/s
+    average bandwidth: 1.50 GiB/s per host  (min 1.00 GiB/s h1, max 2.00 GiB/s h2)
+    written: 30.00 GiB, 15.00 GiB per host  (min 10.00 GiB h1, max 20.00 GiB h2)"
+    case "$out" in *"layout: complete in "*"$want"*) true;; *) printf "%s\n--- want:\n%s\n" "$out" "$want" >&2; false;; esac'
 t_assert "main: the layout is staged from the sweep, before the capacity check and the push; a dry run stages it too" bash -c '
     body=$(source ./wekatester; declare -f main)
     case "$body" in
