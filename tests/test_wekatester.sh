@@ -238,9 +238,12 @@ t_assert "settings: WT_VERBOSE takes from the file, loses to env and to -v (neve
     st_case WT_VERBOSE 2 1 '$VERBOSITY' 2 1 3 -vvv
 t_assert "settings: WT_VERBOSE above 3 stops the run naming the source; 3 is the top" bash -c '
     e=$(st_run - WT_VERBOSE=4 "\$VERBOSITY"); f=$(st_run WT_VERBOSE=4 - "\$VERBOSITY"); t=$(st_run WT_VERBOSE=3 - "\$VERBOSITY")
+    # 2^64+3 wraps to 3 in bash arithmetic; leading zeros are still a count
+    w=$(st_run - WT_VERBOSE=18446744073709551619 "\$VERBOSITY"); z=$(st_run WT_VERBOSE=0003 - "\$VERBOSITY")
     case "$e" in *"environment: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "e: $e" >&2; exit 1;; esac
     case "$f" in *"h.csv:2: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "f: $f" >&2; exit 1;; esac
-    [ "$t" = 3 ] || { echo "t: $t" >&2; false; }'
+    case "$w" in *"environment: WT_VERBOSE takes a count 0..3, not '\''18446744073709551619'\''"*) ;; *) echo "w: $w" >&2; exit 1;; esac
+    [ "$t" = 3 ] && [ "$z" = 3 ] || { echo "t: $t z: $z" >&2; false; }'
 # cli_settings_seen keeps its own list of spellings: every one a setting's
 # help line names (short, long, --long=value, -Xvalue) must mark that
 # setting alone, and every option parse_args takes is a setting or listed
