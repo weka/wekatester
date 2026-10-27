@@ -588,7 +588,17 @@ main() {
     # The host file's settings before any of them is used, then the
     # combinations the passes before it could not check.
     if [ "$TARGETS" -eq 1 ]; then
-        resolve_targets_file
+        targets_path
+        if [ ! -f "$TARGETS_FILE" ]; then
+            # a new file holds only defaults: every check that needs no file
+            # runs first, so a failing one leaves no file behind
+            settings_check_env
+            check_args
+            resolve_local_mode
+            validate_credentials
+            create_targets_file
+        fi
+        log "host file: $TARGETS_FILE"
         settings_from_file
         check_args
     fi

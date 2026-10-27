@@ -4442,6 +4442,21 @@ t_assert "targets file: yes creates the template and uses it" bash -c '
         resolve_targets_file
         [ "$TARGETS_FILE" = "$d/new.csv" ]) >>$SUITE_ASIDE
     head -1 "$d/new.csv" | grep -q "^host,user_login"'
+t_assert "targets file: a missing one is created only after the checks that need no file pass (a bad -i key leaves none)" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"; chmod +x "$d/bin/uname"
+    out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
+          bash ./wekatester -r -t "$d/new.csv" -i /no/such/key h1 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "$d/new.csv" ] || { echo "rc=$rc new.csv: $(ls "$d"); $out" >&2; exit 1; }
+    case "$out" in *"identity file not readable: /no/such/key"*) ;; *) echo "$out" >&2; exit 1;; esac
+    # control: with a readable key the same command line creates the file
+    touch "$d/k"; out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
+          bash ./wekatester -r -n -t "$d/new.csv" -i "$d/k" h1 2>&1)
+    head -1 "$d/new.csv" | grep -q "^host,user_login" || { echo "control: $out" >&2; false; }'
+t_assert "validate_credentials runs once: a second call adds no key" bash -c '
+    d=$(mktemp -d); touch "$d/k"
+    (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("u:$d/k")
+     validate_credentials; validate_credentials
+     [ ${#IDENT_KEYS[@]} -eq 1 ] && [ ${#IDENT_LOGINS[@]} -eq 1 ] || { echo "keys ${IDENT_KEYS[*]} logins ${IDENT_LOGINS[*]}" >&2; false; })'
 t_assert "targets file: under -r a missing path is created after the 5s default" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

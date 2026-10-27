@@ -138,13 +138,16 @@ resolve_local_mode() {
 
 # Split -i entries into (login, key) at the first colon, in order. Paths are
 # checked now: left to ssh, a typo fails every host and reads like a cluster
-# problem.
+# problem. Once per run: a second call would add every key again.
+CREDENTIALS_VALIDATED=""
 validate_credentials() {
     local raw entry login key
+    [ -z "$CREDENTIALS_VALIDATED" ] || return 0
     if [ "$LOCAL_MODE" -eq 1 ]; then
         # Local mode: accepted and ignored, like --ignore-capacity outside -a.
         [ ${#IDENT_RAW[@]} -eq 0 ] && [ "$PW_COUNT" -eq 0 ] \
             || debug "local mode: ignoring -i/-p (no ssh involved)"
+        CREDENTIALS_VALIDATED=1
         return 0
     fi
     for raw in ${IDENT_RAW[@]+"${IDENT_RAW[@]}"}; do
@@ -171,6 +174,7 @@ validate_credentials() {
             IDENT_KEYS+=("$key")
         done
     done
+    CREDENTIALS_VALIDATED=1
 }
 
 # --- interactive prompting (-p, a missing host file or destination, capacity) ---

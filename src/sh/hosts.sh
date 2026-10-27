@@ -131,6 +131,13 @@ host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
 
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
+    targets_path
+    [ -f "$TARGETS_FILE" ] || create_targets_file
+    log "host file: $TARGETS_FILE"
+}
+
+# The -t file this run reads, which may not exist yet. -> TARGETS_FILE
+targets_path() {
     local candidate
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
@@ -139,6 +146,12 @@ resolve_targets_file() {
         [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
         [ -f "$candidate" ] || candidate="./hostlist.csv"
     fi
+    TARGETS_FILE=$candidate
+}
+
+# A missing -t file, created from the template once the user agrees.
+create_targets_file() {
+    local candidate=$TARGETS_FILE
     if [ ! -f "$candidate" ]; then
         if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
             # 5s prompt when a terminal exists; without one, the default
@@ -158,8 +171,6 @@ resolve_targets_file() {
         fi
         write_targets_template "$candidate"
     fi
-    TARGETS_FILE=$candidate
-    log "host file: $TARGETS_FILE"
 }
 
 # Per-host resolved values, phase1 (login/dir before auth). Field numbers
