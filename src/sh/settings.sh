@@ -208,6 +208,47 @@ setting_where() {   # setting_where <name> -> SETTING_WHERE
     esac
 }
 
+# The value the run uses for a setting, wherever it came from.
+setting_value() {   # setting_value <name>
+    local IFS=,
+    case $1 in
+        (WT_DIRECTORY) printf '%s' "$DIRECTORY" ;;
+        (WT_WORKLOAD) printf '%s' "$WORKLOAD" ;;
+        (WT_FIO_BIN) printf '%s' "$FIO_BIN" ;;
+        (WT_OUTPUT) printf '%s' "$OUTPUT_DIR" ;;
+        (WT_ENGINE) if [ -n "${CLI_SET[WT_ENGINE]:-}" ]; then printf '%s' "$ENGINE"; else printf '%s' "$DEFAULT_ENGINE"; fi ;;
+        (WT_AUTO) printf '%s' "$AUTO_LEVEL" ;;
+        (WT_LINE_RATE) printf '%s' "$LINE_RATE_GBPS" ;;
+        (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
+        (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
+        (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;
+        (WT_IDENTITY) printf '%s' "${IDENT_RAW[*]}" ;;
+        (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;
+        (WT_BULK) printf '%s' "$BULK" ;;
+        (WT_DURATION) printf '%s' "$DURATION" ;;
+        (WT_UNLINK) printf '%s' "$UNLINK" ;;
+        (WT_VERBOSE) printf '%s' "$VERBOSITY" ;;
+        (*) printf '%s' "${!1-}" ;;
+    esac
+}
+
+# For the bundle: "<name><tab><value><tab><source>" for each setting whose
+# value is not its default; source is cli, environment or <file>:<line>.
+settings_provenance() {
+    local name src v
+    while read -r name _; do
+        v=$(setting_value "$name")
+        [ "$v" != "${SETTING_DEFAULT[$name]:-}" ] || continue
+        if [ -n "${CLI_SET[$name]:-}" ]; then
+            src=cli
+        else
+            src=${SETTING_SRC[$name]:-}
+            case $src in ("") continue ;; (environment*) src=environment ;; esac
+        fi
+        printf '%s\t%s\t%s\n' "$name" "$v" "$src"
+    done <<<"$SETTINGS_TABLE"
+}
+
 # The template's settings: each one's help, then the setting at its
 # built-in value.
 settings_template() {

@@ -29,7 +29,9 @@ start_run_log() {
 }
 
 # What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
-# settings holds what it resolved to, one "<key><tab><value>" per line.
+# settings holds what it resolved to, one "<key><tab><value>" per line,
+# then each WT_* setting whose value is not its default, as
+# "<name><tab><value><tab><source>".
 # Missing pieces only cost -s its header lines, never the run.
 record_run() {
     local q
@@ -46,6 +48,8 @@ record_run() {
     [ "$ALLOW_FIO_MISMATCH" -eq 0 ] \
         || printf 'allow-fio-mismatch\t%s\n' "${FIO_VERSION_NOTE:-not checked}" >> "$RUN_DIR/settings" \
         || log "WARNING: could not record --allow-fio-mismatch in $RUN_DIR/settings" >&2
+    settings_provenance >> "$RUN_DIR/settings" \
+        || log "WARNING: could not record where the settings came from in $RUN_DIR/settings" >&2
 }
 
 # Per-host system context, one file per item under sysinfo/<host>/ (README,

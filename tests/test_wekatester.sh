@@ -2178,6 +2178,20 @@ t_assert "run bundle: no -a records auto and cal-seconds as -; sourced runs (no 
     d=$(mktemp -d)
     (source ./wekatester; RUN_DIR=$d; parse_args h1; record_run) >>$SUITE_ASIDE 2>&1 || exit 1
     [ ! -e "$d/cmdline" ] && grep -q "^auto	-$" "$d/settings" && grep -q "^cal-seconds	-$" "$d/settings"'
+t_assert "run bundle: settings records each WT_* setting off its default with its source; -s still reads the bundle" bash -c '
+    d=$(mktemp -d); r=$d/20260101-000000; printf "host,user_login\nWT_ENGINE=psync\nWT_SETTLE=2\n" > "$d/h.csv"
+    (unset $(compgen -v WT_); export WT_DURATION=900
+     source ./wekatester
+     settings_parse -t "$d/h.csv" -b h1 && TARGETS_FILE=$d/h.csv && settings_from_file && check_args && settings_check_env &&
+     RUN_DIR=$r && mkdir "$r" && record_run) >>$SUITE_ASIDE 2>&1 || exit 1
+    t=$(printf "\t")
+    # WT_SETTLE=2 is its default: not recorded
+    grep -qx "WT_DURATION${t}900${t}environment" "$r/settings" && grep -qx "WT_ENGINE${t}psync${t}$d/h.csv:2" "$r/settings" &&
+    grep -qx "WT_BULK${t}1${t}cli" "$r/settings" && [ "$(grep -c "^WT_" "$r/settings")" = 3 ] || { cat "$r/settings" >&2; exit 1; }
+    source ./tests/helpers.sh; fio_json_single_fixture "$r/results_011-bw.json"
+    tar -czf "$d/b.tgz" -C "$d" 20260101-000000
+    out=$(./wekatester -s "$d/b.tgz") || { echo "$out" >&2; exit 1; }
+    case "$out" in *"==== 011-bw ===="*) ;; *) echo "$out" >&2; false;; esac'
 t_assert "run bundle: the run records argv and settings right after the run dir exists, before the log starts" bash -c '
     m=$(sed -n "/^main() {/,/^}/p" ./wekatester)
     seq=$(printf "%s\n" "$m" | grep -A2 "mkdir \"\$RUN_DIR\"" | sed "s/^ *//;s/ *||.*//" | tr "\n" "|")
