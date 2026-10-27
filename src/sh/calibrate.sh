@@ -597,7 +597,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     CAL_REP_ALL=$allc
     # the shape's aio room (cal_shapes: its tightest member's), for cal_search
     CAL_REP_AIO=$aio
-    mkdir -p "$sdir""$WORK_DIR/cal/$rep" || die "cannot create $sdir"
+    mkdir -p "$sdir" "$WORK_DIR/cal/$rep" || die "cannot create $sdir"
     rm -f "$WORK_DIR/cal/$rep/seeded.read" "$WORK_DIR/cal/$rep/seeded.write"
     while read -r type dirn; do
         [ -n "$type" ] || continue

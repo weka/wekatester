@@ -6968,6 +6968,16 @@ t_assert "cal_shape_run: a libaio engine cell past the aio room is skipped and t
         { echo "cal_shape_run failed: $out" >&2; exit 1; }
     [ "$(cut -d" " -f3,5 "$d/calls" | tr "\n" ";")" = "bw libaio;bw psync;iops psync;" ] || { cat "$d/calls" >&2; exit 1; }
     case "$out" in *"no iops engine cell for libaio: numjobs=8 iodepth=16 would set up 128 aio events and the kernel has room for 16 (fs.aio-max-nr less fs.aio-nr, as probed)"*) true;; *) echo "$out" >&2; false;; esac'
+# PR #47 Bugbot: one mkdir argument had made cal/<rep> a path under cal/s<N>
+t_assert "cal_shape_run: creates cal/s<N> and cal/<rep> side by side, nothing under the shape dir" bash -c '
+    d=$(mktemp -d)
+    out=$( (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
+     cal_ensure_seed() { :; }; cal_run_cell() { :; }; cal_search() { :; }
+     cal_shape_run 1 h1 8 0-7 0-15 0 libaio - 0 64 "" "") 2>&1 ) ||
+        { echo "cal_shape_run failed: $out" >&2; exit 1; }
+    [ -d "$d/cal/s1" ] && [ -d "$d/cal/h1" ] && [ -z "$(ls -A "$d/cal/s1")" ] ||
+        { find "$d" >&2; false; }'
 t_assert "cal_lat_values: latency in us and IOPS per client, entries of one client weighted by IO count" bash -c '
     d=$(mktemp -d)
     printf "%s\n" "{ \"client_stats\": [ { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 100000 }, \"iops\": 1000, \"total_ios\": 300 } }, { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 200000 }, \"iops\": 500, \"total_ios\": 100 } }, { \"jobname\": \"All clients\", \"read\": { \"lat_ns\": { \"mean\": 9 } } } ] }" > "$d/r.json"
