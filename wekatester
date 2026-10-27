@@ -12,7 +12,7 @@ bash_floor_ok() {   # bash_floor_ok <major> <minor>: 4.4 or later
 }
 bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
     echo "wekatester needs bash 4.4 or later; this is ${BASH_VERSION:-not bash}" >&2
-    exit 1
+    exit 2
 }
 
 VERSION="2026-10-11"
@@ -51,16 +51,16 @@ LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
 
 SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
-# Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
-# TARGET_DIR export must not move it. Test plumbing only.
-TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
-LOCK_DIR="${WEKATESTER_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
+# Fixed paths, never settings: cleanup feeds TARGET_DIR to rm -rf on every
+# host. The WEKATESTER_SUITE_ hooks are the test suite's alone.
+TARGET_DIR="${WEKATESTER_SUITE_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
+LOCK_DIR="${WEKATESTER_SUITE_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
-# local staging: tmpfs, which every Linux controller has (the suite, run on a
-# development Mac, points WEKATESTER_STAGE_BASE elsewhere)
-STAGE_BASE=${WEKATESTER_STAGE_BASE:-/dev/shm}
+# local staging: tmpfs, which every Linux controller has; WT_STAGE_BASE=mktemp
+# (stage_base) moves it under $TMPDIR, as the suite does on a development Mac
+STAGE_BASE=/dev/shm
 
 # Control opts are per host (host_ssh_opts): a host on a user-owned master
 # must not get our ControlPath.
@@ -381,21 +381,53 @@ give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
+EOF
+    local k
+    for k in $USAGE_KEYS; do opt_help "$k"; done
+    cat <<EOF
+
+With no server given, the test runs on the local host -- no ssh required.
+EOF
+}
+
+# The options in -h order, one help block each: usage prints them all, and
+# the host-file template quotes a setting's block (README, Settings).
+USAGE_KEYS="directory workload fio_bin output engine auto line_rate ignore_capacity
+    break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
+    duration unlink summarize verbose version help dashdash"
+opt_help() {   # opt_help <key>
+    case $1 in
+    (directory) cat <<EOF
   -d, --directory dir     target directory on the workers for test files
                           (default: $DIRECTORY); must be on wekafs (see
                           --any-fs); created on request when it is missing
                           under a wekafs mount
+EOF
+    ;;
+    (workload) cat <<EOF
   -w, --workload set      workload definition directory, a subdir of
                           fio-jobfiles (default: $WORKLOAD)
+EOF
+    ;;
+    (fio_bin) cat <<EOF
   -f, --fio-bin path      fio binary on the workers (default: $FIO_BIN);
                           --local-fio is an older spelling
+EOF
+    ;;
+    (output) cat <<EOF
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
+EOF
+    ;;
+    (engine) cat <<EOF
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning; without
                           it: the host file's, the jobfile's own, else
                           (not under -a) the first of io_uring, libaio,
                           psync that passes a test job on the host
+EOF
+    ;;
+    (auto) cat <<EOF
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
@@ -415,67 +447,124 @@ attaching is the way to pass a value that starts with a dash.
                           15 for safe and max, 30 for cal and brutal); it
                           does not change how long the measured jobs run --
                           that is -x/--duration
+EOF
+    ;;
+    (line_rate) cat <<EOF
   --line-rate Gb/s        every client's dataplane line rate, for the -a
                           bandwidth target, in place of what ethtool reports:
                           a cloud VF can report 100 Gb/s on a 16 Gb/s
                           instance, and without the weka CLI nothing reports it
+EOF
+    ;;
+    (ignore_capacity) cat <<EOF
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+EOF
+    ;;
+    (break_lock) cat <<EOF
   --break-lock            a run that died left its lock, staging or fio on a
                           host: kill wekatester's own fio there, clear its
                           files and take the lock (fio it did not start still
                           stops the run)
+EOF
+    ;;
+    (any_fs) cat <<EOF
   --any-fs                turn the filesystem-type check off: -d may be on
                           any filesystem, a local disk included, and a
                           missing -d is created anywhere; the run log says
                           the check was off and what -d is on
+EOF
+    ;;
+    (allow_fio_mismatch) cat <<EOF
   --allow-fio-mismatch    run on when fio --version differs across the
                           hosts: each version and its hosts print as a
                           WARNING and the bundle's settings record it (a
                           host whose fio --version fails still stops the run)
+EOF
+    ;;
+    (identity) cat <<EOF
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
+EOF
+    ;;
+    (password) cat <<EOF
   -p, --password [n]      prompt for n (default 1) login/password pairs, tried
                           after the keys; no sshpass involved
                           Every credential is tried against every worker --
                           existing ssh sessions and plain defaults first, then
                           keys, then passwords -- and per worker the first
                           success wins
+EOF
+    ;;
+    (targets) cat <<EOF
   -t, --targets [file]    per-host settings from a CSV host file: login,
                           ioengine, cpus_allowed, destination dir, per-test
                           geometry. Bare -t = the set's own hostlist.csv,
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
+EOF
+    ;;
+    (bulk) cat <<EOF
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
+EOF
+    ;;
+    (fast) cat <<EOF
   -r             fast track: no prompts -- create whatever is needed (a
                  missing -d only under wekafs, anywhere with --any-fs) and run;
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
+EOF
+    ;;
+    (dry) cat <<EOF
   -n             dry run: create/generate, print the files and the run details;
                  no measured job runs, but a missing -d is created and the
                  ioengines are proven with small fio jobs (with -a/-t/-e,
                  or when a jobfile names none)
+EOF
+    ;;
+    (regen) cat <<EOF
   -g             force regeneration of existing layout jobfiles
+EOF
+    ;;
+    (duration) cat <<EOF
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
+EOF
+    ;;
+    (unlink) cat <<EOF
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun), and
                  the calibration scratch files, which are otherwise kept
                  so the next calibration can reuse them
+EOF
+    ;;
+    (summarize) cat <<EOF
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive, after a synopsis
                  of the run (README, Output) -- and exit; with -v, also
                  the counters that rose and each host's health flags
-  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
-  --version      display version number and exit
-  -h, --help     show this help and exit
-  --             everything after this is a server name
-
-With no server given, the test runs on the local host -- no ssh required.
 EOF
+    ;;
+    (verbose) cat <<EOF
+  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+EOF
+    ;;
+    (version) cat <<EOF
+  --version      display version number and exit
+EOF
+    ;;
+    (help) cat <<EOF
+  -h, --help     show this help and exit
+EOF
+    ;;
+    (dashdash) cat <<EOF
+  --             everything after this is a server name
+EOF
+    ;;
+    esac
 }
 
 # --- argument parsing ----------------------------------------------------------
@@ -1247,6 +1336,46 @@ function csv_line(s, F,    L, CN, CV, k) {   # one line, as csv.reader([line]) p
     for (k = 1; k <= CN[1]; k++) F[k] = CV[1, k]
     return CN[1]
 }
+# A first cell starting WT_ (any case) is a settings line, never a host:
+# a host name holds no underscore (RFC 1123).
+function is_setting_cell(cell) {
+    return tolower(strip(cell)) ~ /^wt_/
+}
+# A host cell with *, ? or [ before any /<machine-id> is a pattern row.
+function is_glob_cell(cell,    name) {
+    name = cell; sub(/\/.*/, "", name)
+    return name ~ /[*?[]/
+}
+# Shell glob to an anchored ERE, lowercased: * and ? cross dots, [..] and
+# [!..] are classes, every other character is literal. "" for a class that
+# holds [ or \, which the two awks read differently, or a backwards range
+# (z-a), which gawk aborts on, mawk reads as the set {a, z} and BSD awk never matches.
+function glob_re(g,    re, i, n, c, j, k, neg, body, p) {
+    g = tolower(g); re = "^"; n = length(g)
+    for (i = 1; i <= n; i++) {
+        c = substr(g, i, 1)
+        if (c == "*") re = re ".*"
+        else if (c == "?") re = re "."
+        else if (c == "[") {
+            k = i + 1; neg = substr(g, k, 1) == "!" || substr(g, k, 1) == "^"
+            if (neg) k++
+            j = k + (substr(g, k, 1) == "]")   # a leading ] is a member
+            while (j <= n && substr(g, j, 1) != "]") j++
+            if (j > n) { re = re "\\["; continue }   # unclosed: a literal [
+            body = substr(g, k, j - k)
+            if (index(body, "[") || index(body, "\\")) return ""
+            for (p = 1; p + 2 <= length(body); p++)
+                if (substr(body, p + 1, 1) == "-") {
+                    if (substr(body, p, 1) > substr(body, p + 2, 1)) return ""
+                    p += 2
+                }
+            re = re "[" (neg ? "^" : "") body "]"; i = j
+        } else if (c == "^" || c == "\\") re = re "\\" c
+        else if (index(".$+(){}|", c)) re = re "[" c "]"
+        else re = re c
+    }
+    return re "$"
+}
 # --- the calibration seed ---
 # A need is (nj, nr, mib) in ND[i, 1..3]. File f is sized to the largest share
 # any need takes (README, Seeding); all sizes fixed before the first seed.
@@ -1691,14 +1820,8 @@ parse_args() {
                            [ -n "$OUTPUT_DIR" ] || { usage >&2; die "option --output requires a value"; }
                            shift ;;
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
-            --line-rate)   need_arg "$1" $# "${2:-}"; LINE_RATE_GBPS=$2
-                           # an empty value (an unset variable in a wrapper)
-                           # would silently mean "no override"
-                           [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
-                           shift 2 ;;
-            --line-rate=*) LINE_RATE_GBPS=${opt#--line-rate=}
-                           [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
-                           shift ;;
+            --line-rate)   need_arg "$1" $# "${2:-}"; set_line_rate "$2"; shift 2 ;;
+            --line-rate=*) set_line_rate "${opt#--line-rate=}"; shift ;;
             -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
             --engine=*)    ENGINE=${opt#--engine=}
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
@@ -1798,15 +1921,16 @@ parse_args() {
         esac
     done
     MASTER=${HOSTS[0]:-}
-    # -d without its trailing slashes (the host file's column: trim_dir), or
-    # every "$hd/$glob" join misses what find prints. / stays /.
-    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
-        DIRECTORY=${DIRECTORY%/}
-    done
+    trim_directory
     [ "$DIRECTORY_EXPLICIT" -eq 0 ] || CLI_DIR=$DIRECTORY
+    # a setting's own check (settings.sh) and the passes before the host
+    # file is read leave the combinations for check_args
+    [ -n "${PARSE_PRECHECK:-}" ] || check_args
+}
 
-    # Combination checks live here rather than in main so they hold for every
-    # caller -- the test suite drives parse_args directly.
+# Combination checks: in parse_args for every caller (the test suite drives
+# it directly), and once more after the host file's settings.
+check_args() {
     # A host named twice gave fio two --client= and raced two lock sessions.
     # Same host = same string: a CLI host is an address (hosts.sh, host identity).
     local h n dups="" rep=()
@@ -1826,18 +1950,33 @@ parse_args() {
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
     fi
-    if [ -n "$LINE_RATE_GBPS" ]; then
-        case "$LINE_RATE_GBPS" in
-            (*[!0-9.]*|*.*.*|.)
-                usage >&2; die "--line-rate takes the line rate in Gb/s, a positive number such as 16 or 12.5: '$LINE_RATE_GBPS'" ;;
-        esac
-        # Bounded: under 8e-9 the target rounds to 0, past ~310 digits it is
-        # inf.
-        awk -v v="$LINE_RATE_GBPS" 'BEGIN {v += 0; exit !(v >= 0.1 && v <= 100000)}' \
-            || { usage >&2; die "--line-rate must be between 0.1 and 100000 Gb/s: '$LINE_RATE_GBPS'"; }
-        # only a calibration's bandwidth search has a target to set
-        cal_mode || { usage >&2; die "--line-rate sets the bandwidth target of a calibration: it needs -a"; }
-    fi
+    # only a calibration's bandwidth search has a target to set; a
+    # WT_LINE_RATE setting is named where it was set
+    [ -z "$LINE_RATE_GBPS" ] || cal_mode || { setting_where WT_LINE_RATE; usage >&2
+        die "${SETTING_WHERE}--line-rate sets the bandwidth target of a calibration: it needs -a"; }
+}
+
+# DIRECTORY without its trailing slashes (the host file's column: trim_dir),
+# or every "$hd/$glob" join misses what find prints. / stays /.
+trim_directory() {
+    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
+        DIRECTORY=${DIRECTORY%/}
+    done
+}
+
+set_line_rate() {   # set_line_rate <Gb/s>
+    LINE_RATE_GBPS=$1
+    # an empty value (an unset variable in a wrapper) would silently mean
+    # "no override"
+    [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
+    case "$LINE_RATE_GBPS" in
+        (*[!0-9.]*|*.*.*|.)
+            usage >&2; die "--line-rate takes the line rate in Gb/s, a positive number such as 16 or 12.5: '$LINE_RATE_GBPS'" ;;
+    esac
+    # Bounded: under 8e-9 the target rounds to 0, past ~310 digits it is
+    # inf.
+    awk -v v="$LINE_RATE_GBPS" 'BEGIN {v += 0; exit !(v >= 0.1 && v <= 100000)}' \
+        || { usage >&2; die "--line-rate must be between 0.1 and 100000 Gb/s: '$LINE_RATE_GBPS'"; }
 }
 
 # Every -a level calibrates: safe and max search numjobs only, cal and brutal
@@ -4513,7 +4652,7 @@ start_fio_servers() {
     [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
     # let the listeners settle before the first coordinator connect; the
     # override exists for the test suite, whose stubbed servers need no settling
-    sleep "${WEKATESTER_SETTLE:-2}"
+    sleep "${WT_SETTLE:-2}"
     debug "fio servers running on all hosts"
 }
 
@@ -4723,7 +4862,9 @@ make_ctrl_dir() {
 # first value, and BatchMode=yes disables askpass.
 prompt_password_creds() {
     local j login pw
-    require_interactive "-p" "use key-based auth (-i) for unattended runs"
+    # a WT_PASSWORD setting is named where it was set
+    setting_where WT_PASSWORD
+    require_interactive "${SETTING_WHERE}-p" "use key-based auth (-i) for unattended runs"
     for ((j = 1; j <= PW_COUNT; j++)); do
         printf 'ssh login %d of %d (empty for %s): ' "$j" "$PW_COUNT" "$(id -un)" >&"$PROMPT_OUT_FD"
         IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"
@@ -4958,7 +5099,7 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         # stall. So: the bounded job reports its exit status down a pipe,
         # read the moment it exits; past the read's bound it is killed, and
         # abandoned if it will not die.
-        tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
+        tmo=${WT_ENGINE_TEST_TIMEOUT:-15}
         # 137 is timeout's -k KILL: said in the evidence, which a silent
         # hung fio would otherwise leave empty, and unquoted.
         # bash -c: process substitution and read -t are bash's. fio
@@ -5089,7 +5230,11 @@ finalize_targets() {
     if [ -n "$bad" ]; then
         host=${bad%% *}; eng=${bad#* }
         [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
-        die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
+        # WT_ENGINE is every row's default: it may be where the engine came from
+        local what="host file"
+        [ -z "$DEFAULT_ENGINE" ] || [ "$eng" != "$DEFAULT_ENGINE" ] \
+            || what="host file (or WT_ENGINE, from ${SETTING_SRC[WT_ENGINE]:-the settings})"
+        die "$what assigns ioengine '$eng' to $host but its test job failed (fio output above)"
     fi
 }
 
@@ -5709,6 +5854,7 @@ write_targets_template() {   # write_targets_template <path>
     # the column list comes from the shared schema, not a second spelling
     for n in $GEOM_NAMES; do header="$header,$n:nj/fs/nr/qd"; done
     { printf '%s\n' "$header"
+      settings_template
       cat <<'CSVEOF'
 # One host per line assigns to that host; lines without a host apply to the
 # hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
@@ -5717,6 +5863,7 @@ write_targets_template() {   # write_targets_template <path>
 # whole tuple.
 # Example:  client-1,ubuntu,io_uring,"8,10",/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8
 # Example:  ,,io_uring,,,,,,,,     (io_uring for every host that supports it)
+# Example:  gpu-*,ubuntu,,,/mnt/weka,,,,,,   (a glob: every host it matches; * alone is every host)
 # A host may be written as <name>/<machine-id>; the id is ignored when the
 # row is read and only ever added by wekatester itself, to name a machine it
 # is recording for the first time. Plain hostnames are equally valid, and a
@@ -5939,7 +6086,8 @@ writeback_targets() {
     function own_line(line,    F, h) {   # the address of the host whose own line this is, or ""
         if (!csv_line(line, F)) return ""
         h = strip(F[1])
-        if (h == "" || substr(h, 1, 1) == "#" || tolower(h) == "host" || !(host_addr(h, ALIAS) in WANTED)) return ""
+        # a pattern row is never any host'\''s own line, whatever it matches
+        if (h == "" || substr(h, 1, 1) == "#" || tolower(h) == "host" || is_glob_cell(h) || is_setting_cell(h) || !(host_addr(h, ALIAS) in WANTED)) return ""
         OWN_CELL = h
         return host_addr(h, ALIAS)
     }
@@ -6136,109 +6284,397 @@ host_dir_v() {   # host_dir_v <host> -> HOST_DIR
 # what the writeback merges against; engines: every line's ioengine, one per
 # line (no hosts needed).
 resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
-    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") awkrun 'BEGIN {
-        phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
-        kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS)
-        nslot = split(geom_slots(), SLOT, " "); split(geom_names(), GNAME, " ")
-        split("nj fs nr qd", TUPLE, " "); ncols = 5 + nslot
-        split("login engine cpus dir", FIELD, " "); nfield = 4
-        for (s = 1; s <= nslot; s++) for (q = 1; q <= 4; q++) FIELD[++nfield] = SLOT[s] "_" TUPLE[q]
-        # ---- parse: one entry per row, its fields in the order they count ----
-        if ((n = readlines(path, L)) < 0) awk_fail("cannot read host file: " path)
-        nrec = csv_read(L, n, CN, CV); ne = 0
-        for (r = 1; r <= nrec; r++) {
-            all = ""
-            for (k = 1; k <= CN[r]; k++) all = all CV[r, k]
-            if (!CN[r] || strip(all) == "") continue
-            if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
-            if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
-            # an unquoted cpu list ("0-3, 8") splits into cells and shifts every
-            # later column; trailing empty cells (spreadsheet padding) are fine
-            for (w = CN[r]; w > ncols && strip(CV[r, w]) == ""; w--) ;
-            if (w > ncols)
-                awk_fail(path ":" r ": " w " cells, but a host-file row has at most " ncols " -- quote cpu lists, e.g. \"0-3,8\"")
-            for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
-            if (C[5] != "" && substr(C[5], 1, 1) != "/")
-                awk_fail(path ":" r ": destination dir \047" C[5] "\047 is not an absolute path -- quote cpu lists, e.g. \"0-3,8\"")
-            ne++; nk = 0
-            if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
-            if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }
-            if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = trim_dir(C[5]) }
-            # geometry: "bandwidthR:12/10G/1/8" or a bare "12/10G/1/8";
-            # empty parts are unset
-            for (s = 1; s <= nslot; s++) {
-                if ((raw = C[5 + s]) == "") continue
-                if ((p = index(raw, ":"))) {
-                    pfx = substr(raw, 1, p - 1)
-                    if (tolower(strip(pfx)) != tolower(GNAME[s]))
-                        awk_fail(path ":" r ": column for " GNAME[s] " carries prefix \047" pfx "\047")
-                    raw = substr(raw, p + 1)
-                }
-                np = lsplit(raw, PART, "/")
-                for (q = 1; q <= 4 && q <= np; q++)
-                    if (strip(PART[q]) != "") { EK[ne, ++nk] = SLOT[s] "_" TUPLE[q]; EV[ne, nk] = strip(PART[q]) }
-            }
-            ELINE[ne] = r
-            if ((EHOST[ne] = host_addr(C[1], ALIAS)) != "") {
-                if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
-                h = EHOST[ne]
-                if (h in HLINE) {
-                    # two spellings of one machine, most likely one short name
-                    # with two machine ids, both resolving to the same address
-                    extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
-                    awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
-                }
-                HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne
-                ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 3
-            } else {
-                # host-less: login and engine are SELECTORS; login is never assigned
-                ELOGIN[ne] = C[2]; EENG[ne] = C[3]; ENSEL[ne] = (C[2] != "") + (C[3] != "")
-                HL[++nhl] = ne   # the host-less lines, in file order
-            }
-            ENK[ne] = nk
-        }
-        # ---- engines: every line'\''s ioengine, the candidates test_engines proves ----
-        if (phase == "engines")
-            for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
-        # ---- phase2 input: the engine test results ----
-        if (phase == "phase2" && results != "-") {
-            if ((n = readlines(results, L)) < 0) awk_fail("cannot read " results)
-            for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 3 && F[3] == "ok") PASSED[F[1], F[2]] = 1
-        }
-        # ---- resolve per host ----
-        for (a = 6; a < ARGC; a++) {
-            h = ARGV[a]; split("", CFG); split("", SN); split("", SL)
-            # the host line first: the most specific, unique -- looked up,
-            # not scanned for: a scan per host was hosts x lines
-            if (h in HENT) {
-                e = HENT[h]
-                for (j = 1; j <= ENK[e]; j++) { k = EK[e, j]; CFG[k] = EV[e, j]; SN[k] = ENSEL[e]; SL[k] = ELINE[e] }
-            }
-            login = ("login" in CFG) ? CFG["login"] : ""
-            # host-less lines, most selectors first, ties to the first line
-            # (none in hostonly: their values are defaults, not the host own)
-            for (sel = 2; sel >= 0 && phase != "hostonly"; sel--)
-                for (q = 1; q <= nhl; q++) {
-                    e = HL[q]
-                    if (ENSEL[e] != sel) continue
-                    if (ELOGIN[e] != "" && ELOGIN[e] != login) continue
-                    # an engine selector needs test results; it folds in later
-                    if (EENG[e] != "" && (phase != "phase2" || !((h, EENG[e]) in PASSED))) continue
-                    for (j = 1; j <= ENK[e]; j++) {
-                        k = EK[e, j]; v = EV[e, j]
-                        if (k == "login") continue
-                        if (!(k in CFG)) { CFG[k] = v; SN[k] = sel; SL[k] = ELINE[e] }
-                        else if (SN[k] == sel && CFG[k] != v)
-                            print "WARNING: " path ": host \047" h "\047 field \047" k "\047: line " ELINE[e] " conflicts with equally specific line " SL[k] "; keeping line " SL[k] > "/dev/stderr"
+    # under -e no host runs WT_ENGINE: it is neither proven nor resolved
+    local de=$DEFAULT_ENGINE
+    [ -z "$ENGINE" ] || de=""
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") WEKATESTER_DEFAULT_ENGINE=$de \
+        awkrun 'BEGIN {
+            phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
+            kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); def_engine = ENVIRON["WEKATESTER_DEFAULT_ENGINE"]
+            nslot = split(geom_slots(), SLOT, " "); split(geom_names(), GNAME, " ")
+            split("nj fs nr qd", TUPLE, " "); ncols = 5 + nslot
+            split("login engine cpus dir", FIELD, " "); nfield = 4
+            for (s = 1; s <= nslot; s++) for (q = 1; q <= 4; q++) FIELD[++nfield] = SLOT[s] "_" TUPLE[q]
+            # ---- parse: one entry per row, its fields in the order they count ----
+            if ((n = readlines(path, L)) < 0) awk_fail("cannot read host file: " path)
+            nrec = csv_read(L, n, CN, CV); ne = 0
+            for (r = 1; r <= nrec; r++) {
+                all = ""
+                for (k = 1; k <= CN[r]; k++) all = all CV[r, k]
+                if (!CN[r] || strip(all) == "") continue
+                if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
+                if (is_setting_cell(CV[r, 1])) continue   # read_settings reads these
+                if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
+                # an unquoted cpu list ("0-3, 8") splits into cells and shifts every
+                # later column; trailing empty cells (spreadsheet padding) are fine
+                for (w = CN[r]; w > ncols && strip(CV[r, w]) == ""; w--) ;
+                if (w > ncols)
+                    awk_fail(path ":" r ": " w " cells, but a host-file row has at most " ncols " -- quote cpu lists, e.g. \"0-3,8\"")
+                for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
+                if (C[5] != "" && substr(C[5], 1, 1) != "/")
+                    awk_fail(path ":" r ": destination dir \047" C[5] "\047 is not an absolute path -- quote cpu lists, e.g. \"0-3,8\"")
+                ne++; nk = 0
+                if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
+                if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }
+                if (C[5] != "") { EK[ne, ++nk] = "dir"; EV[ne, nk] = trim_dir(C[5]) }
+                # geometry: "bandwidthR:12/10G/1/8" or a bare "12/10G/1/8";
+                # empty parts are unset
+                for (s = 1; s <= nslot; s++) {
+                    if ((raw = C[5 + s]) == "") continue
+                    if ((p = index(raw, ":"))) {
+                        pfx = substr(raw, 1, p - 1)
+                        if (tolower(strip(pfx)) != tolower(GNAME[s]))
+                            awk_fail(path ":" r ": column for " GNAME[s] " carries prefix \047" pfx "\047")
+                        raw = substr(raw, p + 1)
                     }
+                    np = lsplit(raw, PART, "/")
+                    for (q = 1; q <= 4 && q <= np; q++)
+                        if (strip(PART[q]) != "") { EK[ne, ++nk] = SLOT[s] "_" TUPLE[q]; EV[ne, nk] = strip(PART[q]) }
                 }
-            if (cli_engine != "-") CFG["engine"] = cli_engine   # the CLI beats the file
-            if (cli_dir != "-") CFG["dir"] = cli_dir
-            line = h
-            for (f = 1; f <= nfield; f++) line = line "\t" ((FIELD[f] in CFG) && CFG[FIELD[f]] != "" ? CFG[FIELD[f]] : "-")
-            print line
+                ELINE[ne] = r
+                if (is_glob_cell(C[1])) {
+                    # a pattern row: a host line for every host it matches, its
+                    # login assigned; a name glob outranks the bare * row
+                    pat = C[1]; sub(/\/.*/, "", pat); pat = strip(pat)
+                    if ((ERE[ne] = glob_re(pat)) == "")
+                        awk_fail(path ":" r ": host pattern \047" pat "\047: a [...] class may not hold [ or \\ or a backwards range such as z-a")
+                    if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
+                    EPAT[ne] = pat; ENSEL[ne] = pat == "*" ? 3 : 4
+                    GL[++ngl] = ne   # the pattern rows, in file order
+                } else if ((EHOST[ne] = host_addr(C[1], ALIAS)) != "") {
+                    if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
+                    h = EHOST[ne]
+                    if (h in HLINE) {
+                        # two spellings of one machine, most likely one short name
+                        # with two machine ids, both resolving to the same address
+                        extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
+                        awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
+                    }
+                    HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne
+                    ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
+                } else {
+                    # host-less: login and engine are SELECTORS; login is never assigned
+                    ELOGIN[ne] = C[2]; EENG[ne] = C[3]; ENSEL[ne] = (C[2] != "") + (C[3] != "")
+                    HL[++nhl] = ne   # the host-less lines, in file order
+                }
+                ENK[ne] = nk
+            }
+            # ---- engines: every line'\''s ioengine, the candidates test_engines proves ----
+            if (phase == "engines") {
+                for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
+                if (def_engine != "") print def_engine
+            }
+            # ---- phase2 input: the engine test results ----
+            if (phase == "phase2" && results != "-") {
+                if ((n = readlines(results, L)) < 0) awk_fail("cannot read " results)
+                for (i = 1; i <= n; i++) if (pysplit(L[i], F) == 3 && F[3] == "ok") PASSED[F[1], F[2]] = 1
+            }
+            # ---- resolve per host ----
+            # a pattern matches the address or a name aliased to it (local mode)
+            for (nm in ALIAS) NAMES[ALIAS[nm]] = NAMES[ALIAS[nm]] "\n" tolower(nm)
+            for (a = 6; a < ARGC; a++) {
+                h = ARGV[a]; split("", CFG); split("", SN); split("", SL)
+                # the host line first: the most specific, unique -- looked up,
+                # not scanned for: a scan per host was hosts x lines
+                if (h in HENT) {
+                    e = HENT[h]
+                    for (j = 1; j <= ENK[e]; j++) { k = EK[e, j]; CFG[k] = EV[e, j]; SN[k] = ENSEL[e]; SL[k] = ELINE[e] }
+                }
+                # then the pattern rows, name globs before *; not the host own
+                nn = split(tolower(h) NAMES[h], NM, "\n")
+                for (sel = 4; sel >= 3 && phase != "hostonly"; sel--)
+                    for (q = 1; q <= ngl; q++) {
+                        e = GL[q]
+                        if (ENSEL[e] != sel) continue
+                        for (i = 1; i <= nn && NM[i] !~ ERE[e]; i++) ;
+                        if (i > nn) continue
+                        GHIT[e] = 1
+                        for (j = 1; j <= ENK[e]; j++) {
+                            k = EK[e, j]; v = EV[e, j]
+                            if (!(k in CFG)) { CFG[k] = v; SN[k] = sel; SL[k] = ELINE[e] }
+                            else if (SN[k] == sel && CFG[k] != v)
+                                print "WARNING: " path ": host \047" h "\047 field \047" k "\047: line " ELINE[e] " conflicts with equally specific line " SL[k] "; keeping line " SL[k] > "/dev/stderr"
+                        }
+                    }
+                login = ("login" in CFG) ? CFG["login"] : ""
+                # host-less lines, most selectors first, ties to the first line
+                # (none in hostonly: their values are defaults, not the host own)
+                for (sel = 2; sel >= 0 && phase != "hostonly"; sel--)
+                    for (q = 1; q <= nhl; q++) {
+                        e = HL[q]
+                        if (ENSEL[e] != sel) continue
+                        if (ELOGIN[e] != "" && ELOGIN[e] != login) continue
+                        # an engine selector needs test results; it folds in later
+                        if (EENG[e] != "" && (phase != "phase2" || !((h, EENG[e]) in PASSED))) continue
+                        for (j = 1; j <= ENK[e]; j++) {
+                            k = EK[e, j]; v = EV[e, j]
+                            if (k == "login") continue
+                            if (!(k in CFG)) { CFG[k] = v; SN[k] = sel; SL[k] = ELINE[e] }
+                            else if (SN[k] == sel && CFG[k] != v)
+                                print "WARNING: " path ": host \047" h "\047 field \047" k "\047: line " ELINE[e] " conflicts with equally specific line " SL[k] "; keeping line " SL[k] > "/dev/stderr"
+                        }
+                    }
+                # WT_ENGINE: the default every row refines, never the host own
+                if (!("engine" in CFG) && def_engine != "" && phase != "hostonly") CFG["engine"] = def_engine
+                if (cli_engine != "-") CFG["engine"] = cli_engine   # the CLI beats the file
+                if (cli_dir != "-") CFG["dir"] = cli_dir
+                line = h
+                for (f = 1; f <= nfield; f++) line = line "\t" ((FIELD[f] in CFG) && CFG[FIELD[f]] != "" ? CFG[FIELD[f]] : "-")
+                print line
+            }
+            # once per run (phase1): a name glob no host matched is likely a typo
+            for (q = 1; q <= ngl && phase == "phase1"; q++)
+                if (ENSEL[e = GL[q]] == 4 && !(e in GHIT))
+                    print "WARNING: " path ":" ELINE[e] ": host pattern \047" EPAT[e] "\047 matches none of this run\047s hosts" > "/dev/stderr"
+        }' "$@"
+}
+
+# --- settings (WT_*) -------------------------------------------------------------
+# README, Settings. Each setting comes from one source: the CLI flag, else the
+# environment, else the -t host file, else the default. Kinds: flag (becomes
+# its long option and goes through parse_args), switch (0/1), count, default
+# (-d/-e: a run-wide default the host rows refine), env (read where used).
+# Columns: name kind option help-key.
+SETTINGS_TABLE="WT_DIRECTORY default --directory directory
+WT_WORKLOAD flag --workload workload
+WT_FIO_BIN flag --fio-bin fio_bin
+WT_OUTPUT flag --output output
+WT_ENGINE default --engine engine
+WT_AUTO flag --auto auto
+WT_LINE_RATE flag --line-rate line_rate
+WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
+WT_ANY_FS switch --any-fs any_fs
+WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
+WT_IDENTITY flag --identity identity
+WT_PASSWORD count --password password
+WT_BULK switch --bulk bulk
+WT_DURATION flag --duration duration
+WT_UNLINK switch --unlink unlink
+WT_VERBOSE count -v verbose
+WT_ENGINE_TEST_TIMEOUT env - -
+WT_SYSINFO_TIMEOUT env - -
+WT_SETTLE env - -
+WT_STAGE_BASE env - -"
+# the built-in values, taken before any parse moves them
+declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
+    [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0
+    [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
+declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
+DEFAULT_ENGINE=""            # WT_ENGINE from the environment or the host file
+
+# The template's own help for the settings whose flag text would mislead:
+# those with no flag, and -d/-e, which as settings are defaults.
+own_setting_help() {   # own_setting_help <name>
+    case $1 in
+        (WT_DIRECTORY) echo "the default target directory for test files (default ${SETTING_DEFAULT[WT_DIRECTORY]}); a host-file line's destination_folder beats it, and -d beats both" ;;
+        (WT_ENGINE) echo "the default fio ioengine (empty: the jobfile's own, else, outside -a, the first of io_uring, libaio, psync that passes its test); a host-file line's ioengine beats it, and -e beats both" ;;
+        (WT_ENGINE_TEST_TIMEOUT) echo "seconds an ioengine's test job may run before it is killed and counts as a failure (default 15)" ;;
+        (WT_SYSINFO_TIMEOUT) echo "seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300)" ;;
+        (WT_SETTLE) echo "seconds to wait after the fio servers start before the first connection to them (default 2)" ;;
+        (WT_STAGE_BASE) echo "where the controller keeps its working files: shm (/dev/shm, the default) or mktemp (\$TMPDIR, else /tmp)" ;;
+    esac
+}
+
+# Which settings the command line sets: a token that starts with - before
+# -- is an option (a separate value never does: need_arg). CLI_INFO: -h or
+# --version, which read no setting.
+declare -gA CLI_SET=()
+CLI_INFO=""
+cli_settings_seen() {   # cli_settings_seen <arg>...
+    local a o
+    CLI_SET=(); CLI_INFO=""
+    for a in "$@"; do
+        [ "$a" != -- ] || break
+        case $a in (-*) ;; (*) continue ;; esac
+        o=$(normalize_opt "$a")
+        case $o in
+            (-d*|--directory|--directory=*) CLI_SET[WT_DIRECTORY]=1 ;;
+            (-w*|--workload|--workload=*) CLI_SET[WT_WORKLOAD]=1 ;;
+            (-f*|--fio-bin|--fio-bin=*|--local-fio|--local-fio=*) CLI_SET[WT_FIO_BIN]=1 ;;
+            (-o*|--output|--output=*) CLI_SET[WT_OUTPUT]=1 ;;
+            (-e*|--engine|--engine=*) CLI_SET[WT_ENGINE]=1 ;;
+            (-a*|--auto|--auto=*) CLI_SET[WT_AUTO]=1 ;;
+            (--line-rate|--line-rate=*) CLI_SET[WT_LINE_RATE]=1 ;;
+            (--ignore-capacity) CLI_SET[WT_IGNORE_CAPACITY]=1 ;;
+            (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
+            (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
+            (-i*|--identity|--identity=*) CLI_SET[WT_IDENTITY]=1 ;;
+            (-p*|--password|--password=*) CLI_SET[WT_PASSWORD]=1 ;;
+            (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
+            (-x*|--duration|--duration=*) CLI_SET[WT_DURATION]=1 ;;
+            (-u|--unlink) CLI_SET[WT_UNLINK]=1 ;;
+            (-v|-vv|-vvv) CLI_SET[WT_VERBOSE]=1 ;;
+            (-h|--help|--version) CLI_INFO=1 ;;
+        esac
+    done
+}
+
+# One setting as the arguments parse_args takes, checked by parse_args
+# itself in a subshell so an error names its source. -> SETTING_ARGS
+setting_args() {   # setting_args <source> <name> <kind> <option> <value>
+    local src=$1 name=$2 kind=$3 opt=$4 v=$5 err i
+    SETTING_ARGS=()
+    case $kind in
+        (switch) case $v in
+                     (0) ;;
+                     (1) SETTING_ARGS=("$opt") ;;
+                     (*) die "$src: $name takes 0 or 1, not '$v'" ;;
+                 esac ;;
+        (count) case $v in
+                    (*[!0-9]*) die "$src: $name takes a count (0 for none), not '$v'" ;;
+                    (0) ;;
+                    (*) if [ "$opt" = -v ]; then
+                            for ((i = 0; i < 10#$v; i++)); do SETTING_ARGS+=(-v); done
+                        else
+                            SETTING_ARGS=("$opt=$v")
+                        fi ;;
+                esac ;;
+        (*) SETTING_ARGS=("$opt=$v") ;;
+    esac
+    [ ${#SETTING_ARGS[@]} -gt 0 ] || return 0
+    err=$( (PARSE_PRECHECK=1; parse_args "${SETTING_ARGS[@]}") 2>&1 ) \
+        || die "$src: $name: ${err##*ERROR: }"
+}
+
+# -d/-e from a setting: the run-wide default, never the flag's override of
+# the host rows (Frank, 2026-10-26).
+setting_default() {   # setting_default <name> <value>
+    if [ "$1" = WT_DIRECTORY ]; then
+        DIRECTORY=$2; trim_directory
+    else
+        DEFAULT_ENGINE=$2
+    fi
+}
+
+# The environment's settings, then the command line: one parse, the CLI
+# last. A setting the CLI sets is not read. Combinations wait for the host
+# file (check_args in main).
+settings_parse() {   # settings_parse <arg>...
+    local name kind opt key v args=() defs=()
+    cli_settings_seen "$@"
+    # help and version text never depends on the environment
+    if [ -n "$CLI_INFO" ]; then parse_args "$@"; return; fi
+    while read -r name kind opt key; do
+        v=${!name-}
+        [ -n "$v" ] && [ -z "${CLI_SET[$name]:-}" ] || continue
+        SETTING_SRC[$name]="environment $name"
+        case $kind in
+            (env) continue ;;
+            (default) setting_args "environment" "$name" "$kind" "$opt" "$v"; defs+=("$name" "$v") ;;
+            (*) setting_args "environment" "$name" "$kind" "$opt" "$v"; args+=("${SETTING_ARGS[@]}") ;;
+        esac
+    done <<<"$SETTINGS_TABLE"
+    PARSE_PRECHECK=1 parse_args "${args[@]}" "$@"
+    set -- "${defs[@]}"
+    while [ $# -gt 0 ]; do setting_default "$1" "$2"; shift 2; done
+    # a host file still to read checks them in main
+    [ "$TARGETS" -eq 1 ] && [ -z "$SUMMARIZE_FILE" ] || check_args
+}
+
+# The host file's settings, for what neither the CLI nor the environment
+# set, then the combination checks.
+settings_from_file() {
+    local out line name v kind opt key args=() defs=()
+    out=$(awkrun 'BEGIN {
+        path = ARGV[1]; n = split(ARGV[2], K, ",")
+        for (i = 1; i <= n; i++) KNOWN[K[i]] = 1
+        if ((n = readlines(path, L)) < 0) awk_fail("cannot read host file: " path)
+        nrec = csv_read(L, n, CN, CV)
+        for (r = 1; r <= nrec; r++) {
+            if (!CN[r] || !is_setting_cell(CV[r, 1])) continue
+            cell = strip(CV[r, 1])
+            # the cell first: a host named wt_... (an ssh alias) lands here
+            if (!(p = index(cell, "="))) awk_fail(path ":" r ": \047" cell "\047 is not WT_NAME=value (a first cell starting WT_ is a setting, never a host)")
+            for (k = 2; k <= CN[r]; k++)
+                if (strip(CV[r, k]) != "") awk_fail(path ":" r ": a settings line is one WT_NAME=value cell; quote a value that holds a comma")
+            name = substr(cell, 1, p - 1); v = strip(substr(cell, p + 1))
+            if (!(name in KNOWN)) awk_fail(path ":" r ": unknown setting \047" name "\047")
+            if (name in SEEN) awk_fail(path ":" r ": " name " is set twice (first at line " SEEN[name] ")")
+            SEEN[name] = r
+            if (v != "") print r "\t" name "\t" v   # empty: this file sets nothing
         }
-    }' "$@"
+    }' "$TARGETS_FILE" "$(settings_names)") \
+        || die "host file settings failed ($TARGETS_FILE)"
+    while IFS=$'\t' read -r line name v; do
+        [ -n "$name" ] || continue
+        [ -z "${CLI_SET[$name]:-}" ] && [ -z "${SETTING_SRC[$name]:-}" ] || continue
+        SETTING_SRC[$name]="$TARGETS_FILE:$line"
+        read -r _ kind opt key < <(grep "^$name " <<<"$SETTINGS_TABLE")
+        case $kind in
+            (env) printf -v "$name" '%s' "$v" ;;
+            (default) setting_args "$TARGETS_FILE:$line" "$name" "$kind" "$opt" "$v"; defs+=("$name" "$v") ;;
+            (*) setting_args "$TARGETS_FILE:$line" "$name" "$kind" "$opt" "$v"; args+=("${SETTING_ARGS[@]}") ;;
+        esac
+    done <<<"$out"
+    [ ${#args[@]} -eq 0 ] || PARSE_PRECHECK=1 parse_args "${args[@]}" -- "${HOSTS[@]}"
+    set -- "${defs[@]}"
+    while [ $# -gt 0 ]; do setting_default "$1" "$2"; shift 2; done
+}
+
+# Without a host file there are no rows for WT_ENGINE to default: it is
+# the engine for every host, as -e is.
+settings_engine_default() {
+    [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ] || ENGINE=$DEFAULT_ENGINE
+}
+
+settings_names() {
+    local name rest out=""
+    while read -r name rest; do out="$out${out:+,}$name"; done <<<"$SETTINGS_TABLE"
+    printf '%s' "$out"
+}
+
+# The settings with no flag, wherever they came from: checked once, before
+# any of them is used.
+settings_check_env() {
+    local name kind v src
+    while read -r name kind _; do
+        [ "$kind" = env ] || continue
+        v=${!name-}
+        [ -n "$v" ] || continue
+        src=${SETTING_SRC[$name]:-environment $name}
+        case $name in
+            (WT_SETTLE) case $v in (*[!0-9]*) die "$src: $name must be a whole number of seconds, not '$v'" ;; esac ;;
+            (WT_STAGE_BASE) case $v in
+                                (shm) STAGE_BASE=/dev/shm ;;
+                                (mktemp) STAGE_BASE=${TMPDIR:-/tmp}; STAGE_BASE=${STAGE_BASE%/} ;;
+                                (*) die "$src: $name takes shm or mktemp, not '$v'" ;;
+                            esac ;;
+            (*) case $v in (*[!0-9]*|0*) die "$src: $name must be a whole number of seconds above 0, not '$v'" ;; esac ;;
+        esac
+    done <<<"$SETTINGS_TABLE"
+}
+
+# Where a setting came from, as an error prefix ("" for the CLI or the
+# default): "environment WT_X: " or "<file>:<line>: WT_X: ".
+setting_where() {   # setting_where <name> -> SETTING_WHERE
+    local src=${SETTING_SRC[$1]:-}
+    case $src in
+        ("") SETTING_WHERE="" ;;
+        (environment*) SETTING_WHERE="$src: " ;;
+        (*) SETTING_WHERE="$src: $1: " ;;
+    esac
+}
+
+# The template's settings: each one's help, then the setting at its
+# built-in value.
+settings_template() {
+    local name kind opt key l
+    printf '#\n# Settings for the whole run, one WT_NAME=value per line: a command-line\n'
+    printf '# flag beats the environment, which beats this file; an empty value sets\n'
+    printf '# nothing.\n'
+    while read -r name kind opt key; do
+        printf '#\n'
+        if [ "$kind" = env ] || [ "$kind" = default ]; then
+            printf '# %s: %s\n' "$name" "$(own_setting_help "$name")"
+        else
+            while IFS= read -r l; do printf '# %s\n' "$l"; done < <(
+                DIRECTORY=${SETTING_DEFAULT[WT_DIRECTORY]} WORKLOAD=${SETTING_DEFAULT[WT_WORKLOAD]} \
+                FIO_BIN=${SETTING_DEFAULT[WT_FIO_BIN]} OUTPUT_DIR=${SETTING_DEFAULT[WT_OUTPUT]} opt_help "$key")
+        fi
+        printf '%s=%s\n' "$name" "${SETTING_DEFAULT[$name]:-}"
+    done <<<"$SETTINGS_TABLE"
+    printf '#\n'
 }
 
 # --- phase 3: stage jobfiles ---------------------------------------------------
@@ -7243,12 +7679,12 @@ $(sysinfo_nic_cmd)"
 }
 
 # One session per host in parallel, each bounded as a whole at
-# WEKATESTER_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
+# WT_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
 # capture, which says where it stopped plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc o f pids=() hs=() t=${WEKATESTER_SYSINFO_TIMEOUT:-300}
+    local host i rc o f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
     if ! o=$(command -v timeout); then
-        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WEKATESTER_SYSINFO_TIMEOUT)" >&2
+        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WT_SYSINFO_TIMEOUT)" >&2
         t=
     fi
     for host in "${HOSTS[@]}"; do
@@ -7261,11 +7697,11 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
         if [ -z "$t" ] || { [ $rc -ne 124 ] && [ $rc -ne 137 ]; }; then
             log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
         fi
-        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WEKATESTER_SYSINFO_TIMEOUT); the partial capture is kept" >&2
+        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WT_SYSINFO_TIMEOUT); the partial capture is kept" >&2
         f=$2${hs[$i]}
         # a cut can land mid-line: the marker must start one
         [ ! -s "$f" ] || [ -z "$(tail -c 1 "$f")" ] || echo >> "$f"
-        printf 'not available: the session was cut off here, after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n' \
+        printf 'not available: the session was cut off here, after %s s (WT_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WT_SYSINFO_TIMEOUT)\n' \
             "$t" "$1" "$t" >> "$f"
     done
 }
@@ -7383,9 +7819,9 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
         || { log "WARNING: cannot create the per-host directories under $RUN_DIR/sysinfo" >&2; return 0; }
     # the raw captures are dead once split: tmpfs is RAM, and a run-window
     # sar slice per host adds up
-    WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
-        FNR == 1 { if (out != "") close(out); out = ""; host = substr(FILENAME, length(ENVIRON["WT_PFX"]) + 1) }
-        /^=== WEKATESTER_SYSINFO / { if (out != "") close(out); out = ENVIRON["WT_ROOT"] "/" host "/" $3 ENVIRON["WT_SFX"]; next }
+    SYSI_ROOT="$RUN_DIR/sysinfo" SYSI_PFX=$1 SYSI_SFX=$2 awk '
+        FNR == 1 { if (out != "") close(out); out = ""; host = substr(FILENAME, length(ENVIRON["SYSI_PFX"]) + 1) }
+        /^=== WEKATESTER_SYSINFO / { if (out != "") close(out); out = ENVIRON["SYSI_ROOT"] "/" host "/" $3 ENVIRON["SYSI_SFX"]; next }
         out != "" { print > out }' "${files[@]}" && rm -f -- "${files[@]}"
 }
 
@@ -8728,10 +9164,16 @@ main() {
     # resolved so the suite can stub it.
     [ "$(uname -s)" = Linux ] \
         || die "wekatester runs on a Linux controller, not $(uname -s); -s summarizes a run bundle anywhere"
+    # The host file's settings before any of them is used, then the
+    # combinations the passes before it could not check.
+    if [ "$TARGETS" -eq 1 ]; then
+        resolve_targets_file
+        settings_from_file
+        check_args
+    fi
+    settings_check_env
+    settings_engine_default
     resolve_local_mode
-    case ${WEKATESTER_SYSINFO_TIMEOUT:-300} in
-        (*[!0-9]*|0*) die "WEKATESTER_SYSINFO_TIMEOUT must be a whole number of seconds above 0, not '$WEKATESTER_SYSINFO_TIMEOUT'" ;;
-    esac
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
 
@@ -8759,7 +9201,6 @@ main() {
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.
     if [ "$TARGETS" -eq 1 ]; then
-        resolve_targets_file
         resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
             - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
             || die "host file resolution failed ($TARGETS_FILE)"
@@ -8847,6 +9288,6 @@ main() {
 # run only when executed, not when sourced (tests source this file)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     ARGV_TYPED=("$0" "$@")
-    parse_args "$@"
+    settings_parse "$@"
     main
 fi

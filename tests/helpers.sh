@@ -471,7 +471,7 @@ export -f lock_fixture
 # FIO_VERSION_NOTE= and settings; returns preflight's status.
 fv_preflight() {
     local a=$1 kv h; shift
-    export WEKATESTER_LOCK_DIR=$LK/lock
+    export WEKATESTER_SUITE_LOCK_DIR=$LK/lock
     for kv in "$@"; do
         h=${kv%%=*}; mkdir -p "$LK/v/$h"
         case ${kv#*=} in
@@ -482,7 +482,7 @@ fv_preflight() {
         chmod +x "$LK/v/$h/fio"
         printf '%s\n' "$h" >> "$LK/hosts"
     done
-    (export WEKATESTER_TARGET_DIR="$LK/tgt"
+    (export WEKATESTER_SUITE_TARGET_DIR="$LK/tgt"
      source ./wekatester
      mapfile -t HOSTS < "$LK/hosts"
      LOCAL_MODE=0; MASTER=${HOSTS[0]}; FIO_BIN=fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w; ALLOW_FIO_MISMATCH=$a
@@ -564,7 +564,7 @@ nic_sysinfo() {
     (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; FIO_BIN=fio
      fx=$1; bash=$(type -P bash)
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
-     snapshot_sysinfo) >>"$WT_ASIDE" 2>&1
+     snapshot_sysinfo) >>"$SUITE_ASIDE" 2>&1
 }
 # nic_pressure <dir> <start|end> <run-start-epoch> [fio-log]: snapshot_pressure
 # the same way, into <dir>/out/sysinfo/h1/<item>-<label>.
@@ -573,7 +573,7 @@ nic_pressure() {
     (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; RUN_EPOCH=$3; FIO_BIN=fio
      fx=$1; bash=$(type -P bash)
      run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
-     snapshot_pressure "$2" ${4:+"$4"}) >>"$WT_ASIDE" 2>&1
+     snapshot_pressure "$2" ${4:+"$4"}) >>"$SUITE_ASIDE" 2>&1
 }
 # bound_capture <dir> <sysinfo|start|end> <host>...: the real run_host, over
 # a fake ssh in <dir>/ctl that runs each host's string under bash against the

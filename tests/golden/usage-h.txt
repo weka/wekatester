@@ -1,0 +1,111 @@
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
+                  [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [--allow-fio-mismatch]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [--] [server ...]
+       wekatester -s results.json
+       wekatester --version
+
+Basic performance test of wekafs, or any filesystem with --any-fs (distributed fio).
+
+Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
+give them are not (-Wmyset names myset, never MYSET). A value may be attached
+or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
+attaching is the way to pass a value that starts with a dash.
+
+  -d, --directory dir     target directory on the workers for test files
+                          (default: /mnt/weka); must be on wekafs (see
+                          --any-fs); created on request when it is missing
+                          under a wekafs mount
+  -w, --workload set      workload definition directory, a subdir of
+                          fio-jobfiles (default: default)
+  -f, --fio-bin path      fio binary on the workers (default: /usr/bin/fio);
+                          --local-fio is an older spelling
+  -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
+                          results, run log, staged jobfiles (default: results)
+  -e, --engine eng        force this fio ioengine on every staged jobfile,
+                          overriding the jobfiles and auto tuning; without
+                          it: the host file's, the jobfile's own, else
+                          (not under -a) the first of io_uring, libaio,
+                          psync that passes a test job on the host
+  -a, --auto [safe|max|cal|brutal[:secs]]
+                          measure the clients and run what they do best
+                          (default level when omitted: max): clients are
+                          grouped into hardware shapes, one client of each
+                          is measured alone; N = its usable physical cores
+                          safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
+                          max: numjobs N/2, N, 2N at the deepest iodepth and
+                          nrfiles cal has chosen (bandwidth 16 and 4, iops
+                          32 and 2)
+                          cal: walk numjobs to 4N, iodepth and nrfiles --
+                          bandwidth toward NIC line rate, the most iops
+                          brutal: the cal search with no early stops --
+                          every rung of every ladder is measured. Slow
+                          every level: the ioengine, and latency at N jobs
+                          over nrfiles beside a one-job test
+                          :secs sets the measured seconds per cell (default
+                          15 for safe and max, 30 for cal and brutal); it
+                          does not change how long the measured jobs run --
+                          that is -x/--duration
+  --line-rate Gb/s        every client's dataplane line rate, for the -a
+                          bandwidth target, in place of what ethtool reports:
+                          a cloud VF can report 100 Gb/s on a 16 Gb/s
+                          instance, and without the weka CLI nothing reports it
+  --ignore-capacity       when the workload needs more space than is available,
+                          ask (no timeout) and run anyway instead of aborting
+  --break-lock            a run that died left its lock, staging or fio on a
+                          host: kill wekatester's own fio there, clear its
+                          files and take the lock (fio it did not start still
+                          stops the run)
+  --any-fs                turn the filesystem-type check off: -d may be on
+                          any filesystem, a local disk included, and a
+                          missing -d is created anywhere; the run log says
+                          the check was off and what -d is on
+  --allow-fio-mismatch    run on when fio --version differs across the
+                          hosts: each version and its hosts print as a
+                          WARNING and the bundle's settings record it (a
+                          host whose fio --version fails still stops the run)
+  -i, --identity [login:]keyfile[,...]
+                          ssh key(s) to try, each optionally bound to a login;
+                          repeatable, tried in the order given
+  -p, --password [n]      prompt for n (default 1) login/password pairs, tried
+                          after the keys; no sshpass involved
+                          Every credential is tried against every worker --
+                          existing ssh sessions and plain defaults first, then
+                          keys, then passwords -- and per worker the first
+                          success wins
+  -t, --targets [file]    per-host settings from a CSV host file: login,
+                          ioengine, cpus_allowed, destination dir, per-test
+                          geometry. Bare -t = the set's own hostlist.csv,
+                          else ./hostlist.csv. CLI flags beat the file; the
+                          file beats the jobfiles and the tuner
+  -b, --bulk     run every latency test at 1MiB blocks too, as a separate
+                 test listed on its own (under -a the 1MiB test is
+                 calibrated on its own)
+  -r             fast track: no prompts -- create whatever is needed (a
+                 missing -d only under wekafs, anywhere with --any-fs) and run;
+                 a wekafs destination that is not mounted forcedirect is a
+                 warning instead of a stop
+  -n             dry run: create/generate, print the files and the run details;
+                 no measured job runs, but a missing -d is created and the
+                 ioengines are proven with small fio jobs (with -a/-t/-e,
+                 or when a jobfile names none)
+  -g             force regeneration of existing layout jobfiles
+  -x, --duration secs     run every measured job for this many seconds
+                          (time_based); layout and unlink keep their own timing
+  -u, --unlink   remove the workload's data files from -d after the last job
+                 that uses them (a failed run keeps them for the rerun), and
+                 the calibration scratch files, which are otherwise kept
+                 so the next calibration can reuse them
+  -s file        summarize an existing results .json -- or every job in a run
+                 bundle .tgz, straight from the archive, after a synopsis
+                 of the run (README, Output) -- and exit; with -v, also
+                 the counters that rose and each host's health flags
+  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+  --version      display version number and exit
+  -h, --help     show this help and exit
+  --             everything after this is a server name
+
+With no server given, the test runs on the local host -- no ssh required.

@@ -5,6 +5,10 @@
 # Anything wrong stops it by name and leaves the target alone; an assembly
 # bash cannot parse is kept beside the target as <target>.rejected.
 set -euo pipefail
+# The bash first in PATH checks the assembly and runs the built tool to
+# write hostlist.example.csv: it needs what the tool needs, 4.4 or later.
+v=$(bash -c 'echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))')
+[ "$v" -ge 404 ] || { echo "build needs bash 4.4 or later first in PATH, and $(command -v bash) is older -- on a Mac: PATH=/opt/homebrew/bin:\$PATH ./build" >&2; exit 2; }
 out=""   # never the caller's: an exported out would redirect the build
 if [ $# -gt 0 ]; then case $1 in /*) out=$1 ;; *) out=$PWD/$1 ;; esac; fi
 cd "$(dirname "$0")"
@@ -76,3 +80,14 @@ bash -n "$tmp" || {
 }
 chmod 755 "$tmp"
 mv -f "$tmp" "$out"
+# The repo's example host file is the built tool's own template (README,
+# Settings), so the two never drift. Only a default build of a tool that
+# has the template writes it.
+if [ "$out" = "$PWD/wekatester" ] && grep -q '^write_targets_template() ' "$out"; then
+    ex=$(mktemp "$PWD/hostlist.example.csv.XXXXXX")
+    trap 'rm -f "${tmp:?}" "${ex:?}"' EXIT
+    said=$(bash -c 'source "$1" && write_targets_template "$2"' _ "$out" "$ex" 2>&1) \
+        || { echo "build: cannot write hostlist.example.csv: $said" >&2; exit 1; }
+    chmod 644 "$ex"   # mktemp's 0600 would survive the mv
+    mv -f "$ex" "$PWD/hostlist.example.csv"
+fi

@@ -8,6 +8,7 @@ write_targets_template() {   # write_targets_template <path>
     # the column list comes from the shared schema, not a second spelling
     for n in $GEOM_NAMES; do header="$header,$n:nj/fs/nr/qd"; done
     { printf '%s\n' "$header"
+      settings_template
       cat <<'CSVEOF'
 # One host per line assigns to that host; lines without a host apply to the
 # hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
@@ -16,6 +17,7 @@ write_targets_template() {   # write_targets_template <path>
 # whole tuple.
 # Example:  client-1,ubuntu,io_uring,"8,10",/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8
 # Example:  ,,io_uring,,,,,,,,     (io_uring for every host that supports it)
+# Example:  gpu-*,ubuntu,,,/mnt/weka,,,,,,   (a glob: every host it matches; * alone is every host)
 # A host may be written as <name>/<machine-id>; the id is ignored when the
 # row is read and only ever added by wekatester itself, to name a machine it
 # is recording for the first time. Plain hostnames are equally valid, and a
@@ -252,5 +254,9 @@ host_dir_v() {   # host_dir_v <host> -> HOST_DIR
 # what the writeback merges against; engines: every line's ioengine, one per
 # line (no hosts needed).
 resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
-    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") awkrun '#@awk resolve_targets' "$@"
+    # under -e no host runs WT_ENGINE: it is neither proven nor resolved
+    local de=$DEFAULT_ENGINE
+    [ -z "$ENGINE" ] || de=""
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") WEKATESTER_DEFAULT_ENGINE=$de \
+        awkrun '#@awk resolve_targets' "$@"
 }

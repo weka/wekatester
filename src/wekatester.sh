@@ -11,7 +11,7 @@ bash_floor_ok() {   # bash_floor_ok <major> <minor>: 4.4 or later
 }
 bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
     echo "wekatester needs bash 4.4 or later; this is ${BASH_VERSION:-not bash}" >&2
-    exit 1
+    exit 2
 }
 
 VERSION="2026-10-11"
@@ -50,16 +50,16 @@ LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
 
 SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
-# Namespaced: cleanup feeds this path to rm -rf on every host, so a stray
-# TARGET_DIR export must not move it. Test plumbing only.
-TARGET_DIR="${WEKATESTER_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
-LOCK_DIR="${WEKATESTER_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
+# Fixed paths, never settings: cleanup feeds TARGET_DIR to rm -rf on every
+# host. The WEKATESTER_SUITE_ hooks are the test suite's alone.
+TARGET_DIR="${WEKATESTER_SUITE_TARGET_DIR:-/dev/shm/fio-jobfiles}"   # staging dir on the master
+LOCK_DIR="${WEKATESTER_SUITE_LOCK_DIR:-/dev/shm/wekatester.lock}"    # one run per host
 FIO_PIDFILE="/dev/shm/wekatester-fio.pid"
 FIO_PORT=8765                           # fio --server listen port
 
-# local staging: tmpfs, which every Linux controller has (the suite, run on a
-# development Mac, points WEKATESTER_STAGE_BASE elsewhere)
-STAGE_BASE=${WEKATESTER_STAGE_BASE:-/dev/shm}
+# local staging: tmpfs, which every Linux controller has; WT_STAGE_BASE=mktemp
+# (stage_base) moves it under $TMPDIR, as the suite does on a development Mac
+STAGE_BASE=/dev/shm
 
 # Control opts are per host (host_ssh_opts): a host on a user-owned master
 # must not get our ControlPath.
@@ -108,21 +108,53 @@ give them are not (-Wmyset names myset, never MYSET). A value may be attached
 or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
 attaching is the way to pass a value that starts with a dash.
 
+EOF
+    local k
+    for k in $USAGE_KEYS; do opt_help "$k"; done
+    cat <<EOF
+
+With no server given, the test runs on the local host -- no ssh required.
+EOF
+}
+
+# The options in -h order, one help block each: usage prints them all, and
+# the host-file template quotes a setting's block (README, Settings).
+USAGE_KEYS="directory workload fio_bin output engine auto line_rate ignore_capacity
+    break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
+    duration unlink summarize verbose version help dashdash"
+opt_help() {   # opt_help <key>
+    case $1 in
+    (directory) cat <<EOF
   -d, --directory dir     target directory on the workers for test files
                           (default: $DIRECTORY); must be on wekafs (see
                           --any-fs); created on request when it is missing
                           under a wekafs mount
+EOF
+    ;;
+    (workload) cat <<EOF
   -w, --workload set      workload definition directory, a subdir of
                           fio-jobfiles (default: $WORKLOAD)
+EOF
+    ;;
+    (fio_bin) cat <<EOF
   -f, --fio-bin path      fio binary on the workers (default: $FIO_BIN);
                           --local-fio is an older spelling
+EOF
+    ;;
+    (output) cat <<EOF
   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
                           results, run log, staged jobfiles (default: $OUTPUT_DIR)
+EOF
+    ;;
+    (engine) cat <<EOF
   -e, --engine eng        force this fio ioengine on every staged jobfile,
                           overriding the jobfiles and auto tuning; without
                           it: the host file's, the jobfile's own, else
                           (not under -a) the first of io_uring, libaio,
                           psync that passes a test job on the host
+EOF
+    ;;
+    (auto) cat <<EOF
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
@@ -142,67 +174,124 @@ attaching is the way to pass a value that starts with a dash.
                           15 for safe and max, 30 for cal and brutal); it
                           does not change how long the measured jobs run --
                           that is -x/--duration
+EOF
+    ;;
+    (line_rate) cat <<EOF
   --line-rate Gb/s        every client's dataplane line rate, for the -a
                           bandwidth target, in place of what ethtool reports:
                           a cloud VF can report 100 Gb/s on a 16 Gb/s
                           instance, and without the weka CLI nothing reports it
+EOF
+    ;;
+    (ignore_capacity) cat <<EOF
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+EOF
+    ;;
+    (break_lock) cat <<EOF
   --break-lock            a run that died left its lock, staging or fio on a
                           host: kill wekatester's own fio there, clear its
                           files and take the lock (fio it did not start still
                           stops the run)
+EOF
+    ;;
+    (any_fs) cat <<EOF
   --any-fs                turn the filesystem-type check off: -d may be on
                           any filesystem, a local disk included, and a
                           missing -d is created anywhere; the run log says
                           the check was off and what -d is on
+EOF
+    ;;
+    (allow_fio_mismatch) cat <<EOF
   --allow-fio-mismatch    run on when fio --version differs across the
                           hosts: each version and its hosts print as a
                           WARNING and the bundle's settings record it (a
                           host whose fio --version fails still stops the run)
+EOF
+    ;;
+    (identity) cat <<EOF
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
                           repeatable, tried in the order given
+EOF
+    ;;
+    (password) cat <<EOF
   -p, --password [n]      prompt for n (default 1) login/password pairs, tried
                           after the keys; no sshpass involved
                           Every credential is tried against every worker --
                           existing ssh sessions and plain defaults first, then
                           keys, then passwords -- and per worker the first
                           success wins
+EOF
+    ;;
+    (targets) cat <<EOF
   -t, --targets [file]    per-host settings from a CSV host file: login,
                           ioengine, cpus_allowed, destination dir, per-test
                           geometry. Bare -t = the set's own hostlist.csv,
                           else ./hostlist.csv. CLI flags beat the file; the
                           file beats the jobfiles and the tuner
+EOF
+    ;;
+    (bulk) cat <<EOF
   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
                  test listed on its own (under -a the 1MiB test is
                  calibrated on its own)
+EOF
+    ;;
+    (fast) cat <<EOF
   -r             fast track: no prompts -- create whatever is needed (a
                  missing -d only under wekafs, anywhere with --any-fs) and run;
                  a wekafs destination that is not mounted forcedirect is a
                  warning instead of a stop
+EOF
+    ;;
+    (dry) cat <<EOF
   -n             dry run: create/generate, print the files and the run details;
                  no measured job runs, but a missing -d is created and the
                  ioengines are proven with small fio jobs (with -a/-t/-e,
                  or when a jobfile names none)
+EOF
+    ;;
+    (regen) cat <<EOF
   -g             force regeneration of existing layout jobfiles
+EOF
+    ;;
+    (duration) cat <<EOF
   -x, --duration secs     run every measured job for this many seconds
                           (time_based); layout and unlink keep their own timing
+EOF
+    ;;
+    (unlink) cat <<EOF
   -u, --unlink   remove the workload's data files from -d after the last job
                  that uses them (a failed run keeps them for the rerun), and
                  the calibration scratch files, which are otherwise kept
                  so the next calibration can reuse them
+EOF
+    ;;
+    (summarize) cat <<EOF
   -s file        summarize an existing results .json -- or every job in a run
                  bundle .tgz, straight from the archive, after a synopsis
                  of the run (README, Output) -- and exit; with -v, also
                  the counters that rose and each host's health flags
-  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
-  --version      display version number and exit
-  -h, --help     show this help and exit
-  --             everything after this is a server name
-
-With no server given, the test runs on the local host -- no ssh required.
 EOF
+    ;;
+    (verbose) cat <<EOF
+  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+EOF
+    ;;
+    (version) cat <<EOF
+  --version      display version number and exit
+EOF
+    ;;
+    (help) cat <<EOF
+  -h, --help     show this help and exit
+EOF
+    ;;
+    (dashdash) cat <<EOF
+  --             everything after this is a server name
+EOF
+    ;;
+    esac
 }
 
 # --- argument parsing ----------------------------------------------------------
@@ -306,14 +395,8 @@ parse_args() {
                            [ -n "$OUTPUT_DIR" ] || { usage >&2; die "option --output requires a value"; }
                            shift ;;
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
-            --line-rate)   need_arg "$1" $# "${2:-}"; LINE_RATE_GBPS=$2
-                           # an empty value (an unset variable in a wrapper)
-                           # would silently mean "no override"
-                           [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
-                           shift 2 ;;
-            --line-rate=*) LINE_RATE_GBPS=${opt#--line-rate=}
-                           [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
-                           shift ;;
+            --line-rate)   need_arg "$1" $# "${2:-}"; set_line_rate "$2"; shift 2 ;;
+            --line-rate=*) set_line_rate "${opt#--line-rate=}"; shift ;;
             -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
             --engine=*)    ENGINE=${opt#--engine=}
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
@@ -413,15 +496,16 @@ parse_args() {
         esac
     done
     MASTER=${HOSTS[0]:-}
-    # -d without its trailing slashes (the host file's column: trim_dir), or
-    # every "$hd/$glob" join misses what find prints. / stays /.
-    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
-        DIRECTORY=${DIRECTORY%/}
-    done
+    trim_directory
     [ "$DIRECTORY_EXPLICIT" -eq 0 ] || CLI_DIR=$DIRECTORY
+    # a setting's own check (settings.sh) and the passes before the host
+    # file is read leave the combinations for check_args
+    [ -n "${PARSE_PRECHECK:-}" ] || check_args
+}
 
-    # Combination checks live here rather than in main so they hold for every
-    # caller -- the test suite drives parse_args directly.
+# Combination checks: in parse_args for every caller (the test suite drives
+# it directly), and once more after the host file's settings.
+check_args() {
     # A host named twice gave fio two --client= and raced two lock sessions.
     # Same host = same string: a CLI host is an address (hosts.sh, host identity).
     local h n dups="" rep=()
@@ -441,18 +525,33 @@ parse_args() {
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
     fi
-    if [ -n "$LINE_RATE_GBPS" ]; then
-        case "$LINE_RATE_GBPS" in
-            (*[!0-9.]*|*.*.*|.)
-                usage >&2; die "--line-rate takes the line rate in Gb/s, a positive number such as 16 or 12.5: '$LINE_RATE_GBPS'" ;;
-        esac
-        # Bounded: under 8e-9 the target rounds to 0, past ~310 digits it is
-        # inf.
-        awk -v v="$LINE_RATE_GBPS" 'BEGIN {v += 0; exit !(v >= 0.1 && v <= 100000)}' \
-            || { usage >&2; die "--line-rate must be between 0.1 and 100000 Gb/s: '$LINE_RATE_GBPS'"; }
-        # only a calibration's bandwidth search has a target to set
-        cal_mode || { usage >&2; die "--line-rate sets the bandwidth target of a calibration: it needs -a"; }
-    fi
+    # only a calibration's bandwidth search has a target to set; a
+    # WT_LINE_RATE setting is named where it was set
+    [ -z "$LINE_RATE_GBPS" ] || cal_mode || { setting_where WT_LINE_RATE; usage >&2
+        die "${SETTING_WHERE}--line-rate sets the bandwidth target of a calibration: it needs -a"; }
+}
+
+# DIRECTORY without its trailing slashes (the host file's column: trim_dir),
+# or every "$hd/$glob" join misses what find prints. / stays /.
+trim_directory() {
+    while [ "$DIRECTORY" != / ] && [ "${DIRECTORY%/}" != "$DIRECTORY" ]; do
+        DIRECTORY=${DIRECTORY%/}
+    done
+}
+
+set_line_rate() {   # set_line_rate <Gb/s>
+    LINE_RATE_GBPS=$1
+    # an empty value (an unset variable in a wrapper) would silently mean
+    # "no override"
+    [ -n "$LINE_RATE_GBPS" ] || { usage >&2; die "option --line-rate requires a value"; }
+    case "$LINE_RATE_GBPS" in
+        (*[!0-9.]*|*.*.*|.)
+            usage >&2; die "--line-rate takes the line rate in Gb/s, a positive number such as 16 or 12.5: '$LINE_RATE_GBPS'" ;;
+    esac
+    # Bounded: under 8e-9 the target rounds to 0, past ~310 digits it is
+    # inf.
+    awk -v v="$LINE_RATE_GBPS" 'BEGIN {v += 0; exit !(v >= 0.1 && v <= 100000)}' \
+        || { usage >&2; die "--line-rate must be between 0.1 and 100000 Gb/s: '$LINE_RATE_GBPS'"; }
 }
 
 #@include sh/calibrate.sh
@@ -466,6 +565,8 @@ parse_args() {
 #@include sh/layout.sh
 
 #@include sh/hosts.sh
+
+#@include sh/settings.sh
 
 #@include sh/stage.sh
 
@@ -484,10 +585,16 @@ main() {
     # resolved so the suite can stub it.
     [ "$(uname -s)" = Linux ] \
         || die "wekatester runs on a Linux controller, not $(uname -s); -s summarizes a run bundle anywhere"
+    # The host file's settings before any of them is used, then the
+    # combinations the passes before it could not check.
+    if [ "$TARGETS" -eq 1 ]; then
+        resolve_targets_file
+        settings_from_file
+        check_args
+    fi
+    settings_check_env
+    settings_engine_default
     resolve_local_mode
-    case ${WEKATESTER_SYSINFO_TIMEOUT:-300} in
-        (*[!0-9]*|0*) die "WEKATESTER_SYSINFO_TIMEOUT must be a whole number of seconds above 0, not '$WEKATESTER_SYSINFO_TIMEOUT'" ;;
-    esac
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
 
@@ -515,7 +622,6 @@ main() {
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.
     if [ "$TARGETS" -eq 1 ]; then
-        resolve_targets_file
         resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
             - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
             || die "host file resolution failed ($TARGETS_FILE)"
@@ -603,6 +709,6 @@ main() {
 # run only when executed, not when sourced (tests source this file)
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     ARGV_TYPED=("$0" "$@")
-    parse_args "$@"
+    settings_parse "$@"
     main
 fi

@@ -36,7 +36,8 @@ function render(h,    cell, row, k, s, n, G) {
 function own_line(line,    F, h) {   # the address of the host whose own line this is, or ""
     if (!csv_line(line, F)) return ""
     h = strip(F[1])
-    if (h == "" || substr(h, 1, 1) == "#" || tolower(h) == "host" || !(host_addr(h, ALIAS) in WANTED)) return ""
+    # a pattern row is never any host's own line, whatever it matches
+    if (h == "" || substr(h, 1, 1) == "#" || tolower(h) == "host" || is_glob_cell(h) || is_setting_cell(h) || !(host_addr(h, ALIAS) in WANTED)) return ""
     OWN_CELL = h
     return host_addr(h, ALIAS)
 }

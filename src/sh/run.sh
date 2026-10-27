@@ -81,12 +81,12 @@ $(sysinfo_nic_cmd)"
 }
 
 # One session per host in parallel, each bounded as a whole at
-# WEKATESTER_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
+# WT_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
 # capture, which says where it stopped plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc o f pids=() hs=() t=${WEKATESTER_SYSINFO_TIMEOUT:-300}
+    local host i rc o f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
     if ! o=$(command -v timeout); then
-        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WEKATESTER_SYSINFO_TIMEOUT)" >&2
+        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WT_SYSINFO_TIMEOUT)" >&2
         t=
     fi
     for host in "${HOSTS[@]}"; do
@@ -99,11 +99,11 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
         if [ -z "$t" ] || { [ $rc -ne 124 ] && [ $rc -ne 137 ]; }; then
             log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
         fi
-        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WEKATESTER_SYSINFO_TIMEOUT); the partial capture is kept" >&2
+        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WT_SYSINFO_TIMEOUT); the partial capture is kept" >&2
         f=$2${hs[$i]}
         # a cut can land mid-line: the marker must start one
         [ ! -s "$f" ] || [ -z "$(tail -c 1 "$f")" ] || echo >> "$f"
-        printf 'not available: the session was cut off here, after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WEKATESTER_SYSINFO_TIMEOUT)\n' \
+        printf 'not available: the session was cut off here, after %s s (WT_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WT_SYSINFO_TIMEOUT)\n' \
             "$t" "$1" "$t" >> "$f"
     done
 }
@@ -221,7 +221,7 @@ split_sysinfo() {   # split_sysinfo <capture-file-prefix> <suffix>
         || { log "WARNING: cannot create the per-host directories under $RUN_DIR/sysinfo" >&2; return 0; }
     # the raw captures are dead once split: tmpfs is RAM, and a run-window
     # sar slice per host adds up
-    WT_ROOT="$RUN_DIR/sysinfo" WT_PFX=$1 WT_SFX=$2 awk '
+    SYSI_ROOT="$RUN_DIR/sysinfo" SYSI_PFX=$1 SYSI_SFX=$2 awk '
         #@awk split_sysinfo' "${files[@]}" && rm -f -- "${files[@]}"
 }
 

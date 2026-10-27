@@ -79,7 +79,7 @@ start_fio_servers() {
     [ ${#failed[@]} -eq 0 ] || die "failed to start fio server on: ${failed[*]}"
     # let the listeners settle before the first coordinator connect; the
     # override exists for the test suite, whose stubbed servers need no settling
-    sleep "${WEKATESTER_SETTLE:-2}"
+    sleep "${WT_SETTLE:-2}"
     debug "fio servers running on all hosts"
 }
 
@@ -289,7 +289,9 @@ make_ctrl_dir() {
 # first value, and BatchMode=yes disables askpass.
 prompt_password_creds() {
     local j login pw
-    require_interactive "-p" "use key-based auth (-i) for unattended runs"
+    # a WT_PASSWORD setting is named where it was set
+    setting_where WT_PASSWORD
+    require_interactive "${SETTING_WHERE}-p" "use key-based auth (-i) for unattended runs"
     for ((j = 1; j <= PW_COUNT; j++)); do
         printf 'ssh login %d of %d (empty for %s): ' "$j" "$PW_COUNT" "$(id -un)" >&"$PROMPT_OUT_FD"
         IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"

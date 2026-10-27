@@ -98,7 +98,7 @@ prove_host_engines() {   # prove_host_engines <host> <dir> <all|first> <engine>.
         # stall. So: the bounded job reports its exit status down a pipe,
         # read the moment it exits; past the read's bound it is killed, and
         # abandoned if it will not die.
-        tmo=${WEKATESTER_ENGINE_TEST_TIMEOUT:-15}
+        tmo=${WT_ENGINE_TEST_TIMEOUT:-15}
         # 137 is timeout's -k KILL: said in the evidence, which a silent
         # hung fio would otherwise leave empty, and unquoted.
         # bash -c: process substitution and read -t are bash's. fio
@@ -206,7 +206,11 @@ finalize_targets() {
     if [ -n "$bad" ]; then
         host=${bad%% *}; eng=${bad#* }
         [ ! -f "$WORK_DIR/et/$host.$eng.out" ] || tail -5 "$WORK_DIR/et/$host.$eng.out" >&2
-        die "host file assigns ioengine '$eng' to $host but its test job failed (fio output above)"
+        # WT_ENGINE is every row's default: it may be where the engine came from
+        local what="host file"
+        [ -z "$DEFAULT_ENGINE" ] || [ "$eng" != "$DEFAULT_ENGINE" ] \
+            || what="host file (or WT_ENGINE, from ${SETTING_SRC[WT_ENGINE]:-the settings})"
+        die "$what assigns ioengine '$eng' to $host but its test job failed (fio output above)"
     fi
 }
 
