@@ -4443,7 +4443,10 @@ t_assert "targets file: yes creates the template and uses it" bash -c '
         [ "$TARGETS_FILE" = "$d/new.csv" ]) >>$SUITE_ASIDE
     head -1 "$d/new.csv" | grep -q "^host,user_login"'
 t_assert "targets file: a missing one is created only after the checks that need no file pass (a bad -i key leaves none)" bash -c '
-    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"; chmod +x "$d/bin/uname"
+    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    # the control run goes on past the file: ssh and scp never leave this box
+    printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
     out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
           bash ./wekatester -r -t "$d/new.csv" -i /no/such/key h1 2>&1); rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "$d/new.csv" ] || { echo "rc=$rc new.csv: $(ls "$d"); $out" >&2; exit 1; }
@@ -4451,7 +4454,8 @@ t_assert "targets file: a missing one is created only after the checks that need
     # control: with a readable key the same command line creates the file
     touch "$d/k"; out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
           bash ./wekatester -r -n -t "$d/new.csv" -i "$d/k" h1 2>&1)
-    head -1 "$d/new.csv" | grep -q "^host,user_login" || { echo "control: $out" >&2; false; }'
+    head -1 "$d/new.csv" | grep -q "^host,user_login" || { echo "control: $out" >&2; exit 1; }
+    case "$out" in *"/bin/ssh stub: "*) ;; *) echo "control reached no ssh stub: $out" >&2; false;; esac'
 t_assert "validate_credentials runs once: a second call adds no key" bash -c '
     d=$(mktemp -d); touch "$d/k"
     (source ./wekatester; LOCAL_MODE=0; IDENT_RAW=("u:$d/k")
