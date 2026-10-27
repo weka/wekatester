@@ -11,7 +11,9 @@ for b in "$BASH" "$(command -v bash)"; do
     [ "$v" -ge 404 ] || { echo "the suite needs bash 4.4 or later, and $b is older -- on a Mac: PATH=/opt/homebrew/bin:\$PATH bash tests/test_wekatester.sh" >&2; exit 2; }
 done
 # One suite per host (Frank, 2026-10-26): a host-wide mkdir lock, its owner
-# named. A holder that is gone (ps, which sees every user) is reclaimed.
+# named. A holder that is gone (ps, which sees every user) is reclaimed by
+# rename, which only one reclaimer wins; a moved lock that is not the one
+# read (another reclaimer's fresh one) goes back.
 SUITE_LOCK=${SUITE_LOCK:-/tmp/wekatester-suite.lock}
 suite_owner="pid $$ user $(id -un) since $(date '+%F %T') repo $PWD"
 if ! held=$(mkdir "$SUITE_LOCK" 2>&1); then
@@ -23,10 +25,16 @@ if ! held=$(mkdir "$SUITE_LOCK" 2>&1); then
     if hps=$(ps -p "$hpid" -o pid= 2>&1); then
         echo "another suite holds $SUITE_LOCK: $held; not running" >&2; exit 2
     fi
+    stale=$SUITE_LOCK.stale.$$
+    why=$(mv -- "$SUITE_LOCK" "$stale" 2>&1) || { echo "cannot take $SUITE_LOCK: $why" >&2; exit 2; }
+    if [ "$(cat "$stale/owner" 2>&1)" != "$held" ]; then
+        why=$(mv -- "$stale" "$SUITE_LOCK" 2>&1)
+        echo "cannot take $SUITE_LOCK: another suite reclaimed it first${why:+ ($why)}" >&2; exit 2
+    fi
+    why=$(rm -rf -- "${stale:?}" 2>&1 && mkdir "$SUITE_LOCK" 2>&1) || { echo "cannot take $SUITE_LOCK: $why" >&2; exit 2; }
     echo "reclaimed $SUITE_LOCK from a suite that is gone: $held"
-    why=$(rm -rf -- "${SUITE_LOCK:?}" 2>&1 && mkdir "$SUITE_LOCK" 2>&1) || { echo "cannot take $SUITE_LOCK: $why" >&2; exit 2; }
 fi
-printf '%s\n' "$suite_owner" > "$SUITE_LOCK/owner"
+printf '%s\n' "$suite_owner" > "$SUITE_LOCK/owner" || { echo "cannot take $SUITE_LOCK: no owner written" >&2; exit 2; }
 trap '[ "$(cat "$SUITE_LOCK/owner")" != "$suite_owner" ] || rm -rf -- "${SUITE_LOCK:?}"' EXIT
 # A timeout's TERM ends the suite with a count it can stand behind. INT is
 # left alone: the tool's own SIGINT tests need it.
@@ -2627,6 +2635,32 @@ t_assert "cal_evidence: quiet copies but does not repeat what check_fio_errors a
 t_assert "no python: the script runs none" bash -c '
     hits=$(grep -nE "python3|pyrun|PYEOF|#@include" ./wekatester || true)
     [ -z "$hits" ] || { printf "python in the script:\n%s\n" "$hits" >&2; false; }'
+
+# The suite's own lock: a stale one is reclaimed by rename, and a reclaimer
+# whose rename fails takes nothing. A nested suite gets its own SUITE_LOCK.
+dead_owner() {   # dead_owner <lockdir>: a lock owned by a pid that is gone
+    local p; bash -c : & p=$!; wait "$p"
+    mkdir "$1" && echo "pid $p user x since y repo z" > "$1/owner"
+}
+export -f dead_owner
+t_assert "suite lock: a reclaimer whose rename fails says cannot take, exits 2, and leaves the lock" bash -c '
+    d=$(mktemp -d); dead_owner "$d/lock"
+    mv() { echo "mv: cannot stat: gone" >&2; return 1; }; export -f mv
+    out=$(SUITE_LOCK=$d/lock SUITE_ONLY="^build: every file under src/" bash tests/test_wekatester.sh 2>&1); rc=$?
+    [ "$rc" = 2 ] && [ -d "$d/lock" ] || { echo "rc=$rc [$out]" >&2; exit 1; }
+    case "$out" in *"cannot take $d/lock: mv: cannot stat: gone"*) ;; *) echo "[$out]" >&2; exit 1;; esac
+    case "$out" in *reclaimed*) echo "reclaimed: [$out]" >&2; false;; esac'
+t_assert "suite lock: two reclaimers of a stale lock started together: one runs, one exits 2, the lock is gone after" bash -c '
+    for round in 1 2 3; do
+        d=$(mktemp -d); dead_owner "$d/lock"
+        SUITE_LOCK=$d/lock SUITE_ONLY="^build: every file under src/" bash tests/test_wekatester.sh > "$d/a" 2>&1 & pa=$!
+        SUITE_LOCK=$d/lock SUITE_ONLY="^build: every file under src/" bash tests/test_wekatester.sh > "$d/b" 2>&1 & pb=$!
+        wait "$pa"; ra=$?; wait "$pb"; rb=$?
+        [ "$(printf "%s\n" "$ra" "$rb" | sort | tr "\n" " ")" = "0 2 " ] &&
+        [ "$(cat "$d/a" "$d/b" | grep -c "^reclaimed $d/lock")" = 1 ] &&
+        [ ! -e "$d/lock" ] && [ -z "$(compgen -G "$d/lock.stale.*")" ] ||
+            { { echo "round $round: rc $ra $rb"; cat "$d/a" "$d/b"; ls -la "$d"; } >&2; exit 1; }
+    done'
 
 # An apostrophe in a comment inside a bash -c '...' body closes the string
 # early: the rest of the body becomes arguments to bash, and the test passes
