@@ -8743,14 +8743,22 @@ t_assert "build: a missing include or awk file stops it by name and leaves the t
     printf "x=%s#@awk y%s\n" "$q" "$q" > "$d/src/sh/x.sh"
     out=$("$d/build" 2>&1) && { echo "built without y.awk" >&2; exit 1; }
     case "$out" in *"cannot read src/awk/y.awk"*) ;; *) echo "[$out]" >&2; exit 1;; esac
-    echo "x=1" > "$d/src/sh/x.sh"
+    printf "x=1\nwrite_targets_template() { :; }\n" > "$d/src/sh/x.sh"
     "$d/build" && [ "$(sed -n 3p "$d/wekatester")" = "x=1" ] && head -2 "$d/wekatester" | grep -q "^# Built by ./build"'
 t_assert "build: an out exported by the caller does not redirect a no-argument build" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src"; cp ./build "$d/"
-    printf "#!/usr/bin/env bash\nx=1\n" > "$d/src/wekatester.sh"
+    printf "#!/usr/bin/env bash\nx=1\nwrite_targets_template() { :; }\n" > "$d/src/wekatester.sh"
     out=$d/leaked "$d/build" || exit 1
     [ ! -e "$d/leaked" ] || { echo "built into the exported out" >&2; exit 1; }
     [ "$(sed -n 3p "$d/wekatester")" = "x=1" ]'
+t_assert "build: a default build of a tool with no write_targets_template stops naming it, target and example untouched" bash -c '
+    d=$(mktemp -d); cp -R ./src ./build "$d/"; echo keep > "$d/wekatester"
+    sed "s/^write_targets_template() /write_targets_templat() /" ./src/sh/hosts.sh > "$d/src/sh/hosts.sh"
+    out=$("$d/build" 2>&1) && { echo "built anyway" >&2; exit 1; }
+    case "$out" in *"build: the assembly defines no write_targets_template(), which writes hostlist.example.csv; $d/wekatester left alone"*) ;; *) echo "[$out]" >&2; exit 1;; esac
+    [ "$(cat "$d/wekatester")" = keep ] && [ ! -e "$d/hostlist.example.csv" ] || { echo "target or example touched" >&2; exit 1; }
+    # control: the same tree unrenamed builds the tool and the repo example
+    cp ./src/sh/hosts.sh "$d/src/sh/hosts.sh" && "$d/build" && cmp ./wekatester "$d/wekatester" && cmp ./hostlist.example.csv "$d/hostlist.example.csv"'
 t_assert "build: an include cycle, an unknown directive or an assembly bash cannot parse stops it, target untouched" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/sh"; cp ./build "$d/"; echo keep > "$d/wekatester"
     try() {   # try <message>: the build fails within 20 s, saying it
@@ -8770,7 +8778,7 @@ t_assert "build: an include cycle, an unknown directive or an assembly bash cann
     try "does not parse" && [ -s "$d/wekatester.rejected" ]'
 t_assert "build: an apostrophe in an awk file reaches awk intact, at either marker position" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/awk"; cp ./build "$d/"; q=$(printf "\\047")
-    printf "#!/usr/bin/env bash\nawk %s#@awk a%s\nawk %s\n    #@awk b%s\n" "$q" "$q" "$q" "$q" > "$d/src/wekatester.sh"
+    printf "#!/usr/bin/env bash\nawk %s#@awk a%s\nawk %s\n    #@awk b%s\nwrite_targets_template() { :; }\n" "$q" "$q" "$q" "$q" > "$d/src/wekatester.sh"
     printf "# it%ss a test\nBEGIN { print \"don%st\" }\n" "$q" "$q" > "$d/src/awk/a.awk"
     printf "BEGIN {\n    print \"it%ss\"\n}\n" "$q" > "$d/src/awk/b.awk"
     "$d/build" && out=$(bash "$d/wekatester") && [ "$out" = "$(printf "don%st\nit%ss" "$q" "$q")" ] || { echo "[$out]" >&2; false; }'

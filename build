@@ -78,12 +78,16 @@ bash -n "$tmp" || {
     echo "build: the assembly does not parse (kept as $out.rejected); $out left alone" >&2
     exit 1
 }
+# The repo's example host file is the built tool's own template (README,
+# Settings), so the two never drift: a default build must be able to write
+# it, and a build to another path never does.
+if [ "$out" = "$PWD/wekatester" ] && ! grep -q '^write_targets_template() ' "$tmp"; then
+    echo "build: the assembly defines no write_targets_template(), which writes hostlist.example.csv; $out left alone" >&2
+    exit 1
+fi
 chmod 755 "$tmp"
 mv -f "$tmp" "$out"
-# The repo's example host file is the built tool's own template (README,
-# Settings), so the two never drift. Only a default build of a tool that
-# has the template writes it.
-if [ "$out" = "$PWD/wekatester" ] && grep -q '^write_targets_template() ' "$out"; then
+if [ "$out" = "$PWD/wekatester" ]; then
     ex=$(mktemp "$PWD/hostlist.example.csv.XXXXXX")
     trap 'rm -f "${tmp:?}" "${ex:?}"' EXIT
     said=$(bash -c 'source "$1" && write_targets_template "$2"' _ "$out" "$ex" 2>&1) \
