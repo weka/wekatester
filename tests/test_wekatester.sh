@@ -228,6 +228,11 @@ t_assert "settings: WT_PASSWORD takes from the file, loses to env and to -p" \
     st_case WT_PASSWORD 2 3 '$PW_COUNT' 2 3 4 -p 4
 t_assert "settings: WT_VERBOSE takes from the file, loses to env and to -v (never added together)" \
     st_case WT_VERBOSE 2 1 '$VERBOSITY' 2 1 3 -vvv
+t_assert "settings: WT_VERBOSE above 3 stops the run naming the source; 3 is the top" bash -c '
+    e=$(st_run - WT_VERBOSE=4 "\$VERBOSITY"); f=$(st_run WT_VERBOSE=4 - "\$VERBOSITY"); t=$(st_run WT_VERBOSE=3 - "\$VERBOSITY")
+    case "$e" in *"environment: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "e: $e" >&2; exit 1;; esac
+    case "$f" in *"h.csv:2: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "f: $f" >&2; exit 1;; esac
+    [ "$t" = 3 ] || { echo "t: $t" >&2; false; }'
 for sw in "WT_BULK BULK -b" "WT_UNLINK UNLINK -u" "WT_ANY_FS ANY_FS --any-fs" \
           "WT_ALLOW_FIO_MISMATCH ALLOW_FIO_MISMATCH --allow-fio-mismatch" \
           "WT_IGNORE_CAPACITY IGNORE_CAPACITY --ignore-capacity"; do

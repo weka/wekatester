@@ -6525,6 +6525,7 @@ setting_args() {   # setting_args <source> <name> <kind> <option> <value>
                     (*[!0-9]*) die "$src: $name takes a count (0 for none), not '$v'" ;;
                     (0) ;;
                     (*) if [ "$opt" = -v ]; then
+                            [[ $v =~ ^0*[0-3]$ ]] || die "$src: $name takes a count 0..3, not '$v'"
                             for ((i = 0; i < 10#$v; i++)); do SETTING_ARGS+=(-v); done
                         else
                             SETTING_ARGS=("$opt=$v")
