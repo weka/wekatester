@@ -233,6 +233,37 @@ t_assert "settings: WT_VERBOSE above 3 stops the run naming the source; 3 is the
     case "$e" in *"environment: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "e: $e" >&2; exit 1;; esac
     case "$f" in *"h.csv:2: WT_VERBOSE takes a count 0..3, not '\''4'\''"*) ;; *) echo "f: $f" >&2; exit 1;; esac
     [ "$t" = 3 ] || { echo "t: $t" >&2; false; }'
+# cli_settings_seen keeps its own list of spellings: every one a setting's
+# help line names (short, long, --long=value, -Xvalue) must mark that
+# setting alone, and every option parse_args takes is a setting or listed
+# here as not one.
+t_assert "settings: cli_settings_seen knows every spelling of every flag setting, and parse_args has no other" bash -c '
+    source ./wekatester; bad=""
+    seen() { cli_settings_seen "$@"; printf "%s" "${!CLI_SET[*]}"; }
+    while read -r name kind opt key; do
+        [ "$kind" != env ] || continue
+        sp=$(opt_help "$key" | head -1 | tr -d ,); set -- $sp; sps=()
+        for w in "$1" "${2:-}" "${3:-}"; do case $w in (-*) sps+=("$w");; esac; done
+        [ ${#sps[@]} -gt 0 ] || bad="$bad [$name: no spelling in its help]"
+        for s in "${sps[@]}"; do
+            forms=("$s")
+            case $kind:$s in
+                (switch:*) ;;
+                (count:-v) forms+=(-vv -vvv) ;;
+                (*:--*) forms+=("$s=x") ;;
+                (*) forms+=("${s}x") ;;
+            esac
+            for f in "${forms[@]}" "${forms[0]^^}"; do
+                [ "$(seen "$f")" = "$name" ] || bad="$bad [$f: $(seen "$f") want $name]"
+            done
+        done
+    done <<<"$SETTINGS_TABLE"
+    none=" - -- --break-lock --customize --help --load --targets --version -c -g -h -l -n -r -s -t "
+    for o in $(awk "/^parse_args\\(\\) /{p=1} p&&/^}/{exit} p" src/wekatester.sh |
+               grep -oE "^[[:space:]]+-[-a-zA-Z?*=|]+\\)" | tr -d " )" | tr "|" "\n" | sed "s/[?*]//g; s/=\$//" | sort -u); do
+        [ -n "$(seen "$o")" ] || [[ $none == *" $o "* ]] || bad="$bad [$o: parse_args takes it, cli_settings_seen does not]"
+    done
+    [ -z "$bad" ] || { echo "$bad" >&2; false; }'
 for sw in "WT_BULK BULK -b" "WT_UNLINK UNLINK -u" "WT_ANY_FS ANY_FS --any-fs" \
           "WT_ALLOW_FIO_MISMATCH ALLOW_FIO_MISMATCH --allow-fio-mismatch" \
           "WT_IGNORE_CAPACITY IGNORE_CAPACITY --ignore-capacity"; do
