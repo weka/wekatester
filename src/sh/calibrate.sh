@@ -454,12 +454,34 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
     fi
     cal_host_cpus "$host"
     if [ "$dirn" = read ]; then
-        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+        if [ "${CAL_NS_DIR-unset}" = "" ]; then
+            # the shared read set is one per filesystem group: shapes
+            # calibrating at once take turns seeding it (and the second
+            # finds the first's files complete)
+            cal_group_lock "$host"
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+            cal_group_unlock "$host"
+        else
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+        fi
     else
         cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL"
     fi
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
+}
+
+# A mkdir lock per filesystem group under cal/, for the shared read seed.
+# A seed that dies holds it, and the shape it ran in dies with it, which
+# stops the run (calibrate).
+cal_group_lock() {   # cal_group_lock <host>
+    local g; g=$(group_first "$1")
+    local said
+    until said=$(mkdir "$WORK_DIR/cal/.seed-$g" 2>&1); do cal_pause 0.2; done
+}
+cal_group_unlock() {   # cal_group_unlock <host>
+    local g; g=$(group_first "$1")
+    rmdir "$WORK_DIR/cal/.seed-$g" || log "WARNING: cannot release the seed lock of $g's filesystem group" >&2
 }
 
 # The clients a shape calibrates on: its representative, then its other
@@ -774,7 +796,9 @@ cal_dispatch() {   # cal_dispatch engines|searches
                 for p in "${others[@]}"; do kill "$p" 2>&1 || :; done
                 for p in "${others[@]}"; do wait "$p" || :; done
                 what="cell"; [ "$mode" != engines ] || what="engine cell"
-                die "shape $CAL_SID: the ${P_WHAT[$pid]} $what numjobs=$nj iodepth=$qd nrfiles=$nr failed on $c (above); the shape's other cells were stopped"
+                # a stopped cell's fio on the master runs until the teardown
+                # kills the fio servers (cleanup), seconds later
+                die "shape $CAL_SID: the ${P_WHAT[$pid]} $what numjobs=$nj iodepth=$qd nrfiles=$nr failed on $c (above); the shape's other cells were stopped (one still running on a client ends when the fio servers are stopped)"
             fi
             [ -s "${P_RF[$pid]}" ] || die "shape $CAL_SID: no reading from the cell numjobs=$nj iodepth=$qd nrfiles=$nr on $c"
             read -r v < "${P_RF[$pid]}"
@@ -790,8 +814,16 @@ cal_dispatch() {   # cal_dispatch engines|searches
             others=(); for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done; pids=("${others[@]}")
             any=1
         done
-        [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.2
+        [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.05
     done
+}
+
+# A shape's subshell on TERM (calibrate stopping the shapes after one
+# failed): its cells first, by the pids the dispatcher recorded.
+cal_shape_stop() {
+    local n p
+    [ ! -s "$WORK_DIR/cal/s$CAL_SID/pids" ] || while read -r n p; do kill "$p" 2>&1 || :; done < "$WORK_DIR/cal/s$CAL_SID/pids"
+    exit 143
 }
 
 # Whether the newline-separated todo list holds this exact line (was a
@@ -1076,7 +1108,13 @@ calibrate() {
         return 0
     fi
     echo
-    log "calibrating ($AUTO_LEVEL) $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g') per client shape, each shape solo on its first host"
+    local on="on its first host"
+    case "$CAL_CLIENTS" in
+        (all) on="on all of its members" ;;
+        (1) ;;
+        (*) on="on its first host and up to $((CAL_CLIENTS - 1)) more of its members" ;;
+    esac
+    log "calibrating ($AUTO_LEVEL) $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g') per client shape, the shapes at once, each $on"
     if brutal_mode; then
         log "cal: -a brutal: the same search with every early stop disabled -- every rung of every ladder is measured"
     fi
@@ -1123,10 +1161,23 @@ calibrate() {
         wait "${pids[$i]}" || die "cannot create the calibration namespace dir on ${hs[$i]}"
     done
     cal_capacity_check "$shapes" "$ladders"
-    # one shape at a time, each alone
+    # every shape at once, each in a subshell of its own; a failed shape
+    # stops the others (their cells too: cal_shape_stop), then the run
+    pids=(); hs=(); local failed=""
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
-        cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders"
+        ( trap cal_shape_stop TERM
+          cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders" ) &
+        pids+=($!); hs+=("$sid ($rep)")
     done 3< "$shapes"
+    for i in "${!pids[@]}"; do
+        if [ -n "$failed" ]; then
+            kill "${pids[$i]}" 2>&1 || :
+            wait "${pids[$i]}" || :
+        elif ! wait "${pids[$i]}"; then
+            failed=${hs[$i]}
+        fi
+    done
+    [ -z "$failed" ] || die "calibration of shape $failed failed (above); the other shapes were stopped"
 
     # One cal.results line per member: engine, then (qd nr fs nj) per
     # GEOM_SLOTS slot, "- - - -" for a slot the set does not run.

@@ -339,7 +339,7 @@ dry_run_report() {
     if cal_mode; then
         ! cal_ladders_once || call=$CAL_LADDERS
         if [ -n "$call" ]; then
-            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, each shape solo on its first host; the searches need live fio servers, so a dry run only names the shapes:"
+            log "-a $AUTO_LEVEL would calibrate before staging: $(printf '%s' "$call" | tr '\n' ',' | sed 's/,$//;s/,/, /g') -- per client shape, the shapes at once; the searches need live fio servers, so a dry run only names the shapes:"
             mkdir -p "$WORK_DIR/cal"
             if cal_shapes_once; then
                 while IFS= read -r line; do log "  $line"; done < "$WORK_DIR/cal/shapes.txt"

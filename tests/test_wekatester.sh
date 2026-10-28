@@ -7342,10 +7342,10 @@ t_assert "calibrate: each shape is measured solo on its first host, the answer l
     # the engine and the tuples reach targets.final, which staging reads
     t=$(awk -F"\t" "\$1==\"h2\" {print \$3, \$6, \$9, \$14, \$17}" "$d/targets.final") &&
     [ "$t" = "io_uring 10 2 5 1" ] &&
-    case "$out" in
-        *"shape 1 of 2: 2 host(s), calibrated on h1"*"N=5"*"shape 1: ioengine io_uring"*"shape 1 bw-write: numjobs=10 iodepth=2"*"siblings in that did"*"shape 1 lat-read: numjobs=5 iodepth=1 nrfiles=1 -> 100.0 us"*"shape 2: measuring"*"solo on h3"*) true;;
-        *) printf "%s\n" "$out" >&2; false;;
-    esac'
+    # the shapes run at once, so their lines interleave: each in turn
+    for want in "shape 1 of 2: 2 host(s), calibrated on h1" "N=5" "shape 1: ioengine io_uring" "shape 1 bw-write: numjobs=10 iodepth=2" "siblings in that did" "shape 1 lat-read: numjobs=5 iodepth=1 nrfiles=1 -> 100.0 us" "shape 2: measuring" "solo on h3" "per client shape, the shapes at once, each on its first host"; do
+        case "$out" in *"$want"*) ;; *) echo "missing [$want]"; printf "%s\n" "$out"; false;; esac >&2 || exit 1
+    done'
 t_assert "calibrate: with --line-rate the bandwidth answer the host file carries is measured again and replaces it; iops is measured at its pins" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8
@@ -7542,6 +7542,33 @@ t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has
     [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }
     out=$(cal_clients_run "$d" x "$d/set" h1 h2 h3) && { echo "x ran: $out" >&2; exit 1; }
     case "$out" in *"CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '\''x'\''"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
+# --- the shapes at once (wtCal, 2026-10-28) ---
+t_assert "calibrate: the shapes calibrate at once -- a second shape'\''s cell starts while the first'\''s are running, each cell still one client'\''s, the answers unchanged" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8 h2:8 h3:16:200000
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    out=$(CAL_SIM_CELL_SLEEP=1 cal_clients_run "$d" - "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -v cal-seed- "$d/simlog" | grep -- "--client=" > "$d/cells"
+    # an h3 (shape 2) cell between two h1 (shape 1) cells; one client per cell; h2 never runs a cell
+    awk "/--client=h1 / { if (seen3 && seen1) hit = 1; seen1 = 1 } /--client=h3 / { if (seen1) seen3 = 1 } END { exit !hit }" "$d/cells" &&
+    ! grep -q -- "--client=.*--client=" "$d/cells" && ! grep -q -- "--client=h2 " "$d/cells" || { cat "$d/cells" >&2; exit 1; }
+    cp "$d/cal.results" "$d/slow.results"
+    out=$(cal_clients_run "$d" - "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
+    cmp "$d/cal.results" "$d/slow.results" && grep -q "^h1 " "$d/cal.results" && grep -q "^h3 " "$d/cal.results"'
+t_assert "calibrate: shapes in one filesystem group take turns seeding its shared read set" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8 h3:16:200000
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    out=$( (source ./wekatester
+     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
+     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     copy_to_master() { :; }
+     run_host() { case "$2" in (*cal-seed-read*) echo "SEED-START $1 $(printf "%(%s)T" -1)" >> "$d/seeds"; sleep 1; echo "SEED-END $1 $(printf "%(%s)T" -1)" >> "$d/seeds";; esac; cal_sim_host "$@"; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(grep -c SEED-START "$d/seeds")" -ge 1 ] &&
+    # never a start between a start and its end
+    awk "/^SEED-START/ { if (open) bad = 1; open = 1 } /^SEED-END/ { open = 0 } END { exit bad }" "$d/seeds" || { cat "$d/seeds" >&2; false; }'
 # --- the dispatcher: a shape's cells over its clients (wtCal, 2026-10-28) ---
 t_assert "calibrate: CAL_CLIENTS=2 spreads a shape'\''s cells over both clients, confirm cells on the representative, the same answer as solo" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)

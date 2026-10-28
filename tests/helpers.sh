@@ -327,6 +327,8 @@ cal_sim_host() {   # cal_sim_host <host> <command>
         (*--client=*)
             h=${2#*--client=}; h=${h%% *}
             jf=${2##*/}; jf=${jf%\'}
+            # CAL_SIM_CELL_SLEEP: a cell takes this long (the shapes-at-once test)
+            [ -z "${CAL_SIM_CELL_SLEEP:-}" ] || sleep "$CAL_SIM_CELL_SLEEP"
             cal_fake_fio "$jf" "$h" ;;
     esac
     return 0
