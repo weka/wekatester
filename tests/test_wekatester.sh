@@ -7123,8 +7123,9 @@ t_assert "cal_shape_run: engine cells on a pinned 32-job x 64-file shape seed it
     (source ./wekatester
      WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
      cal_ensure_seed() { echo "seed $*" >> "$d/calls"; }
-     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; }
-     cal_search() { echo "search $*" >> "$d/calls"; }
+     # a cell runs in a background subshell: the reading file is its hand-off
+     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; [ -z "${10:-}" ] || echo 1000 > "${10}"; }
+     cal_searches() { echo "searches $*" >> "$d/calls"; }
      cal_shape_run 1 h1 8 0-7 0-15 0 libaio,psync - 0 64 "bw_r=1/64/-/32" "bw read") >>$SUITE_ASIDE 2>&1 ||
         { echo "cal_shape_run failed" >&2; exit 1; }
     # the seed covering 32 jobs x 64 files lands before the first engine cell
@@ -7136,8 +7137,8 @@ t_assert "cal_shape_run: a libaio engine cell past the aio room is skipped and t
     out=$( (source ./wekatester
      WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
      cal_ensure_seed() { :; }
-     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; }
-     cal_search() { :; }
+     cal_run_cell() { echo "cell $*" >> "$d/calls"; CAL_READING=1000; [ -z "${10:-}" ] || echo 1000 > "${10}"; }
+     cal_searches() { :; }
      cal_shape_run 1 h1 8 0-7 0-15 0 libaio,psync - 0 16 "" "$(printf "bw read\niops read")") 2>&1 ) ||
         { echo "cal_shape_run failed: $out" >&2; exit 1; }
     [ "$(cut -d" " -f3,5 "$d/calls" | tr "\n" ";")" = "bw libaio;bw psync;iops psync;" ] || { cat "$d/calls" >&2; exit 1; }
@@ -7147,7 +7148,7 @@ t_assert "cal_shape_run: creates cal/s<N> and cal/<rep> side by side, nothing un
     d=$(mktemp -d)
     out=$( (source ./wekatester
      WORK_DIR=$d; DIRECTORY=/mnt/weka; CAL_SETTLE=0
-     cal_ensure_seed() { :; }; cal_run_cell() { :; }; cal_search() { :; }
+     cal_ensure_seed() { :; }; cal_run_cell() { :; }; cal_searches() { :; }
      cal_shape_run 1 h1 8 0-7 0-15 0 libaio - 0 64 "" "") 2>&1 ) ||
         { echo "cal_shape_run failed: $out" >&2; exit 1; }
     [ -d "$d/cal/s1" ] && [ -d "$d/cal/h1" ] && [ -z "$(ls -A "$d/cal/s1")" ] ||
@@ -7513,12 +7514,12 @@ t_assert "calibrate: CAL_CLIENTS=2 on a two-member shape seeds and prices the se
     # both write sets seeded, each by its own client; the shared read set once, by the group as before
     grep cal-seed-write "$d/simlog" | grep -q -- "--client=h1 " && grep cal-seed-write "$d/simlog" | grep -q -- "--client=h2 " &&
     grep cal-seed-read "$d/simlog" | grep -q -- "--client=h1 .*--client=h2 " &&
-    ! grep cal-seed-read "$d/simlog" | grep -qv -- "--client=h1 " &&
+    grep cal-seed-read "$d/simlog" | head -1 | grep -q -- "^h1|.*--client=h1 " &&
     [ -s "$d/cal/res-seed-write-h1.json" ] && [ -s "$d/cal/res-seed-write-h2.json" ] &&
     [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] &&
     case "$out" in *"cal: capacity: h1'\''s own write set"*"cal: capacity: h2'\''s own write set"*) true;; *) printf "%s\n" "$out" >&2; false;; esac || exit 1
-    # the cells themselves still run on the representative alone (the dispatcher is a later step)
-    grep -v cal-seed- "$d/simlog" | grep -- "--client=" > "$d/cells" && ! grep -q -- "--client=h2" "$d/cells" || { cat "$d/cells" >&2; exit 1; }
+    # every cell is one client'\''s (the dispatcher spreads them: its own tests)
+    grep -v cal-seed- "$d/simlog" | grep -- "--client=" > "$d/cells" && ! grep -- "--client=" "$d/cells" | grep -q -- "--client=.*--client=" || { cat "$d/cells" >&2; exit 1; }
     # control: unset and 1 are today'\''s run, with no second write seed and the same commands
     out=$(cal_clients_run "$d" - "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
     cp "$d/simlog" "$d/simlog.unset"
@@ -7541,6 +7542,73 @@ t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has
     [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }
     out=$(cal_clients_run "$d" x "$d/set" h1 h2 h3) && { echo "x ran: $out" >&2; exit 1; }
     case "$out" in *"CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '\''x'\''"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
+# --- the dispatcher: a shape's cells over its clients (wtCal, 2026-10-28) ---
+t_assert "calibrate: CAL_CLIENTS=2 spreads a shape'\''s cells over both clients, confirm cells on the representative, the same answer as solo" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2
+    cp fio-jobfiles/default/0* "$d/set/"
+    out=$(cal_clients_run "$d" 1 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    cp "$d/cal.results" "$d/solo.results"; cp "$d/simlog" "$d/solo.simlog"
+    out=$(cal_clients_run "$d" 2 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -v cal-seed- "$d/simlog" | grep -- "--client=" > "$d/cells"
+    grep -q -- "--client=h1 " "$d/cells" && grep -q -- "--client=h2 " "$d/cells" &&
+    ! grep -q -- "--client=.*--client=" "$d/cells" || { cat "$d/cells" >&2; exit 1; }
+    # the provenance: one line per cell, confirm cells on h1 only, two in flight at some point
+    [ "$(cat "$d"/cal/s1/ran-* | wc -l | tr -d " ")" = "$(wc -l < "$d/cells" | tr -d " ")" ] &&
+    [ "$(cat "$d"/cal/s1/ran-* | grep -c "^[0-9]* [a-z0-9]* [0-9]* [0-9]* [0-9]* confirm ")" -gt 0 ] &&
+    ! cat "$d"/cal/s1/ran-* | grep " confirm " | grep -qv "^[0-9]* h1 " &&
+    [ "$(cat "$d"/cal/s1/ran-* | awk "\$3 >= 2" | wc -l | tr -d " ")" -gt 0 ] || { cat "$d"/cal/s1/ran-* >&2; exit 1; }
+    # every cell solo measured was measured (a batch may add cells past a
+    # stop: cost, never the answer), and the answer is the solo one
+    grep -o "cal-[a-z0-9]*-[a-z]*-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" "$d/cells" | sort -u > "$d/two.cells" &&
+    grep -v cal-seed- "$d/solo.simlog" | grep -o "cal-[a-z0-9]*-[a-z]*-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" | sort -u > "$d/solo.cells" &&
+    [ -z "$(comm -23 "$d/solo.cells" "$d/two.cells")" ] && [ -s "$d/solo.cells" ] &&
+    cmp "$d/cal.results" "$d/solo.results" &&
+    case "$out" in *"measuring bw read, bw write, iops read, iops write, lat read, lat write on 2 client(s): h1 h2 -- at most "*"cell(s) (~"*" min at 30s on one client, down to ~"*" on 2)"*"on 2 client(s), io_uring]"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
+t_assert "calibrate: a client that fails a cell mid-grid stops the shape naming it, with no cell left running" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    out=$(timeout 120 bash -c "
+        export CAL_CLIENTS=2
+        source ./wekatester
+        AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1 h2); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
+        TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+        SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+        copy_to_master() { :; }
+        run_host() { case \"\$2\" in (*--client=h2*cal-bw-read-*-nj2-*) echo \"fio: client: h2: Connection refused\"; return 1;; esac; cal_sim_host \"\$@\"; }
+        calibrate" 2>&1); rc=$?
+    [ "$rc" -eq 1 ] || { echo "rc=$rc"; printf "%s\n" "$out"; } >&2 || exit 1
+    case "$out" in *"ERROR: shape 1: the bw-read cell numjobs=2 iodepth="*" failed on h2 (above); the shape'\''s other cells were stopped"*) true;; *) printf "%s\n" "$out" >&2; exit 1;; esac
+    # every cell pid the dispatcher recorded is gone
+    [ -s "$d/cal/s1/pids" ] || { echo "no pids recorded" >&2; exit 1; }
+    while read -r n p; do ps -p "$p" -o pid= > "$d/ps.$n" 2>&1 && { echo "pid $p (cell $n) still runs" >&2; exit 1; }; done < "$d/cal/s1/pids"
+    # control: the same run with the failure on no cell completes
+    out=$(cal_clients_run "$d" 2 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -q -- "--client=h2 " "$d/simlog"'
+t_assert "calibrate: brutal on 3 clients measures every grid cell across all three and picks what solo brutal picks" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2 h3
+    printf "# report bandwidth iops\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    run() { ( export CAL_CLIENTS=$1; source ./wekatester
+        AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
+        TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+        SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+        CAL_NR_LADDER="1 2"; CAL_BW_QD_LADDER="1 2"; CAL_IOPS_QD_LADDER="1 2 4"
+        copy_to_master() { :; }
+        run_host() { cal_sim_host "$@"; }
+        calibrate ) 2>&1; }
+    # a run writes its answers to targets.final, which the next would read as pins: start each clean
+    rm -rf "${d:?}/simlog" "${d:?}/cal" "${d:?}/cal.results" "${d:?}/targets.final"; out=$(run 1) || { printf "%s\n" "$out" >&2; exit 1; }
+    cp "$d/cal.results" "$d/solo.results"; grep -v cal-seed- "$d/simlog" | grep -o "cal-[a-z]*-read-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" | sort > "$d/solo.cells"
+    rm -rf "${d:?}/simlog" "${d:?}/cal" "${d:?}/cal.results" "${d:?}/targets.final"; out=$(run 3) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -v cal-seed- "$d/simlog" | grep -o "cal-[a-z]*-read-[a-z_]*-nj[0-9]*-qd[0-9]*-nr[0-9]*" | sort > "$d/three.cells"
+    cmp "$d/solo.cells" "$d/three.cells" && cmp "$d/cal.results" "$d/solo.results" &&
+    for h in h1 h2 h3; do grep -v cal-seed- "$d/simlog" | grep -q -- "--client=$h " || { echo "no cell on $h" >&2; exit 1; }; done &&
+    # the grid: every bw rung (N, 2N and 4N x qd x nr: the budget less its 5 confirm re-reads), then those re-reads
+    b=$( (source ./wekatester; CAL_NR_LADDER="1 2"; CAL_BW_QD_LADDER="1 2"; CAL_IOPS_QD_LADDER="1 2 4"; AUTO_LEVEL=brutal; cal_plan budget bw read libaio 1 0 0 /dev/null $(cal_knobs bw)) )
+    [ "$(grep -v " confirm " "$d/cal/s1/ran-bw-read" | wc -l | tr -d " ")" = "$((b - 5))" ] &&
+    [ "$(grep -c " confirm " "$d/cal/s1/ran-bw-read")" = 5 ] || { echo "budget $b"; cat "$d/cal/s1/ran-bw-read"; false; } >&2'
 t_assert "calibrate: in the scratch every client gets its namespace dir and seeds both sides" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2

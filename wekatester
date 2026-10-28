@@ -3537,40 +3537,173 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     # the file is the hand-off (a background cell has no other); CAL_READING
     # spares the serial callers a cat per cell
     printf '%s\n' "$CAL_READING" > "$rf" || die "cannot write the reading of ${json##*/} to $rf"
-    debug "cal: shape $CAL_SID $what ${rt}s: $CAL_READING"
+    debug "cal: shape $CAL_SID $what ${rt}s on $rep: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
 
-# The planner names each cell, bash runs it; the tuple lands in
-# cal/s<id>/tuple-<type>-<dirn> as "qd nr fs nj".
-cal_search() {   # cal_search <rep> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap>
-    local rep=$1 type=$2 dirn=$3 eng=$4 usable=$5 linerate=$6 memcap=$7
-    local sdir="$WORK_DIR/cal/s$CAL_SID" hist act phase nj qd nr rt msg n=0 knobs
-    hist="$sdir/hist-$type-$dirn"
-    : > "$hist"
-    knobs="$(cal_knobs "$type")aio=${CAL_REP_AIO:--} $(cal_pin_knobs "$sdir" "$type" "$dirn")"
-    CAL_PIN_FS=$(cal_pin_fs "$sdir" "$type" "$dirn")
+# --- the dispatcher: a shape's cells over its clients ----------------------
+# The planner names the cells, the dispatcher hands them to idle clients of
+# the shape (CAL_SHAPE_CLIENTS), each cell in a background subshell: its
+# wider seed first, in the dispatcher itself so seeds never overlap, then
+# cal_run_cell with a cell number and a reading file of its own. A search
+# with no cell in flight asks `cal_plan batch` again; one with cells in
+# flight hands out the rest of its batch, whose cells need no reading from
+# each other. Confirm cells run on the representative only. A cell that
+# fails stops the shape: the other cells are reaped first, then die names
+# the client and the cell. Per search, cal/s<id>/hist-<type>-<dirn> is the
+# planner's history as before, and ran-<type>-<dirn> says who ran what:
+# "<n> <client> <inflight> <start> <end> <phase> <nj> <qd> <nr> <value>"
+# (inflight: the shape's cells running as this one started, itself
+# included; start and end in epoch seconds). The engine cells go the same
+# way (ran-engines). The tuple lands in tuple-<type>-<dirn> as "qd nr fs nj".
+#
+# Search state, by index: S_TYPE S_DIRN S_HIST S_KNOBS S_PINFS S_N (cells
+# run) S_INFL (in flight) S_DONE S_Q (the batch left to hand out, one
+# "phase nj qd nr rt" per line) S_ASK (ask the planner again). Engine
+# cells: E_CELL ("etype ctype edirn engine nj qd nr pinfs"), E_RES.
+cal_searches() {   # cal_searches <engine> <N> <linerate> <memcap>: every search of the shape
+    local eng=$1 usable=$2 linerate=$3 memcap=$4 sdir="$WORK_DIR/cal/s$CAL_SID" type dirn i=0
+    S_TYPE=(); S_DIRN=(); S_HIST=(); S_KNOBS=(); S_PINFS=(); S_N=(); S_INFL=(); S_DONE=(); S_Q=(); S_ASK=()
+    for type in bw iops lat lat1m; do
+        for dirn in write read; do
+            cal_todo_has "$CAL_TODO" "$type $dirn" || continue
+            S_TYPE[i]=$type; S_DIRN[i]=$dirn; S_HIST[i]="$sdir/hist-$type-$dirn"
+            : > "${S_HIST[$i]}"
+            S_KNOBS[i]="$(cal_knobs "$type")aio=${CAL_REP_AIO:--} $(cal_pin_knobs "$sdir" "$type" "$dirn")"
+            S_PINFS[i]=$(cal_pin_fs "$sdir" "$type" "$dirn")
+            S_N[i]=0; S_INFL[i]=0; S_DONE[i]=0; S_Q[i]=""; S_ASK[i]=1
+            i=$((i + 1))
+        done
+    done
+    [ "$i" -gt 0 ] || return 0
+    CAL_DISPATCH_ARGS="$eng $usable $linerate $memcap"
+    cal_dispatch searches
+}
+
+# One search's next batch, or its verdict. -> S_Q, S_DONE
+cal_search_ask() {   # cal_search_ask <search-index>
+    local i=$1 act nj qd nr msg type=${S_TYPE[$1]} dirn=${S_DIRN[$1]} sdir="$WORK_DIR/cal/s$CAL_SID"
+    set -- $CAL_DISPATCH_ARGS
+    [ "${S_N[$i]}" -lt 400 ] || die "the $type $dirn search did not converge in 400 cells (history: cal/s$CAL_SID/${S_HIST[$i]##*/})"
+    # shellcheck disable=SC2086 -- the knobs are one k=v word each
+    act=$(cal_plan batch "$type" "$dirn" "$1" "$2" "$3" "$4" "${S_HIST[$i]}" ${S_KNOBS[$i]}) \
+        || die "the calibration planner failed for $type $dirn (history: cal/s$CAL_SID/${S_HIST[$i]##*/} in the run bundle)"
+    S_ASK[i]=0
+    case "$act" in
+        ("cell "*) S_Q[i]=$act ;;
+        ("done "*)
+            read -r _ nj qd nr msg <<<"$act"
+            printf '%s %s %s %s\n' "$qd" "$nr" "${S_PINFS[$i]:-$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))M}" "$nj" > "$sdir/tuple-$type-$dirn"
+            log "cal: shape $CAL_SID $type-$dirn: $msg [${S_N[$i]} cell(s) on $CAL_NCLIENTS client(s), $1]"
+            S_DONE[i]=1; S_Q[i]="" ;;
+        (*) die "the calibration planner said something unexpected for $type $dirn: $act" ;;
+    esac
+}
+
+# A pause with no process: a read that times out on a fifo nobody writes
+# (the settle test counts every sleep the cells make).
+cal_pause() {   # cal_pause <seconds>
+    [ -n "${CAL_PAUSE_FD:-}" ] || {
+        [ -p "$WORK_DIR/cal/.pause" ] || mkfifo "$WORK_DIR/cal/.pause" || die "cannot create $WORK_DIR/cal/.pause"
+        exec {CAL_PAUSE_FD}<>"$WORK_DIR/cal/.pause"
+    }
+    read -r -t "$1" -u "$CAL_PAUSE_FD" _ || :
+}
+
+cal_dispatch() {   # cal_dispatch engines|searches
+    local mode=$1 sdir="$WORK_DIR/cal/s$CAL_SID" clients=($CAL_SHAPE_CLIENTS) rep=${CAL_SHAPE_CLIENTS%% *}
+    local -A BUSY=() P_CLIENT=() P_SRCH=() P_CELL=() P_N=() P_START=() P_INFL=() P_RF=() P_DONEF=() P_WHAT=()
+    local c i j n pid line phase nj qd nr rt type dirn eng pinfs what rf donef rc v inflight started any left pids=() p others=()
+    set -- $CAL_DISPATCH_ARGS; eng=${1:-}
+    CAL_NCLIENTS=${#clients[@]}
+    [ "$mode" != engines ] || { E_RES=(); j=0; }
+    : > "$sdir/pids"
     while :; do
-        # shellcheck disable=SC2086 -- the knobs are one k=v word each
-        act=$(cal_plan next "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap" "$hist" $knobs) \
-            || die "the calibration planner failed for $type $dirn (history: cal/s$CAL_SID/${hist##*/} in the run bundle)"
-        case "$act" in
-            ("cell "*)
-                read -r _ phase nj qd nr rt <<<"$act"
-                [ "$n" -lt 400 ] || die "the $type $dirn search did not converge in 400 cells (history: cal/s$CAL_SID/${hist##*/})"
-                cal_ensure_seed "$rep" "$dirn" "$nj" "$nr"
-                cal_run_cell "$rep" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
-                printf '%s %s %s %s %s %s %s\n' "$phase" "$eng" "$nj" "$qd" "$nr" "$rt" \
-                    "$CAL_READING" >> "$hist"
-                n=$((n + 1)) ;;
-            ("done "*)
-                read -r _ nj qd nr msg <<<"$act"
-                printf '%s %s %s %s\n' "$qd" "$nr" "${CAL_PIN_FS:-$(( FILESIZE_MIB / nr > 0 ? FILESIZE_MIB / nr : 1 ))M}" "$nj" > "$sdir/tuple-$type-$dirn"
-                log "cal: shape $CAL_SID $type-$dirn: $msg [$n cell(s), $eng]"
-                CAL_PIN_FS=""
-                return 0 ;;
-            (*) die "the calibration planner said something unexpected for $type $dirn: $act" ;;
-        esac
+        # searches with nothing in flight ask the planner again
+        if [ "$mode" = searches ]; then
+            for i in "${!S_TYPE[@]}"; do
+                [ "${S_DONE[$i]}" -eq 0 ] && [ "${S_INFL[$i]}" -eq 0 ] && [ "${S_ASK[$i]}" -eq 1 ] || continue
+                cal_search_ask "$i"
+            done
+        fi
+        # idle clients take the next cell: the first search with cells to
+        # hand out; a confirm cell waits for the representative
+        started=0
+        for c in "${clients[@]}"; do
+            [ -z "${BUSY[$c]:-}" ] || continue
+            line=""; i=""
+            if [ "$mode" = engines ]; then
+                [ "$j" -lt ${#E_CELL[@]} ] || break
+                set -- ${E_CELL[$j]}; i=$j; j=$((j + 1))
+                # etype ctype edirn engine nj qd nr pinfs; the engine runtime
+                line="engine $5 $6 $7 $CAL_ENGINE_RUNTIME"; type=$2; dirn=$3; eng=$4; pinfs=$8
+                [ "$8" != - ] || pinfs=""
+            else
+                for i in "${!S_TYPE[@]}"; do
+                    [ "${S_DONE[$i]}" -eq 0 ] && [ -n "${S_Q[$i]}" ] || continue
+                    line=${S_Q[$i]%%$'\n'*}
+                    case "$line" in ("cell confirm "*) [ "$c" = "$rep" ] || { line=""; continue; } ;; esac
+                    S_Q[i]=${S_Q[$i]#"$line"}; S_Q[i]=${S_Q[$i]#$'\n'}
+                    break
+                done
+                [ -n "$line" ] || continue
+                read -r _ phase nj qd nr rt <<<"$line"
+                line="$phase $nj $qd $nr $rt"; type=${S_TYPE[$i]}; dirn=${S_DIRN[$i]}; pinfs=${S_PINFS[$i]}
+                S_INFL[i]=$(( S_INFL[i] + 1 ))
+            fi
+            read -r phase nj qd nr rt <<<"$line"
+            CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS
+            rf="$sdir/reading-$n"; donef="$sdir/done-$n"; rm -f "$rf" "$donef"
+            # the seed here, never in the cell: two clients' seeds of one
+            # shared set must not overlap
+            cal_ensure_seed "$c" "$dirn" "$nj" "$nr"
+            inflight=$(( ${#pids[@]} + 1 ))
+            { ( CAL_PIN_FS=$pinfs; cal_run_cell "$c" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt" "$n" "$rf" ); printf '%s\n' "$?" > "$donef"; } &
+            pid=$!
+            pids+=("$pid"); printf '%s %s\n' "$n" "$pid" >> "$sdir/pids"
+            BUSY[$c]=$pid; P_CLIENT[$pid]=$c; P_SRCH[$pid]=$i; P_CELL[$pid]=$line; P_N[$pid]=$n; P_WHAT[$pid]="$type-$dirn"
+            P_START[$pid]=$(printf '%(%s)T' -1); P_INFL[$pid]=$inflight; P_RF[$pid]=$rf; P_DONEF[$pid]=$donef
+            started=1
+        done
+        if [ ${#pids[@]} -eq 0 ]; then
+            # nothing running: done, or a search still to ask
+            left=0
+            if [ "$mode" = searches ]; then
+                for i in "${!S_TYPE[@]}"; do [ "${S_DONE[$i]}" -eq 1 ] || left=1; done
+            fi
+            [ "$left" -eq 1 ] && [ "$started" -eq 0 ] && continue
+            [ "$left" -eq 1 ] || break
+        fi
+        # reap what finished: the done file says so (a zombie still answers kill -0)
+        any=0
+        for pid in "${pids[@]}"; do
+            [ -s "${P_DONEF[$pid]}" ] || continue
+            wait "$pid" || :
+            read -r rc < "${P_DONEF[$pid]}"
+            c=${P_CLIENT[$pid]}; i=${P_SRCH[$pid]}; read -r phase nj qd nr rt <<<"${P_CELL[$pid]}"
+            if [ "$rc" -ne 0 ]; then
+                others=()
+                for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done
+                for p in "${others[@]}"; do kill "$p" 2>&1 || :; done
+                for p in "${others[@]}"; do wait "$p" || :; done
+                what="cell"; [ "$mode" != engines ] || what="engine cell"
+                die "shape $CAL_SID: the ${P_WHAT[$pid]} $what numjobs=$nj iodepth=$qd nrfiles=$nr failed on $c (above); the shape's other cells were stopped"
+            fi
+            [ -s "${P_RF[$pid]}" ] || die "shape $CAL_SID: no reading from the cell numjobs=$nj iodepth=$qd nrfiles=$nr on $c"
+            read -r v < "${P_RF[$pid]}"
+            if [ "$mode" = engines ]; then
+                E_RES[$i]=$v
+                printf '%s %s %s %s %s %s %s %s %s %s\n' "${P_N[$pid]}" "$c" "${P_INFL[$pid]}" "${P_START[$pid]}" "$(printf '%(%s)T' -1)" "$phase" "$nj" "$qd" "$nr" "$v" >> "$sdir/ran-engines"
+            else
+                printf '%s %s %s %s %s %s %s\n' "$phase" "$eng" "$nj" "$qd" "$nr" "$rt" "$v" >> "${S_HIST[$i]}"
+                printf '%s %s %s %s %s %s %s %s %s %s\n' "${P_N[$pid]}" "$c" "${P_INFL[$pid]}" "${P_START[$pid]}" "$(printf '%(%s)T' -1)" "$phase" "$nj" "$qd" "$nr" "$v" >> "$sdir/ran-${S_TYPE[$i]}-${S_DIRN[$i]}"
+                S_N[i]=$(( S_N[i] + 1 )); S_INFL[i]=$(( S_INFL[i] - 1 )); S_ASK[i]=1
+            fi
+            unset "BUSY[$c]"
+            others=(); for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done; pids=("${others[@]}")
+            any=1
+        done
+        [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.2
     done
 }
 
@@ -3585,8 +3718,8 @@ cal_todo_has() {   # cal_todo_has <todo> <line>
 cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <linerate> <engines> <pinned> <memcap> <aio> <pins> <ladders>
     local sid=$1 rep=$2 usable=$3 phys=$4 allc=$5 linerate=$6 engines=$7 pinned=$8 memcap=$9 aio=${10} pins=${11} ladders=${12}
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
-    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax ran
-    CAL_SID=$sid
+    local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax ran pinfs nclients on est i
+    CAL_SID=$sid; E_CELL=(); E_RES=()
     CAL_REP_N=$usable
     CAL_REP_PHYS=$phys
     CAL_REP_ALL=$allc
@@ -3630,11 +3763,19 @@ BUDEOF
     mins=$(( (budget * (CAL_RUNTIME + 5) + wcells * CAL_SETTLE) / 60 + 1 ))
     # engine cells: one per candidate per type (bw, iops, lat; lat1m stands in
     # for lat only when no 4k latency search is asked for)
-    log "cal: shape $sid: measuring $(printf '%s' "$todo" | tr '\n' ',' | sed 's/,$//;s/,/, /g') solo on $rep -- at most $budget search cell(s) (~$mins min at ${CAL_RUNTIME}s)$([ "$ncand" -le 1 ] || printf ' plus %d engine cell(s)' $(( ncand * $(printf '%s\n' "$todo" | awk '{t = ($1 == "lat1m") ? "lat" : $1} t == "bw" || t == "iops" || t == "lat" {print t}' | sort -u | wc -l) )))"
+    cal_shape_clients "$sid" "$rep"
+    set -- $CAL_SHAPE_CLIENTS; nclients=$#
+    # on k clients the cells of a search's independent ladders run side by
+    # side, so the whole takes at most the solo time and nearer a k-th of it
+    if [ "$nclients" -gt 1 ]; then
+        on="on $nclients client(s): $CAL_SHAPE_CLIENTS"; est="~$mins min at ${CAL_RUNTIME}s on one client, down to ~$(( (mins + nclients - 1) / nclients )) on $nclients"
+    else
+        on="solo on $rep"; est="~$mins min at ${CAL_RUNTIME}s"
+    fi
+    log "cal: shape $sid: measuring $(printf '%s' "$todo" | tr '\n' ',' | sed 's/,$//;s/,/, /g') $on -- at most $budget search cell(s) ($est)$([ "$ncand" -le 1 ] || printf ' plus %d engine cell(s)' $(( ncand * $(printf '%s\n' "$todo" | awk '{t = ($1 == "lat1m") ? "lat" : $1} t == "bw" || t == "iops" || t == "lat" {print t}' | sort -u | wc -l) )))"
     # the dataset every first-pass cell reads or writes; wider cells seed
     # their own extra files as they come
     if [ "$pinned" != "-" ]; then CAL_SEED_ENG=$pinned; else CAL_SEED_ENG=${engines%%,*}; fi
-    cal_shape_clients "$sid" "$rep"
     [ "$any_read" -eq 0 ] || cal_seed_clients read "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
     [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
     if [ "$pinned" != "-" ]; then
@@ -3672,10 +3813,9 @@ BUDEOF
             [ "$pj" = - ] || enj=$pj
             [ "$pq" = - ] || eqd=$pq
             [ "$pn" = - ] || enr=$pn
-            CAL_PIN_FS=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
-            # seed what pins past usable x CAL_NR need, as cal_search does;
-            # else fio lays the files out inside the timed cell
-            cal_ensure_seed "$rep" "$edirn" "$enj" "$enr"
+            pinfs=$(cal_pin_fs "$sdir" "$ctype" "$edirn")
+            # the pins' seed, past usable x CAL_NR, comes with the cell
+            # (cal_dispatch); else fio lays the files out inside the timed cell
             ran=0
             for e in ${engines//,/ }; do
                 # libaio past the aio room dies with EAGAIN: rank the others
@@ -3683,24 +3823,25 @@ BUDEOF
                     log "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
                     continue
                 fi
-                cal_run_cell "$rep" "$ctype" "$edirn" "$e" "$enj" "$eqd" "$enr" "$CAL_ENGINE_RUNTIME"
-                printf '%s %s %s\n' "$etype" "$e" "$CAL_READING" >> "$sdir/engines"
+                E_CELL+=("$etype $ctype $edirn $e $enj $eqd $enr ${pinfs:--}")
                 ran=1
             done
             [ "$ran" -eq 1 ] || die "shape $sid: no candidate ioengine can run the $etype engine cell: numjobs=$enj iodepth=$eqd needs $((enj * eqd)) aio events with libaio, and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed) -- raise fs.aio-max-nr or pin another ioengine (-e or the host file)"
-            CAL_PIN_FS=""
+        done
+        # the engine cells are independent of each other: all the clients
+        CAL_DISPATCH_ARGS=""
+        cal_dispatch engines
+        for i in "${!E_CELL[@]}"; do
+            set -- ${E_CELL[$i]}
+            printf '%s %s %s\n' "$1" "$4" "${E_RES[$i]}" >> "$sdir/engines"
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
         read -r eng rest <<<"$pick"
         log "cal: shape $sid: ioengine $eng -- $rest"
     fi
     printf '%s\n' "$eng" > "$sdir/engine"
-    for type in bw iops lat lat1m; do
-        for dirn in write read; do
-            cal_todo_has "$todo" "$type $dirn" || continue
-            cal_search "$rep" "$type" "$dirn" "$eng" "$usable" "$linerate" "$memcap"
-        done
-    done
+    CAL_TODO=$todo
+    cal_searches "$eng" "$usable" "$linerate" "$memcap"
 }
 
 # Removal for the files <name><sep><fmt> names under <hd> (the sweep glob),
