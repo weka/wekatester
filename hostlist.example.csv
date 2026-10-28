@@ -25,8 +25,9 @@ WT_ENGINE=
 #   -a, --auto [safe|max|cal|brutal[:secs]]
 #                           measure the clients and run what they do best
 #                           (default level when omitted: max): clients are
-#                           grouped into hardware shapes, one client of each
-#                           is measured alone; N = its usable physical cores
+#                           grouped into hardware shapes, each measured on its
+#                           first client (--cal-clients spreads it); N = its
+#                           usable physical cores
 #                           safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
 #                           max: numjobs N/2, N, 2N at the deepest iodepth and
 #                           nrfiles cal has chosen (bandwidth 16 and 4, iops
@@ -48,6 +49,12 @@ WT_AUTO=
 #                           a cloud VF can report 100 Gb/s on a 16 Gb/s
 #                           instance, and without the weka CLI nothing reports it
 WT_LINE_RATE=
+#
+#   --cal-clients n|all     spread each shape's -a cells over up to n of its
+#                           clients (all: every one), in command-line order,
+#                           to calibrate sooner; the confirm re-reads stay on
+#                           the first client (default: 1, the first alone)
+WT_CAL_CLIENTS=1
 #
 #   --ignore-capacity       when the workload needs more space than is available,
 #                           ask (no timeout) and run anyway instead of aborting

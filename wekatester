@@ -48,6 +48,8 @@ BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s
                     # on a 16 Gb/s instance) or when nothing can report it
+CAL_CLIENTS=1       # --cal-clients: the clients a shape's calibration cells are
+                    # spread over (a count, or all); 1 = its first host alone
 
 SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
@@ -369,8 +371,8 @@ confirm_explicit() {   # confirm_explicit <message>
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
+                  [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
@@ -396,7 +398,7 @@ EOF
 
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
-USAGE_KEYS="directory workload fio_bin output engine auto line_rate ignore_capacity
+USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
     break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
     duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
@@ -435,8 +437,9 @@ EOF
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
-                          grouped into hardware shapes, one client of each
-                          is measured alone; N = its usable physical cores
+                          grouped into hardware shapes, each measured on its
+                          first client (--cal-clients spreads it); N = its
+                          usable physical cores
                           safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
                           max: numjobs N/2, N, 2N at the deepest iodepth and
                           nrfiles cal has chosen (bandwidth 16 and 4, iops
@@ -451,6 +454,13 @@ EOF
                           15 for safe and max, 30 for cal and brutal); it
                           does not change how long the measured jobs run --
                           that is -x/--duration
+EOF
+    ;;
+    (cal_clients) cat <<EOF
+  --cal-clients n|all     spread each shape's -a cells over up to n of its
+                          clients (all: every one), in command-line order,
+                          to calibrate sooner; the confirm re-reads stay on
+                          the first client (default: 1, the first alone)
 EOF
     ;;
     (line_rate) cat <<EOF
@@ -1826,6 +1836,8 @@ parse_args() {
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
             --line-rate)   need_arg "$1" $# "${2:-}"; set_line_rate "$2"; shift 2 ;;
             --line-rate=*) set_line_rate "${opt#--line-rate=}"; shift ;;
+            --cal-clients)   need_arg "$1" $# "${2:-}"; set_cal_clients "$2"; shift 2 ;;
+            --cal-clients=*) set_cal_clients "${opt#--cal-clients=}"; shift ;;
             -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
             --engine=*)    ENGINE=${opt#--engine=}
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
@@ -1958,6 +1970,18 @@ check_args() {
     # WT_LINE_RATE setting is named where it was set
     [ -z "$LINE_RATE_GBPS" ] || cal_mode || { setting_where WT_LINE_RATE; usage >&2
         die "${SETTING_WHERE}--line-rate sets the bandwidth target of a calibration: it needs -a"; }
+    [ "$CAL_CLIENTS" = 1 ] || cal_mode || { setting_where WT_CAL_CLIENTS; usage >&2
+        die "${SETTING_WHERE}--cal-clients spreads a calibration over the shape's clients: it needs -a"; }
+}
+
+# --cal-clients: a count, or all; case does not matter
+set_cal_clients() {   # set_cal_clients <value>
+    local v; v=$(lower "$1")
+    case "$v" in
+        (all) CAL_CLIENTS=all ;;
+        (""|*[!0-9]*|0*) usage >&2; die "--cal-clients takes a positive whole number of clients per shape, or all, not '$1'" ;;
+        (*) CAL_CLIENTS=$v ;;
+    esac
 }
 
 # DIRECTORY without its trailing slashes (the host file's column: trim_dir),
@@ -2730,11 +2754,10 @@ cal_group_unlock() {   # cal_group_unlock <host>
 }
 
 # The clients a shape calibrates on: its representative, then its other
-# members in command-line order, at most CAL_CLIENTS (all: every member).
-# calibrate writes cal/clients once ("<id>\t<host>..." per shape) and says
-# when a shape has fewer than asked; a shape not listed there runs on its
-# representative alone. -> CAL_SHAPE_CLIENTS
-CAL_CLIENTS=${CAL_CLIENTS:-1}   # clients per shape; the option lands in S4
+# members in command-line order, at most CAL_CLIENTS (--cal-clients; all:
+# every member). calibrate writes cal/clients once ("<id>\t<host>..." per
+# shape) and says when a shape has fewer than asked; a shape not listed
+# there runs on its representative alone. -> CAL_SHAPE_CLIENTS
 cal_shape_clients() {   # cal_shape_clients <id> <rep>
     local id h
     CAL_SHAPE_CLIENTS=$2
@@ -2745,10 +2768,6 @@ cal_shape_clients() {   # cal_shape_clients <id> <rep>
 }
 cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
     local sid rep usable phys allc linerate engines pinned memcap aio cached members n m take list
-    case "$CAL_CLIENTS" in
-        (all) ;;
-        (""|*[!0-9]*|0*) die "CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '$CAL_CLIENTS'" ;;
-    esac
     : > "$WORK_DIR/cal/clients" || die "cannot write $WORK_DIR/cal/clients"
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members; do
         set -- $members; n=$#
@@ -6784,6 +6803,7 @@ WT_OUTPUT flag --output output
 WT_ENGINE default --engine engine
 WT_AUTO flag --auto auto
 WT_LINE_RATE flag --line-rate line_rate
+WT_CAL_CLIENTS flag --cal-clients cal_clients
 WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
 WT_ANY_FS switch --any-fs any_fs
 WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
@@ -6800,7 +6820,7 @@ WT_STAGE_BASE env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
-    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
     [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
 declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
 DEFAULT_ENGINE=""            # WT_ENGINE from the environment or the host file
@@ -6838,6 +6858,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (-e*|--engine|--engine=*) CLI_SET[WT_ENGINE]=1 ;;
             (-a*|--auto|--auto=*) CLI_SET[WT_AUTO]=1 ;;
             (--line-rate|--line-rate=*) CLI_SET[WT_LINE_RATE]=1 ;;
+            (--cal-clients|--cal-clients=*) CLI_SET[WT_CAL_CLIENTS]=1 ;;
             (--ignore-capacity) CLI_SET[WT_IGNORE_CAPACITY]=1 ;;
             (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
             (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
@@ -7010,6 +7031,7 @@ setting_value() {   # setting_value <name>
         (WT_ENGINE) if [ -n "${CLI_SET[WT_ENGINE]:-}" ]; then printf '%s' "$ENGINE"; else printf '%s' "$DEFAULT_ENGINE"; fi ;;
         (WT_AUTO) printf '%s' "$AUTO_LEVEL" ;;
         (WT_LINE_RATE) printf '%s' "$LINE_RATE_GBPS" ;;
+        (WT_CAL_CLIENTS) printf '%s' "$CAL_CLIENTS" ;;
         (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
         (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
         (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;

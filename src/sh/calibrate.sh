@@ -485,11 +485,10 @@ cal_group_unlock() {   # cal_group_unlock <host>
 }
 
 # The clients a shape calibrates on: its representative, then its other
-# members in command-line order, at most CAL_CLIENTS (all: every member).
-# calibrate writes cal/clients once ("<id>\t<host>..." per shape) and says
-# when a shape has fewer than asked; a shape not listed there runs on its
-# representative alone. -> CAL_SHAPE_CLIENTS
-CAL_CLIENTS=${CAL_CLIENTS:-1}   # clients per shape; the option lands in S4
+# members in command-line order, at most CAL_CLIENTS (--cal-clients; all:
+# every member). calibrate writes cal/clients once ("<id>\t<host>..." per
+# shape) and says when a shape has fewer than asked; a shape not listed
+# there runs on its representative alone. -> CAL_SHAPE_CLIENTS
 cal_shape_clients() {   # cal_shape_clients <id> <rep>
     local id h
     CAL_SHAPE_CLIENTS=$2
@@ -500,10 +499,6 @@ cal_shape_clients() {   # cal_shape_clients <id> <rep>
 }
 cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
     local sid rep usable phys allc linerate engines pinned memcap aio cached members n m take list
-    case "$CAL_CLIENTS" in
-        (all) ;;
-        (""|*[!0-9]*|0*) die "CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '$CAL_CLIENTS'" ;;
-    esac
     : > "$WORK_DIR/cal/clients" || die "cannot write $WORK_DIR/cal/clients"
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members; do
         set -- $members; n=$#

@@ -55,8 +55,9 @@ attaching is the way to pass a value that starts with a dash.
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
-                          grouped into hardware shapes, one client of each
-                          is measured alone; N = its usable physical cores
+                          grouped into hardware shapes, each measured on its
+                          first client (--cal-clients spreads it); N = its
+                          usable physical cores
                           safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
                           max: numjobs N/2, N, 2N at the deepest iodepth and
                           nrfiles cal has chosen (bandwidth 16 and 4, iops
@@ -200,8 +201,9 @@ A generated layout job carries a `# wekatester-layout: generated sha256=...` mar
 of trusting the jobfiles' static values. Four levels:
 
 Every level calibrates before staging, **per client shape**: the clients are
-grouped by hardware, one client of each shape is measured alone, and what it
-finds is what every client of that shape runs. N is the shape's usable
+grouped by hardware, each shape is measured on its first client (or spread over
+more of them with `--cal-clients`), and what it finds is what every client of
+that shape runs. N is the shape's usable
 physical cores (fio never shares a core with weka or with core 0's pair).
 The levels differ only in how wide the bandwidth and IOPS searches go:
 
@@ -280,12 +282,20 @@ warns and runs the bandwidth search to its peak instead. That happens when
 there is no weka CLI, no root and no escalator, UDP mode, a NIC bound to vfio
 with no kernel netdev, or ethtool reporting no speed.
 
-The first host of each shape on the command line is its representative, and it
-is measured **alone**: nothing else runs while a shape calibrates, so every
-number is that client's ceiling rather than its share of a contended fleet.
-Shapes run one after another. The answer is written for every member of the
-shape. The run log names each shape, its hosts, its NICs and line rate, and
-says up front the most cells the shape can take and roughly how long.
+The first host of each shape on the command line is its representative, and by
+default every cell of the shape runs on it, one at a time, so every number is
+that client's own reading. The shapes calibrate at once, each on its own
+clients. `--cal-clients N` (or `all`; the setting `WT_CAL_CLIENTS`) spreads a
+shape's cells over up to N of its members, in command-line order, to finish
+sooner: cells of one search run together only where the search allows it (the
+ladders are unchanged, each rung after the one before; independent ladders and
+job counts run side by side, and under `brutal` the whole grid), and the confirm
+re-reads always run on the representative. Contention only subtracts, so a
+spread cell that reaches line rate stands, and a cell that misses can push a
+ladder one rung heavier, which the representative's confirm re-read settles.
+The answer is written for every member of the shape. The run log names each
+shape, its hosts, its NICs and line rate, and says up front the most cells the
+shape can take and roughly how long, on one client and on the clients it has.
 
 ### Usable cores: N
 
@@ -382,7 +392,9 @@ two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
 
 **The pick** (bandwidth and IOPS, every level). Under `cal` the top three
 cells (`CAL_CONFIRM`) first get a second reading, under `brutal` the top five;
-`safe` and `max` measure each job count once. Contention only subtracts, so a
+`safe` and `max` measure each job count once. The re-reads run on the shape's
+representative, one at a time, whatever `--cal-clients` says. Contention only
+subtracts, so a
 second chance can raise a cell and never lower it, and the best reading is
 what a cell is credited with. Then the best reading wins, and an exact tie goes
 to the heavier cell: more outstanding IO (numjobs × iodepth), then more jobs,
@@ -482,9 +494,10 @@ files and GiB to write, and the free space at the
 destination with the share the seed will take. A seed that would not fit
 stops there. Before the first cell, calibration also prices everything it
 will write per filesystem — each group's shared read set for its widest
-reader and each representative's own write set for its shape's widest cell,
-less what is already laid out — adding up the groups and hosts on one weka
-filesystem, and stops (or, with `--ignore-capacity`, asks) when it cannot
+reader and the own write set of every client a shape calibrates on (its
+representative, and the members `--cal-clients` adds) for the shape's widest
+cell, less what is already laid out — adding up the groups and hosts on one
+weka filesystem, and stops (or, with `--ignore-capacity`, asks) when it cannot
 fit. The other members' own write sets are priced by the run's capacity
 check, at the measured answers. The dataset is kept after the run, so the next calibration seeds
 nothing; `-u` removes it once the last measured job has finished, exactly as
@@ -636,7 +649,7 @@ A line naming a host assigns to that host (two lines naming the same host is an 
 
 A host cell holding `*`, `?` or `[...]` makes a **pattern** line: a shell glob matched against each host as given on the command line (in local mode, its short hostname too), ignoring case, with no DNS lookup. `*` crosses dots, so `cg-*` matches `cg-01.lab`, and the dots in `10.0.0.*` are literal; a bare `*` covers every host. For each host it matches, a pattern line works like that host's own line, so its login is assigned, not a selector, but it ranks below a real host line: a host line beats a name glob, which beats `*`, which beats every selector line, and two equally specific patterns that disagree keep the first line and print a warning. A glob that matches none of the run's hosts is named in a warning (file and line) and the run goes on. `-a` never edits a pattern line; each host it matched gets its own line recording what the run resolved.
 
-**Settings.** A line whose first cell is `WT_NAME=value` sets an option for the whole run instead of naming a host. `WT_DIRECTORY`, `WT_WORKLOAD`, `WT_FIO_BIN`, `WT_OUTPUT`, `WT_ENGINE`, `WT_AUTO`, `WT_LINE_RATE`, `WT_DURATION`, `WT_BULK`, `WT_UNLINK`, `WT_VERBOSE`, `WT_IDENTITY`, `WT_PASSWORD`, `WT_ANY_FS`, `WT_ALLOW_FIO_MISMATCH` and `WT_IGNORE_CAPACITY` stand for the flag with the same long name: a switch takes 0 or 1, `WT_VERBOSE` a count of 0 to 3, and `WT_PASSWORD` the number of `-p` prompts, never a password. `WT_ENGINE_TEST_TIMEOUT`, `WT_SYSINFO_TIMEOUT`, `WT_SETTLE` and `WT_STAGE_BASE` (`shm`, or `mktemp` for `$TMPDIR`) have no flag. The same names work as environment variables (`WT_WORKLOAD=mixed ./wekatester ...`), with or without `-t`; `-h` and `--version` read none of them. Each setting comes from one place: its flag, else the environment, else the host file, else the built-in default; an empty value sets nothing. `WT_DIRECTORY` and `WT_ENGINE`, from the environment or the file, are run-wide defaults: a host, pattern or selector line's `destination_folder` or `ioengine` beats them, and only `-d` and `-e` beat those lines. A value passes the same checks as its flag. A bad value, an unknown name, a name set twice, or a second cell on a settings line stops the run, naming the file and line or the environment variable; quote a value that holds a comma. A bare `-t` finds the file through the command line's or the environment's workload, so a `WT_WORKLOAD` inside the file changes the workload but not which file is read. `-a` never edits a settings line. A new host file starts from a template that lists every setting at its default under its help, as `hostlist.example.csv` in the repository does.
+**Settings.** A line whose first cell is `WT_NAME=value` sets an option for the whole run instead of naming a host. `WT_DIRECTORY`, `WT_WORKLOAD`, `WT_FIO_BIN`, `WT_OUTPUT`, `WT_ENGINE`, `WT_AUTO`, `WT_LINE_RATE`, `WT_CAL_CLIENTS`, `WT_DURATION`, `WT_BULK`, `WT_UNLINK`, `WT_VERBOSE`, `WT_IDENTITY`, `WT_PASSWORD`, `WT_ANY_FS`, `WT_ALLOW_FIO_MISMATCH` and `WT_IGNORE_CAPACITY` stand for the flag with the same long name: a switch takes 0 or 1, `WT_VERBOSE` a count of 0 to 3, and `WT_PASSWORD` the number of `-p` prompts, never a password. `WT_ENGINE_TEST_TIMEOUT`, `WT_SYSINFO_TIMEOUT`, `WT_SETTLE` and `WT_STAGE_BASE` (`shm`, or `mktemp` for `$TMPDIR`) have no flag. The same names work as environment variables (`WT_WORKLOAD=mixed ./wekatester ...`), with or without `-t`; `-h` and `--version` read none of them. Each setting comes from one place: its flag, else the environment, else the host file, else the built-in default; an empty value sets nothing. `WT_DIRECTORY` and `WT_ENGINE`, from the environment or the file, are run-wide defaults: a host, pattern or selector line's `destination_folder` or `ioengine` beats them, and only `-d` and `-e` beat those lines. A value passes the same checks as its flag. A bad value, an unknown name, a name set twice, or a second cell on a settings line stops the run, naming the file and line or the environment variable; quote a value that holds a comma. A bare `-t` finds the file through the command line's or the environment's workload, so a `WT_WORKLOAD` inside the file changes the workload but not which file is read. `-a` never edits a settings line. A new host file starts from a template that lists every setting at its default under its help, as `hostlist.example.csv` in the repository does.
 
 Without `-t` no host file is used. Bare `-t` looks in the `-w` set's folder first, falling back to `./hostlist.csv`; when both exist, the set folder wins and is the copy later writebacks (`-a`) update. The host file is taken as prepared for the run. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. Precedence overall: **CLI flags > environment > host file > jobfiles/tuner**. For the ioengine in full: `-e`, then the host file's engine for the host, then `WT_ENGINE` (Settings), then the jobfile's own `ioengine=`, then (outside `-a`) the first of io_uring, libaio, psync that passes its test job on the host (see `-e`).
 
@@ -668,7 +681,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 - `cmdline` — the command line as typed, shell-quoted on one line, `./wekatester` first; `settings` — what it resolved to, one `<key><tab><value>` per line: `version`, `workload`, `auto` (the `-a` level, `-` without it), `cal-seconds` (the calibration cell length, `-` without `-a`), `master` and `hosts`, then, only under `--allow-fio-mismatch`, `allow-fio-mismatch` (what the fio version check found: the versions and their hosts when they differ), and once the sweep has run, `layout` (what the generated layout writes: `<n> file(s), <bytes> bytes to write on <h> host(s)`, or `nothing to write (files reused)`, which `-s` repeats), then one `<WT_NAME><tab><value><tab><source>` line for each setting whose value is not its default, the source being `cli`, `environment` or `<file>:<line>` (`WT_PASSWORD` records its prompt count, never a password); `fs-groups` — `<host> <group>` per host, the filesystem groups (hosts sharing one destination directory);
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host — this is the execution truth);
 - `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`); the receive path: `sysctl` (`net.core.netdev_max_backlog`, `net.ipv4.tcp_rmem`, and `rp_filter`, `arp_filter`, `arp_ignore` and `arp_announce` under `net.ipv4.conf` for `all`, `default` and each NIC), `chrony` (`chronyc tracking`, the clock offset; `timedatectl status` where chrony is absent), `cpu-governor` (cpus per frequency governor), `irqbalance` (running or not), `nics` (every netdev backed by a device, the probe's choice) and per NIC `nic-<dev>` (PCI address, driver, NUMA node, PCIe link speed and width current and max, its MSI IRQs and the cpus each may run on (a NIC whose device is not a PCI function itself, such as virtio, reads these and its AER counts below from the nearest PCI device above it, each such line ending `pci_parent=<PCI address>`; with no PCI device above it, it says `pci_parent not available`), `ethtool -g`/`-l`/`-c`/`-a` — rings, channels, coalescing, pause — and per-priority PFC from `mlnx_qos -i` where installed, retried under a passwordless escalator when it fails as a non-root user), each tool bounded at 10 s (an escalator check at 5 s, `journalctl` at 60 s); plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, raw counters for working out what changed over the run (wekatester computes no delta): `tcp-{start,end}` (`nstat -asz`, which leaves nstat's own history alone, else `/proc/net/snmp` and `/proc/net/netstat`; retransmits and drops), `nics-{start,end}` and per NIC `ethtool-S-<dev>-{start,end}` (every `ethtool -S` counter, per-priority discards and pauses included) and `aer-<dev>-{start,end}` (the PCIe AER correctable, nonfatal and fatal counts); then `kernel-log-end` (the kernel log from the run start, the last 2000 lines: `dmesg` windowed by the host's uptime, under a passwordless escalator when `dmesg_restrict` refuses a non-root user, else `journalctl -k --since` the run start) and `sar-end` (the sysstat log slice covering the run window, when the box keeps one); after a failed run whose fio servers were started, `fio-server-log-end`: a daemonized fio server writes its own messages only to syslog, so this is `journalctl -t fio` from the run start (every fio that logged in that window, the last 2000 lines), under a passwordless escalator for a non-root login, which otherwise sees only its own entries (the file says so when no escalator works); a host without `journalctl` records `not available` and nothing else is read. A successful run reads no server log, and a run that stopped before the servers started says in the log that there is none. A host missing a tool records `not available` instead of failing the run. Each host's sysinfo session, and each of its pressure sessions, is bounded as a whole at 300 s (`WT_SYSINFO_TIMEOUT`, whole seconds; any other value stops the run before it starts): a host past the bound is cut off, a log WARNING names the host and the bound, the item it stopped in ends `not available: the session was cut off here`, a `session-timeout` item (`session-timeout-{start,end}` for pressure) says so, everything already captured is kept, and the run carries on as it does when a capture fails. A controller without `timeout` warns and leaves the sessions unbounded;
-- `cal/` — on every `-a` run: `shapes` and `shapes.txt` (the client shapes), per shape `s<n>/` with the engine cells, each search's history of readings, and the tuples it settled, every cell's jobfile and raw JSON, and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`, every host at once, reported in host order) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
+- `cal/` — on every `-a` run: `shapes` and `shapes.txt` (the client shapes), `clients` (per shape, the clients its cells ran on), per shape `s<n>/` with the engine cells, each search's history of readings (`hist-<type>-<direction>`), who ran each cell (`ran-<type>-<direction>`, one line per cell: `<cell number> <client> <cells in flight, this one included> <start> <end> <phase> <numjobs> <iodepth> <nrfiles> <value>`, the times in epoch seconds; `ran-engines` for the engine cells), and the tuples it settled, every cell's jobfile and raw JSON (`res-s<n>-<cell number>-<client>-<cell>.json`), and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`, every host at once, reported in host order) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. When `pigz` is installed on the machine running wekatester, it does the compressing on all cores, writing the same gzip format at the same default level (a large run's bundle otherwise takes several seconds of single-threaded gzip); without it, tar's own gzip does. Either way the archive is a plain `.tgz` that `-s` and `tar -xzf` read. If compression fails, the directory is left uncompressed and the run says so. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 

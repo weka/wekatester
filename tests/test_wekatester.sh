@@ -296,6 +296,36 @@ t_assert "settings: WT_STAGE_BASE mktemp from the file, shm from env beats it; a
     case "$c" in *"environment WT_STAGE_BASE: WT_STAGE_BASE takes shm or mktemp, not '\''/tmp'\''"*) true;; *) false;; esac &&
     case "$f" in *"h.csv:2: WT_STAGE_BASE takes shm or mktemp, not '\''ram'\''"*) true;; *) false;; esac ||
         { echo "a [$a] b [$b] c [$c] f [$f]" >&2; false; }'
+t_assert "settings: --cal-clients takes a count or all from the CLI, the environment and a file line; 0, x and -1 stop naming the source" bash -c '
+    a=$(st_run WT_CAL_CLIENTS=3 - "\$CAL_CLIENTS" -a cal); b=$(st_run - WT_CAL_CLIENTS=all "\$CAL_CLIENTS" -a cal)
+    c=$(st_run - - "\$CAL_CLIENTS" -a cal --cal-clients ALL); e=$(st_run - - "\$CAL_CLIENTS" -a cal --cal-clients=2)
+    [ "$a" = 3 ] && [ "$b" = all ] && [ "$c" = all ] && [ "$e" = 2 ] || { echo "a=$a b=$b c=$c e=$e" >&2; exit 1; }
+    for v in 0 x -1; do
+        f=$(st_run "WT_CAL_CLIENTS=$v" - x -a cal); n=$(st_run - "WT_CAL_CLIENTS=$v" x -a cal)
+        case "$f" in *"h.csv:2: WT_CAL_CLIENTS: --cal-clients takes a positive whole number of clients per shape, or all, not '\''$v'\''"*) ;; *) echo "file $v: $f" >&2; exit 1;; esac
+        case "$n" in *"environment: WT_CAL_CLIENTS: --cal-clients takes a positive whole number of clients per shape, or all, not '\''$v'\''"*) ;; *) echo "env $v: $n" >&2; exit 1;; esac
+        k=$( (source ./wekatester; parse_args -a cal --cal-clients="$v" h1) 2>&1 ) && { echo "cli $v passed" >&2; exit 1; }
+        case "$k" in *"ERROR: --cal-clients takes a positive whole number of clients per shape, or all, not '\''$v'\''"*) ;; *) echo "cli $v: $k" >&2; exit 1;; esac
+    done
+    # without -a it stops, naming the source; 1 (the default) is not an ask
+    w=$(st_run WT_CAL_CLIENTS=2 - x); x=$( (source ./wekatester; parse_args --cal-clients=2 h1) 2>&1 ); y=$(st_run WT_CAL_CLIENTS=1 - "\$CAL_CLIENTS")
+    case "$w" in *"h.csv:2: WT_CAL_CLIENTS: --cal-clients spreads a calibration over the shape'\''s clients: it needs -a"*) ;; *) echo "w: $w" >&2; exit 1;; esac
+    case "$x" in *"ERROR: --cal-clients spreads a calibration over the shape'\''s clients: it needs -a"*) ;; *) echo "x: $x" >&2; exit 1;; esac
+    [ "$y" = 1 ] || { echo "y: $y" >&2; false; }'
+t_assert "settings: WT_CAL_CLIENTS=2 from a file line reaches the calibration: cal/clients lists two clients" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    printf "host,user_login\nWT_CAL_CLIENTS=2\n" > "$d/h.csv"
+    out=$( (unset $(compgen -v WT_); source ./wekatester
+     settings_parse -a cal -t "$d/h.csv" h1 h2 && TARGETS_FILE=$d/h.csv && settings_from_file && check_args && settings_check_env || exit 1
+     WORK_DIR=$d; MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h2 " &&
+    case "$out" in *"the shapes at once, each on its first host and up to 1 more of its members"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
 t_assert "settings: a bad value stops the run naming file:line or the environment, in the flag's own words" bash -c '
     f=$(st_run WT_LINE_RATE=fast - x -a cal); e=$(st_run - WT_AUTO=turbo x); s=$(st_run WT_BULK=yes - x)
     case "$f" in *"h.csv:2: WT_LINE_RATE: --line-rate takes the line rate in Gb/s"*) ;; *) echo "f: $f" >&2; exit 1;; esac
@@ -382,7 +412,8 @@ t_assert "settings: the template quotes each flag setting's -h block, gives -d/-
          fi
          [[ $t == *"$want"* ]] || { echo "$name: its help and default are not in the template" >&2; exit 1; }
      done <<<"$SETTINGS_TABLE"
-     [ "$n" -eq 14 ] && [ "$o" -eq 6 ] || { echo "$n flag and $o own-help settings checked, want 14 and 6" >&2; exit 1; }
+     [ "$n" -eq 15 ] && [ "$o" -eq 6 ] || { echo "$n flag and $o own-help settings checked, want 15 and 6" >&2; exit 1; }
+     case $t in *"#   --cal-clients n|all"*"WT_CAL_CLIENTS=1"*) ;; *) echo "no --cal-clients line in the template" >&2; exit 1;; esac
      case $t in *"--directory dir"*|*"--engine eng"*) echo "the -d or -e block is still in the template" >&2; exit 1;; esac
      for nm in WT_DIRECTORY WT_ENGINE; do [ -n "$(own_setting_help "$nm")" ] || { echo "$nm has no help" >&2; exit 1; }; done
      a=$(declare -p DIRECTORY WORKLOAD FIO_BIN OUTPUT_DIR AUTO_LEVEL BULK VERBOSITY PW_COUNT 2>&1)
@@ -2191,6 +2222,12 @@ t_assert "run bundle: settings records each WT_* setting off its default with it
     # WT_SETTLE=2 is its default: not recorded
     grep -qx "WT_DURATION${t}900${t}environment" "$r/settings" && grep -qx "WT_ENGINE${t}psync${t}$d/h.csv:2" "$r/settings" &&
     grep -qx "WT_BULK${t}1${t}cli" "$r/settings" && [ "$(grep -c "^WT_" "$r/settings")" = 3 ] || { cat "$r/settings" >&2; exit 1; }
+    # --cal-clients off its default of 1 is recorded too, from a file line
+    printf "host,user_login\nWT_CAL_CLIENTS=2\n" > "$d/c.csv"; r2=$d/20260101-000001
+    (unset $(compgen -v WT_); source ./wekatester
+     settings_parse -a cal -t "$d/c.csv" h1 && TARGETS_FILE=$d/c.csv && settings_from_file && check_args && settings_check_env &&
+     RUN_DIR=$r2 && mkdir "$r2" && record_run) >>$SUITE_ASIDE 2>&1 || exit 1
+    grep -qx "WT_CAL_CLIENTS${t}2${t}$d/c.csv:2" "$r2/settings" && [ "$(grep -c "^WT_CAL" "$r/settings")" = 0 ] || { cat "$r2/settings" >&2; exit 1; }
     source ./tests/helpers.sh; fio_json_single_fixture "$r/results_011-bw.json"
     tar -czf "$d/b.tgz" -C "$d" 20260101-000000
     out=$(./wekatester -s "$d/b.tgz") || { echo "$out" >&2; exit 1; }
@@ -7494,8 +7531,8 @@ t_assert "calibrate: a cell failure files its evidence and dies pointing at the 
 cal_clients_run() {
     local d=$1 cc=$2 set=$3; shift 3
     rm -rf "$d/simlog" "$d/cal" "$d/cal.results" "$d/targets.final"
-    ( [ "$cc" = - ] || export CAL_CLIENTS=$cc
-      source ./wekatester
+    ( source ./wekatester
+      [ "$cc" = - ] || CAL_CLIENTS=$cc
       AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=("$@"); MASTER=$1; FIO_BIN=fio
       TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
       SET_DIR_OVERRIDE=$set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
@@ -7527,7 +7564,7 @@ t_assert "calibrate: CAL_CLIENTS=2 on a two-member shape seeds and prices the se
     case "$out" in *"h2'\''s own write set"*) false;; *) true;; esac || { printf "%s\n" "$out" >&2; exit 1; }
     out=$(cal_clients_run "$d" 1 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
     cmp "$d/simlog" "$d/simlog.unset"'
-t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has takes them all and says so; a bad value stops" bash -c '
+t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has takes them all and says so" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2 h3
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-w.job"
@@ -7539,9 +7576,7 @@ t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has
     [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2 h3")" ] &&
     case "$out" in *"cal: shape 1: 5 client(s) asked and the shape has 3: calibrating on 3"*) true;; *) printf "%s\n" "$out" >&2; false;; esac || exit 1
     out=$(cal_clients_run "$d" 2 "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
-    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }
-    out=$(cal_clients_run "$d" x "$d/set" h1 h2 h3) && { echo "x ran: $out" >&2; exit 1; }
-    case "$out" in *"CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '\''x'\''"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }'
 # --- the shapes at once (wtCal, 2026-10-28) ---
 t_assert "calibrate: the shapes calibrate at once -- a second shape'\''s cell starts while the first'\''s are running, each cell still one client'\''s, the answers unchanged" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
@@ -7597,8 +7632,8 @@ t_assert "calibrate: a client that fails a cell mid-grid stops the shape naming 
     cal_sim_fixture "$d" h1 h2
     printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
     out=$(timeout 120 bash -c "
-        export CAL_CLIENTS=2
         source ./wekatester
+        CAL_CLIENTS=2
         AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1 h2); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
@@ -7617,7 +7652,7 @@ t_assert "calibrate: brutal on 3 clients measures every grid cell across all thr
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2 h3
     printf "# report bandwidth iops\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
-    run() { ( export CAL_CLIENTS=$1; source ./wekatester
+    run() { ( source ./wekatester; CAL_CLIENTS=$1
         AUTO_LEVEL=brutal; WORK_DIR=$d; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
         TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
         SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog

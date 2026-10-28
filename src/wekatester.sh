@@ -47,6 +47,8 @@ BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s
                     # on a 16 Gb/s instance) or when nothing can report it
+CAL_CLIENTS=1       # --cal-clients: the clients a shape's calibration cells are
+                    # spread over (a count, or all); 1 = its first host alone
 
 SET_DIR_OVERRIDE="" # test plumbing only: a jobfile set to run in place of -w's
 
@@ -92,8 +94,8 @@ ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not st
 usage() {
     cat <<EOF
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
+                  [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
@@ -119,7 +121,7 @@ EOF
 
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
-USAGE_KEYS="directory workload fio_bin output engine auto line_rate ignore_capacity
+USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
     break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
     duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
@@ -158,8 +160,9 @@ EOF
   -a, --auto [safe|max|cal|brutal[:secs]]
                           measure the clients and run what they do best
                           (default level when omitted: max): clients are
-                          grouped into hardware shapes, one client of each
-                          is measured alone; N = its usable physical cores
+                          grouped into hardware shapes, each measured on its
+                          first client (--cal-clients spreads it); N = its
+                          usable physical cores
                           safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
                           max: numjobs N/2, N, 2N at the deepest iodepth and
                           nrfiles cal has chosen (bandwidth 16 and 4, iops
@@ -174,6 +177,13 @@ EOF
                           15 for safe and max, 30 for cal and brutal); it
                           does not change how long the measured jobs run --
                           that is -x/--duration
+EOF
+    ;;
+    (cal_clients) cat <<EOF
+  --cal-clients n|all     spread each shape's -a cells over up to n of its
+                          clients (all: every one), in command-line order,
+                          to calibrate sooner; the confirm re-reads stay on
+                          the first client (default: 1, the first alone)
 EOF
     ;;
     (line_rate) cat <<EOF
@@ -397,6 +407,8 @@ parse_args() {
             -o?*) opt_val "$opt" -o; OUTPUT_DIR=$OPT_VAL; shift ;;
             --line-rate)   need_arg "$1" $# "${2:-}"; set_line_rate "$2"; shift 2 ;;
             --line-rate=*) set_line_rate "${opt#--line-rate=}"; shift ;;
+            --cal-clients)   need_arg "$1" $# "${2:-}"; set_cal_clients "$2"; shift 2 ;;
+            --cal-clients=*) set_cal_clients "${opt#--cal-clients=}"; shift ;;
             -e|--engine)   need_arg "$1" $# "${2:-}"; ENGINE=$2; shift 2 ;;
             --engine=*)    ENGINE=${opt#--engine=}
                            [ -n "$ENGINE" ] || { usage >&2; die "option --engine requires a value"; }
@@ -529,6 +541,18 @@ check_args() {
     # WT_LINE_RATE setting is named where it was set
     [ -z "$LINE_RATE_GBPS" ] || cal_mode || { setting_where WT_LINE_RATE; usage >&2
         die "${SETTING_WHERE}--line-rate sets the bandwidth target of a calibration: it needs -a"; }
+    [ "$CAL_CLIENTS" = 1 ] || cal_mode || { setting_where WT_CAL_CLIENTS; usage >&2
+        die "${SETTING_WHERE}--cal-clients spreads a calibration over the shape's clients: it needs -a"; }
+}
+
+# --cal-clients: a count, or all; case does not matter
+set_cal_clients() {   # set_cal_clients <value>
+    local v; v=$(lower "$1")
+    case "$v" in
+        (all) CAL_CLIENTS=all ;;
+        (""|*[!0-9]*|0*) usage >&2; die "--cal-clients takes a positive whole number of clients per shape, or all, not '$1'" ;;
+        (*) CAL_CLIENTS=$v ;;
+    esac
 }
 
 # DIRECTORY without its trailing slashes (the host file's column: trim_dir),

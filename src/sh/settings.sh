@@ -11,6 +11,7 @@ WT_OUTPUT flag --output output
 WT_ENGINE default --engine engine
 WT_AUTO flag --auto auto
 WT_LINE_RATE flag --line-rate line_rate
+WT_CAL_CLIENTS flag --cal-clients cal_clients
 WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
 WT_ANY_FS switch --any-fs any_fs
 WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
@@ -27,7 +28,7 @@ WT_STAGE_BASE env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
-    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
     [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
 declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
 DEFAULT_ENGINE=""            # WT_ENGINE from the environment or the host file
@@ -65,6 +66,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (-e*|--engine|--engine=*) CLI_SET[WT_ENGINE]=1 ;;
             (-a*|--auto|--auto=*) CLI_SET[WT_AUTO]=1 ;;
             (--line-rate|--line-rate=*) CLI_SET[WT_LINE_RATE]=1 ;;
+            (--cal-clients|--cal-clients=*) CLI_SET[WT_CAL_CLIENTS]=1 ;;
             (--ignore-capacity) CLI_SET[WT_IGNORE_CAPACITY]=1 ;;
             (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
             (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
@@ -219,6 +221,7 @@ setting_value() {   # setting_value <name>
         (WT_ENGINE) if [ -n "${CLI_SET[WT_ENGINE]:-}" ]; then printf '%s' "$ENGINE"; else printf '%s' "$DEFAULT_ENGINE"; fi ;;
         (WT_AUTO) printf '%s' "$AUTO_LEVEL" ;;
         (WT_LINE_RATE) printf '%s' "$LINE_RATE_GBPS" ;;
+        (WT_CAL_CLIENTS) printf '%s' "$CAL_CLIENTS" ;;
         (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
         (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
         (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;
