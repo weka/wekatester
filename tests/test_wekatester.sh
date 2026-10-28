@@ -6562,7 +6562,7 @@ t_assert "cal_plan max: a sync engine runs the job counts at iodepth 1, as the l
     out=$(plan_sim "$d" bw read psync 16 0 0 lvl=max fq=16 fn=4 confirm=0)
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 4;numjobs 16 1 4;numjobs 32 1 4;" ] || { cat "$d/asked" >&2; false; }'
 
-# --- cal_plan batch: every cell the walk can name at once (wtCal, 2026-10-28) ---
+# --- cal_plan batch: every cell the walk can name at once (Frank, 2026-10-28) ---
 # The same model as plan_sim, every cell of a batch read at once. The verdict
 # must be next's, and each batch's first line what next would name
 # (batch_sim checks that every round).
@@ -7190,7 +7190,7 @@ t_assert "cal_shape_run: creates cal/s<N> and cal/<rep> side by side, nothing un
         { echo "cal_shape_run failed: $out" >&2; exit 1; }
     [ -d "$d/cal/s1" ] && [ -d "$d/cal/h1" ] && [ -z "$(ls -A "$d/cal/s1")" ] ||
         { find "$d" >&2; false; }'
-# --- cells of several clients at once (wtCal, 2026-10-28) ---
+# --- cells of several clients at once (Frank, 2026-10-28) ---
 t_assert "cal_run_cell: two clients'\'' cells at once -- each on its own cpus, its own json named by host, its own reading file" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); mkdir -p "$d/cal"
     printf "h1\t0-15\tio_uring\t0-7\nh3\t0-31\tio_uring\t0-15\n" > "$d/cal/hostinfo"
@@ -7526,7 +7526,7 @@ t_assert "calibrate: a cell failure files its evidence and dies pointing at the 
         *) echo "$err" >&2; false;;
     esac &&
     case "$err" in *"/dev/shm/wt"*) echo "points at tmpfs: $err" >&2; false;; *) true;; esac'
-# --- several clients per shape (wtCal, 2026-10-28): CAL_CLIENTS, internal until the option ---
+# --- several clients per shape (Frank, 2026-10-28): CAL_CLIENTS, which --cal-clients sets ---
 # cal_clients_run <dir> <CAL_CLIENTS or -> <set-dir> [hosts...]: calibrate under cal_sim_host, SIMLOG in $d/simlog
 cal_clients_run() {
     local d=$1 cc=$2 set=$3; shift 3
@@ -7577,7 +7577,7 @@ t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has
     case "$out" in *"cal: shape 1: 5 client(s) asked and the shape has 3: calibrating on 3"*) true;; *) printf "%s\n" "$out" >&2; false;; esac || exit 1
     out=$(cal_clients_run "$d" 2 "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
     [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }'
-# --- the shapes at once (wtCal, 2026-10-28) ---
+# --- the shapes at once (Frank, 2026-10-28) ---
 t_assert "calibrate: the shapes calibrate at once -- a second shape'\''s cell starts while the first'\''s are running, each cell still one client'\''s, the answers unchanged" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8 h2:8 h3:16:200000
@@ -7604,7 +7604,7 @@ t_assert "calibrate: shapes in one filesystem group take turns seeding its share
     [ "$(grep -c SEED-START "$d/seeds")" -ge 1 ] &&
     # never a start between a start and its end
     awk "/^SEED-START/ { if (open) bad = 1; open = 1 } /^SEED-END/ { open = 0 } END { exit bad }" "$d/seeds" || { cat "$d/seeds" >&2; false; }'
-# --- the dispatcher: a shape's cells over its clients (wtCal, 2026-10-28) ---
+# --- the dispatcher: a shape's cells over its clients (Frank, 2026-10-28) ---
 t_assert "calibrate: CAL_CLIENTS=2 spreads a shape'\''s cells over both clients, confirm cells on the representative, the same answer as solo" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1 h2
