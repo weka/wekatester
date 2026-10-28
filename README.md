@@ -21,8 +21,8 @@ wekatester uses fio's native client/server mode:
 # Usage
 ```
 usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
-                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--ignore-capacity]
-                  [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
+                  [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
@@ -72,6 +72,10 @@ attaching is the way to pass a value that starts with a dash.
                           15 for safe and max, 30 for cal and brutal); it
                           does not change how long the measured jobs run --
                           that is -x/--duration
+  --cal-clients n|all     spread each shape's -a cells over up to n of its
+                          clients (all: every one), in command-line order,
+                          to calibrate sooner; the confirm re-reads stay on
+                          the first client (default: 1, the first alone)
   --line-rate Gb/s        every client's dataplane line rate, for the -a
                           bandwidth target, in place of what ethtool reports:
                           a cloud VF can report 100 Gb/s on a 16 Gb/s
