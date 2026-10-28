@@ -7152,6 +7152,36 @@ t_assert "cal_shape_run: creates cal/s<N> and cal/<rep> side by side, nothing un
         { echo "cal_shape_run failed: $out" >&2; exit 1; }
     [ -d "$d/cal/s1" ] && [ -d "$d/cal/h1" ] && [ -z "$(ls -A "$d/cal/s1")" ] ||
         { find "$d" >&2; false; }'
+# --- cells of several clients at once (wtCal, 2026-10-28) ---
+t_assert "cal_run_cell: two clients'\'' cells at once -- each on its own cpus, its own json named by host, its own reading file" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); mkdir -p "$d/cal"
+    printf "h1\t0-15\tio_uring\t0-7\nh3\t0-31\tio_uring\t0-15\n" > "$d/cal/hostinfo"
+    (source ./wekatester
+     WORK_DIR=$d; DIRECTORY=/mnt/weka; MASTER=h1; FIO_BIN=fio; TARGET_DIR=/dev/shm/x; CAL_SETTLE=0
+     CAL_SID=1; CAL_REP_N=8; CAL_REP_PHYS=0-3; CAL_REP_ALL=0-3
+     copy_to_master() { :; }
+     run_host() { cal_sim_host "$@"; }
+     cal_run_cell h1 bw read io_uring 2 1 1 30 7 "$d/r1" & p1=$!
+     cal_run_cell h3 bw read io_uring 4 1 1 30 8 "$d/r2" & p2=$!
+     wait "$p1" && wait "$p2") >>$SUITE_ASIDE 2>&1 || { echo "a cell failed" >&2; exit 1; }
+    j1=$d/cal/res-s1-7-h1-cal-bw-read-io_uring-nj2-qd1-nr1-30s.json; j3=$d/cal/res-s1-8-h3-cal-bw-read-io_uring-nj4-qd1-nr1-30s.json
+    [ -s "$j1" ] && [ -s "$j3" ] && grep -q "\"hostname\": \"h1\"" "$j1" && grep -q "\"hostname\": \"h3\"" "$j3" &&
+    [ "$(cat "$d/r1")" = 2147483648 ] && [ "$(cat "$d/r2")" = 4294967296 ] &&
+    # physical cores at or below N, from hostinfo, not the shape'\''s lists
+    grep -qx "cpus_allowed=0-7" "$d/cal/h1/cal-bw-read-io_uring-nj2-qd1-nr1-30s.job" &&
+    grep -qx "cpus_allowed=0-15" "$d/cal/h3/cal-bw-read-io_uring-nj4-qd1-nr1-30s.job" || { ls -R "$d" >&2; false; }'
+t_assert "cal_push: two pushes at once each land their own jobfile; no shared staging dir is left" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal/h1" "$d/cal/h2" "$d/master"
+    printf "[a]\n" > "$d/cal/h1/a.job"; printf "[b]\n" > "$d/cal/h2/b.job"
+    (source ./wekatester
+     WORK_DIR=$d; TARGET_DIR=/dev/shm/x
+     # slow, so the two pushes overlap
+     copy_to_master() { sleep 1; cp -R "${@:1:$#-1}" "$d/master/"; }
+     cal_push a.job h1 & p1=$!
+     cal_push b.job h2 & p2=$!
+     wait "$p1" && wait "$p2") >>$SUITE_ASIDE 2>&1 || { echo "a push failed" >&2; exit 1; }
+    cmp -s "$d/cal/h1/a.job" "$d/master/h1/a.job" && cmp -s "$d/cal/h2/b.job" "$d/master/h2/b.job" &&
+    [ -z "$(compgen -G "$d/cal/.push*")" ] || { ls -R "$d" >&2; false; }'
 t_assert "cal_lat_values: latency in us and IOPS per client, entries of one client weighted by IO count" bash -c '
     d=$(mktemp -d)
     printf "%s\n" "{ \"client_stats\": [ { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 100000 }, \"iops\": 1000, \"total_ios\": 300 } }, { \"jobname\": \"cal-lat-read\", \"hostname\": \"h1\", \"read\": { \"lat_ns\": { \"mean\": 200000 }, \"iops\": 500, \"total_ios\": 100 } }, { \"jobname\": \"All clients\", \"read\": { \"lat_ns\": { \"mean\": 9 } } } ] }" > "$d/r.json"
@@ -8778,14 +8808,14 @@ t_assert "fleet phases start as many processes for 40 hosts as for 3: -x/-e stam
         (export PATH="$d/bin:$PATH"; source ./wekatester
          WORK_DIR=$d/w; RUN_DIR=$d/run; HOSTS=($hs); DIRECTORY=/mnt/x; LOCAL_MODE=0
          run_host() { :; }
-         copy_to_master() { :; }
+         copy_to_master() { mkdir -p "$d/pushed" && cp -R "${@:1:$#-1}" "$d/pushed/"; }
          cal_push c.job $hs &&
          override_staged measured runtime 30 time_based 1 &&
          split_sysinfo "$WORK_DIR/sysinfo." "" &&
          ensure_layout_dirs 000-wekatester-layout.job &&
          load_host_dirs && [ "${HOST_DIRS[$((n - 1))]}" = "/mnt/h$n" ] &&
          ids=$(host_idents) && [ "${ids%%,*}" = "h1=h1/abc1" ]) || { echo "the phases failed at $n hosts" >&2; return 1; }
-        cmp -s "$d/w/cal/h$n/c.job" "$d/w/cal/.push/h$n/c.job" &&
+        cmp -s "$d/w/cal/h$n/c.job" "$d/pushed/h$n/c.job" && [ -z "$(compgen -G "$d/w/cal/.push*")" ] &&
         grep -qx "runtime=30" "$d/w/jobs/h$n/011-r.job" && grep -qx "time_based=1" "$d/w/jobs/h$n/011-r.job" &&
         ! grep -q "runtime" "$d/w/jobs/h$n/000-wekatester-layout.job" &&
         grep -qx "Linux" "$d/run/sysinfo/h$n/uname" && grep -qx "ro" "$d/run/sysinfo/h$n/cmdline" &&

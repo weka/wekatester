@@ -300,16 +300,18 @@ apply_cal_results() {
     HOST_DIRS_KEY=""   # a host_dir_v map of the old targets.final is stale
 }
 
-# Only this cell file goes to the master, one copy per push.
+# Only this cell file goes to the master, one copy per push, from a staging
+# dir of the push's own: cells of several clients push at once.
 cal_push() {   # cal_push <basename> <host>...
-    local base=$1 h dirs=(); shift
-    rm -rf "$WORK_DIR/cal/.push" || return 1
-    for h in "$@"; do dirs+=("$WORK_DIR/cal/.push/$h"); done
-    mkdir -p "${dirs[@]}" || return 1
+    local base=$1 h dirs=() push rc; shift
+    push=$(mktemp -d "$WORK_DIR/cal/.push.XXXXXX") || return 1
+    for h in "$@"; do dirs+=("$push/$h"); done
     # one awk copies every host's jobfile: a seed can name the whole fleet,
     # and a cp per host was a process per host
-    awkrun '#@awk cal_push' "$WORK_DIR/cal" "$base" "$@" || return 1
-    copy_to_master "$WORK_DIR/cal/.push"/* "$TARGET_DIR.cal/"
+    mkdir -p "${dirs[@]}" && awkrun '#@awk cal_push' "$WORK_DIR/cal" "$base" "$push" "$@" \
+        && copy_to_master "$push"/* "$TARGET_DIR.cal/"; rc=$?
+    rm -rf -- "${push:?}"
+    return "$rc"
 }
 
 # One line of the pre-seed estimate: what this host's seed will write, and
@@ -493,11 +495,29 @@ cal_engine_pick() {   # cal_engine_pick <engine-cells-file>
     awkrun '#@awk cal_engine_pick' "$1"
 }
 
-# Run one cell solo on <rep>; the reading lands in cal/reading. Never inside
-# $(...): a die there ends only the substitution. Globals from cal_shape_run:
-# CAL_SID, CAL_REP_DIR, CAL_REP_NAME, CAL_REP_N, CAL_REP_PHYS, CAL_REP_ALL.
+# Run one cell on one client; the reading lands in <reading-file> (default
+# cal/reading) and CAL_READING. Never inside $(...): a die there ends only
+# the substitution. The client's dir, name and cpus are its own, so cells
+# of several clients run at once in background subshells, each with a cell
+# number <n> from the caller (serial callers count CAL_CELLS). Globals from
+# cal_shape_run: CAL_SID, CAL_REP_N (the shape's N), CAL_REP_PHYS and
+# CAL_REP_ALL (cpus for a host cal/hostinfo does not list).
 CAL_CELLS=0
 CAL_PIN_FS=""   # a pinned filesize for the cells being run (cal_search, the engine cells)
+
+# A client's cpu lists from cal/hostinfo (cal_shapes): all, then physical.
+# -> CAL_HOST_ALL, CAL_HOST_PHYS; the shape's lists for a host not listed.
+cal_host_cpus() {   # cal_host_cpus <host>
+    local h a e p
+    CAL_HOST_ALL=$CAL_REP_ALL; CAL_HOST_PHYS=$CAL_REP_PHYS
+    [ -s "$WORK_DIR/cal/hostinfo" ] || return 0
+    while IFS=$'\t' read -r h a e p; do
+        [ "$h" = "$1" ] || continue
+        [ -z "$a" ] || CAL_HOST_ALL=$a
+        [ -z "$p" ] || CAL_HOST_PHYS=$p
+        return 0
+    done < "$WORK_DIR/cal/hostinfo"
+}
 
 # A slot's host-file pins, from cal_shape_run's pins-<type>-<dirn> file ("qd nr
 # fs nj", "-" for an unpinned knob): as planner knobs, and the pinned fs.
@@ -512,17 +532,19 @@ cal_pin_fs() {   # cal_pin_fs <shape-dir> <type> <dirn> -> the pinned fs, or not
     [ "$f" = - ] || printf '%s' "$f"
 }
 
-cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime>
-    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 base json vals h v a what cpus
+cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime> [<n> [<reading-file>]]
+    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 n=${9:-} rf=${10:-} base json vals h v a what cpus
     base="cal-$type-$dirn-$eng-nj$nj-qd$qd-nr$nr-${rt}s"
     what="cell $type-$dirn $eng numjobs=$nj iodepth=$qd nrfiles=$nr"
-    cpus=$CAL_REP_ALL
-    [ "$nj" -gt "$CAL_REP_N" ] || cpus=$CAL_REP_PHYS
-    stage_cal_cell "$WORK_DIR/cal/$rep/$base.job" "$CAL_REP_DIR" "$CAL_REP_NAME" \
+    host_dir_v "$rep"; host_name_v "$rep"; cal_host_cpus "$rep"
+    cpus=$CAL_HOST_ALL
+    [ "$nj" -gt "$CAL_REP_N" ] || cpus=$CAL_HOST_PHYS
+    stage_cal_cell "$WORK_DIR/cal/$rep/$base.job" "$HOST_DIR" "$HOST_NAME" \
         "$cpus" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt"
     cal_push "$base.job" "$rep" || die "cannot copy a calibration cell to $MASTER"
-    CAL_CELLS=$((CAL_CELLS + 1))
-    json="$WORK_DIR/cal/res-s$CAL_SID-$CAL_CELLS-$base.json"
+    [ -n "$n" ] || { CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS; }
+    [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
+    json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
     if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta=never --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
         cal_evidence "$what" "$json" "$base.job" say "$rep"
         die "calibration $what failed on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
@@ -540,8 +562,9 @@ cal_run_cell() {   # cal_run_cell <rep> <bw|iops|lat|lat1m> <read|write> <engine
         read -r h v <<<"$vals"
         CAL_READING=$v
     fi
-    # the file is the hand-off; CAL_READING spares the callers a cat per cell
-    printf '%s\n' "$CAL_READING" > "$WORK_DIR/cal/reading"
+    # the file is the hand-off (a background cell has no other); CAL_READING
+    # spares the serial callers a cat per cell
+    printf '%s\n' "$CAL_READING" > "$rf" || die "cannot write the reading of ${json##*/} to $rf"
     debug "cal: shape $CAL_SID $what ${rt}s: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
@@ -592,8 +615,6 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
     local sdir="$WORK_DIR/cal/s$1" type dirn slot kv c todo="" any_read=0 any_write=0
     local eng pick rest etype ctype edirn enj eqd enr pq pn pj e ncand budget wcells mins qmax ran
     CAL_SID=$sid
-    host_dir_v "$rep"; CAL_REP_DIR=$HOST_DIR
-    host_name_v "$rep"; CAL_REP_NAME=$HOST_NAME
     CAL_REP_N=$usable
     CAL_REP_PHYS=$phys
     CAL_REP_ALL=$allc

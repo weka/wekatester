@@ -190,8 +190,9 @@ BEGIN {
         pinsig = ""
         for (i = 1; i <= npin; i++) pinsig = pinsig SUBSEP PS[i] SUBSEP PQ[i] SUBSEP PNR[i] SUBSEP PFS[i] SUBSEP PJ[i]
         key = model SUBSEP ncpus SUBSEP memgib SUBSEP nweka SUBSEP nicsig SUBSEP CR["n"] SUBSEP set_size(ALL) SUBSEP cands SUBSEP pinned SUBSEP GF[h] SUBSEP pinsig
-        # every host may help seed its group shared set: what it runs on
-        HOSTINFO[x] = h "\t" fmt_cpulist(ALL) "\t" (pinned != "" ? pinned : first)
+        # every host may seed its group shared set or run a cell: all its
+        # cpus, its engine, its physical cores (cal_run_cell)
+        HOSTINFO[x] = h "\t" fmt_cpulist(ALL) "\t" (pinned != "" ? pinned : first) "\t" fmt_cpulist(PHYS)
         if (!(key in SHAPE)) {
             SHAPE[key] = ++ns; s = ns
             SREP[s] = h; SNM[s] = 0; SMODEL[s] = model; SNCPU[s] = ncpus; SMEMKB[s] = memkb; SMEMGIB[s] = memgib
@@ -270,7 +271,8 @@ BEGIN {
             printf "WARNING: shape %d (%s): %s -- the bandwidth search has no line-rate target and runs to its peak instead\n", s, rep, (SWHY[s] != "" ? SWHY[s] : "no line rate") > "/dev/stderr"
     }
     close(out)
-    # per host: the cpus and engine it seeds its group shared set with
+    # per host: the cpus and engine it seeds its group shared set with, and
+    # its physical cores
     caldir = dirname(out)
     f = path_join(caldir, "hostinfo")
     if (nh) writelines(f, HOSTINFO, nh)
