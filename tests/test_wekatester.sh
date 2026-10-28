@@ -6541,13 +6541,13 @@ t_assert "cal_plan batch: cal bw with a target -- the low walk one cell at a tim
     # the same cells as next asked for, fewer rounds
     [ "$(sort "$d/asked")" = "$(sort "$p/asked")" ] && [ "$(wc -l < "$d/batches" | tr -d " ")" -lt "$(wc -l < "$p/asked" | tr -d " ")" ] ||
         { cat "$d/batches" >&2; false; }'
-t_assert "cal_plan batch: cal iops -- N/2 and N together, then both queue ladders, a ladder'\''s nrfiles rungs only after its whole ladder" bash -c '
+t_assert "cal_plan batch: cal iops -- N/2, N and both queue ladders'\'' first rungs together, a ladder'\''s nrfiles rungs only after its whole ladder" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
     out=$(batch_sim "$d" iops read io_uring 16 0 0) || { echo "$out" >&2; exit 1; }
     ref=$(plan_sim "$p" iops read io_uring 16 0 0)
     [ "$out" = "$ref" ] && case "$out" in "done 64 8 4 "*) true;; *) false;; esac || { echo "batch [$out] next [$ref]" >&2; exit 1; }
-    [ "$(sed -n 1p "$d/batches")" = "numjobs 8 1 1;numjobs 16 1 1" ] &&
-    [ "$(sed -n 2p "$d/batches")" = "iodepth 32 1 1;iodepth 64 1 1" ] || { cat "$d/batches" >&2; exit 1; }
+    [ "$(sed -n 1p "$d/batches")" = "numjobs 8 1 1;numjobs 16 1 1;iodepth 32 1 1;iodepth 64 1 1" ] &&
+    [ "$(sed -n 2p "$d/batches")" = "iodepth 32 2 1;iodepth 64 2 1" ] || { cat "$d/batches" >&2; exit 1; }
     # no batch mixes a job count'\''s nrfiles rungs with its queue rungs, and the
     # last queue rung is asked before the first nrfiles rung, for 32 and for 64
     ! grep -E "iodepth 32 .*nrfiles 32 |nrfiles 32 .*iodepth 32 |iodepth 64 .*nrfiles 64 |nrfiles 64 .*iodepth 64 " "$d/batches" &&

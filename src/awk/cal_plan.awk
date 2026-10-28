@@ -266,9 +266,8 @@ BEGIN {
             POOL[++np] = k
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d", IOPS_LOW[i], human(best(k, 1)), QD1)
         }
-        # the ladders past N start once the counts at and below it are in
-        if (npend && !EXH) flush()
-        # past N the siblings join, and iodepth x nrfiles are searched
+        # past N the siblings join, and iodepth x nrfiles are searched; batch:
+        # their first rungs need no reading from the counts at or below N
         for (h = 1; h <= nhigh; h++) {
             nj = HIGH[h]; nm = 0; split("", MINE); lpend = 0
             nrs = EXH ? nnrl : 1
