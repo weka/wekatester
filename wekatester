@@ -3644,8 +3644,11 @@ cal_search_ask() {   # cal_search_ask <search-index>
 # A pause with no process: a read that times out on a fifo nobody writes
 # (the settle test counts every sleep the cells make).
 cal_pause() {   # cal_pause <seconds>
+    local said
     [ -n "${CAL_PAUSE_FD:-}" ] || {
-        [ -p "$WORK_DIR/cal/.pause" ] || mkfifo "$WORK_DIR/cal/.pause" || die "cannot create $WORK_DIR/cal/.pause"
+        # two shapes may make it at once: the loser finds the winner's
+        [ -p "$WORK_DIR/cal/.pause" ] || said=$(mkfifo "$WORK_DIR/cal/.pause" 2>&1) || [ -p "$WORK_DIR/cal/.pause" ] \
+            || die "cannot create $WORK_DIR/cal/.pause: $said"
         exec {CAL_PAUSE_FD}<>"$WORK_DIR/cal/.pause"
     }
     read -r -t "$1" -u "$CAL_PAUSE_FD" _ || :

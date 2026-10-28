@@ -7590,6 +7590,18 @@ t_assert "calibrate: the shapes calibrate at once -- a second shape'\''s cell st
     cp "$d/cal.results" "$d/slow.results"
     out=$(cal_clients_run "$d" - "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
     cmp "$d/cal.results" "$d/slow.results" && grep -q "^h1 " "$d/cal.results" && grep -q "^h3 " "$d/cal.results"'
+t_assert "cal_pause: a second shape that loses the race to make the pause fifo uses the winner'\''s" bash -c '
+    d=$(mktemp -d); mkdir "$d/cal"
+    # what the loser sees: the fifo is there by the time its mkfifo fails
+    out=$( (source ./wekatester; WORK_DIR=$d
+     mkfifo() { command mkfifo "$@"; echo "mkfifo: cannot create fifo '\''$1'\'': File exists" >&2; return 1; }
+     cal_pause 0.1; echo "returned $?") 2>&1 ); rc=$?
+    [ "$rc" -eq 0 ] && [ -p "$d/cal/.pause" ] && [ "$out" = "returned 0" ] || { echo "rc=$rc [$out]" >&2; exit 1; }
+    # control: a mkfifo that fails and leaves no fifo still stops, saying why
+    out=$( (source ./wekatester; WORK_DIR=$d; rm -f "$d/cal/.pause"
+     mkfifo() { echo "mkfifo: cannot create fifo '\''$1'\'': Permission denied" >&2; return 1; }
+     cal_pause 0.1; echo "returned $?") 2>&1 ) && { echo "no stop: $out" >&2; exit 1; }
+    case "$out" in *"ERROR: cannot create $d/cal/.pause: mkfifo: cannot create fifo"*"Permission denied"*) true;; *) echo "[$out]" >&2; false;; esac'
 t_assert "calibrate: shapes in one filesystem group take turns seeding its shared read set" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8 h3:16:200000
