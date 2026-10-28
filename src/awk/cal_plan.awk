@@ -22,11 +22,17 @@ function kr(k,    P) { split(k, P, SUBSEP); return P[3] + 0 }
 # whose readings never steer a step that came before it
 function best(k, decision) { return decision ? ((k in BDEC) ? BDEC[k] : "") : ((k in BALL) ? BALL[k] : "") }
 function nreads(k) { return (k in NRD) ? NRD[k] : 0 }
-function cell(phase, k, rt) {
-    printf "cell %s %d %d %d %s\n", phase, kj(k), kq(k), kr(k), (rt != "" ? rt : RUNT)
-    exit 0
+# next: the first cell with no reading ends the walk. batch: it is held
+# (PENDL) and the walk goes on naming every cell that needs no pending
+# reading, in walk order; flush() prints them where a decision would need
+# one. The first batch line is what next names.
+function cell(phase, k, rt,    line) {
+    line = sprintf("cell %s %d %d %d %s", phase, kj(k), kq(k), kr(k), (rt != "" ? rt : RUNT))
+    if (!BATCH) { print line; exit 0 }
+    PENDL[++npend] = line
 }
-function finish(k, msg) { printf "done %d %d %d %s\n", kj(k), kq(k), kr(k), msg; exit 0 }
+function flush(    i) { for (i = 1; i <= npend; i++) print PENDL[i]; exit 0 }
+function finish(k, msg) { if (npend) flush(); printf "done %d %d %d %s\n", kj(k), kq(k), kr(k), msg; exit 0 }
 # The stop rule (Frank, 2026-10-05, kept 2026-10-23): a rung makes
 # progress only when at least THR percent better than the best so far.
 function ahead(v, lead) { return lead <= 0 || v >= lead * (1 + THR / 100) }
@@ -73,6 +79,7 @@ function order(KS, n, I,    i, j, t) {
 function confirm_then_pick(KS, n,    I, i) {
     order(KS, n, I)
     for (i = 1; i <= n && i <= CONFIRM; i++) if (nreads(I[i]) < 2) cell("confirm", I[i])
+    if (npend) flush()   # the re-reads are independent of each other
     return leader(KS, n, 0)
 }
 function human(v) { return ctype == "bw" ? sprintf("%.2f GiB/s", v / 1073741824) : commas(v) " IOPS" }
@@ -104,6 +111,8 @@ function add(A, n, v) { A[n + 1] = v; return n + 1 }
 function none_fit() { awk_fail(sprintf("cal_plan: -a %s: no %s cell fits (%s)", LVL, ctype == "bw" ? "bandwidth" : "IOPS", substr(note(), 3))) }
 BEGIN {
     act = ARGV[1]; ctype = ARGV[2]; eng = ARGV[4]
+    if (act != "next" && act != "batch" && act != "budget") awk_fail("cal_plan: unknown action: " act " (next|batch|budget)")
+    BATCH = act == "batch"; npend = 0
     N = py_int(ARGV[5]) + 0; if (N < 1) N = 1
     linerate = ARGV[6] + 0; memcap = ARGV[7] + 0; hist = ARGV[8]
     for (a = 9; a < ARGC; a++) if ((p = index(ARGV[a], "="))) K[substr(ARGV[a], 1, p - 1)] = substr(ARGV[a], p + 1)
@@ -179,9 +188,10 @@ BEGIN {
         for (i = 1; i <= nfx; i++) {
             k = key(FIXED_NJ[i], qd, nr)
             if (!fits(k)) { guard(k, "job"); break }   # both guards grow with numjobs: a wider count cannot fit either
-            if (best(k, 1) == "") cell("numjobs", k)
+            if (best(k, 1) == "") { cell("numjobs", k); continue }   # batch: the counts are independent
             KS[++nk] = k
         }
+        if (npend) flush()
         if (!nk) awk_fail(sprintf("cal_plan: -a %s: no job count fits at iodepth=%d (%s)", LVL, qd, substr(note(), 3)))
         k = confirm_then_pick(KS, nk)
         js = ""
@@ -202,13 +212,17 @@ BEGIN {
             k = key(BW_LOW[i], QD1, NRT)
             # both guards grow with numjobs: no wider count fits either
             if (!fits(k)) { guard(k, "job"); nhigh = 0; break }
-            if (best(k, 1) == "") cell("numjobs", k)
+            # batch: the next rung waits on this one (the stop, the plateau
+            # skip), except under brutal, which measures every rung
+            if (best(k, 1) == "") { cell("numjobs", k); if (EXH) continue; break }
             D1[++n1] = k; V[++nv] = best(k, 1)
             if (target && !EXH && best(k, 1) >= target)
                 finish(k, sprintf("%s -> %s%s (the first numjobs at >= %g%% of line rate, one job per physical core)%s", geo(k), human(best(k, 0)), of_line(k), LINE, note()))
             # a plateau skips the rungs below N/2, never N/2 and N themselves
             if (!target && !EXH && BW_LOW[i] < N2 && plateau(V, nv)) while (i < nbl && BW_LOW[i + 1] < N2) i++
         }
+        # whether the wide walk runs at all is the low walk's call (the stop)
+        if (npend && !EXH) flush()
         # past N the siblings join, and iodepth x nrfiles are searched
         n2 = 0
         for (h = 1; h <= nhigh; h++) {
@@ -218,7 +232,9 @@ BEGIN {
                 for (q = 1; q <= nbq; q++) {
                     k = key(nj, BWQD[q], NRL[r])
                     if (!fits(k)) { guard(k); break }
-                    if (best(k, 1) == "") cell("wide", k)
+                    # batch: each (numjobs, nrfiles) queue ladder is its own
+                    # sequence; the other ladders go on
+                    if (best(k, 1) == "") { cell("wide", k); got = 1; if (EXH) continue; break }
                     D2[++n2] = k; got = 1
                     v = best(k, 1); V[++nv] = v
                     if (target && !EXH && v >= target)
@@ -230,6 +246,7 @@ BEGIN {
             # measured, and 4N cannot fit either
             if (!got) break
         }
+        if (npend) flush()   # the pick reads every cell
         nk = 0
         for (i = 1; i <= n1; i++) KS[++nk] = D1[i]
         for (i = 1; i <= n2; i++) KS[++nk] = D2[i]
@@ -245,25 +262,30 @@ BEGIN {
         for (i = 1; i <= nil; i++) {
             k = key(IOPS_LOW[i], QD1, NRT)
             if (!fits(k)) { guard(k, "job"); nhigh = 0; break }   # as for bandwidth
-            if (best(k, 1) == "") cell("numjobs", k)
+            if (best(k, 1) == "") { cell("numjobs", k); continue }   # batch: both counts at once
             POOL[++np] = k
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d", IOPS_LOW[i], human(best(k, 1)), QD1)
         }
+        # the ladders past N start once the counts at and below it are in
+        if (npend && !EXH) flush()
         # past N the siblings join, and iodepth x nrfiles are searched
         for (h = 1; h <= nhigh; h++) {
-            nj = HIGH[h]; nm = 0; split("", MINE)
+            nj = HIGH[h]; nm = 0; split("", MINE); lpend = 0
             nrs = EXH ? nnrl : 1
             for (r = 1; r <= nrs; r++) {
                 nr = EXH ? NRL[r] : NRT; nv = 0; split("", V)
                 for (q = 1; q <= niq; q++) {
                     k = key(nj, IOPSQD[q], nr)
                     if (!fits(k)) { guard(k); break }
-                    if (best(k, 1) == "") cell(nr == NRT ? "iodepth" : "nrfiles", k)
+                    # batch: a queue ladder is a sequence (the plateau); the
+                    # other job count's ladder goes on
+                    if (best(k, 1) == "") { cell(nr == NRT ? "iodepth" : "nrfiles", k); lpend = 1; if (EXH) continue; break }
                     POOL[++np] = k; MINE[++nm] = k; V[++nv] = best(k, 1)
                     if (!EXH && plateau(V, nv)) break
                 }
             }
-            if (!nm) break   # a guard (memory or aio room) stopped this job count before its first cell
+            if (!nm && !lpend) break   # a guard (memory or aio room) stopped this job count before its first cell
+            if (lpend) continue   # batch: the nrfiles rungs wait on the whole queue ladder
             # the nrfiles rungs run at the depth the pick would choose
             # (Frank, 2026-10-23), and twice it within the ladder
             top = leader(MINE, nm, 1)
@@ -274,13 +296,15 @@ BEGIN {
                     for (q = 1; q <= nq; q++) {
                         k = key(nj, QS[q], NRX[r])
                         if (!fits(k)) continue
-                        if (best(k, 1) == "") cell("nrfiles", k)
+                        if (best(k, 1) == "") { cell("nrfiles", k); lpend = 1; continue }   # batch: independent of each other
                         POOL[++np] = k; MINE[++nm] = k
                     }
                 }
+            if (lpend) continue   # batch: the trail needs the readings; finish never prints with cells pending
             top = leader(MINE, nm, 1)
             trail = trail (trail == "" ? "" : ", ") sprintf("%d jobs %s at iodepth %d nrfiles %d", nj, human(best(top, 1)), kq(top), kr(top))
         }
+        if (npend) flush()   # the pick reads every cell
         if (!np) none_fit()
         k = confirm_then_pick(POOL, np)
         finish(k, sprintf("%s -> %s (%s; %s)%s", geo(k), reading(k), trail, where(kj(k)), note()))
@@ -290,6 +314,7 @@ BEGIN {
         # N jobs at qd1, nrfiles the only ladder, the lowest mean wins
         nj = PNJ ? PNJ : N
         for (r = 1; r <= nnrl; r++) { k = key(nj, QD1, NRL[r]); if (!nreads(k)) cell("nrfiles", k) }
+        if (npend) flush()   # batch: the whole ladder at once; the pick reads it all
         bk = ""; list = ""
         for (r = 1; r <= nnrl; r++) {
             k = key(nj, QD1, NRL[r])

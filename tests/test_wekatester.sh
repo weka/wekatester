@@ -6525,6 +6525,74 @@ t_assert "cal_plan max: a sync engine runs the job counts at iodepth 1, as the l
     out=$(plan_sim "$d" bw read psync 16 0 0 lvl=max fq=16 fn=4 confirm=0)
     [ "$(tr "\n" ";" < "$d/asked")" = "numjobs 8 1 4;numjobs 16 1 4;numjobs 32 1 4;" ] || { cat "$d/asked" >&2; false; }'
 
+# --- cal_plan batch: every cell the walk can name at once (wtCal, 2026-10-28) ---
+# The same model as plan_sim, every cell of a batch read at once. The verdict
+# must be next's, and each batch's first line what next would name
+# (batch_sim checks that every round).
+t_assert "cal_plan batch: cal bw with a target -- the low walk one cell at a time, then the first rung of all six wide ladders" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
+    out=$(CAL_SIM_BWCAP=9663676416 batch_sim "$d" bw write libaio 16 12500000000 0) || { echo "$out" >&2; exit 1; }
+    ref=$(CAL_SIM_BWCAP=9663676416 plan_sim "$p" bw write libaio 16 12500000000 0)
+    [ "$out" = "$ref" ] && case "$out" in "done 64 4 4 "*) true;; *) false;; esac || { echo "batch [$out] next [$ref]" >&2; exit 1; }
+    [ "$(sed -n 1,5p "$d/batches" | tr "\n" "|")" = "numjobs 1 1 1|numjobs 2 1 1|numjobs 4 1 1|numjobs 8 1 1|numjobs 16 1 1|" ] &&
+    [ "$(sed -n 6p "$d/batches")" = "wide 32 1 1;wide 32 1 2;wide 32 1 4;wide 64 1 1;wide 64 1 2;wide 64 1 4" ] &&
+    # the confirm re-reads come as one batch, last
+    [ "$(tail -1 "$d/batches")" = "confirm 16 1 1;confirm 32 1 1;confirm 32 1 2" ] &&
+    # the same cells as next asked for, fewer rounds
+    [ "$(sort "$d/asked")" = "$(sort "$p/asked")" ] && [ "$(wc -l < "$d/batches" | tr -d " ")" -lt "$(wc -l < "$p/asked" | tr -d " ")" ] ||
+        { cat "$d/batches" >&2; false; }'
+t_assert "cal_plan batch: cal iops -- N/2 and N together, then both queue ladders, a ladder'\''s nrfiles rungs only after its whole ladder" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
+    out=$(batch_sim "$d" iops read io_uring 16 0 0) || { echo "$out" >&2; exit 1; }
+    ref=$(plan_sim "$p" iops read io_uring 16 0 0)
+    [ "$out" = "$ref" ] && case "$out" in "done 64 8 4 "*) true;; *) false;; esac || { echo "batch [$out] next [$ref]" >&2; exit 1; }
+    [ "$(sed -n 1p "$d/batches")" = "numjobs 8 1 1;numjobs 16 1 1" ] &&
+    [ "$(sed -n 2p "$d/batches")" = "iodepth 32 1 1;iodepth 64 1 1" ] || { cat "$d/batches" >&2; exit 1; }
+    # no batch mixes a job count'\''s nrfiles rungs with its queue rungs, and the
+    # last queue rung is asked before the first nrfiles rung, for 32 and for 64
+    ! grep -E "iodepth 32 .*nrfiles 32 |nrfiles 32 .*iodepth 32 |iodepth 64 .*nrfiles 64 |nrfiles 64 .*iodepth 64 " "$d/batches" &&
+    for nj in 32 64; do
+        [ "$(grep -n "^iodepth $nj " "$d/asked" | tail -1 | cut -d: -f1)" -lt "$(grep -n "^nrfiles $nj " "$d/asked" | head -1 | cut -d: -f1)" ] || { cat "$d/asked" >&2; exit 1; }
+    done &&
+    [ "$(sort "$d/asked")" = "$(sort "$p/asked")" ] || { cat "$d/batches" >&2; false; }'
+t_assert "cal_plan batch: lat -- the whole nrfiles ladder in one batch, then done" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
+    out=$(CAL_SIM_LATNRBEST=2 batch_sim "$d" lat read io_uring 16 0 0) || { echo "$out" >&2; exit 1; }
+    ref=$(CAL_SIM_LATNRBEST=2 plan_sim "$p" lat read io_uring 16 0 0)
+    [ "$out" = "$ref" ] && [ "$(cat "$d/batches")" = "nrfiles 16 1 1;nrfiles 16 1 2;nrfiles 16 1 4" ] || { echo "[$out] [$ref]"; cat "$d/batches"; false; } >&2'
+t_assert "cal_plan batch: brutal bw and iops -- the whole grid in one batch, the confirm set in the next, then done" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
+    for t in bw iops; do
+        out=$(batch_sim "$d" $t read io_uring 2 0 0 lvl=brutal exh=1 confirm=3 nrc=1,2 bwqd=1,2 iopsqd=1,2) || { echo "$t: $out" >&2; exit 1; }
+        ref=$(plan_sim "$p" $t read io_uring 2 0 0 lvl=brutal exh=1 confirm=3 nrc=1,2 bwqd=1,2 iopsqd=1,2)
+        [ "$out" = "$ref" ] || { echo "$t: batch [$out] next [$ref]" >&2; exit 1; }
+        b=$(source ./wekatester; cal_plan budget $t read x 2 0 0 /dev/null $K lvl=brutal exh=1 confirm=3 nrc=1,2 bwqd=1,2 iopsqd=1,2)
+        # the grid is the budget less the confirm set; two batches in all
+        [ "$(wc -l < "$d/batches" | tr -d " ")" = 2 ] &&
+        [ "$(sed -n 1p "$d/batches" | tr ";" "\n" | wc -l | tr -d " ")" = "$((b - 3))" ] &&
+        [ "$(sed -n 2p "$d/batches" | tr ";" "\n" | grep -c "^confirm ")" = 3 ] &&
+        [ "$(sed -n 2p "$d/batches" | tr ";" "\n" | wc -l | tr -d " ")" = 3 ] || { echo "$t: budget $b"; cat "$d/batches"; false; } >&2 || exit 1
+    done'
+t_assert "cal_plan batch: safe and max -- the three job counts in one batch, then done" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); p=$(mktemp -d)
+    out=$(batch_sim "$d" bw read io_uring 16 12500000000 0 lvl=safe fq=1 fn=1 confirm=0) || { echo "$out" >&2; exit 1; }
+    ref=$(plan_sim "$p" bw read io_uring 16 12500000000 0 lvl=safe fq=1 fn=1 confirm=0)
+    [ "$out" = "$ref" ] && [ "$(cat "$d/batches")" = "numjobs 8 1 1;numjobs 16 1 1;numjobs 32 1 1" ] || { echo "safe [$out] [$ref]"; cat "$d/batches"; false; } >&2 || exit 1
+    out=$(batch_sim "$d" iops read io_uring 16 0 0 lvl=max fq=32 fn=2 confirm=0) || { echo "$out" >&2; exit 1; }
+    ref=$(plan_sim "$p" iops read io_uring 16 0 0 lvl=max fq=32 fn=2 confirm=0)
+    [ "$out" = "$ref" ] && [ "$(cat "$d/batches")" = "numjobs 8 32 2;numjobs 16 32 2;numjobs 32 32 2" ] || { echo "max [$out] [$ref]"; cat "$d/batches"; false; } >&2'
+t_assert "cal_plan batch: control -- a batch that names only its first cell fails the bw, lat and brutal checks" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    # the mutant: batch behaves as next (sourcing the tool restores the real
+    # cal_plan, so the stand-in wraps it by another name)
+    cal_plan_mut() { if [ "$1" = batch ]; then cal_plan "$@" | sed 1q; else cal_plan "$@"; fi; }
+    export -f cal_plan_mut; export BATCH_PLAN=cal_plan_mut
+    out=$(CAL_SIM_BWCAP=9663676416 batch_sim "$d" bw write libaio 16 12500000000 0) && [ "$(sed -n 6p "$d/batches")" = "wide 32 1 1;wide 32 1 2;wide 32 1 4;wide 64 1 1;wide 64 1 2;wide 64 1 4" ] && { echo "bw check passed under the mutant" >&2; exit 1; }
+    out=$(CAL_SIM_LATNRBEST=2 batch_sim "$d" lat read io_uring 16 0 0) && [ "$(cat "$d/batches")" = "nrfiles 16 1 1;nrfiles 16 1 2;nrfiles 16 1 4" ] && { echo "lat check passed under the mutant" >&2; exit 1; }
+    out=$(batch_sim "$d" bw read io_uring 2 0 0 lvl=brutal exh=1 confirm=3 nrc=1,2 bwqd=1,2 iopsqd=1,2) && [ "$(wc -l < "$d/batches" | tr -d " ")" = 2 ] && { echo "brutal check passed under the mutant" >&2; exit 1; }
+    # the mutant still reaches a verdict: the checks failed on the batches, not on a broken planner
+    case "$out" in "done "*) true;; *) echo "mutant: $out" >&2; false;; esac'
+
 # --- N from physical cores (Frank, 2026-09-25): topology, the reserve, placement ---
 # topo_fixture <file> <ncpus> <adjacent|split> <weka cpus...>: a probe file with
 # one core per sibling pair, numbered 2i/2i+1 (adjacent, as OCI VMs do) or

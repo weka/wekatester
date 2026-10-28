@@ -375,6 +375,40 @@ plan_sim() {   # plan_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memc
 }
 export -f plan_sim
 
+# plan_sim with `cal_plan batch`: every cell of a batch gets its reading at
+# once. $d/batches holds one line per batch, "<phase> <nj> <qd> <nr>" cells
+# joined by ";"; $d/asked lists the cells in batch order. Each batch's
+# first line must be what `next` names from the same history.
+batch_sim() {   # batch_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
+    local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act nxt line phase nj qd nr rt n=0 knobs b
+    shift 7
+    knobs="exh=0 line=95 band=98.5 thr=3 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 $*"
+    : > "$d/hist"; : > "$d/asked"; : > "$d/batches"
+    while [ "$n" -lt 300 ]; do
+        # BATCH_PLAN: a test's stand-in for cal_plan (the mutation control)
+        act=$( (source ./wekatester; ${BATCH_PLAN:-cal_plan} batch "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED"; return 1; }
+        nxt=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED (next)"; return 1; }
+        [ "${act%%$'\n'*}" = "$nxt" ] || { echo "FIRST MISMATCH: batch [${act%%$'\n'*}] next [$nxt]"; return 1; }
+        case "$act" in
+            ("cell "*)
+                b=""
+                while IFS= read -r line; do
+                    read -r _ phase nj qd nr rt <<<"$line"
+                    echo "$phase $nj $qd $nr" >> "$d/asked"
+                    echo "$phase $e $nj $qd $nr $rt $(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")" >> "$d/hist"
+                    b="$b${b:+;}$phase $nj $qd $nr"
+                done <<<"$act"
+                echo "$b" >> "$d/batches"
+                n=$((n + 1)) ;;
+            (*) printf '%s\n' "$act"; return 0 ;;
+        esac
+    done
+    echo "NO VERDICT"; return 1
+}
+export -f batch_sim
+
 # --- calibration: one ladder step's fio client_stats -------------------------
 # Same shape as fio's client-mode output and the same traps: a create-phase
 # entry per host FIRST with absurd figures, an "All clients" aggregate that is

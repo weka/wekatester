@@ -477,9 +477,11 @@ cal_shapes() {   # cal_shapes <out> <ladders>
 # next cell or the verdict:
 #   cell <phase> <numjobs> <iodepth> <nrfiles> <runtime>
 #   done <numjobs> <iodepth> <nrfiles> <message>
+# batch: every cell the walk can name without a pending reading, one line
+# each in walk order (the first is what next names); done as next says it.
 # History: <phase> <engine> <nj> <qd> <nr> <runtime> <value> [aux]; value in
 # bytes/s, IOPS or mean us (aux IOPS). budget: the most cells possible.
-cal_plan() {   # cal_plan <next|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...
+cal_plan() {   # cal_plan <next|batch|budget> <bw|iops|lat|lat1m> <read|write> <engine> <N> <linerate> <memcap> <history> <k=v>...
     awkrun '
     #@awk cal_plan' "$@"
 }
