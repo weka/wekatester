@@ -279,8 +279,9 @@ BEGIN {
     else { printf "" > f; close(f) }
     # Seed needs the pins add beyond the ladder ("<nj> <nr> <mib>",
     # seed_size): an off-ladder nrfiles, a pinned filesize, nj past 4N, the
-    # twin of a pinned latency fs. Reads go to the group shared set, writes
-    # to the rep.
+    # twin of a pinned latency fs. Reads go to each member group shared
+    # set, writes to each member (the same pins: pins split shapes), so any
+    # member can run the shape cells.
     nd = 0
     for (s = 1; s <= ns; s++) {
         rep = SREP[s]
@@ -293,14 +294,19 @@ BEGIN {
             nj = PJ[i] ~ /^[0-9]+$/ ? PJ[i] + 0 : wide * SN[s]
             fmib = 0
             if (PFS[i] != "" && (b = parse_size(PFS[i])) != "") fmib = int(b / 1048576)
-            dest = d == "r" ? "needs.read." GF[rep] : "needs.write." rep
-            if (!(dest in DL)) { DO[++nd] = dest; DL[dest] = "" }
-            mx = 0
+            lines = ""; mx = 0
             for (j = 1; j <= n2; j++) {
-                DL[dest] = DL[dest] sprintf("%d %d %d\n", nj, NR2[j], fmib ? fmib : (int(fsmib / NR2[j]) > 1 ? int(fsmib / NR2[j]) : 1))
+                lines = lines sprintf("%d %d %d\n", nj, NR2[j], fmib ? fmib : (int(fsmib / NR2[j]) > 1 ? int(fsmib / NR2[j]) : 1))
                 if (NR2[j] > mx) mx = NR2[j]
             }
-            if ((typ == "lat" || typ == "lat1m") && fmib) DL[dest] = DL[dest] sprintf("1 1 %d\n", fmib * mx)
+            if ((typ == "lat" || typ == "lat1m") && fmib) lines = lines sprintf("1 1 %d\n", fmib * mx)
+            for (m = 1; m <= SNM[s]; m++) {
+                dest = d == "r" ? "needs.read." GF[SMEM[s, m]] : "needs.write." SMEM[s, m]
+                if ((dest, s, i) in DSEEN) continue   # one group, several members
+                DSEEN[dest, s, i] = 1
+                if (!(dest in DL)) { DO[++nd] = dest; DL[dest] = "" }
+                DL[dest] = DL[dest] lines
+            }
         }
     }
     for (i = 1; i <= nd; i++) { f = path_join(caldir, DO[i]); printf "%s", DL[DO[i]] > f; close(f) }

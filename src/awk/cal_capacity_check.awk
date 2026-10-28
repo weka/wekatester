@@ -17,11 +17,13 @@ function charge(rep, need, what,    k) {
     print "cal: capacity: " what ": ~" gib(need) "GiB to write"
     if (!(rep in AVAIL) || need == 0) return
     k = PKEY[rep]
-    if (!(k in PNEED)) { PNEED[k] = 0; PAVAIL[k] = AVAIL[rep]; PO[++np] = k; PHOSTS[k] = ""; P0[k] = K0[rep]; P1[k] = K1[rep] }
+    if (!(k in PNEED)) { PNEED[k] = 0; PAVAIL[k] = AVAIL[rep]; PO[++np] = k; P0[k] = K0[rep]; P1[k] = K1[rep] }
     PNEED[k] += need
     if (AVAIL[rep] < PAVAIL[k]) PAVAIL[k] = AVAIL[rep]
-    if (!((k, rep) in PH)) { PH[k, rep] = 1; PHOSTS[k] = PHOSTS[k] (PHOSTS[k] == "" ? "" : " ") rep }
+    PH[k, rep] = 1
 }
+# the hosts charged to a filesystem, in host order
+function phosts(k,    i, s) { s = ""; for (i = 1; i <= nh; i++) if ((k, H[i]) in PH) s = s (s == "" ? "" : " ") H[i]; return s }
 BEGIN {
     work = ARGV[1]; unified = ARGV[4] == ""; fmt = ARGV[5]; sep = ARGV[6]
     fsmib = ARGV[7] + 0; nrs = ARGV[8]; wide = ARGV[9] + 0   # the widest job count, x N (cal_wide)
@@ -35,9 +37,18 @@ BEGIN {
     for (i = 1; i <= n; i++) if (index(L[i], "\t")) { lsplit(L[i], F, "\t"); NAME[F[1]] = F[2] }
     if ((n = readlines(ARGV[2], L)) < 0) awk_fail("cannot read " ARGV[2])
     ns = 0
-    for (i = 1; i <= n; i++) if (lsplit(L[i], F, "\t") >= 3) { ns++; SR[ns] = F[2]; SN[ns] = F[3] + 0 }
+    for (i = 1; i <= n; i++) if (lsplit(L[i], F, "\t") >= 3) { ns++; SID[ns] = F[1] + 0; SR[ns] = F[2]; SN[ns] = F[3] + 0 }
+    # the clients each shape calibrates on (cal/clients, cal_list_clients):
+    # every one is priced; without the file, the representative alone
+    if ((n = readlines(work "/cal/clients", L)) >= 0)
+        for (i = 1; i <= n; i++) if (lsplit(L[i], F, "\t") == 2) CL[F[1] + 0] = F[2]
+    nc = 0
     for (s = 1; s <= ns; s++) {
-        rep = SR[s]
+        m = split((SID[s] in CL) ? CL[SID[s]] : SR[s], F, " ")
+        for (j = 1; j <= m; j++) { C[++nc] = F[j]; CS[nc] = s }
+    }
+    for (x = 1; x <= nc; x++) {
+        rep = C[x]
         if ((n = readlines(cap "/" rep, L)) < 0) awk_fail("cannot read " cap "/" rep)
         # deficit asks only for shared. and the rep own files: a shared
         # destination lists every member write set too
@@ -55,24 +66,25 @@ BEGIN {
         }
     }
     if (unified && ("read" in DIRS)) {
-        # one shared read set per filesystem group, for every shape that
+        # one shared read set per filesystem group, for every client that
         # reads it, in host order
         nf = 0
-        for (s = 1; s <= ns; s++)
-            if (!((g = GF[SR[s]]) in FSEEN)) { FSEEN[g] = 1; FL[++nf] = sprintf("%09d %s", HIDX[g], g) }
+        for (x = 1; x <= nc; x++)
+            if (!((g = GF[C[x]]) in FSEEN)) { FSEEN[g] = 1; FL[++nf] = sprintf("%09d %s", HIDX[g], g) }
         sort_arr(FL, nf, 0)
-        for (x = 1; x <= nf; x++) {
-            first = substr(FL[x], 11); split("", ND); nd = 0
-            for (s = 1; s <= ns; s++) if (GF[SR[s]] == first) nd = needs_ladder(ND, nd, nrs, fsmib, wide * SN[s])
+        for (y = 1; y <= nf; y++) {
+            first = substr(FL[y], 11); split("", ND); nd = 0; split("", SSEEN)
+            for (x = 1; x <= nc; x++)
+                if (GF[C[x]] == first && !(CS[x] in SSEEN)) { SSEEN[CS[x]] = 1; nd = needs_ladder(ND, nd, nrs, fsmib, wide * SN[CS[x]]) }
             nd = needs_listed(ND, nd, work "/cal/needs.read." first)
             lister = first
-            if (!(first in LISTED)) for (s = 1; s <= ns; s++) if (GF[SR[s]] == first) { lister = SR[s]; break }
+            if (!(first in LISTED)) for (x = 1; x <= nc; x++) if (GF[C[x]] == first) { lister = C[x]; break }
             need = deficit("shared.", ND, nd, lister)
             charge(lister, need, sprintf("the shared read set of %s\047s filesystem group (up to %d jobs x %d files)", first, DNJ, DNR))
         }
     }
-    for (s = 1; s <= ns; s++) {
-        rep = SR[s]
+    for (x = 1; x <= nc; x++) {
+        rep = C[x]; s = CS[x]
         if (unified && !("write" in DIRS)) continue
         split("", ND)
         nd = needs_listed(ND, needs_ladder(ND, 0, nrs, fsmib, wide * SN[s]), work "/cal/needs.write." rep)
@@ -86,7 +98,7 @@ BEGIN {
         k = PO[x]
         if (PNEED[k] <= PAVAIL[k]) continue
         over = 1
-        printf "ERROR: calibration needs ~%sGiB on %s (%s) but only %sGiB is available\n", gib(PNEED[k]), (P0[k] != "host" ? "weka filesystem " P0[k] : P1[k] "\047s destination"), PHOSTS[k], gib(PAVAIL[k]) > "/dev/stderr"
+        printf "ERROR: calibration needs ~%sGiB on %s (%s) but only %sGiB is available\n", gib(PNEED[k]), (P0[k] != "host" ? "weka filesystem " P0[k] : P1[k] "\047s destination"), phosts(k), gib(PAVAIL[k]) > "/dev/stderr"
     }
     exit over ? 3 : 0   # not 2: an awk that dies on its own exits 2
 }

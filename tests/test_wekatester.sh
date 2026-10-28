@@ -7488,6 +7488,101 @@ t_assert "calibrate: a cell failure files its evidence and dies pointing at the 
         *) echo "$err" >&2; false;;
     esac &&
     case "$err" in *"/dev/shm/wt"*) echo "points at tmpfs: $err" >&2; false;; *) true;; esac'
+# --- several clients per shape (wtCal, 2026-10-28): CAL_CLIENTS, internal until the option ---
+# cal_clients_run <dir> <CAL_CLIENTS or -> <set-dir> [hosts...]: calibrate under cal_sim_host, SIMLOG in $d/simlog
+cal_clients_run() {
+    local d=$1 cc=$2 set=$3; shift 3
+    rm -rf "$d/simlog" "$d/cal" "$d/cal.results" "$d/targets.final"
+    ( [ "$cc" = - ] || export CAL_CLIENTS=$cc
+      source ./wekatester
+      AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=("$@"); MASTER=$1; FIO_BIN=fio
+      TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+      SET_DIR_OVERRIDE=$set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
+      export CAL_SIM_BWCAP=12000000000
+      copy_to_master() { :; }
+      run_host() { cal_sim_host "$@"; }
+      calibrate) 2>&1
+}
+export -f cal_clients_run
+t_assert "calibrate: CAL_CLIENTS=2 on a two-member shape seeds and prices the second client'\''s write set; 1 or unset changes nothing" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-r.job"
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-w.job"
+    out=$(cal_clients_run "$d" 2 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    # both write sets seeded, each by its own client; the shared read set once, by the group as before
+    grep cal-seed-write "$d/simlog" | grep -q -- "--client=h1 " && grep cal-seed-write "$d/simlog" | grep -q -- "--client=h2 " &&
+    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h1 .*--client=h2 " &&
+    ! grep cal-seed-read "$d/simlog" | grep -qv -- "--client=h1 " &&
+    [ -s "$d/cal/res-seed-write-h1.json" ] && [ -s "$d/cal/res-seed-write-h2.json" ] &&
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] &&
+    case "$out" in *"cal: capacity: h1'\''s own write set"*"cal: capacity: h2'\''s own write set"*) true;; *) printf "%s\n" "$out" >&2; false;; esac || exit 1
+    # the cells themselves still run on the representative alone (the dispatcher is a later step)
+    grep -v cal-seed- "$d/simlog" | grep -- "--client=" > "$d/cells" && ! grep -q -- "--client=h2" "$d/cells" || { cat "$d/cells" >&2; exit 1; }
+    # control: unset and 1 are today'\''s run, with no second write seed and the same commands
+    out=$(cal_clients_run "$d" - "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    cp "$d/simlog" "$d/simlog.unset"
+    ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h2" && [ ! -e "$d/cal/res-seed-write-h2.json" ] &&
+    case "$out" in *"h2'\''s own write set"*) false;; *) true;; esac || { printf "%s\n" "$out" >&2; exit 1; }
+    out=$(cal_clients_run "$d" 1 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    cmp "$d/simlog" "$d/simlog.unset"'
+t_assert "calibrate: CAL_CLIENTS=all takes every member; more than the shape has takes them all and says so; a bad value stops" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2 h3
+    printf "# report bandwidth\n[global]\nfilename_format=\$filenum/\$jobnum\nfilesize=1G\n[a]\nrw=write\n" > "$d/set/012-w.job"
+    out=$(cal_clients_run "$d" all "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2 h3")" ] &&
+    for h in h1 h2 h3; do grep cal-seed-write "$d/simlog" | grep -q -- "--client=$h " || { echo "no write seed on $h" >&2; exit 1; }; done &&
+    case "$out" in *"client(s) asked"*) echo "all said asked: $out" >&2; false;; *) true;; esac || exit 1
+    out=$(cal_clients_run "$d" 5 "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2 h3")" ] &&
+    case "$out" in *"cal: shape 1: 5 client(s) asked and the shape has 3: calibrating on 3"*) true;; *) printf "%s\n" "$out" >&2; false;; esac || exit 1
+    out=$(cal_clients_run "$d" 2 "$d/set" h1 h2 h3) || { printf "%s\n" "$out" >&2; exit 1; }
+    [ "$(cat "$d/cal/clients")" = "$(printf "1\th1 h2")" ] && ! grep cal-seed-write "$d/simlog" | grep -q -- "--client=h3" || { cat "$d/cal/clients" >&2; exit 1; }
+    out=$(cal_clients_run "$d" x "$d/set" h1 h2 h3) && { echo "x ran: $out" >&2; exit 1; }
+    case "$out" in *"CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '\''x'\''"*) true;; *) printf "%s\n" "$out" >&2; false;; esac'
+t_assert "calibrate: in the scratch every client gets its namespace dir and seeds both sides" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1 h2
+    printf "# report bandwidth\n[global]\nfilesize=1G\n[a]\nrw=read\n" > "$d/set/011-a.job"
+    out=$(cal_clients_run "$d" 2 "$d/set" h1 h2) || { printf "%s\n" "$out" >&2; exit 1; }
+    grep -qx "h1|mkdir -p '\''/mnt/weka/.wekatester-cal'\''" "$d/simlog" && grep -qx "h2|mkdir -p '\''/mnt/weka/.wekatester-cal'\''" "$d/simlog" &&
+    # each client seeds its own scratch read side (no shared set here), from its own listing
+    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h2 .*/h2/cal-seed-read.job" &&
+    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h1 .*/h1/cal-seed-read.job" &&
+    grep -q "^h2|.*WEKATESTER_DF" "$d/simlog" || { cat "$d/simlog" >&2; false; }'
+t_assert "cal_shapes: a shape'\''s seed needs are written for every member, its group'\''s read needs once" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d)
+    cal_sim_fixture "$d" h1:8 h2:8; mkdir -p "$d/cal"
+    # both rows pin bw_r nrfiles 3 and lat_w fs 8G at nrfiles 2 (the same pins: one shape)
+    for h in h1 h2; do { printf "%s" "$h"; for i in $(seq 2 37); do
+          case $i in (8) printf "\t3";; (19) printf "\t8G";; (20) printf "\t2";; (*) printf "\t-";; esac
+      done; printf "\n"; } >> "$d/targets.final"; done
+    (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); REGEN_LAYOUT=0; ENGINE=""
+     cal_shapes "$d/cal/shapes" "$(printf "bw read\nlat write\n")") >>$SUITE_ASIDE 2>&1 || exit 1
+    [ "$(wc -l < "$d/cal/shapes" | tr -d " ")" = 1 ] &&
+    [ "$(cat "$d/cal/needs.read.h1")" = "20 3 1706" ] && [ ! -e "$d/cal/needs.read.h2" ] &&
+    [ "$(cat "$d/cal/needs.write.h1" | tr "\n" " ")" = "20 2 8192 1 1 16384 " ] &&
+    cmp "$d/cal/needs.write.h1" "$d/cal/needs.write.h2" || { head "$d"/cal/needs.* >&2; false; }'
+t_assert "calibration capacity: every client a shape calibrates on is priced, not only its representative" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/cal"
+    printf "h1 1\nh2 1\nh3 2\nh4 2\nh5 3\n" > "$d/groups"
+    { printf "1\th1\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th1 h2\n"
+      printf "2\th3\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th3 h4\n"
+      printf "3\th5\t1\t2\t2\t0\tlibaio\t-\t0\t-\t-\th5\n"; } > "$d/cal/shapes"
+    printf "1\th1 h2\n2\th3\n3\th5\n" > "$d/cal/clients"
+    err=$( (export WEKATESTER_PROMPT_TTY=/dev/null; source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1 h2 h3 h4 h5); DIRECTORY=/mnt/w; IGNORE_CAPACITY=0
+         CAL_NS_DIR=""; CAL_FMT="\$jobnum.\$filenum"; CAL_SEP=.; FILESIZE_MIB=1024; CAL_NR=1; CAL_NR_LADDER="1 2 4"
+         run_host() { case "$1" in
+             (h1|h2|h3) printf "WEKATESTER_DF\nfs1 99999999 30720\nwekafs\n" ;;
+             (h5) printf "WEKATESTER_DF\nfs2 88888888 20480\nwekafs\n" ;;
+         esac; }
+         cal_capacity_check "$d/cal/shapes" "bw read
+bw write") 2>&1 >>$SUITE_ASIDE ) && { echo "passed at 30 GiB: $err" >&2; exit 1; }
+    # fs1: two shared sets plus the h1, h2 and h3 write sets = 40 GiB, h2 named among the hosts
+    case "$err" in *"calibration needs ~40.0GiB on weka filesystem fs1 (h1 h2 h3) but only 30.0GiB is available"*) ;; *) echo "$err" >&2; exit 1;; esac
+    grep -q "h2'\''s own write set" "$d/cal/cap/report" && [ -s "$d/cal/cap/h2" ]'
 t_assert "calibrate: -u removes the calibration scratch after the last job, never during calibration; the default keeps it" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1

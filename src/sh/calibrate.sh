@@ -335,7 +335,7 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     local wantnj tag job res
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
-    job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag.json"
+    job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag-$host.json"   # several clients seed at once
     host_dir_v "$host"; hd=$HOST_DIR
     root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
     host_name_v "$host"
@@ -442,8 +442,8 @@ SUBDIREOF
     sleep "$CAL_SETTLE"   # let the seed's write backlog destage
 }
 
-# Seed what a cell of nj jobs x nr files needs in one direction; skips the
-# listing and df when already covered.
+# Seed what a cell of nj jobs x nr files needs in one direction, on the
+# host's own cpus; skips the listing and df when already covered.
 cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
     local host=$1 dirn=$2 nj=$3 nr=$4 cov a b
     cov="$WORK_DIR/cal/$host/seeded.$dirn"
@@ -452,13 +452,72 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
             [ "$a" -ge "$nj" ] && [ "$b" -ge "$nr" ] && return 0
         done < "$cov"
     fi
+    cal_host_cpus "$host"
     if [ "$dirn" = read ]; then
-        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_REP_ALL"
+        cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
     else
-        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_REP_ALL"
+        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL"
     fi
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
+}
+
+# The clients a shape calibrates on: its representative, then its other
+# members in command-line order, at most CAL_CLIENTS (all: every member).
+# calibrate writes cal/clients once ("<id>\t<host>..." per shape) and says
+# when a shape has fewer than asked; a shape not listed there runs on its
+# representative alone. -> CAL_SHAPE_CLIENTS
+CAL_CLIENTS=${CAL_CLIENTS:-1}   # clients per shape; the option lands in S4
+cal_shape_clients() {   # cal_shape_clients <id> <rep>
+    local id h
+    CAL_SHAPE_CLIENTS=$2
+    [ -s "$WORK_DIR/cal/clients" ] || return 0
+    while IFS=$'\t' read -r id h; do
+        [ "$id" != "$1" ] || { CAL_SHAPE_CLIENTS=$h; return 0; }
+    done < "$WORK_DIR/cal/clients"
+}
+cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
+    local sid rep usable phys allc linerate engines pinned memcap aio cached members n m take list
+    case "$CAL_CLIENTS" in
+        (all) ;;
+        (""|*[!0-9]*|0*) die "CAL_CLIENTS must be a positive whole number of clients per shape, or all, not '$CAL_CLIENTS'" ;;
+    esac
+    : > "$WORK_DIR/cal/clients" || die "cannot write $WORK_DIR/cal/clients"
+    while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members; do
+        set -- $members; n=$#
+        take=$n; [ "$CAL_CLIENTS" = all ] || take=$CAL_CLIENTS
+        if [ "$take" -gt "$n" ]; then
+            log "cal: shape $sid: $CAL_CLIENTS client(s) asked and the shape has $n: calibrating on $n"
+            take=$n
+        fi
+        list=""
+        for m in "$@"; do
+            [ "$take" -gt 0 ] || break
+            list="$list${list:+ }$m"; take=$((take - 1))
+        done
+        printf '%s\t%s\n' "$sid" "$list" >> "$WORK_DIR/cal/clients"
+    done < "$1"
+}
+
+# The first-pass seed for every client of the shape at once: each client
+# its own write set, and the shared read set once per filesystem group
+# (its group seeds it, as cal_seed_rep does); in the scratch every client
+# seeds both sides. A failure names the client.
+cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
+    local dirn=$1 nj=$2 nr=$3 m g pids=() hs=() i seen=" "
+    shift 3
+    for m in "$@"; do
+        if [ "$dirn" = read ] && [ "${CAL_NS_DIR-unset}" = "" ]; then
+            g=$(group_first "$m")
+            case "$seen" in (*" $g "*) continue ;; esac
+            seen="$seen$g "
+        fi
+        cal_ensure_seed "$m" "$dirn" "$nj" "$nr" &
+        pids+=($!); hs+=("$m")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || die "the calibration $dirn seed failed on ${hs[$i]}"
+    done
 }
 
 # Client shapes in command-line order, the first host the representative
@@ -662,8 +721,9 @@ BUDEOF
     # the dataset every first-pass cell reads or writes; wider cells seed
     # their own extra files as they come
     if [ "$pinned" != "-" ]; then CAL_SEED_ENG=$pinned; else CAL_SEED_ENG=${engines%%,*}; fi
-    [ "$any_read" -eq 0 ] || cal_ensure_seed "$rep" read "$usable" "$CAL_NR"
-    [ "$any_write" -eq 0 ] || cal_ensure_seed "$rep" write "$usable" "$CAL_NR"
+    cal_shape_clients "$sid" "$rep"
+    [ "$any_read" -eq 0 ] || cal_seed_clients read "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
+    [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
     if [ "$pinned" != "-" ]; then
         eng=$pinned
         log "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
@@ -785,18 +845,22 @@ cal_remove_dataset() {
 # widest cell, less what exists, pooled per weka filesystem. Other members are
 # left to check_capacity. Over: die, or ask under --ignore-capacity.
 cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
-    local shapes=$1 ladders=$2 rep hd root depth pids=() hs=() i rc line fmt=${CAL_FMT:-\$jobnum.\$filenum} slashes
+    local shapes=$1 ladders=$2 sid rep hd root depth pids=() hs=() i rc line fmt=${CAL_FMT:-\$jobnum.\$filenum} slashes
     slashes=${fmt//[!\/]/}; depth=$(( ${#slashes} + 1 ))
     mkdir -p "$WORK_DIR/cal/cap" || die "cannot create $WORK_DIR/cal/cap"
     : > "$WORK_DIR/cal/cap/names"
-    while IFS=$'\t' read -r _ rep _; do
-        host_dir_v "$rep"; hd=$HOST_DIR
-        root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
-        host_name_v "$rep"
-        printf '%s\t%s\n' "$rep" "$HOST_NAME" >> "$WORK_DIR/cal/cap/names"
-        # only the names the check prices: shared. and this rep's own
-        ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
-        pids+=($!); hs+=("$rep")
+    # every client a shape calibrates on is listed and priced
+    while IFS=$'\t' read -r sid rep _; do
+        cal_shape_clients "$sid" "$rep"
+        for rep in $CAL_SHAPE_CLIENTS; do
+            host_dir_v "$rep"; hd=$HOST_DIR
+            root="$hd${CAL_NS_DIR-/$CAL_SCRATCH}"
+            host_name_v "$rep"
+            printf '%s\t%s\n' "$rep" "$HOST_NAME" >> "$WORK_DIR/cal/cap/names"
+            # only the names the check prices: shared. and this client's own
+            ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
+            pids+=($!); hs+=("$rep")
+        done
     done < "$shapes"
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "${hs[$i]}: cannot list the calibration dataset or its free space"
@@ -905,10 +969,14 @@ calibrate() {
     local sid rep usable phys allc linerate engines pinned memcap aio cached members
     pids=(); hs=()
     load_host_dirs   # host_dir_v answers from it for every shape and seed below
+    cal_list_clients "$shapes"
     while IFS=$'\t' read -r sid rep rest; do
-        host_dir_v "$rep"
-        run_host "$rep" "mkdir -p '$HOST_DIR${CAL_NS_DIR-/$CAL_SCRATCH}'" &
-        pids+=($!); hs+=("$rep")
+        cal_shape_clients "$sid" "$rep"
+        for host in $CAL_SHAPE_CLIENTS; do
+            host_dir_v "$host"
+            run_host "$host" "mkdir -p '$HOST_DIR${CAL_NS_DIR-/$CAL_SCRATCH}'" &
+            pids+=($!); hs+=("$host")
+        done
     done < "$shapes"
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "cannot create the calibration namespace dir on ${hs[$i]}"
