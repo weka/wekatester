@@ -3713,7 +3713,9 @@ cal_dispatch() {   # cal_dispatch engines|searches
             # shared set must not overlap
             cal_ensure_seed "$c" "$dirn" "$nj" "$nr"
             inflight=$(( ${#pids[@]} + 1 ))
+            set -m   # the cell is a process group of its own (cal_stop_tree)
             { ( CAL_PIN_FS=$pinfs; cal_run_cell "$c" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt" "$n" "$rf" ); printf '%s\n' "$?" > "$donef"; } &
+            set +m
             pid=$!
             pids+=("$pid"); printf '%s %s\n' "$n" "$pid" >> "$sdir/pids"
             BUSY[$c]=$pid; P_CLIENT[$pid]=$c; P_SRCH[$pid]=$i; P_CELL[$pid]=$line; P_N[$pid]=$n; P_WHAT[$pid]="$type-$dirn"
@@ -3764,66 +3766,70 @@ cal_dispatch() {   # cal_dispatch engines|searches
     done
 }
 
-# -> CAL_DESC: every process under the pids given, parents before children
-# (pgrep -P, Linux procps).
-cal_descendants_v() {   # cal_descendants_v <pid>...
-    local p k q=("$@")
-    CAL_DESC=()
-    while [ ${#q[@]} -gt 0 ]; do
-        p=${q[0]}; q=("${q[@]:1}")
-        k=$(pgrep -P "$p") || k=""
-        for p in $k; do CAL_DESC+=("$p"); q+=("$p"); done
-    done
+# Whether a process still runs: one that has exited is a zombie until its
+# parent waits, and a zombie answers kill -0 (ps, procps).
+cal_proc_runs() {   # cal_proc_runs <pid>
+    local k
+    k=$(ps -o stat= -p "$1" 2>&1) || return 1
+    case ${k//[[:space:]]/} in (Z*|"") return 1 ;; esac
 }
 
-# Stop processes and everything under them: TERM, parents before children (a
-# parent alive starts its next step), a second walk for a child forked
-# meanwhile, 2 seconds for the descendants to go, KILL for the rest, then a
-# wait on the given pids alone: this shell's children, never reused.
-cal_stop_tree() {   # cal_stop_tree <pid>...
-    local p k i live said desc=() walk=0
-    if ! said=$(command -v pgrep); then
-        log "WARNING: pgrep is not installed: stopping the calibration processes alone, not what runs under them" >&2
-    else
-        walk=1; cal_descendants_v "$@"; desc=(${CAL_DESC[@]+"${CAL_DESC[@]}"})
-    fi
-    for p in "$@" ${desc[@]+"${desc[@]}"}; do said=$(kill "$p" 2>&1) || :; done
-    if [ "$walk" -eq 1 ]; then
-        cal_descendants_v "$@"
-        for p in ${CAL_DESC[@]+"${CAL_DESC[@]}"}; do
-            case " ${desc[*]} " in (*" $p "*) ;; (*) desc+=("$p"); said=$(kill "$p" 2>&1) || : ;; esac
-        done
-    fi
+# Whether this shell is the parent of a process (and so the one to wait it).
+cal_my_child() {   # cal_my_child <pid> <my-pid>
+    local k
+    k=$(ps -o ppid= -p "$1" 2>&1) || return 1
+    [ "${k//[[:space:]]/}" = "$2" ]
+}
+
+# Stop process groups: each pid given leads one (a shape or a cell, forked
+# under set -m), so the signals reach everything it started, reparented or
+# not. TERM, 2 seconds for the groups to empty, KILL for the rest, and a
+# wait on the leaders this shell forked.
+cal_stop_tree() {   # cal_stop_tree <pgid>...
+    local p i live said me=$BASHPID
+    for p in "$@"; do said=$(kill -- "-$p" 2>&1) || :; done
     for ((i = 0; i < 40; i++)); do
         live=""
-        for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || live=1; done
-        [ -n "$live" ] || break
+        for p in "$@"; do
+            cal_proc_runs "$p" && { live=1; continue; }
+            # the leader is done: reap it (a zombie would answer for the
+            # group), then ask whether the group still has anyone
+            ! cal_my_child "$p" "$me" || wait "$p" || :
+            ! said=$(kill -0 -- "-$p" 2>&1) || live=1
+        done
+        [ -n "$live" ] || return 0
         sleep 0.05
     done
-    for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || said=$(kill -9 "$p" 2>&1) || :; done
-    for p in "$@"; do
-        # one that has exited (a zombie until waited) answers kill -0: no KILL
-        k=$(ps -o stat= -p "$p" 2>&1) || k=""
-        case ${k//[[:space:]]/} in (Z*|"") ;; (*) said=$(kill -9 "$p" 2>&1) || : ;; esac
-        wait "$p" || :
-    done
+    for p in "$@"; do said=$(kill -9 -- "-$p" 2>&1) || :; done
+    for p in "$@"; do ! cal_my_child "$p" "$me" || wait "$p" || :; done
 }
 
 # A shape's subshell once TERM has set CAL_SHAPE_TERM (calibrate stopping the
-# shapes after one failed, or cleanup on a signal): its cells still running,
-# each with the ssh under it -- the pids the dispatcher recorded that are
-# still this shape's children (a reaped pid may be another process by now).
+# shapes after one failed, or cleanup on a signal): the cells the dispatcher
+# recorded that have not finished (a done file), each a process group of
+# its own, with whatever runs under it.
 cal_shape_stop() {
-    local n p kids all=0 roots=() me=$BASHPID   # inside $( ) BASHPID is the child's
-    # no pgrep: every recorded pid, as before (cal_stop_tree says so once)
-    if ! kids=$(command -v pgrep); then all=1
-    else kids=$(pgrep -P "$me") || kids=""; fi
-    [ ! -s "$WORK_DIR/cal/s$CAL_SID/pids" ] || while read -r n p; do
-        if [ "$all" -eq 1 ]; then roots+=("$p")
-        else case " ${kids//$'\n'/ } " in (*" $p "*) roots+=("$p") ;; esac; fi
-    done < "$WORK_DIR/cal/s$CAL_SID/pids"
+    local n p sdir="$WORK_DIR/cal/s$CAL_SID" roots=()
+    [ ! -s "$sdir/pids" ] || while read -r n p; do
+        [ -s "$sdir/done-$n" ] || roots+=("$p")
+    done < "$sdir/pids"
     [ ${#roots[@]} -eq 0 ] || cal_stop_tree "${roots[@]}"
     exit 143
+}
+
+# -> CAL_CELL_GROUPS: every cell any shape recorded and has not finished (no
+# done file), each a process group. main stops them with the shapes: a
+# shape left to stop its own cells could be KILLed first, its budget being
+# main's.
+cal_cell_groups_v() {
+    local f n p
+    CAL_CELL_GROUPS=()
+    for f in "$WORK_DIR"/cal/s*/pids; do
+        [ -s "$f" ] || continue
+        while read -r n p; do
+            [ -s "${f%/pids}/done-$n" ] || CAL_CELL_GROUPS+=("$p")
+        done < "$f"
+    done
 }
 
 # cleanup, on a signal while calibration runs: the shape subshells and
@@ -3833,7 +3839,8 @@ cal_shape_stop() {
 cal_stop_shapes() {
     [ ${#CAL_SHAPE_PIDS[@]} -gt 0 ] || return 0
     log "stopping calibration: ${#CAL_SHAPE_PIDS[@]} shape(s) still running"
-    cal_stop_tree "${CAL_SHAPE_PIDS[@]}"
+    cal_cell_groups_v
+    cal_stop_tree "${CAL_SHAPE_PIDS[@]}" ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
     CAL_SHAPE_PIDS=()
 }
 
@@ -4321,14 +4328,19 @@ calibrate() {
     # run. The TERM handler only sets a flag (see cal_pause).
     pids=(); hs=(); local failed=""
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
+        # set -m for the fork alone: the shape is a process group of its own
+        # (cal_stop_tree); main keeps the terminal's group and its traps
+        set -m
         ( trap 'CAL_SHAPE_TERM=1' TERM
           cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders" ) &
+        set +m
         pids+=($!); hs+=("$sid ($rep)")
         CAL_SHAPE_PIDS+=($!)   # from its fork on, a signal has cleanup stop it
     done 3< "$shapes"
     for i in "${!pids[@]}"; do
         if [ -n "$failed" ]; then
-            cal_stop_tree "${pids[$i]}"
+            cal_cell_groups_v
+            cal_stop_tree "${pids[$i]}" ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
         elif ! wait "${pids[$i]}"; then
             failed=${hs[$i]}
         fi
