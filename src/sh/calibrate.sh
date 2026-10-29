@@ -718,6 +718,11 @@ cal_pause() {   # cal_pause <seconds>
         exec {CAL_PAUSE_FD}<>"$WORK_DIR/cal/.pause"
     }
     read -r -t "$1" -u "$CAL_PAUSE_FD" _ || :
+    # a TERM that landed in the read, or anywhere before: the stop runs here,
+    # never in the handler -- a handler entered from this read was seen
+    # abandoned, the shape resuming its loop, once a command substitution in
+    # it outlived the read's timeout (bash 5.3.20, traced 2026-10-29)
+    [ "${CAL_SHAPE_TERM:-0}" -eq 0 ] || cal_shape_stop
 }
 
 cal_dispatch() {   # cal_dispatch engines|searches
@@ -729,6 +734,7 @@ cal_dispatch() {   # cal_dispatch engines|searches
     [ "$mode" != engines ] || { E_RES=(); j=0; }
     : > "$sdir/pids"
     while :; do
+        [ "${CAL_SHAPE_TERM:-0}" -eq 0 ] || cal_shape_stop   # a TERM during a wait
         # searches with nothing in flight ask the planner again
         if [ "$mode" = searches ]; then
             for i in "${!S_TYPE[@]}"; do
@@ -819,22 +825,36 @@ cal_dispatch() {   # cal_dispatch engines|searches
     done
 }
 
+# -> CAL_DESC: every process under the pids given, parents before children
+# (pgrep -P, Linux procps).
+cal_descendants_v() {   # cal_descendants_v <pid>...
+    local p k q=("$@")
+    CAL_DESC=()
+    while [ ${#q[@]} -gt 0 ]; do
+        p=${q[0]}; q=("${q[@]:1}")
+        k=$(pgrep -P "$p") || k=""
+        for p in $k; do CAL_DESC+=("$p"); q+=("$p"); done
+    done
+}
+
 # Stop processes and everything under them: TERM, parents before children (a
-# parent left alive would start its next step), 2 seconds for the descendants
-# (pgrep -P, Linux procps) to go, KILL for the rest, then a wait on the given
-# pids alone: this shell's children, never a reused pid.
+# parent alive starts its next step), a second walk for a child forked
+# meanwhile, 2 seconds for the descendants to go, KILL for the rest, then a
+# wait on the given pids alone: this shell's children, never reused.
 cal_stop_tree() {   # cal_stop_tree <pid>...
-    local p k i live said q=("$@") desc=()
+    local p k i live said desc=() walk=0
     if ! said=$(command -v pgrep); then
         log "WARNING: pgrep is not installed: stopping the calibration processes alone, not what runs under them" >&2
     else
-        while [ ${#q[@]} -gt 0 ]; do
-            p=${q[0]}; q=("${q[@]:1}")
-            k=$(pgrep -P "$p") || k=""
-            for p in $k; do desc+=("$p"); q+=("$p"); done
-        done
+        walk=1; cal_descendants_v "$@"; desc=(${CAL_DESC[@]+"${CAL_DESC[@]}"})
     fi
     for p in "$@" ${desc[@]+"${desc[@]}"}; do said=$(kill "$p" 2>&1) || :; done
+    if [ "$walk" -eq 1 ]; then
+        cal_descendants_v "$@"
+        for p in ${CAL_DESC[@]+"${CAL_DESC[@]}"}; do
+            case " ${desc[*]} " in (*" $p "*) ;; (*) desc+=("$p"); said=$(kill "$p" 2>&1) || : ;; esac
+        done
+    fi
     for ((i = 0; i < 40; i++)); do
         live=""
         for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || live=1; done
@@ -850,10 +870,10 @@ cal_stop_tree() {   # cal_stop_tree <pid>...
     done
 }
 
-# A shape's subshell on TERM (calibrate stopping the shapes after one
-# failed, or cleanup on a signal): its cells still running, each with the
-# ssh under it -- the pids the dispatcher recorded that are still this
-# shape's children (a reaped pid may be another process by now).
+# A shape's subshell once TERM has set CAL_SHAPE_TERM (calibrate stopping the
+# shapes after one failed, or cleanup on a signal): its cells still running,
+# each with the ssh under it -- the pids the dispatcher recorded that are
+# still this shape's children (a reaped pid may be another process by now).
 cal_shape_stop() {
     local n p kids all=0 roots=() me=$BASHPID   # inside $( ) BASHPID is the child's
     # no pgrep: every recorded pid, as before (cal_stop_tree says so once)
@@ -1214,18 +1234,18 @@ calibrate() {
     done
     cal_capacity_check "$shapes" "$ladders"
     # every shape at once, each in a subshell of its own; a failed shape
-    # stops the others (their cells too: cal_shape_stop), then the run
+    # stops the others, whole trees (a foreground seed included), then the
+    # run. The TERM handler only sets a flag (see cal_pause).
     pids=(); hs=(); local failed=""
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
-        ( trap cal_shape_stop TERM
+        ( trap 'CAL_SHAPE_TERM=1' TERM
           cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders" ) &
         pids+=($!); hs+=("$sid ($rep)")
+        CAL_SHAPE_PIDS+=($!)   # from its fork on, a signal has cleanup stop it
     done 3< "$shapes"
-    CAL_SHAPE_PIDS=("${pids[@]}")   # a signal from here on: cleanup stops them
     for i in "${!pids[@]}"; do
         if [ -n "$failed" ]; then
-            kill "${pids[$i]}" 2>&1 || :
-            wait "${pids[$i]}" || :
+            cal_stop_tree "${pids[$i]}"
         elif ! wait "${pids[$i]}"; then
             failed=${hs[$i]}
         fi
