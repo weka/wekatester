@@ -1056,6 +1056,9 @@ sigcal_ps() {
     [ -z "$p" ] || ps -o pid=,ppid=,stat=,command= -p "${p%,}" | cut -c1-120
 }
 export -f sigcal_ps
+# sigcal_alive <pid>: true while the pid answers; kill's own message kept out of the output
+sigcal_alive() { local _o; _o=$(kill -0 "$1" 2>&1); }
+export -f sigcal_alive
 # sigcal_run <INT|TERM> <rc>: the signal goes to the process group (INT,
 # what a terminal's Ctrl-C does) or to main alone (TERM, what kill or a job
 # scheduler does).
@@ -1066,8 +1069,8 @@ sigcal_run() {
     # the precondition: a cell in flight on each shape (h1 and h3), asserted
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
-        if [ "$i" -ge 300 ] || ! kill -0 "$pid" 2>&1; then
-            echo "no cell in flight on both shapes after $((i / 10)) s (pid $pid alive: $(kill -0 "$pid" 2>&1 && echo yes || echo no))" >&2
+        if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
+            echo "no cell in flight on both shapes after $((i / 10)) s (pid $pid alive: $(sigcal_alive "$pid" && echo yes || echo no))" >&2
             cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
         fi
         sleep 0.1; i=$((i + 1))
@@ -1082,9 +1085,9 @@ sigcal_run() {
     esac
     # the bounded wait, on main's pid only
     i=0
-    while kill -0 "$pid" 2>&1 && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+    while sigcal_alive "$pid" && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
     took=$(( SECONDS - t0 ))
-    if kill -0 "$pid" 2>&1; then
+    if sigcal_alive "$pid"; then
         echo "main (pid $pid) still alive $took s after $sig; the run's processes now:" >&2
         sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; echo "--- the run's console:" >&2; cat "$d/run.out" >&2
         kill -9 -- "-$pid" 2>&1 || :; return 1
@@ -1158,39 +1161,27 @@ failshape_run() {
     # the precondition: shape 2 has a cell in flight when shape 1 fails
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
-        if [ "$i" -ge 300 ] || ! kill -0 "$pid" 2>&1; then
+        if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
             echo "no cell in flight on shape 2 after $((i / 10)) s" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
         fi
         sleep 0.1; i=$((i + 1))
     done
     # the control, inside the grace second: the run, both shapes, shape 2's cell and its sim sleep
     n0=$("$pg" -f "wtsig-$tag" | grep -cvx "$$"); s0=$("$pg" -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
-    cp "$d/w/cal/s2/pids" "$d/s2.pids" 2>&1 || :
     [ "$n0" -ge 4 ] && [ "$s0" -ge 1 ] || { echo "control: $n0 run processes, $s0 sim cells with shape 2's cell in flight (want >= 4 and >= 1)" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
     # the failure itself, a second after the control
     i=0
     until grep -q "FAILING|h1|" "$d/simlog"; do
-        if [ "$i" -ge 100 ] || ! kill -0 "$pid" 2>&1; then echo "the h1 cell never failed:" >&2; cat "$d/simlog" "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; fi
+        if [ "$i" -ge 100 ] || ! sigcal_alive "$pid"; then echo "the h1 cell never failed:" >&2; cat "$d/simlog" "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; fi
         sleep 0.1; i=$((i + 1))
     done
     # the bound: 4 s from the failure, well under the 8 s cells (an orphaned
     # cell holds the log, and with it finalize_run_dir, until it ends on its own)
     t0=$SECONDS
     i=0
-    while kill -0 "$pid" 2>&1 && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
-    if [ "$mode" = nopgrep ]; then
-        # without pgrep the stop reaches the recorded cell pids alone: they
-        # are gone by now, while their sim sleeps may live on and hold the
-        # run's log, and with it the run, until they end
-        [ -s "$d/s2.pids" ] || { echo "shape 2 recorded no cell pid" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
-        left=""
-        while read -r i x; do ! kill -0 "$x" 2>&1 || left="$left $x"; done < "$d/s2.pids"
-        [ -z "$left" ] || { echo "shape 2's recorded cell pid(s)$left still alive 4 s after shape 1 failed:" >&2; sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :; return 1; }
-        i=0
-        while kill -0 "$pid" 2>&1 && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
-    fi
+    while sigcal_alive "$pid" && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
     took=$(( SECONDS - t0 ))
-    if kill -0 "$pid" 2>&1; then
+    if sigcal_alive "$pid"; then
         echo "the run (pid $pid) is still alive $took s after shape 1 failed (the bound is 4 s, the cells 8); its processes, the late child included:" >&2
         sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag|sleep 7\.$tag" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep 7\.$tag" 2>&1 || :; return 1
     fi
@@ -1203,26 +1194,18 @@ failshape_run() {
     grep -q "ERROR: calibration of shape 1 (h1) failed (above); the other shapes were stopped" "$d/run/wekatester.log" ||
         { echo "the log does not name the failed cell and the stopped shapes:" >&2; grep ERROR "$d/run/wekatester.log" >&2; return 1; }
     # 2. shape 2's cells: with pgrep every process under them is gone; without
-    #    it the recorded cell pids got their TERM (their sim sleeps may stay)
+    #    it the same (the stop signals process groups, pgrep plays no part)
     sleep 0.3
+    n1=$("$pg" -f "wtsig-$tag" | grep -cvx "$$"); s1=$("$pg" -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
+    if [ "$n1" -ne 0 ] || [ "$s1" -ne 0 ]; then
+        echo "after shape 1 failed (exit $rc in $took s): $n1 run processes and $s1 sim cells still alive (before: $n0 and $s0):" >&2
+        sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :
+        return 1
+    fi
     if [ "$mode" = nopgrep ]; then
-        # the run's own shells first (an orphan is the finding that matters), then the warning
-        n1=$("$pg" -f "wtsig-$tag" | grep -cvx "$$")
-        if [ "$n1" -ne 0 ]; then
-            echo "after the run ended (exit $rc in $took s) $n1 of its shell(s) still alive (before the failure: $n0):" >&2
-            sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :
-            return 1
-        fi
-        "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :   # the orphaned sim cells, if any are left
-        [ "$(grep -c "WARNING: pgrep is not installed: stopping the calibration processes alone, not what runs under them" "$d/run/wekatester.log")" -eq 1 ] ||
-            { echo "the pgrep warning is not in the log exactly once:" >&2; grep -c "pgrep is not installed" "$d/run/wekatester.log" >&2; return 1; }
-    else
-        n1=$("$pg" -f "wtsig-$tag" | grep -cvx "$$"); s1=$("$pg" -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
-        if [ "$n1" -ne 0 ] || [ "$s1" -ne 0 ]; then
-            echo "after shape 1 failed (exit $rc in $took s): $n1 run processes and $s1 sim cells still alive (before: $n0 and $s0):" >&2
-            sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :
-            return 1
-        fi
+        # no pgrep, no warning about it: the stop above is the control
+        n1=$(grep -c "pgrep is not installed" "$d/run/wekatester.log")
+        [ "$n1" -eq 0 ] || { echo "the log warns about pgrep $n1 time(s) though the stop needs none:" >&2; grep "pgrep is not installed" "$d/run/wekatester.log" >&2; return 1; }
     fi
     if [ "$mode" = late ]; then
         # the handler did fork its child (the control), and the child is gone
@@ -1239,7 +1222,7 @@ export -f sigcal_launch failshape_run
 t_assert "signal: a shape that fails a cell while the other shape has cells in flight stops that shape's cells too, names the failed cell, keeps the bundle and exits 1" bash -c '
     source ./tests/helpers.sh
     out=$(failshape_run pgrep 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
-t_assert "signal: without pgrep the stopped shape warns once and TERMs every cell pid it recorded" bash -c '
+t_assert "signal: without pgrep on PATH the stop still ends every cell and sim sleep, and the log carries no pgrep warning" bash -c '
     source ./tests/helpers.sh
     out=$(failshape_run nopgrep 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 t_assert "signal: a child forked by a stopped cell on its way out is stopped too, and the run ends on time" bash -c '
