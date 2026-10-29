@@ -4520,6 +4520,54 @@ t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
      [ "$TARGETS_FILE" = "./hostlist.csv" ]) >>$SUITE_ASIDE'
+# --- hosts from the host file (Frank, 2026-10-29) ---
+t_assert "hosts from file: resolve_targets hosts prints the file's host lines as addresses in file order; pattern, selector, setting, comment and header lines add none" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\n#c0,root,,,\nc2/abc-123,ubuntu,,,/mnt/w\ncg-*,ubuntu,,,\n,,io_uring,,\nWT_DIRECTORY=/mnt/x\n\nc1,,,,\n# c9,,,,\n" > "$d/h.csv"
+    out=$( (source ./wekatester; resolve_targets hosts "$d/h.csv" - - -) ) || { echo "$out" >&2; exit 1; }
+    [ "$(tr "\n" ";" <<<"$out")" = "c2;c1;" ] || { echo "got: $out" >&2; exit 1; }
+    # control: the same file through phase1 still resolves c2 its own row
+    [ "$( (source ./wekatester; resolve_targets phase1 "$d/h.csv" - - - c2) | tr "\t" " " | cut -d" " -f1,2,5)" = "c2 ubuntu /mnt/w" ]'
+t_assert "hosts from file: -t with host lines and no server runs on them, master the first; servers add after in order, one the file names is that row, not a duplicate" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nc2,ubuntu,,,/mnt/w\n,,,,/mnt/g\nc1,,,,\n" > "$d/h.csv"
+    (source ./wekatester; TARGETS=1; TARGETS_FILE=$d/h.csv; HOSTS=()
+     hosts_from_file > "$d/log" 2>&1
+     [ "${HOSTS[*]}" = "c2 c1" ] && [ "$MASTER" = c2 ] && [ "$LOCAL_MODE" = 0 ] &&
+     grep -qF "host file: $d/h.csv (2 host(s) from the file, 0 more from the command line)" "$d/log" || { cat "$d/log" >&2; echo "hosts: ${HOSTS[*]} master $MASTER" >&2; false; }) &&
+    (source ./wekatester; TARGETS=1; TARGETS_FILE=$d/h.csv; HOSTS=(c3 c1 c4)
+     hosts_from_file > "$d/log" 2>&1
+     [ "${HOSTS[*]}" = "c2 c1 c3 c4" ] && [ "$MASTER" = c2 ] &&
+     grep -qF "(2 host(s) from the file, 2 more from the command line)" "$d/log" || { cat "$d/log" >&2; echo "hosts: ${HOSTS[*]} master $MASTER" >&2; false; }
+     check_args
+     # a server with no row of its own takes the generic row, like any host
+     [ "$(resolve_targets phase1 "$d/h.csv" - - - "${HOSTS[@]}" | tr "\t" " " | cut -d" " -f1,5 | tr "\n" ";")" = "c2 /mnt/w;c1 /mnt/g;c3 /mnt/g;c4 /mnt/g;" ])'
+t_assert "hosts from file: a file with no host lines and no server is local mode, the log saying so; a template just created too" bash -c '
+    d=$(mktemp -d)
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\n,,io_uring,,\n# c1,,,,\n" > "$d/h.csv"
+    (source ./wekatester; TARGETS=1; TARGETS_FILE=$d/h.csv; HOSTS=()
+     hosts_from_file > "$d/log" 2>&1; resolve_local_mode >> "$d/log" 2>&1
+     [ "$LOCAL_MODE" = 1 ] && [ "${HOSTS[*]}" = localhost ] &&
+     grep -qF "host file: $d/h.csv (no host lines; 0 host(s) from the command line)" "$d/log" &&
+     grep -qF "no servers given: running on the local host" "$d/log" || { cat "$d/log" >&2; false; }) &&
+    (source ./wekatester; TARGETS=1; TARGETS_FILE=$d/new.csv; HOSTS=()
+     resolve_local_mode > "$d/log2" 2>&1; write_targets_template "$d/new.csv" >> "$d/log2" 2>&1
+     hosts_from_file >> "$d/log2" 2>&1
+     [ "${HOSTS[*]}" = localhost ] && [ "$MASTER" = localhost ] &&
+     grep -qF "host file: $d/new.csv (no host lines; running on the local host)" "$d/log2" || { cat "$d/log2" >&2; false; })'
+t_assert "hosts from file: through main, -t with two host lines and no server reaches both over ssh instead of running locally" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    # ssh and scp never leave this box
+    printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
+    printf "host,user_login,ioengine,allowed_cpus,destination_folder\nc1,,,,\nc2/0123,,,,\n" > "$d/h.csv"
+    out=$(unset $(compgen -v WT_); [ -w /dev/shm ] || export WT_STAGE_BASE=mktemp
+          PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
+          bash ./wekatester -r -n -t "$d/h.csv" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || { echo "rc=$rc: $out" >&2; exit 1; }
+    case "$out" in *"no servers given: running on the local host"*) echo "went local: $out" >&2; exit 1;; esac
+    case "$out" in *": 2 worker(s), master c1, workload "*) ;; *) echo "$out" >&2; exit 1;; esac
+    [ "$(grep "ssh stub" <<<"$out" | grep -cw c1)" -ge 1 ] && [ "$(grep "ssh stub" <<<"$out" | grep -cw c2)" -ge 1 ] || { echo "$out" >&2; exit 1; }'
 t_assert "auth rounds: the host file pins a host's login when the credential has none" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

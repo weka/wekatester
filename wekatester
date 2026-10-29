@@ -512,11 +512,13 @@ EOF
 EOF
     ;;
     (targets) cat <<EOF
-  -t, --targets [file]    per-host settings from a CSV host file: login,
-                          ioengine, cpus_allowed, destination dir, per-test
-                          geometry. Bare -t = the set's own hostlist.csv,
-                          else ./hostlist.csv. CLI flags beat the file; the
-                          file beats the jobfiles and the tuner
+  -t, --targets [file]    the hosts to run on and their settings, from a CSV
+                          host file: login, ioengine, cpus_allowed,
+                          destination dir, per-test geometry. Its host lines
+                          run, then any server named here that it lacks.
+                          Bare -t = the set's own hostlist.csv, else
+                          ./hostlist.csv. CLI flags beat the file; the file
+                          beats the jobfiles and the tuner
 EOF
     ;;
     (bulk) cat <<EOF
@@ -6209,8 +6211,9 @@ write_targets_template() {   # write_targets_template <path>
     { printf '%s\n' "$header"
       settings_template
       cat <<'CSVEOF'
-# One host per line assigns to that host; lines without a host apply to the
-# hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
+# One host per line: the run uses every host named here, with that line's
+# settings; lines without a host apply to the hosts their login and/or
+# ioengine select. Quote cpu lists: "22,24,26".
 # Geometry is per type AND direction: R columns shape read jobs, W columns
 # write jobs; a mixed-direction jobfile takes the deeper-queued direction's
 # whole tuple.
@@ -6341,6 +6344,36 @@ resolve_targets_file() {
     targets_path
     [ -f "$TARGETS_FILE" ] || create_targets_file
     log "host file: $TARGETS_FILE"
+}
+
+# With -t the file's host lines are the run's hosts, in file order; a CLI
+# host is a row with the host cell only, so one the file already names is
+# that row, and the rest follow in CLI order (README, Host files). The
+# master is the merged list's first. No host anywhere: local mode, as ever.
+hosts_from_file() {
+    local out h nf=0 nc=0 merged=()
+    local -A infile=()
+    out=$(resolve_targets hosts "$TARGETS_FILE" - - -) \
+        || die "host file resolution failed ($TARGETS_FILE)"
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        merged+=("$h"); infile[$h]=1; nf=$((nf + 1))
+    done <<<"$out"
+    for h in "${HOSTS[@]}"; do
+        [ -n "${infile[$h]+set}" ] || { merged+=("$h"); nc=$((nc + 1)); }
+    done
+    # a file created this run (the template) names no host: local mode
+    # was settled before it was written
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        log "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
+    fi
+    HOSTS=("${merged[@]}")
+    MASTER=${HOSTS[0]:-}
+    if [ "$nf" -gt 0 ]; then
+        log "host file: $TARGETS_FILE ($nf host(s) from the file, $nc more from the command line)"
+    else
+        log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
+    fi
 }
 
 # The -t file this run reads, which may not exist yet. -> TARGETS_FILE
@@ -6646,7 +6679,8 @@ host_dir_v() {   # host_dir_v <host> -> HOST_DIR
 # phase1: before the engine tests (no engine selectors yet); phase2: with
 # engine.results, the finished resolution; hostonly: each host OWN row only,
 # what the writeback merges against; engines: every line's ioengine, one per
-# line (no hosts needed).
+# line; hosts: the file's host lines as addresses, in file order (neither
+# needs hosts).
 resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     # under -e no host runs WT_ENGINE: it is neither proven nor resolved
     local de=$DEFAULT_ENGINE
@@ -6714,7 +6748,7 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                         extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
                         awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
                     }
-                    HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne
+                    HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne; HO[++nho] = h   # the host lines, in file order
                     ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
                 } else {
                     # host-less: login and engine are SELECTORS; login is never assigned
@@ -6723,6 +6757,9 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                 }
                 ENK[ne] = nk
             }
+            # ---- hosts: the file'\''s host lines as addresses, in file order; the run'\''s
+            # hosts when -t is given (pattern, selector and setting lines name none) ----
+            if (phase == "hosts") for (i = 1; i <= nho; i++) print HO[i]
             # ---- engines: every line'\''s ioengine, the candidates test_engines proves ----
             if (phase == "engines") {
                 for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
@@ -9590,8 +9627,9 @@ main() {
             validate_credentials
             create_targets_file
         fi
-        log "host file: $TARGETS_FILE"
         settings_from_file
+        # the file's hosts first, so the duplicate check sees the merged list
+        hosts_from_file
         check_args
     fi
     settings_check_env

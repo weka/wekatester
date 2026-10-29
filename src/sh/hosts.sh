@@ -10,8 +10,9 @@ write_targets_template() {   # write_targets_template <path>
     { printf '%s\n' "$header"
       settings_template
       cat <<'CSVEOF'
-# One host per line assigns to that host; lines without a host apply to the
-# hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
+# One host per line: the run uses every host named here, with that line's
+# settings; lines without a host apply to the hosts their login and/or
+# ioengine select. Quote cpu lists: "22,24,26".
 # Geometry is per type AND direction: R columns shape read jobs, W columns
 # write jobs; a mixed-direction jobfile takes the deeper-queued direction's
 # whole tuple.
@@ -134,6 +135,36 @@ resolve_targets_file() {
     targets_path
     [ -f "$TARGETS_FILE" ] || create_targets_file
     log "host file: $TARGETS_FILE"
+}
+
+# With -t the file's host lines are the run's hosts, in file order; a CLI
+# host is a row with the host cell only, so one the file already names is
+# that row, and the rest follow in CLI order (README, Host files). The
+# master is the merged list's first. No host anywhere: local mode, as ever.
+hosts_from_file() {
+    local out h nf=0 nc=0 merged=()
+    local -A infile=()
+    out=$(resolve_targets hosts "$TARGETS_FILE" - - -) \
+        || die "host file resolution failed ($TARGETS_FILE)"
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        merged+=("$h"); infile[$h]=1; nf=$((nf + 1))
+    done <<<"$out"
+    for h in "${HOSTS[@]}"; do
+        [ -n "${infile[$h]+set}" ] || { merged+=("$h"); nc=$((nc + 1)); }
+    done
+    # a file created this run (the template) names no host: local mode
+    # was settled before it was written
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        log "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
+    fi
+    HOSTS=("${merged[@]}")
+    MASTER=${HOSTS[0]:-}
+    if [ "$nf" -gt 0 ]; then
+        log "host file: $TARGETS_FILE ($nf host(s) from the file, $nc more from the command line)"
+    else
+        log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
+    fi
 }
 
 # The -t file this run reads, which may not exist yet. -> TARGETS_FILE
@@ -263,7 +294,8 @@ host_dir_v() {   # host_dir_v <host> -> HOST_DIR
 # phase1: before the engine tests (no engine selectors yet); phase2: with
 # engine.results, the finished resolution; hostonly: each host OWN row only,
 # what the writeback merges against; engines: every line's ioengine, one per
-# line (no hosts needed).
+# line; hosts: the file's host lines as addresses, in file order (neither
+# needs hosts).
 resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <cli_engine|-> <cli_dir|-> <results|-> <host>...
     # under -e no host runs WT_ENGINE: it is neither proven nor resolved
     local de=$DEFAULT_ENGINE

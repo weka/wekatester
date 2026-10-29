@@ -115,8 +115,9 @@ WT_SETTLE=2
 # WT_STAGE_BASE: where the controller keeps its working files: shm (/dev/shm, the default) or mktemp ($TMPDIR, else /tmp)
 WT_STAGE_BASE=shm
 #
-# One host per line assigns to that host; lines without a host apply to the
-# hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
+# One host per line: the run uses every host named here, with that line's
+# settings; lines without a host apply to the hosts their login and/or
+# ioengine select. Quote cpu lists: "22,24,26".
 # Geometry is per type AND direction: R columns shape read jobs, W columns
 # write jobs; a mixed-direction jobfile takes the deeper-queued direction's
 # whole tuple.

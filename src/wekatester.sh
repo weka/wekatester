@@ -235,11 +235,13 @@ EOF
 EOF
     ;;
     (targets) cat <<EOF
-  -t, --targets [file]    per-host settings from a CSV host file: login,
-                          ioengine, cpus_allowed, destination dir, per-test
-                          geometry. Bare -t = the set's own hostlist.csv,
-                          else ./hostlist.csv. CLI flags beat the file; the
-                          file beats the jobfiles and the tuner
+  -t, --targets [file]    the hosts to run on and their settings, from a CSV
+                          host file: login, ioengine, cpus_allowed,
+                          destination dir, per-test geometry. Its host lines
+                          run, then any server named here that it lacks.
+                          Bare -t = the set's own hostlist.csv, else
+                          ./hostlist.csv. CLI flags beat the file; the file
+                          beats the jobfiles and the tuner
 EOF
     ;;
     (bulk) cat <<EOF
@@ -622,8 +624,9 @@ main() {
             validate_credentials
             create_targets_file
         fi
-        log "host file: $TARGETS_FILE"
         settings_from_file
+        # the file's hosts first, so the duplicate check sees the merged list
+        hosts_from_file
         check_args
     fi
     settings_check_env

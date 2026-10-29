@@ -60,7 +60,7 @@ BEGIN {
                 extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
                 awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
             }
-            HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne
+            HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne; HO[++nho] = h   # the host lines, in file order
             ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
         } else {
             # host-less: login and engine are SELECTORS; login is never assigned
@@ -69,6 +69,9 @@ BEGIN {
         }
         ENK[ne] = nk
     }
+    # ---- hosts: the file's host lines as addresses, in file order; the run's
+    # hosts when -t is given (pattern, selector and setting lines name none) ----
+    if (phase == "hosts") for (i = 1; i <= nho; i++) print HO[i]
     # ---- engines: every line's ioengine, the candidates test_engines proves ----
     if (phase == "engines") {
         for (e = 1; e <= ne; e++) for (j = 1; j <= ENK[e]; j++) if (EK[e, j] == "engine") print EV[e, j]
