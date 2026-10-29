@@ -67,18 +67,18 @@ PASS=0; FAIL=0; SKIP=0
 # suite's cost is read from its own output (Frank, 2026-10-29). Microseconds
 # from EPOCHREALTIME (bash 5; digits only, whatever the locale's decimal
 # mark), whole seconds from SECONDS on an older bash.
-suite_now_us() {   # the clock, in microseconds
-    if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "${EPOCHREALTIME//[!0-9]/}"
-    else printf '%s000000' "$SECONDS"; fi
+suite_now_us_v() {   # the clock, in microseconds, into NOW_US (no subshell)
+    if [ -n "${EPOCHREALTIME:-}" ]; then NOW_US=${EPOCHREALTIME//[!0-9]/}
+    else NOW_US=${SECONDS}000000; fi
 }
 t_assert() {   # t_assert <description> <command...>
     local aside l t0 took
     if [ -n "${SUITE_ONLY:-}" ] && ! [[ $1 =~ $SUITE_ONLY ]]; then SKIP=$((SKIP+1)); return 0; fi
     : > "$SUITE_ASIDE"
-    t0=$(suite_now_us)
-    if "${@:2}"; then took=$(( $(suite_now_us) - t0 )); PASS=$((PASS+1))
+    suite_now_us_v; t0=$NOW_US
+    if "${@:2}"; then suite_now_us_v; took=$(( NOW_US - t0 )); PASS=$((PASS+1))
          printf 'ok - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
-    else took=$(( $(suite_now_us) - t0 )); FAIL=$((FAIL+1))
+    else suite_now_us_v; took=$(( NOW_US - t0 )); FAIL=$((FAIL+1))
          printf 'FAIL - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
          aside=$(<"$SUITE_ASIDE")
          [ -z "$aside" ] || while IFS= read -r l; do printf '    | %s\n' "$l"; done <<<"$aside"
@@ -996,6 +996,114 @@ t_assert "SIGINT during preflight exits 130" bash -c '
               wait "$pid") 2>&1 )
     rc=$?
     [ "$rc" -eq 130 ] || { echo "expected 130, got $rc ($noise)" >&2; false; }'
+
+# --- signal handling during calibration (Frank, 2026-10-29) ---
+# README (Usage, -u): "A failed or interrupted run never unlinks"; (Output):
+# at exit the bundle is kept "for every run, failed and interrupted ones
+# included". src/wekatester.sh main: "Signals exit instead; the EXIT trap
+# alone runs cleanup (idempotent)", INT exits 130, TERM 143; cleanup
+# (connect.sh) logs "stopping fio servers..." and finalize_run_dir (run.sh)
+# ends with "run bundle: <OUTPUT_DIR>/<RUN_STAMP>.tgz". calibrate() runs
+# every shape in a subshell of its own and the dispatcher every cell in
+# another: a correct stop leaves none of them, nor a sim cell, behind.
+t_assert "signal: main's traps are the three lines the calibration signal tests install" bash -c '
+    for l in "trap '\''rc=\$?; RUN_RC=\$rc; cleanup; finalize_run_dir; exit \$rc'\'' EXIT" "trap '\''exit 130'\'' INT" "trap '\''exit 143'\'' TERM"; do
+        n=$(grep -cF -- "$l" src/wekatester.sh)
+        [ "$n" -eq 1 ] || { echo "[$l] found $n times in src/wekatester.sh" >&2; exit 1; }
+    done'
+# sigcal_run <INT|TERM> <rc>: two shapes (h1 h2 rep h1; h3) calibrated at
+# once over two clients each, cells of 5 s in flight; the signal goes to the
+# process group (INT, what a terminal's Ctrl-C does) or to main alone (TERM,
+# what kill or a job scheduler does). main's three trap lines, verbatim.
+sigcal_run() {
+    local sig=$1 want=$2 d tag prog pid i n0 s0 n1 s1 rc t0 took left
+    d=$(mktemp -d); tag=$$$RANDOM
+    mkdir -p "$d/w" "$d/out"
+    cal_sim_fixture "$d/w" h1:8 h2:8 h3:16:200000
+    printf '# report bandwidth\n[global]\nfilename_format=$filenum/$jobnum\nfilesize=1G\n[a]\nrw=read\n' > "$d/w/set/011-r.job"
+    prog=$(cat <<'EOF'
+source ./wekatester
+trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+d=$1
+CAL_CLIENTS=2; AUTO_LEVEL=cal; WORK_DIR=$d/w; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
+TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0; SET_DIR_OVERRIDE=$d/w/set; AUTH_DIR=$d/w/auth
+CAL_SETTLE=0; SIMLOG=$d/simlog; OUTPUT_DIR=$d/out; RUN_STAMP=run; RUN_DIR=$d/out/run
+export CAL_SIM_CELL_SLEEP=$2 CAL_SIM_BWCAP=12000000000
+copy_to_master() { :; }
+run_host() { cal_sim_host "$@"; }
+mkdir -p "$RUN_DIR"; start_run_log
+FIO_STARTED=1   # as in a real run: the servers are up before calibration
+calibrate
+echo "calibration finished with no signal"
+EOF
+)
+    # its own process group, as a terminal's foreground job: the group is
+    # what Ctrl-C signals, and what pgrep counts by the $0 tag
+    set -m
+    bash -c "$prog" "wtsig-$tag" "$d" "5.$tag" > "$d/run.out" 2>&1 &
+    pid=$!
+    set +m
+    # the precondition: a cell in flight on each shape (h1 and h3), asserted
+    i=0
+    until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
+        if [ "$i" -ge 300 ] || ! kill -0 "$pid" 2>&1; then
+            echo "no cell in flight on both shapes after $((i / 10)) s (pid $pid alive: $(kill -0 "$pid" 2>&1 && echo yes || echo no))" >&2
+            cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+        fi
+        sleep 0.1; i=$((i + 1))
+    done
+    # the control: the run, its shape subshells and cells, and the sim cells' sleeps are there
+    n0=$(pgrep -f "wtsig-$tag" | grep -cvx "$$"); s0=$(pgrep -fx "sleep 5\.$tag" | wc -l | tr -d ' ')
+    [ "$n0" -ge 4 ] && [ "$s0" -ge 2 ] || { echo "control: $n0 run processes, $s0 sim cells before the signal (want >= 4 and >= 2)" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    t0=$SECONDS
+    case $sig in
+        (INT)  kill -INT -- "-$pid" ;;
+        (TERM) kill -TERM "$pid" ;;
+    esac
+    # the bounded wait, on main's pid only
+    i=0
+    while kill -0 "$pid" 2>&1 && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+    took=$(( SECONDS - t0 ))
+    if kill -0 "$pid" 2>&1; then
+        echo "main (pid $pid) still alive $took s after $sig; the run's processes now:" >&2
+        pgrep -af "wtsig-$tag|sleep 5\.$tag" >&2; echo "--- the run's console:" >&2; cat "$d/run.out" >&2
+        kill -9 -- "-$pid" 2>&1 || :; return 1
+    fi
+    wait "$pid"; rc=$?
+    # 1. the exit status, with the time it took
+    [ "$rc" -eq "$want" ] || { echo "exit $rc after $took s, want $want" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    # 2. nothing of the run survives: no shape subshell, no cell, no sim cell
+    sleep 0.2
+    n1=$(pgrep -f "wtsig-$tag" | grep -cvx "$$"); s1=$(pgrep -fx "sleep 5\.$tag" | wc -l | tr -d ' ')
+    if [ "$n1" -ne 0 ] || [ "$s1" -ne 0 ]; then
+        echo "after $sig (exit $rc in $took s): $n1 run processes and $s1 sim cells still alive (before: $n0 and $s0):" >&2
+        pgrep -af "wtsig-$tag|sleep 5\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; pkill -9 -fx "sleep 5\.$tag" 2>&1 || :
+        return 1
+    fi
+    # 3. cleanup ran: the fio servers were stopped on every host and the work dir is gone
+    for h in h1 h2 h3; do
+        [ "$(grep -c "^$h|.*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")" -eq 1 ] || { echo "no fio-server stop for $h in the simlog" >&2; cat "$d/simlog" >&2; return 1; }
+    done
+    [ ! -e "$d/w" ] || { echo "the work dir survived: $(ls "$d/w" "$d/w/cal" 2>&1 | tr '\n' ' ')" >&2; return 1; }
+    # 4. the bundle is kept: the archive exists, the dir is gone, the log says the servers were stopped, the console ends with the bundle line
+    [ -s "$d/out/run.tgz" ] && [ ! -d "$d/out/run" ] || { echo "no bundle: $(ls "$d/out" 2>&1 | tr '\n' ' ')" >&2; return 1; }
+    tar -xzf "$d/out/run.tgz" -C "$d" run/wekatester.log || return 1
+    grep -q "stopping fio servers\.\.\." "$d/run/wekatester.log" || { echo "the archived log does not say the servers were stopped:" >&2; tail -5 "$d/run/wekatester.log" >&2; return 1; }
+    case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $d/out/run.tgz") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
+    # 5. the dataset is untouched: the only removals are cleanup's, one per host
+    left=$(grep -c "|.*rm " "$d/simlog")
+    [ "$left" -eq 3 ] || { echo "$left rm commands in the simlog, want cleanup's 3:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
+}
+export -f sigcal_run
+t_assert "signal: Ctrl-C (INT to the process group) during calibration with cells in flight on two shapes ends every cell and shape, keeps the bundle and exits 130" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    # job-control notices on stderr are noise: shown only on failure
+    out=$(sigcal_run INT 130 2>&1) || { printf "%s\n" "$out" >&2; false; }'
+t_assert "signal: TERM to the controller alone during calibration with cells in flight on two shapes ends every cell and shape, keeps the bundle and exits 143" bash -c '
+    source ./tests/helpers.sh; signal_trappable TERM || exit 1
+    out=$(sigcal_run TERM 143 2>&1) || { printf "%s\n" "$out" >&2; false; }'
 
 # --- staging: jobfiles with no [global] section ---
 # Both insert paths (python override(), the awk non-auto branch) used to match
