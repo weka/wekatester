@@ -63,12 +63,23 @@ PASS=0; FAIL=0; SKIP=0
 
 # SUITE_ONLY=<ERE>: run only the tests whose description matches (a fast
 # tier); the rest are counted as skipped.
+# Every result line ends with the test's wall time, "(N.Ns)", so the
+# suite's cost is read from its own output (Frank, 2026-10-29). Microseconds
+# from EPOCHREALTIME (bash 5; digits only, whatever the locale's decimal
+# mark), whole seconds from SECONDS on an older bash.
+suite_now_us() {   # the clock, in microseconds
+    if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "${EPOCHREALTIME//[!0-9]/}"
+    else printf '%s000000' "$SECONDS"; fi
+}
 t_assert() {   # t_assert <description> <command...>
-    local aside l
+    local aside l t0 took
     if [ -n "${SUITE_ONLY:-}" ] && ! [[ $1 =~ $SUITE_ONLY ]]; then SKIP=$((SKIP+1)); return 0; fi
     : > "$SUITE_ASIDE"
-    if "${@:2}"; then PASS=$((PASS+1)); echo "ok - $1"
-    else FAIL=$((FAIL+1)); echo "FAIL - $1"
+    t0=$(suite_now_us)
+    if "${@:2}"; then took=$(( $(suite_now_us) - t0 )); PASS=$((PASS+1))
+         printf 'ok - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
+    else took=$(( $(suite_now_us) - t0 )); FAIL=$((FAIL+1))
+         printf 'FAIL - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
          aside=$(<"$SUITE_ASIDE")
          [ -z "$aside" ] || while IFS= read -r l; do printf '    | %s\n' "$l"; done <<<"$aside"
     fi
