@@ -1,0 +1,129 @@
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd
+#
+# Settings for the whole run, one WT_NAME=value per line: a command-line
+# flag beats the environment, which beats this file; an empty value sets
+# nothing.
+#
+# WT_DIRECTORY: the default target directory for test files (default /mnt/weka); a host-file line's destination_folder beats it, and -d beats both
+WT_DIRECTORY=/mnt/weka
+#
+#   -w, --workload set      workload definition directory, a subdir of
+#                           fio-jobfiles (default: default)
+WT_WORKLOAD=default
+#
+#   -f, --fio-bin path      fio binary on the workers (default: /usr/bin/fio);
+#                           --local-fio is an older spelling
+WT_FIO_BIN=/usr/bin/fio
+#
+#   -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
+#                           results, run log, staged jobfiles (default: results)
+WT_OUTPUT=results
+#
+# WT_ENGINE: the default fio ioengine (empty: the jobfile's own, else, outside -a, the first of io_uring, libaio, psync that passes its test); a host-file line's ioengine beats it, and -e beats both
+WT_ENGINE=
+#
+#   -a, --auto [safe|max|cal|brutal[:secs]]
+#                           measure the clients and run what they do best
+#                           (default level when omitted: max): clients are
+#                           grouped into hardware shapes, each measured on its
+#                           first client (--cal-clients spreads it); N = its
+#                           usable physical cores
+#                           safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
+#                           max: numjobs N/2, N, 2N at the deepest iodepth and
+#                           nrfiles cal has chosen (bandwidth 16 and 4, iops
+#                           32 and 2)
+#                           cal: walk numjobs to 4N, iodepth and nrfiles --
+#                           bandwidth toward NIC line rate, the most iops
+#                           brutal: the cal search with no early stops --
+#                           every rung of every ladder is measured. Slow
+#                           every level: the ioengine, and latency at N jobs
+#                           over nrfiles beside a one-job test
+#                           :secs sets the measured seconds per cell (default
+#                           15 for safe and max, 30 for cal and brutal); it
+#                           does not change how long the measured jobs run --
+#                           that is -x/--duration
+WT_AUTO=
+#
+#   --line-rate Gb/s        every client's dataplane line rate, for the -a
+#                           bandwidth target, in place of what ethtool reports:
+#                           a cloud VF can report 100 Gb/s on a 16 Gb/s
+#                           instance, and without the weka CLI nothing reports it
+WT_LINE_RATE=
+#
+#   --cal-clients n|all     spread each shape's -a cells over up to n of its
+#                           clients (all: every one), in command-line order,
+#                           to calibrate sooner; the confirm re-reads stay on
+#                           the first client (default: 1, the first alone)
+WT_CAL_CLIENTS=1
+#
+#   --ignore-capacity       when the workload needs more space than is available,
+#                           ask (no timeout) and run anyway instead of aborting
+WT_IGNORE_CAPACITY=0
+#
+#   --any-fs                turn the filesystem-type check off: -d may be on
+#                           any filesystem, a local disk included, and a
+#                           missing -d is created anywhere; the run log says
+#                           the check was off and what -d is on
+WT_ANY_FS=0
+#
+#   --allow-fio-mismatch    run on when fio --version differs across the
+#                           hosts: each version and its hosts print as a
+#                           WARNING and the bundle's settings record it (a
+#                           host whose fio --version fails still stops the run)
+WT_ALLOW_FIO_MISMATCH=0
+#
+#   -i, --identity [login:]keyfile[,...]
+#                           ssh key(s) to try, each optionally bound to a login;
+#                           repeatable, tried in the order given
+WT_IDENTITY=
+#
+#   -p, --password [n]      prompt for n (default 1) login/password pairs, tried
+#                           after the keys; no sshpass involved
+#                           Every credential is tried against every worker --
+#                           existing ssh sessions and plain defaults first, then
+#                           keys, then passwords -- and per worker the first
+#                           success wins
+WT_PASSWORD=0
+#
+#   -b, --bulk     run every latency test at 1MiB blocks too, as a separate
+#                  test listed on its own (under -a the 1MiB test is
+#                  calibrated on its own)
+WT_BULK=0
+#
+#   -x, --duration secs     run every measured job for this many seconds
+#                           (time_based); layout and unlink keep their own timing
+WT_DURATION=
+#
+#   -u, --unlink   remove the workload's data files from -d after the last job
+#                  that uses them (a failed run keeps them for the rerun), and
+#                  the calibration scratch files, which are otherwise kept
+#                  so the next calibration can reuse them
+WT_UNLINK=0
+#
+#   -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+WT_VERBOSE=0
+#
+# WT_ENGINE_TEST_TIMEOUT: seconds an ioengine's test job may run before it is killed and counts as a failure (default 15)
+WT_ENGINE_TEST_TIMEOUT=15
+#
+# WT_SYSINFO_TIMEOUT: seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300)
+WT_SYSINFO_TIMEOUT=300
+#
+# WT_SETTLE: seconds to wait after the fio servers start before the first connection to them (default 2)
+WT_SETTLE=2
+#
+# WT_STAGE_BASE: where the controller keeps its working files: shm (/dev/shm, the default) or mktemp ($TMPDIR, else /tmp)
+WT_STAGE_BASE=shm
+#
+# One host per line assigns to that host; lines without a host apply to the
+# hosts their login and/or ioengine select. Quote cpu lists: "22,24,26".
+# Geometry is per type AND direction: R columns shape read jobs, W columns
+# write jobs; a mixed-direction jobfile takes the deeper-queued direction's
+# whole tuple.
+# Example:  client-1,ubuntu,io_uring,"8,10",/mnt/weka,12/10G/2/8,12/10G/2/4,1/1G/2/1,1/1G/2/1,42/256M/2/16,42/256M/2/8
+# Example:  ,,io_uring,,,,,,,,     (io_uring for every host that supports it)
+# Example:  gpu-*,ubuntu,,,/mnt/weka,,,,,,   (a glob: every host it matches; * alone is every host)
+# A host may be written as <name>/<machine-id>; the id is ignored when the
+# row is read and only ever added by wekatester itself, to name a machine it
+# is recording for the first time. Plain hostnames are equally valid, and a
+# row you wrote keeps the spelling you gave it.

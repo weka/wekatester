@@ -1,80 +1,804 @@
 # wekatester
-Performance test weka clusters with distributed fio
+Performance test weka clusters (or any filesystem, with `--any-fs`) with distributed fio.
 
-Includes fio both consistency (versions vary) and convienience. 
-
-
-```
-# ./wekatester --help
-usage: wekatester.py [-h] -d DIRECTORY [-w WORKLOAD] [--fio-bin LOCAL_FIO]
-                     [-V] [-v]
-                     [server ...]
-
-Basic Performance Test a Network/Parallel Filesystem
-
-positional arguments:
-  server                One or more Servers to use a workers
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -d DIRECTORY, --directory DIRECTORY
-                        target directory on the workers for test files
-  -w WORKLOAD, --workload WORKLOAD
-                        workload definition directory (a subdir of fio-
-                        jobfiles)
-  --fio-bin LOCAL_FIO   Specify the fio binary on the target servers (default
-                        /usr/bin/fio)
-  -V, --version         Display version number
-  -v, --verbosity       increase output verbosity
-```                        
+wekatester is a single bash script; it reads fio's results with awk. There is nothing to install: it needs only a Linux machine to run it from with bash 4.4 or later, awk and an OpenSSH client, plus fio on the workers. The workers are Linux hosts reachable by ssh — or, with no server on the command line, the local host itself, in which case the OpenSSH client is not needed either.
 
 # Basics
-fio is a benchmark for IO, and is quite popular.  However, running it in a distributed fashion across multiple servers can be a bit of a bear to manage, and the output can be quite difficult to read.
+fio is a benchmark for IO, and is quite popular. However, running it in a distributed fashion across multiple servers can be a bit of a bear to manage, and the output can be quite difficult to read.
 
-The idea of wekatester is to bring some order to this chaos.   To make running fio in a distributed environment, wekatester automatically distributes and executes fio commands on remote servers, runs a standard set of benchmark workloads, and summarizes the results.
+The idea of wekatester is to bring some order to this chaos. It starts fio on your workers, runs a standard set of benchmark workloads across all of them at once, and summarizes the results in a few human-readable lines per job.
 
-# Options
-`servers` - a list of servers to use as workers.
+# How it works
+wekatester uses fio's native client/server mode:
 
-`-d DIRECTORY` sets the directory where the benchmark files will be created.  This is a required argument.
+- An `fio --server` daemon is started on every worker (daemonized with a pidfile in `/dev/shm`; on exit it is killed via that pidfile only, and only while that pid is still the server — never by name, so fio jobs that are not ours are untouched). A daemonized server writes its own messages only to syslog: after a failed run, the teardown reads them from each worker's journal into the bundle (Output, `fio-server-log-end`).
+- The **first host on the command line acts as the coordinator**: jobfiles are staged only to that host, and the fio client process runs there, driving all the workers. Aggregation across workers is done by fio itself (the "All clients" totals).
+- ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
+- All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
+- With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
+- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio (and, with two hosts or more, reads its version: one fio version across the hosts, Caveats): a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start, which it never kills. A run that died without cleaning up leaves that evidence behind: `--break-lock` kills wekatester's own fio processes on those hosts (escalating for a root fio, and never a pid the kernel has since given to another process), removes its staging and its lock, and takes the lock. It also removes every filesystem-group file (`.wekatester-group.*.lst`, below) in each host's destination, whether or not that host held other evidence. A destination shared with another controller's live run can lose that run's group file this way.
 
-`-w WORKLOAD` get fio jobfile specifications from a subdirectory of fio-jobfiles.   The default is 'default'.  Currently, there are 2 discributed with wekatester, "default" (4-corners tests), and "mixed", a set of 70/30 RW workloads.  You can add your own directories, and use the with -w.
+# Usage
+```
+usage: wekatester [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
+                  [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
+                  [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
+                  [--allow-fio-mismatch]
+                  [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [--] [server ...]
+       wekatester -s results.json
+       wekatester --version
 
-`--fio-bin` Default is `/usr/bin/fio`.  You can use this argument to set a different location.
+Basic performance test of wekafs, or any filesystem with --any-fs (distributed fio).
 
-`-v` Sets verbosity.  `-vv`, and `-vvv` are supported to set ever increasing verbosity.
+Option names are case-insensitive (-W is -w, --AUTO is --auto); the values you
+give them are not (-Wmyset names myset, never MYSET). A value may be attached
+or separate: -w smoke, -wsmoke, -w=smoke and --auto=max all work, and
+attaching is the way to pass a value that starts with a dash.
+
+  -d, --directory dir     target directory on the workers for test files
+                          (default: /mnt/weka); must be on wekafs (see
+                          --any-fs); created on request when it is missing
+                          under a wekafs mount
+  -w, --workload set      workload definition directory, a subdir of
+                          fio-jobfiles (default: default)
+  -f, --fio-bin path      fio binary on the workers (default: /usr/bin/fio);
+                          --local-fio is an older spelling
+  -o, --output dir        each run lands here as <date>-<time>.tgz: fio JSON
+                          results, run log, staged jobfiles (default: results)
+  -e, --engine eng        force this fio ioengine on every staged jobfile,
+                          overriding the jobfiles and auto tuning; without
+                          it: the host file's, the jobfile's own, else
+                          (not under -a) the first of io_uring, libaio,
+                          psync that passes a test job on the host
+  -a, --auto [safe|max|cal|brutal[:secs]]
+                          measure the clients and run what they do best
+                          (default level when omitted: max): clients are
+                          grouped into hardware shapes, each measured on its
+                          first client (--cal-clients spreads it); N = its
+                          usable physical cores
+                          safe: numjobs N/2, N, 2N at iodepth 1, nrfiles 1
+                          max: numjobs N/2, N, 2N at the deepest iodepth and
+                          nrfiles cal has chosen (bandwidth 16 and 4, iops
+                          32 and 2)
+                          cal: walk numjobs to 4N, iodepth and nrfiles --
+                          bandwidth toward NIC line rate, the most iops
+                          brutal: the cal search with no early stops --
+                          every rung of every ladder is measured. Slow
+                          every level: the ioengine, and latency at N jobs
+                          over nrfiles beside a one-job test
+                          :secs sets the measured seconds per cell (default
+                          15 for safe and max, 30 for cal and brutal); it
+                          does not change how long the measured jobs run --
+                          that is -x/--duration
+  --cal-clients n|all     spread each shape's -a cells over up to n of its
+                          clients (all: every one), in command-line order,
+                          to calibrate sooner; the confirm re-reads stay on
+                          the first client (default: 1, the first alone)
+  --line-rate Gb/s        every client's dataplane line rate, for the -a
+                          bandwidth target, in place of what ethtool reports:
+                          a cloud VF can report 100 Gb/s on a 16 Gb/s
+                          instance, and without the weka CLI nothing reports it
+  --ignore-capacity       when the workload needs more space than is available,
+                          ask (no timeout) and run anyway instead of aborting
+  --break-lock            a run that died left its lock, staging or fio on a
+                          host: kill wekatester's own fio there, clear its
+                          files and take the lock (fio it did not start still
+                          stops the run)
+  --any-fs                turn the filesystem-type check off: -d may be on
+                          any filesystem, a local disk included, and a
+                          missing -d is created anywhere; the run log says
+                          the check was off and what -d is on
+  --allow-fio-mismatch    run on when fio --version differs across the
+                          hosts: each version and its hosts print as a
+                          WARNING and the bundle's settings record it (a
+                          host whose fio --version fails still stops the run)
+  -i, --identity [login:]keyfile[,...]
+                          ssh key(s) to try, each optionally bound to a login;
+                          repeatable, tried in the order given
+  -p, --password [n]      prompt for n (default 1) login/password pairs, tried
+                          after the keys; no sshpass involved
+                          Every credential is tried against every worker --
+                          existing ssh sessions and plain defaults first, then
+                          keys, then passwords -- and per worker the first
+                          success wins
+  -t, --targets [file]    per-host settings from a CSV host file: login,
+                          ioengine, cpus_allowed, destination dir, per-test
+                          geometry. Bare -t = the set's own hostlist.csv,
+                          else ./hostlist.csv. CLI flags beat the file; the
+                          file beats the jobfiles and the tuner
+  -b, --bulk     run every latency test at 1MiB blocks too, as a separate
+                 test listed on its own (under -a the 1MiB test is
+                 calibrated on its own)
+  -r             fast track: no prompts -- create whatever is needed (a
+                 missing -d only under wekafs, anywhere with --any-fs) and run;
+                 a wekafs destination that is not mounted forcedirect is a
+                 warning instead of a stop
+  -n             dry run: create/generate, print the files and the run details;
+                 no measured job runs, but a missing -d is created and the
+                 ioengines are proven with small fio jobs (with -a/-t/-e,
+                 or when a jobfile names none)
+  -g             force regeneration of existing layout jobfiles
+  -x, --duration secs     run every measured job for this many seconds
+                          (time_based); layout and unlink keep their own timing
+  -u, --unlink   remove the workload's data files from -d after the last job
+                 that uses them (a failed run keeps them for the rerun), and
+                 the calibration scratch files, which are otherwise kept
+                 so the next calibration can reuse them
+  -s file        summarize an existing results .json -- or every job in a run
+                 bundle .tgz, straight from the archive, after a synopsis
+                 of the run (README, Output) -- and exit; with -v, also
+                 the counters that rose and each host's health flags
+  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+  --version      display version number and exit
+  -h, --help     show this help and exit
+  --             everything after this is a server name
+
+With no server given, the test runs on the local host -- no ssh required.
+```
+
+`server ...` — the worker hostnames; the first one is the coordinator/master. Name each server once: a name given twice (after `--` too) is a usage error naming every repeated host, since fio would get that `--client=` twice. Same name means the same string, as you typed it — the `<name>/<machine-id>` spelling belongs to host files, not the command line. Optional: give no server at all and wekatester benchmarks the local host instead, using no ssh, no keys, and no sshd (**local mode**). That is the quickest way to sanity-check a single client — `./wekatester -a max` and nothing else. In local mode the data files on the destination are prefixed with the box's short hostname (`hostname -s`, else `$HOSTNAME`), never `localhost` — `localhost.*` identifies nothing on a shared filesystem, and two boxes in local mode against the same mount would otherwise write (and `-u` unlink) each other's files.
+
+`-d directory`, `--directory directory` — where the benchmark files are created on the workers, typically your mounted filesystem. Defaults to `/mnt/weka`. This overrides the `directory=` line in every jobfile at staging time. Trailing slashes are dropped, here and in the host file's `destination_folder` (`/mnt/weka/` is `/mnt/weka`; `/` stays `/`).
+
+`-w workload`, `--workload workload` — pick a workload set, a subdirectory of `fio-jobfiles`. See below.
+
+`-f fio_bin`, `--fio-bin fio_bin` — path to fio on the workers, if it isn't `/usr/bin/fio`. `--local-fio` is an older spelling (the Python wekatester's, like the other long names here).
+
+`--allow-fio-mismatch` — run on when the hosts' fio versions differ. Preflight compares the first line `fio --version` prints on every host, the coordinator included, and by default a difference stops the run before any fio server starts, with an `ERROR` per distinct version naming its hosts (the host count, then up to eight names and `(+N more)`). With this option the same table prints as a `WARNING`, also kept in the run log, the run continues, and the bundle's `settings` gains an `allow-fio-mismatch` line saying what was found. It never covers a host whose `fio --version` fails or prints nothing: there is no version to compare, so that host still stops the run, named. One host (local mode included) has nothing to compare.
+
+`-o output_dir` — where the run bundles land on the machine running wekatester. Defaults to `./results`, created on first use. Each run produces one `<date>-<time>.tgz` there; see Results below.
+
+`-e engine` — force a specific fio ioengine everywhere: every staged jobfile, the layout job, and everything derived from it. Beats both the jobfiles' own `ioengine=` lines and auto tuning's choice. The engine is **proven with a real one-file job on every worker's destination** before anything runs — `--enghelp` only shows what fio was built with, and engines routinely pass it yet fail on the actual filesystem — and a host failing the test is fatal, naming the host and the evidence file. A broken engine hangs as often as it errors, so a test job still running after 15 seconds (`WT_ENGINE_TEST_TIMEOUT`) is killed and counts as a failure (one ignoring TERM is killed 5 seconds later, and its evidence says so), and one stuck in uninterruptible IO is abandoned with a warning; it still holds the ssh session's output, so that host's test ends only when its IO does. A working engine's test returns the moment fio exits. Values are passed to fio as typed.
+
+**Engine precedence**, for every staged jobfile on every host: (1) `-e`; (2) the host file's ioengine for that host (`-t`), then `WT_ENGINE` (see Settings; without `-t` it acts as `-e`); (3) the jobfile's own `ioengine=` line, kept as written; (4) otherwise wekatester **discovers** one: it proves io_uring, libaio and psync in that order with the same one-file test job on the host's destination, and the first that works there goes into that host's jobfiles that set no ioengine in any section (an `ioengine=` line in `[global]`). Each host's discovered engine is logged, with the reason; a host where none works stops the run, naming the host and quoting each test's output. The generated layout job, whose engine is otherwise the set's most-used one, is re-derived for those hosts so it runs the discovered engine too. Nothing is tested when every jobfile names an engine (every shipped set does) or the host file gives the host one. Under `-a` the tuner chooses the engines instead (see Auto mode).
+
+`-t [hostfile]` — per-host settings from one CSV; see **Host files** below.
+
+`-i` / `-p` — the credential pool; see **Authentication** below.
+
+`-s file` — offline mode: re-summarize existing results and exit, no hosts involved. The full summary (all metric groups) is always printed. Takes a single results `.json`, or a run-bundle `.tgz` — every job's results inside the bundle are summarized in run order, read straight from the archive in memory, so nothing needs unpacking and no extra disk space is used. The layout's sequential write reports as it did during the run (Output); an older bundle's `create_only` layout, a set's own layout job and the `-u` unlink job are skipped. The Python wekatester's results file (one fio JSON per job, keyed by job name) is not read: `-s` names it and shows how to extract one job with `jq`.
+
+`-u/--unlink` — clean up after the run: one final generated job removes every data file the layout created, per client, after the last test has finished with them. It is derived from each host's staged layout grid, before the sweep turns the layout into a write of what is missing (so it always matches the exact file grid, whatever auto tuning or hand edits did, even when nothing was written) and fio itself does the removal — including the per-client name prefixes only fio can reconstruct. A failed or interrupted run never unlinks: the files stay for debugging, and the next run's layout reuses them. The per-client namespace directories themselves may remain, empty.
+
+`-b/--bulk` — run every latency test at 1 MiB blocks too. Each latency jobfile gains a 1 MiB twin at staging (`021-latencyR.job` gains `021b-latencyR-1M.job`), which runs right after it on the same files and is summarized as a test of its own. IOPS stays 4k. Under `-a` the 1 MiB test is calibrated on its own and recorded in its own host-file columns (`latency1mR`, `latency1mW`).
+
+`--line-rate Gb/s` — every client's dataplane line rate, the target the `-a cal` bandwidth search stops at (95% of it), in place of the sum of the weka NICs' `ethtool` speeds. Use it when those speeds are wrong — a cloud VF reports 100 Gb/s on an instance capped at 16 Gb/s — or when nothing can report them, such as a client without the weka CLI. It needs `-a`, and takes 0.1 to 100000 Gb/s. `-a safe`, `-a max` and `-a brutal` measure every rung whatever the target, so there it only sets the share of line rate the verdict quotes. The host file does not record which line rate a bandwidth answer stopped at, so with `--line-rate` the bandwidth answers are always measured again (under `-a brutal`, the whole bandwidth grid) and replace the ones the host file carries; its IOPS and latency values still pin their knobs.
+
+`-x/--duration secs` — run every measured job for this many seconds (`time_based`), whatever its jobfile says. A burn-in or soak is one such run with long jobs: `-x 86400` runs each test in the set for 24 hours, one after another. There is no repeat mode. The end capture keeps the last 2000 lines of each host's kernel log, so on a multi-day run the start of the window may be cut (the file says so).
+
+`-v` — more verbosity; repeatable (`-vv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`.
+
+# Workloads
+A workload is a directory of standard fio jobfiles under `fio-jobfiles/`, run in sorted filename order. Shipped sets:
+
+- `default` — the classic 4-corners tests (read/write bandwidth, latency, iops)
+- `mixed` — 70/30 read/write workloads
+- `2x400Gb` — a heavier bandwidth-oriented variant
+- `wekawithin` — 1M/128k/4k reads, writes, and mixed IO
+- `smoke` — a fast validation set for the harness itself: 256M files, 10s runs, and it removes its own files afterwards (`-w smoke`)
+
+Add your own directory under `fio-jobfiles/` and select it with `-w`. A few conventions:
+
+- Jobfile names must start with a digit (`011-bandwidthR.job`, ...) — that numeric prefix is both how files are discovered and what sets the run order.
+- A comment line of the form `# report bandwidth` (or `latency`, `iops`, or several) at the top of a jobfile selects which metrics appear in the summary for that job. No directive means report everything. `#report` works too; at least one space must follow `report`, so a prose comment such as `# reporting notes` is not a directive, and a bare `# report` names nothing.
+- The `directory=` line is overridden by `-d` when the jobfiles are staged — inserted into `[global]` if missing, and if the jobfile has no `[global]` section at all one is created — so the shipped jobfiles work against any mount point.
+- The measured workload should be the **last** job in the jobfile, and the summary describes that last job.
+- Staging makes every data file's path predictable. fio in client/server mode prefixes generated file names with its own idea of the client, and the rule differs between fio versions, so every staged jobfile gets `unique_filename=0` and a `<host>.` prefix on its `filename_format` instead (a jobfile with no format gets fio's default names, prefixed). A format that uses `$clientuid` keeps its own scheme. A `filename_format` with a space or tab in it stops the run before the probe, calibration or staging, naming the jobfile. So does a `cpumask` or `numa_cpu_nodes` line in any section, naming the jobfile and the line: either could place fio on weka's cores or core 0's pair, so use `cpus_allowed`, which staging holds to the host's fio cpus. A jobfile's own `cpus_allowed` is trimmed to the host's fio cpus (see fio never lands on weka's pinned cores). Every cpu list is staged with `cpus_allowed_policy=split` unless the jobfile names its own policy: on isolcpus cores there is no load balancing, so without it every job of a range stays on the cpu it forked on.
+
+**File layout is a separate, generated job.** Every run puts a `000-wekatester-layout.job` first. Its grid comes from the set's own jobfiles, one section per distinct geometry in each file namespace (a geometry another one fully covers is dropped), so it names exactly the files the jobs will open — one section of each namespace's largest `numjobs`/`nrfiles`/`filesize` would create the whole cross-product and over-provision the disk — and **all files exist on all machines before any measured test starts** — wekatester runs jobfiles serially and fio's coordinator waits for every client, so that first job is a true cross-client barrier. After the sweep (below), each host's layout becomes the run's own: **a dense sequential write of exactly what is missing**. Every file missing or short of its size is written with `rw=write`, `direct=1`, `create_on_open=1` and `file_append=1`, which fio writes from the file's current end up to its size, in blocks of 1MiB (the largest power of two up to 1MiB that divides the file's size; fio leaves a tail shorter than its block unwritten). A file whose end is off that block is rewritten from offset 0 in place instead; a file at or above its size is left alone, since fio uses its first N bytes. The files are listed by name, grouped by job and size, up to 16 to a section (fio's parser takes 4096 bytes a line), and every section runs at once: each file is in exactly one section, at the largest size any geometry gives it, so nothing needs ordering. Each host writes its own `<host>.` files, and a filesystem group's shared read set is written by the group's first host. A namespace the sweep cannot size (a `$clientuid` format, a section with `size=` but no `filesize=`, or a size that is not a multiple of 4KiB) keeps its `create_only` sections, and the run warns. A workload directory that carries its own layout job keeps it as written (it is never regenerated unless you ask with `-g`, which stages a freshly generated one in its place); every other set gets one generated on the fly, without touching the source directory. The shipped jobfiles still contain their original `create_only` sections — they are harmless no-ops after the layout job has run, and they keep each file usable standalone with plain fio. The layout's write reports like a test (Output).
+
+**Layouts heal incrementally, from evidence.** Before the capacity check, every run sweeps each host's destination: one `find` lists every file of the grid its layout implies, with its size, and nothing is deleted. A short file is extended by the layout, not started over; a geometry change writes just its delta (bumping `nrfiles` 502→510 writes 8 files, not 22TiB); an interrupted layout is finished file by file on the next run; and nothing is trusted that wasn't measured — there are no marker files. The bytes present are **credited against the capacity requirement**. Size is a sufficient test **because the layout writes each file sequentially from its end**, so a layout stopped by a kill, a crash or a full filesystem leaves a short file, never a full-size one with a hole. The `create_only` pass earlier versions ran could not promise that, `fallocate=none` or not: fio sizes a file it lays out with `ftruncate` before writing its data (`extend_file` in fio's filesetup.c), so a stopped layout left a full-size file the sweep credited as complete, and the run then measured reads of nothing. A set's own layout job, and a namespace the sweep cannot size, still runs `create_only`, so an interrupted one can leave full-size files with holes that the next sweep credits: regenerate it with `-g`, or remove its files after an interrupted layout. To force a from-scratch rebuild, remove the files (`-u` on a run, or `rm -rf` the grid).
+
+# Prompts, fast track and dry runs
+The host file and the workload set are prepared before a run: wekatester opens no editors. A few prompts remain, for things a run would otherwise create or risk: a missing host file (`-t`), a missing destination directory, a workload that does not fit, and the `-p` passwords. They read the terminal directly, so they work fine under `... | tee run.log`.
+
+- `-r` — fast track: no prompts; whatever is needed (the layout, a missing destination directory under a wekafs mount, or anywhere with `--any-fs`) is created and the run proceeds. Existing layout jobs are never touched (add `-g` to regenerate them). A wekafs destination that is not mounted `forcedirect` is a warning instead of a stop: the run goes ahead with the client cache in the IO path, and the warning is repeated into the run log so the bundle says so. A destination mount that changes before the measured run is still a stop (Caveats).
+- `-n` — dry run: everything is resolved, generated and staged, then every staged jobfile's contents and the would-be run details are printed — and no measured job runs. Two things do happen on the hosts, because the staged jobs depend on them: a missing `-d` is created (as under `-r`), and the ioengines are proven with small one-file fio jobs: with `-a`, `-t` or `-e`, and when an ioengine is discovered (see `-e`), so the staged variants show the engine the run would use. The layout sweep lists each host's grid too (a `find`, which changes nothing), so the staged layout job shows exactly what the layout would write. The pinning check runs too, so a dry run stops where the real run would; so does the fio version check, whose result the run details print.
+- `-g` — force regeneration of existing layout jobs (works with `-r` and `-n` too): a set's own layout job, edited or not, gives way to one generated for this run, staged like any generated layout (re-derived per host under `-a`). The source directory is never changed.
+
+A generated layout job carries a `# wekatester-layout: generated sha256=...` marker. If you edit the file the hash no longer matches, and wekatester treats it as yours: auto mode stages it exactly as written (with a warning that it may not cover auto-tuned namespaces) instead of re-deriving it, unless `-g` regenerates it. A pristine layout job under `-a` is re-derived per host so it lays out what that host will run: its measured job counts and file geometry.
+
+# Auto mode
+`-a` / `--auto` derives system-specific fio options from the workers instead
+of trusting the jobfiles' static values. Four levels:
+
+Every level calibrates before staging, **per client shape**: the clients are
+grouped by hardware, each shape is measured on its first client (or spread over
+more of them with `--cal-clients`), and what it finds is what every client of
+that shape runs. N is the shape's usable
+physical cores (fio never shares a core with weka or with core 0's pair).
+The levels differ only in how wide the bandwidth and IOPS searches go:
+
+- `-a safe` — numjobs N/2, N and 2N at iodepth 1 and nrfiles 1, 15 s cells.
+  The quickest measured answer.
+- `-a max` (default when the level is omitted) — the same three job counts at
+  the deepest iodepth and nrfiles any cal or brutal search had chosen across
+  the labs and field runs: bandwidth iodepth 16 with 4 files, IOPS iodepth 32
+  with 2 files (`CAL_MAX_BW_QD`, `CAL_MAX_BW_NR`, `CAL_MAX_IOPS_QD`,
+  `CAL_MAX_IOPS_NR`). 15 s cells.
+- `-a cal` — walks the ladders: numjobs up to 4N, iodepth and nrfiles (see The
+  search). 30 s cells.
+- `-a brutal` — the same search with every early stop disabled (see below).
+
+At every level the ioengine is chosen by measurement, latency runs at N jobs
+over the nrfiles ladder with the one-job test beside it, the best reading
+wins and a tie goes to the heavier setting (the pick), and the answers are recorded in
+`hostlist.csv`, where they pin the next calibration (see What lands in the
+host file). The answer to "why these numbers" becomes "measured on your
+clients against this cluster."
+
+Each jobfile's `# report` directive decides what it calibrates. `latency`
+anywhere in it makes it a latency test, and nothing else is searched for that
+file. Otherwise `bandwidth` asks for the bandwidth search and `iops` for the
+IOPS search; a file naming both asks for both, stages the bandwidth answer,
+and records the IOPS one in the host file only. A jobfile with no directive is
+not calibrated and runs as written. The direction comes from the job's measured
+sections (a `create_only` one is not measured): each one's `rw=` (its own, else
+`[global]`'s), and a mixed one asks for both.
+
+### What calibration optimizes
+
+The cluster is assumed to have far more headroom than its clients can
+consume, so `-a` exists to make every client run the parameters that give its
+hardware its absolute best result per test type. The fleet-wide run then shows
+what the cluster can do.
+
+- **Bandwidth** — as close to the client's NIC line rate as it gets, on 1 MiB
+  IO, the block size weka moves between clients and backends. Line rate counts
+  as reached at 95% (`CAL_LINE_PCT`).
+- **IOPS** — the client's maximum 4k random IOPS, with fio's latency
+  accounting off. The iops test records no latency, so the calibration cells
+  and the staged iops jobs both run with `disable_lat`, `disable_clat`,
+  `disable_slat` and `norandommap`.
+- **Latency** — N jobs, one per physical core, at queue depth 1. The only
+  ladder is nrfiles, and the lowest mean latency wins, with no threshold. The
+  one-job twin below runs beside it, so a single stream and full load
+  compare. With `-b` the same again at 1 MiB.
+
+Under every `-a` level every latency test also runs as a **one-job
+twin** (`021-latencyR-1job.job`, just before its original): numjobs, iodepth
+and nrfiles all 1 on every client, with the same data per job. The run then
+shows one single-threaded stream's latency across the fleet next to every
+client's latency at its calibrated load.
+
+### Client shapes
+
+Hosts are grouped by their hardware:
+
+- cpu model and count;
+- memory, as MemTotal rounded to the nearest GiB;
+- how many cores weka has pinned;
+- the NICs weka uses, with the link speed `ethtool` reports for each.
+
+The probe reads weka's NICs from `weka local resources net`, which needs root.
+It runs that command as the login user when that user is root, and otherwise
+under the passwordless escalator the probe already found. Line rate is the sum
+of those NICs' link speeds, or the figure `--line-rate` gives for every
+client. More things split a shape, because a job count or
+an engine measured on one host would not describe the other: N and the number
+of usable threads (see below), the engines that passed their test, and an
+engine pinned by `-e` or the host file.
+
+When line rate cannot be known and `--line-rate` does not give it, calibration
+warns and runs the bandwidth search to its peak instead. That happens when
+there is no weka CLI, no root and no escalator, UDP mode, a NIC bound to vfio
+with no kernel netdev, or ethtool reporting no speed.
+
+The first host of each shape on the command line is its representative, and by
+default every cell of the shape runs on it, one at a time, so every number is
+that client's own reading. The shapes calibrate at once, each on its own
+clients. `--cal-clients N` (or `all`; the setting `WT_CAL_CLIENTS`) spreads a
+shape's cells over up to N of its members, in command-line order, to finish
+sooner: cells of one search run together only where the search allows it (the
+ladders are unchanged, each rung after the one before; independent ladders and
+job counts run side by side, and under `brutal` the whole grid), and the confirm
+re-reads always run on the representative. Contention only subtracts, so a
+spread cell that reaches line rate stands, and a cell that misses can push a
+ladder one rung heavier, which the representative's confirm re-read settles.
+The answer is written for every member of the shape. The run log names each
+shape, its hosts, its NICs and line rate, and says up front the most cells the
+shape can take and roughly how long, on one client and on the clients it has.
+
+### Usable cores: N
+
+Job counts are counted in **physical cores**. The probe reads every cpu's
+socket, core and SMT siblings from sysfs, and N is what is left for fio:
+
+- **weka's DPDK cores go whole.** Weka pins each dedicated io thread to one cpu
+  and keeps that core's sibling idle on purpose, so both threads are weka's.
+- **core 0 of socket 0 and its sibling always stay with the OS**, and a reserve
+  of more cores stays with them, for the OS and weka's own non-DPDK processes:
+  2 cores on a host of up to 24 physical cores, 4 above, plus one for every 4
+  DPDK cores past 4 (5–8 DPDK cores add 1, 9–12 add 2), at most 12 and never
+  more than half the cores. The reserve takes core 0 first, then one core at a
+  time round-robin over the sockets starting at socket 1, the lowest free core
+  of each: two sockets reserve core 0 and the next core of socket 0 plus the
+  first two of socket 1; one socket reserves its next cores.
+- **N = physical cores − DPDK cores − reserved cores.** fio never runs on
+  weka's cores (either thread) or core 0's pair, whatever a cpu list says:
+  the host file's, or a jobfile's own `cpus_allowed` (trimmed at staging; see
+  fio never lands on weka's pinned cores). An operator cpu list in the host
+  file that leaves out more than those is the operator's own reserve: only
+  weka's cores and core 0's pair come out of it.
+  A list that covers every cpu fio could use — `0-255`, or every cpu but
+  weka's — restricts nothing, so the whole rule applies (and the pinning notes
+  say so). A client with N < 1 stops the run with the numbers.
+
+The searches use four job counts: **N/2 and N run one job per physical core
+with the siblings idle; 2N and 4N put the siblings to work too**, which is how
+a search finds out whether they help or hurt. Every cell and every staged job
+declares its cpu set with split affinity, and a job count at or below N gets
+the one-thread-per-core set. The log prints each shape's arithmetic, for
+example `8 physical core(s) - 2 weka DPDK - 2 reserved for the OS (0-1 2-3) =
+N=4`, with a term of its own for any core a host-file cpu list leaves out or
+the host cannot bind.
+
+isolcpus does not narrow the set fio runs on. Measured on a lab client,
+confining the OS to its housekeeping cores cost 4–7% write IOPS at every
+housekeeping-core count tried, and split affinity keeps a cpu set that spans
+both partitions safe.
+
+### The search
+
+**The engine comes first.** Short comparison cells (`CAL_ENGINE_RUNTIME`,
+10s) run once per test type and per candidate engine, meaning whichever of
+io_uring, libaio and psync passed its test job. Bandwidth runs at N jobs and
+queue depth 1, IOPS at N jobs and queue depth 16, and latency at one job and
+queue depth 1. Each type's best reading wins, or its lowest latency, with no
+band; an exact tie goes to io_uring, then libaio, then psync. The type winners
+are tallied into **one engine per shape** (the engine that won the most types;
+a tie goes by the same order), because the host file carries one
+engine per host, and every search then runs on that engine. An engine pinned
+by `-e` or by the host file is used as it is; `-g` re-chooses a host-file
+engine.
+
+**Then one search per test type and direction** the set runs, with cells of
+`CAL_RUNTIME` seconds (15 for safe and max, 30 for cal and brutal;
+`-a <level>:<secs>` sets them):
+
+**At or below N there is no queue or file ladder**: every cell runs iodepth 1
+and nrfiles 1. The ladders — nrfiles 1, 2, 4 (`CAL_NR_LADDER`), iodepth 1–16
+for bandwidth (`CAL_BW_QD_LADDER`) and 1–512 for IOPS (`CAL_IOPS_QD_LADDER`) —
+run only at 2N and 4N. A ladder ends when it flattens, meaning two rungs in a
+row that fail to beat the best before them by 3% (`CAL_SHAPE_THR`, the stop
+rule). N → 2N → 4N is only
+two steps, so 2N and 4N always run, unless a memory or aio guard refuses them
+(below).
+
+- **Bandwidth** walks numjobs 1, 2, 4 … N/2, N. The first rung at 95% of line
+  rate is the answer. If none reaches it, 2N and 4N walk iodepth for every
+  nrfiles, and again the first cell at 95% is the answer. If nothing reaches
+  line rate, or line rate is unknown, the pick below decides. A reading
+  more than 5% *above* line rate means line rate is not this client's ceiling,
+  and the pick decides then too.
+- **IOPS** measures N/2 and N, then at 2N and 4N walks the queue ladder at
+  nrfiles 1 until it flattens, and tries nrfiles 2 and 4 at the iodepth the
+  pick (below) chooses from that ladder and one step deeper. The pick decides.
+  With libaio, every job reserves its iodepth against the kernel's `fs.aio-max-nr` (65,536
+  by default), so the probe reads the room left on every client, and a
+  bandwidth or IOPS cell past the room of the shape's tightest member is not
+  run, at any job count: the log says where the job or queue ladder stopped
+  and to raise `fs.aio-max-nr` and re-measure with `-g` to search deeper (the
+  host file keeps the shorter answer until then). A search where no cell fits
+  stops, naming the limit. A libaio engine cell past the room is skipped, and
+  the engine is chosen from the other candidates' cells. The latency ladders
+  run N jobs at iodepth 1 and are not checked; a pinned iodepth there is
+  checked before the run (below). Once everything is
+  staged, any libaio job past its host's room — a host-file answer recorded
+  when the limit was higher, `-e libaio` over an answer another engine found —
+  stops the run before the first test (see What lands in the host file).
+- **Latency** runs N jobs at queue depth 1 with each nrfiles (1, 2, 4): three
+  cells. The lowest mean latency wins, with no threshold; equal means keep the
+  fewer files. Numjobs is not searched: the one-job twin is the other end of
+  the comparison. With `-b` the 1 MiB latency test gets the same search.
+
+**The pick** (bandwidth and IOPS, every level). Under `cal` the top three
+cells (`CAL_CONFIRM`) first get a second reading, under `brutal` the top five;
+`safe` and `max` measure each job count once. The re-reads run on the shape's
+representative, one at a time, whatever `--cal-clients` says. Contention only
+subtracts, so a
+second chance can raise a cell and never lower it, and the best reading is
+what a cell is credited with. Then the best reading wins, and an exact tie goes
+to the heavier cell: more outstanding IO (numjobs × iodepth), then more jobs,
+the deeper queue and more files. There is no threshold in the pick, so a
+heavier cell 1% ahead of a lighter one wins; the 3% of `CAL_SHAPE_THR` only
+decides when a ladder stops (Frank, 2026-10-23). The order the cells were
+measured in does not matter, so `cal` and `brutal` pick alike.
+
+Every write cell is followed by `CAL_SETTLE` (10s), so the next cell does not
+start inside the previous one's destage backlog. The first field grids showed
+exactly that without it: every read surface was smooth, while the write
+surfaces carried the previous cell's debt. A cell whose in-flight buffers
+(numjobs × iodepth × bs) would exceed `CAL_MEM_PCT` (25%) of the client's
+MemTotal is not run, and the log says so. Under `safe` and `max`, where the
+iodepth is fixed, the memory and aio guards drop the job counts it cannot fit
+instead. A sync engine (psync) keeps one IO in flight per job, so its searches
+run at iodepth 1 only.
+
+### `-a brutal`
+
+`-a brutal` runs the same search with every early stop disabled: every
+combination of job count, iodepth and nrfiles the ladders define is measured,
+and the top five cells get a second reading (`BRUTAL_CONFIRM`). Bandwidth takes
+the pick instead of the first rung at line rate. With the default ladders that
+is at most about 67 IOPS cells, 40 bandwidth cells and 3 latency cells per
+direction: some 220 per shape for a set with all six tests, or a little over
+two hours at 30s cells with the write settles. Use `cal` for the answer
+cheaply, and `brutal` when the stopping rules themselves are the suspect.
+
+### Calibration measures what the test will run
+
+A value measured under a parallelism, an engine or a file layout the staged
+jobs will not reproduce is not the test's ceiling. So:
+
+- **cpus** come from one rule for the cells and the staged jobs alike, N and
+  its two cpu sets (see Usable cores), minus any cpu the host refuses to bind.
+  A job count at or below N runs one job per physical core; a wider one
+  spreads over the siblings too.
+- **the engine** a shape was measured on is the engine its staged jobs run.
+- **one amount of data per job.** Every calibration cell and, through the
+  recorded tuples, every staged test gives each job `FILESIZE_MIB` (5G) of
+  data split over its files: nrfiles 2 runs two 2560M regions, nrfiles 4
+  four 1280M ones, each the leading part of its file. The working set is part of the measurement — the same staged
+  iops-write geometry delivered 7.5% differently at 256M vs 1024M files, and
+  WEKAPP-289548 saw 4k random reads lose 30% from 1M files to 3G files — so
+  the file ladder changes the file count and nothing else. A host file that
+  pins its own `fs` still wins.
+
+**Calibration measures on the workload's own files** whenever the set's
+`filename_format` can address the grid, meaning it has both `$filenum` and
+`$jobnum` and no `$jobname`. The dataset splits along the read/write line:
+
+- **Reads use one fleet-shared dataset per filesystem group** (`shared.<fmt>`).
+  Every client's read cells and staged read-only jobs (whatever their own
+  `filename_format`) open the *same* files as the rest of its group. That is the realistic fleet workload, and it lets one
+  dense set serve any number of clients. The layout job lays it out once per
+  group, from the group's first host, for the widest job count any member
+  reads it with. The host name `shared` is reserved.
+- **A filesystem group** is every client whose destination is the same
+  directory, whatever path it is mounted at: one weka filesystem can sit at
+  `/mnt/foo` on one client and `/mnt/bar` on another. The mount check's write
+  probe has each client append its name to the run's group file
+  (`.wekatester-group.<run>.lst`) in its own destination; once every client
+  has passed every other check, each returns that file's sha256, and equal
+  hashes are one group. A separate subdirectory, even of the same filesystem,
+  is a group of its own. Once every hash is in, each group's first host
+  removes the file, one removal per group. A run that stops before then
+  removes its own file from every destination as it exits, dry runs too.
+  Each group has its own representative for every shape, so a group's read
+  cells read that group's own set.
+- **Writes use per-client sets** (`<host>.<fmt>`), because concurrent
+  cross-client writes to shared files measure lease arbitration, not the
+  client. The write set is seeded dense, like the read set: 4k random
+  writes into holes cost a measured 6.7% on the extent-map insert, and a
+  reader would read holes.
+
+Sets whose format cannot express the grid fall back to the private
+`.wekatester-cal` scratch.
+
+**Seeding is incremental, and each file only as big as its largest use.** A
+job at nrfiles 4 reads 1.25G of each of its first four files, so file 0 is
+seeded at 5G (nrfiles 1 reads all of it), file 1 at 2.5G, files 2 and 3 at
+1.25G: 10G per job at nrfiles 4, not four 5G files. Every size is fixed
+before the first seed from every nrfiles step, so a file is created once at
+its final size and never grows. Before its first cell, a shape's
+representative gets the files N jobs need; a wider cell, such as 4N jobs or
+a higher nrfiles, seeds its own extra files first. The shared read set is
+seeded by its whole filesystem group: every member's fio server is idle while
+shapes calibrate one at a time, so each writes a round-robin share of the
+missing files into its own view of the directory. Write sets stay on their
+own client. A file already at or above its size is left alone. Size is
+a sufficient test for the seed **because it writes each file
+sequentially as it creates it** (`rw=write`, `create_on_open=1`,
+`fallocate=none`): a partial create leaves a short file that fails the test,
+never a full-size hollow one that passes it. Before a byte is written the seed prints its estimate: the
+files and GiB to write, and the free space at the
+destination with the share the seed will take. A seed that would not fit
+stops there. Before the first cell, calibration also prices everything it
+will write per filesystem — each group's shared read set for its widest
+reader and the own write set of every client a shape calibrates on (its
+representative, and the members `--cal-clients` adds) for the shape's widest
+cell, less what is already laid out — adding up the groups and hosts on one
+weka filesystem, and stops (or, with `--ignore-capacity`, asks) when it cannot
+fit. The other members' own write sets are priced by the run's capacity
+check, at the measured answers. The dataset is kept after the run, so the next calibration seeds
+nothing; `-u` removes it once the last measured job has finished, exactly as
+it removes the workload's own files (a failed run keeps it for the rerun).
+
+### What lands in the host file
+
+Each measured direction records its whole tuple, (numjobs, filesize, nrfiles,
+iodepth), into its own host-file column: `bandwidthR`, `bandwidthW`,
+`latencyR`, `latencyW`, `iopsR`, `iopsW`, and with `-b` `latency1mR` and
+`latency1mW`, which come last so a file written before they existed still
+lines up. The shape's engine goes into
+`ioengine`. `numjobs` is always recorded for a measured direction, because
+bandwidth's answer *is* a job count, and so is latency's. The rules are the
+usual ones: calibration fills empty fields only, and overwrites them under
+`-g`, so a geometry you authored yourself still wins over calibration.
+
+**The host file is only ever added to.** Nothing in it is replaced, deleted
+or rewritten in place. A host's own line that the run would change is
+commented out (`# superseded by -a: ...`) and its new version written directly
+below it; a host with no line of its own gets one appended at the end; a
+line whose values all hold is left exactly as it is. Values compare by what
+they mean, not how they are spelled: `5G` is `5120M`, a cpu list `2-4` is
+`2,3,4` (but `2,4` is not `2-4`).
+
+Under `-g` everything derived overwrites the host file except the three columns
+the operator owns outright: host, login, and allowed_cpus, as written on the
+host's **own** line. A generic (host-less) line is a default, not the host's
+setting. It is never edited, and each host that ran on it gets its own line
+recording what actually ran: the cpu list fio executed on (the generic list
+minus weka's cores, both threads, core 0's pair and any cpu the host does not
+have), the engine, and the resolved destination.
+
+A jobfile that runs both directions takes the deeper-qd direction's WHOLE
+tuple. Tuples never mix across directions, because a mixed tuple was never
+itself measured. The writeback records each measured direction's own tuple
+straight from `cal.results`, so a mixed file cannot copy one direction's tuple
+over the other's.
+
+Results flow into the run's geometry one precedence slot below the operator:
+CLI > host file > calibration > tuner. They persist to `hostlist.csv` through
+the `-a` writeback. **A host-file value pins its knob** (Frank, 2026-10-02):
+whatever the value — written by you or recorded by an earlier calibration —
+it is the only value that knob takes in that host's searches, used as
+written on every rung (a pinned iodepth holds on the qd1 rungs too) and
+never capped by a guard; the knobs the row leaves open are searched around
+it, and a row with all four fields is measured again at exactly that cell.
+Nothing is skipped. Hosts whose rows pin different values calibrate as
+shapes of their own. A pin past the grid (a nrfiles off the ladder, a
+filesize, a job count past 4N) sizes the seed so its files exist. `-g`
+ignores the host file's values and searches everything; `--line-rate`
+searches bandwidth again, because a recorded bandwidth answer does not say
+which line rate it stopped at, while the other values still pin. The
+writeback never records a *staged* numjobs, so a tuned guess never becomes a
+pin. `-n` names the shapes and the searches a run would perform without
+executing them.
+
+**A kernel aio room that would be exceeded stops the run before it starts.**
+libaio sets up numjobs x iodepth aio events at once, and past
+`fs.aio-max-nr` (less what is in use) the job fails with EAGAIN. A
+calibration pin whose smallest cell would exceed a shape's room (an open
+numjobs counts as the fewest jobs its search runs: 1 for bandwidth, N/2 for
+IOPS, N for latency), with libaio
+pinned or among the engines calibration tries, and a staged libaio job past
+its host's room, both stop with an alert naming the slot or job, the events
+and the room; nothing has run and the host file is unchanged. The pin
+check runs before the fio servers start, the staged-job check before the
+first test, and a dry run (`-n`) runs both. A searched
+cell past the room is skipped by the planner's guard instead, and the
+verdict says so; a search with no cell that fits stops, naming the guard.
+
+Every staged jobfile records what auto derived for that host in header
+comments. Auto also warns when workers differ (core counts, weka cores).
+
+**Every run** is capacity-checked after staging, per host, against each
+host's own destination filesystem: the staged variants (auto-tuned,
+host-file-shaped, or plain) are what actually run, so their footprint — the
+larger of the per-namespace job footprints and the layout grid's
+per-section total, less the bytes the sweep found present — is compared with that host's `df`
+before any fio job starts. Hosts on one weka filesystem draw from one pool, so their needs are
+also added up and checked against it together (a filesystem is known by its
+name and size). Continuing would only march fio into `ENOSPC` partway through and
+throw away the run. Pass `--ignore-capacity` to be **asked** (no timeout)
+instead of aborted, and run anyway on a yes — unattended runs with the flag
+warn and continue (useful when `df` under-reports, e.g. a filesystem that
+is thin-provisioned or still rebalancing). If `df` returns nothing usable
+for a host, that host goes unchecked, with a warning.
+
+A dry run under `-a` stops before calibration, so the sizes it has staged are
+the jobfiles' own, not the ones the run will use. Its capacity check is a
+preview: it prints those sizes labelled "before calibration", turns a
+shortfall into a note, and stops nothing. The real run checks again after
+calibration, at the measured sizes.
+
+# Source
+
+`wekatester` is one file on purpose: it reaches a jump box by `scp`, `pdcp` or a paste, and needs only bash, awk and ssh there, and fio on the workers. It is bash and awk throughout: the rules more than one part needs (the core rule, the host-file schema, the seed sizes, the layout, JSON) live once, in the awk library `awkrun` prepends to every program.
+
+That one file is built, not edited: `./build` assembles it from `src/`, and both are committed. Edit `src/`, run `./build`, then run the suite (`bash tests/test_wekatester.sh`); both need bash 4.4 or later first in PATH -- on a development Mac, Homebrew's. `./build` also writes `hostlist.example.csv` from the built tool's own template. The suite tests the built `wekatester`, and fails while it differs from what `./build` makes of `src/`. One suite runs at a time per host: a second one refuses, naming the first (the lock is `/tmp/wekatester-suite.lock`, or `SUITE_LOCK`). `SUITE_ONLY=<regex>` runs only the tests whose description matches and counts the rest as skipped; a pattern that matches nothing fails. A suite stopped by `timeout` prints `TIMEOUT after N s` with the counts so far and exits 124.
+
+- `src/wekatester.sh`: the defaults, usage, option parsing and `main`, and where each module goes in.
+- `src/sh/*.sh`: the rest of the bash, one module per part of a run: `base` (logging, the ssh transport, prompts), `awk` (the awk library and `awkrun`), `fiojson` (fio's JSON), `calibrate` (`-a`), `preflight` (reachability, mount mode, filesystem groups), `connect` (fio servers, limits, logins, teardown), `probe` (worker facts, engine tests, cpu pinning), `layout` (the capacity check, layout jobs), `hosts` (host files), `stage`, and `run` (the run, the dry run's report, the bundle and summary).
+- `src/awk/lib/*.awk`: the awk library, in the order `awkrun` prepends it.
+- `src/awk/<function>.awk`: every awk program longer than one line, named for the function that runs it (`<function>.<role>.awk` where one runs several).
+
+In a `.sh` file `./build` reads two directives; an `.awk` file goes in as it is.
+
+- A line `#@include <path>` becomes that file under `src/`, recursively.
+- `#@awk <name>`, inside an awk program's single quotes and one to a line, becomes `src/awk/<name>.awk`: its first line takes the marker's place, each later line is indented like the marker's own line (an empty one stays empty), and every `'` becomes `'\''`, so the program stays one bash string. The marker goes right after the opening quote, or alone on the next line at the program's indent.
+
+`./build` stops, naming the problem and leaving the target alone, on:
+
+- a file it cannot read, or an awk file with no text;
+- an include cycle;
+- a second directive on a line, or anything else that looks like one;
+- a directive left in the assembly (an include not named `.sh` comes in as it is);
+- a program line ending in a backslash: `cal_evidence`'s program sits inside an unquoted heredoc, where bash would join it to the next line;
+- a directory as the target;
+- an assembly `bash -n` rejects, which it keeps as `<target>.rejected`.
+
+The awk has to run the same under gawk, mawk and macOS awk, so every program keeps to a few conventions. Run the suite under all three before calling an awk change done.
+
+- `BEGIN` only, with its data on `ARGV`: `-v` would put a value through awk's escape processing. `awk_fail` exits from anywhere, which only `BEGIN` makes safe.
+- `LC_ALL=C`, for byte order whatever the locale. Files are read whole by `readlines`, with universal newlines, and written back joined by `\n`.
+- Byte counts are printed with `%.0f`: mawk's `%d` clips past 2^31.
+- A comparison or `?:` inside a `print` list is parenthesized (macOS awk reads `>` there as a redirection). No regex interval `{n}` (mawk lacks it). No program variable named after a gawk built-in such as `RT` or `NR`.
+- At most 50 parameters and locals per function, and never `A[k] = (k in A) ? ...` (mawk creates `A[k]` before the test).
+- A line at a time, never a whole file in one string: `substr` and appends on a long string are quadratic in macOS awk and mawk.
+- Files under `src/awk/` may contain apostrophes. A one-line program written inline in a `.sh` file sits inside bash single quotes, so it never contains one: write `\047`.
+
+# SSH configuration
+Because wekatester uses the real ssh client, anything you can express in `~/.ssh/config` just works. Two field-typical examples are included:
+
+- `aws_ssh_config.example` — `ec2-user` with a support key, host key checking off
+- `on-prem_ssh_config.example` — default key, host key checking off
+
+Remember that `BatchMode` means keys must be usable without a passphrase prompt (use an agent), and unknown host keys will fail the run unless your config handles them.
+
+# Host files (-t)
+One CSV assigns per-host settings without a jobfile set per client:
+
+```
+host,user_login,ioengine,allowed_cpus,destination_folder,bandwidthR:nj/fs/nr/qd,bandwidthW:nj/fs/nr/qd,latencyR:nj/fs/nr/qd,latencyW:nj/fs/nr/qd,iopsR:nj/fs/nr/qd,iopsW:nj/fs/nr/qd,latency1mR:nj/fs/nr/qd,latency1mW:nj/fs/nr/qd
+client-1,ubuntu,io_uring,"8,10,12,14",/mnt/weka,12/10G//8,12/10G//4,1///1,1///1,12/1G/2/64,12/1G/2/16
+,,io_uring,,,,,,,,
+```
+
+A line naming a host assigns to that host (two lines naming the same host is an error, both line numbers named). Host-less lines are **selector** lines: their login and/or ioengine choose the hosts they apply to — a login selects hosts using that login, an ioengine selects hosts that **passed that engine's functional test** — and their remaining fields fold into any host whose more-specific settings left them unset. A host line beats two selectors beats one beats a global `,,...` line; a generic line never overrides a more specific one regardless of file order; equally specific conflicts keep the *first* line and print a warning. A host-less line's login is only ever a selector — logins are assigned by host and pattern lines, the CLI, or your ssh defaults. Empty fields mean "default"; geometry sub-fields may be omitted (`12/10G//8` sets numjobs, filesize and iodepth). Geometry is per type AND direction: the R columns shape read jobs, the W columns write jobs, and a mixed-direction jobfile takes the deeper-queued direction's whole tuple. Quote cpu lists (`"22,24"`), and `#` starts a comment. An unquoted list splits into cells and shifts every later column, so a row with more non-empty cells than the header defines, or a `destination_folder` that is not an absolute path, stops the run, naming the file and line.
+
+A host cell holding `*`, `?` or `[...]` makes a **pattern** line: a shell glob matched against each host as given on the command line (in local mode, its short hostname too), ignoring case, with no DNS lookup. `*` crosses dots, so `cg-*` matches `cg-01.lab`, and the dots in `10.0.0.*` are literal; a bare `*` covers every host. For each host it matches, a pattern line works like that host's own line, so its login is assigned, not a selector, but it ranks below a real host line: a host line beats a name glob, which beats `*`, which beats every selector line, and two equally specific patterns that disagree keep the first line and print a warning. A glob that matches none of the run's hosts is named in a warning (file and line) and the run goes on. `-a` never edits a pattern line; each host it matched gets its own line recording what the run resolved.
+
+**Settings.** A line whose first cell is `WT_NAME=value` sets an option for the whole run instead of naming a host. `WT_DIRECTORY`, `WT_WORKLOAD`, `WT_FIO_BIN`, `WT_OUTPUT`, `WT_ENGINE`, `WT_AUTO`, `WT_LINE_RATE`, `WT_CAL_CLIENTS`, `WT_DURATION`, `WT_BULK`, `WT_UNLINK`, `WT_VERBOSE`, `WT_IDENTITY`, `WT_PASSWORD`, `WT_ANY_FS`, `WT_ALLOW_FIO_MISMATCH` and `WT_IGNORE_CAPACITY` stand for the flag with the same long name: a switch takes 0 or 1, `WT_VERBOSE` a count of 0 to 3, and `WT_PASSWORD` the number of `-p` prompts, never a password. `WT_ENGINE_TEST_TIMEOUT`, `WT_SYSINFO_TIMEOUT`, `WT_SETTLE` and `WT_STAGE_BASE` (`shm`, or `mktemp` for `$TMPDIR`) have no flag. The same names work as environment variables (`WT_WORKLOAD=mixed ./wekatester ...`), with or without `-t`; `-h` and `--version` read none of them. Each setting comes from one place: its flag, else the environment, else the host file, else the built-in default; an empty value sets nothing. `WT_DIRECTORY` and `WT_ENGINE`, from the environment or the file, are run-wide defaults: a host, pattern or selector line's `destination_folder` or `ioengine` beats them, and only `-d` and `-e` beat those lines. A value passes the same checks as its flag. A bad value, an unknown name, a name set twice, or a second cell on a settings line stops the run, naming the file and line or the environment variable; quote a value that holds a comma. A bare `-t` finds the file through the command line's or the environment's workload, so a `WT_WORKLOAD` inside the file changes the workload but not which file is read. `-a` never edits a settings line. A new host file starts from a template that lists every setting at its default under its help, as `hostlist.example.csv` in the repository does.
+
+Without `-t` no host file is used. Bare `-t` looks in the `-w` set's folder first, falling back to `./hostlist.csv`; when both exist, the set folder wins and is the copy later writebacks (`-a`) update. The host file is taken as prepared for the run. A named path that doesn't exist asks (no timeout) whether to create the self-describing template or quit — under `-r` the same question gets 5 seconds and defaults to create. Precedence overall: **CLI flags > environment > host file > jobfiles/tuner**. For the ioengine in full: `-e`, then the host file's engine for the host, then `WT_ENGINE` (Settings), then the jobfile's own `ioengine=`, then (outside `-a`) the first of io_uring, libaio, psync that passes its test job on the host (see `-e`).
+
+**fio never lands on weka's pinned cores.** Every run probes every host, so a host the file gives no cpu list is pinned too: its fio server and jobs run on every cpu except weka's cores (both threads) and core 0's pair, limited to the cpus the login can bind without privilege (under `-a`, on the tuner's set). One note names how many hosts that covers. Only a host whose probe could not be read stays unpinned. A jobfile's own `cpus_allowed` is trimmed too: staging holds every `cpus_allowed=` line, in any section, to the host's fio cpus, with a note naming the host, the jobfile, its list and what runs (the source jobfile keeps its list as written). A list with none of those cpus, or one that is not a cpu list, stops the run, naming the jobfile, its list and the host's cpus. `cpus_allowed_policy` names no cpus and is kept as written.
+
+Every cpu in a host's `allowed_cpus` is **checked against what that host lets the login bind** before the run. The probe reads it, never trial-binds a cpu: `sched_setaffinity` accepts the cpus of the task's cgroup cpuset, so the probe reads the cpuset of its shell's cgroup from `/proc/self/cgroup` (cgroup v2: `cpuset.cpus.effective`; v1: `cpuset.effective_cpus`, else `cpuset.cpus`; a cgroup without the cpuset controller takes its nearest ancestor's), falling back to the shell's `taskset -cp` affinity where no cpuset file is readable. An escalated launch can land in another cgroup, so the probe reads that cgroup once under the escalator (`cat /proc/self/cgroup`, no shell under it) and the cpus it adds are the ones that bind only under the escalator; if that read fails they are unknown, never guessed, and a cpu outside the login's set is trimmed. A cpu can be online and outside weka's pinned set and still refuse the bind — offline but counted, or held by another cgroup's cpuset partition — and fio's only answer to that is `err=22 cpu_set_affinity` per job, raised on the daemonized server after the run has started. Such cpus are trimmed with a note naming them, on the same contract as the weka overlap: the host file keeps your list as written, execution runs on what works. A cpu that binds only under the escalator is escalated, not trimmed. fio launches under `taskset -c`, so a host where `taskset -cp` fails, prints no affinity list, or is not installed cannot be pinned, whatever its cpuset says: the run stops before any engine test, naming each such host and why (taskset's own words), and its cpus are never guessed.
+
+Every ioengine the file (or `-e`) names is **proven with a real one-file job on that host's destination** before use — `--enghelp` lists what fio was built with, not what the kernel and filesystem will run — and in auto mode the tuner's common engine comes from the proven set. A requested `allowed_cpus` outside the host's current `taskset -cp` mask, or overlapping weka's pinned cores, is an error showing all three (request, mask, weka cores) unless a passwordless escalator works — probed per host as dzdo, pbrun, sesu, pmrun, doas, ksu, then sudo last (sites that install an enterprise escalator usually mandate it), each tested non-interactively with a 5s timeout. Escalation is as-needed: a self-affinable mask (inside the cpus the login binds, as the probe read them) runs fio as the login user even when an escalator exists. When escalation is needed it covers the `taskset` only — fio itself drops back to the login user via `runuser` where policy allows (keeping test files user-owned), falls back to a root fio with a NOTE otherwise, and is torn down with the same privilege (cpus overlapping weka's dedicated cores are excluded at execution — the host file keeps your list as written). weka CLI queries, when a future feature issues any, try the login user first and get one escalated retry on failure. Each host may also point at its own `destination_folder`: the mount guard, write probe, layout grid sweep, capacity check and staged variants all follow it.
+
+With `-a`, the derived values (established login, proven engine, cpus, directory, per-direction geometry) are recorded back into the host file for re-use — filling only what the host's own line didn't provide (what a generic line supplied counts as unset, so the host line records the value the run resolved); with `-g` the derived and measured values overwrite instead, without asking (see What lands in the host file). Updates never edit lines in place: the old host line is commented out and the new one written directly below it, preserving history. A machine wekatester records for the **first** time is named `<short hostname>/<machine-id>` rather than by whatever the run happened to address it as — `localhost` identifies nothing, and a bare hostname collides as soon as a host file is shared between labs. The id comes from `/sys/class/dmi/id/product_uuid`, falling back to `/etc/machine-id`, and is omitted entirely when neither can be read. You never have to type it: a row you wrote keeps your spelling forever, and the id is ignored when the file is read — the name before the `/` is matched against the host the run is using, so a local run still resolves its own row without ssh. Two rows whose names collide but whose ids differ are rejected with both spellings named, since the run cannot tell which machine you meant.
+
+# Authentication
+A large client list rarely shares one credential, so wekatester carries a pool and finds each worker's own. `-i [login:]keyfile` names a key, optionally bound to a login (`-i ubuntu:lab.pem`); it takes comma-separated lists and may be repeated, accumulating in order. A bare path (`-i lab.pem`) means ssh's default user. A key path starting `~/` works after a login too (`-i ubuntu:~/.ssh/lab.pem`): the shell leaves that `~` alone, so wekatester expands it to `$HOME`; a `~user/` path is not expanded. `-p [n]` prompts — on your terminal, passwords never echoed — for *n* (default 1) login/password pairs; an empty login answer means ssh's default user. `-i` and `-p` combine freely.
+
+Connection establishment runs before anything else touches a host, in rounds, each round trying one credential against **all still-unconnected workers in parallel**:
+
+1. **existing ssh sessions** — a live ControlMaster from your own ssh config is detected (`ssh -O check`) and reused as-is. wekatester never closes a master it didn't create: its teardown only touches its own socket directory.
+2. **plain defaults** — your agent and `~/.ssh/config` identities;
+3. **each `-i` key**, in the order given;
+4. **each `-p` pair**, in the order given — keys go first because failed password attempts burn sshd's `MaxAuthTries` counters.
+
+Per worker, the first success wins and every later ssh/scp in the run rides that session (multiplexed, pinned open until the run ends). Keys are tried with `IdentitiesOnly=yes` so the agent's other keys aren't offered alongside. Passwords are fed through an `SSH_ASKPASS` helper over a per-attempt fifo in tmpfs — no `sshpass`, and the password never appears on a command line, on disk, or in any process's environment; a wrong one fails cleanly rather than hanging, and so does an unknown host key (the helper answers ssh's "continue connecting?" with no, as `BatchMode` does for keys; connect once by hand, or list the host in `known_hosts`, to accept it). A key path that is missing or unreadable (`-i ~/.ssh` instead of `-i ~/.ssh/id_ed25519`) is reported before the first connection; entries may not contain whitespace. Workers that no credential reaches are named and fail preflight. `-p` needs a terminal — unattended runs should use keys. In local mode both options are accepted and ignored — there is no ssh to configure.
 
 # Output
-The output will be summarized after each workload run, and all results are writting to a log file.
+Each job prints a summary block as it completes, and every run leaves one self-contained bundle in the output directory (`./results` by default, `-o` to choose another). During the run the bundle is a `<date>-<time>/` directory holding:
 
-Typical output will look something like this:
+- `results_<jobname>.json` — the raw fio JSON, one file per job, written as each job completes;
+- `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
+- `cmdline` — the command line as typed, shell-quoted on one line, `./wekatester` first; `settings` — what it resolved to, one `<key><tab><value>` per line: `version`, `workload`, `auto` (the `-a` level, `-` without it), `cal-seconds` (the calibration cell length, `-` without `-a`), `master` and `hosts`, then, only under `--allow-fio-mismatch`, `allow-fio-mismatch` (what the fio version check found: the versions and their hosts when they differ), and once the sweep has run, `layout` (what the generated layout writes: `<n> file(s), <bytes> bytes to write on <h> host(s)`, or `nothing to write (files reused)`, which `-s` repeats), then one `<WT_NAME><tab><value><tab><source>` line for each setting whose value is not its default, the source being `cli`, `environment` or `<file>:<line>` (`WT_PASSWORD` records its prompt count, never a password); `fs-groups` — `<host> <group>` per host, the filesystem groups (hosts sharing one destination directory);
+- `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host — this is the execution truth);
+- `sysinfo/<host>/` — the box context the numbers depend on, one file per item: `cmdline` and `isolated` (kernel command line and the live isolcpus set), `mounts` and `df`, `meminfo` and `free`, `lscpu` and `numactl`, `lspci` and `ip` (addresses), `uname` and `os-release`, `uptime` (load at run start), `fio` (`--version`), and `weka` (`weka local ps`); the receive path: `sysctl` (`net.core.netdev_max_backlog`, `net.ipv4.tcp_rmem`, and `rp_filter`, `arp_filter`, `arp_ignore` and `arp_announce` under `net.ipv4.conf` for `all`, `default` and each NIC), `chrony` (`chronyc tracking`, the clock offset; `timedatectl status` where chrony is absent), `cpu-governor` (cpus per frequency governor), `irqbalance` (running or not), `nics` (every netdev backed by a device, the probe's choice) and per NIC `nic-<dev>` (PCI address, driver, NUMA node, PCIe link speed and width current and max, its MSI IRQs and the cpus each may run on (a NIC whose device is not a PCI function itself, such as virtio, reads these and its AER counts below from the nearest PCI device above it, each such line ending `pci_parent=<PCI address>`; with no PCI device above it, it says `pci_parent not available`), `ethtool -g`/`-l`/`-c`/`-a` — rings, channels, coalescing, pause — and per-priority PFC from `mlnx_qos -i` where installed, retried under a passwordless escalator when it fails as a non-root user), each tool bounded at 10 s (an escalator check at 5 s, `journalctl` at 60 s); plus before/after pairs captured at run start and teardown: `pressure-{cpu,io,memory}-{start,end}` (PSI — sustained cpu `some avg10` above a few percent during a run means housekeeping tasks were queuing), `loadavg-{start,end}`, raw counters for working out what changed over the run (wekatester computes no delta): `tcp-{start,end}` (`nstat -asz`, which leaves nstat's own history alone, else `/proc/net/snmp` and `/proc/net/netstat`; retransmits and drops), `nics-{start,end}` and per NIC `ethtool-S-<dev>-{start,end}` (every `ethtool -S` counter, per-priority discards and pauses included) and `aer-<dev>-{start,end}` (the PCIe AER correctable, nonfatal and fatal counts); then `kernel-log-end` (the kernel log from the run start, the last 2000 lines: `dmesg` windowed by the host's uptime, under a passwordless escalator when `dmesg_restrict` refuses a non-root user, else `journalctl -k --since` the run start) and `sar-end` (the sysstat log slice covering the run window, when the box keeps one); after a failed run whose fio servers were started, `fio-server-log-end`: a daemonized fio server writes its own messages only to syslog, so this is `journalctl -t fio` from the run start (every fio that logged in that window, the last 2000 lines), under a passwordless escalator for a non-root login, which otherwise sees only its own entries (the file says so when no escalator works); a host without `journalctl` records `not available` and nothing else is read. A successful run reads no server log, and a run that stopped before the servers started says in the log that there is none. A host missing a tool records `not available` instead of failing the run. Each host's sysinfo session, and each of its pressure sessions, is bounded as a whole at 300 s (`WT_SYSINFO_TIMEOUT`, whole seconds; any other value stops the run before it starts): a host past the bound is cut off, a log WARNING names the host and the bound, the item it stopped in ends `not available: the session was cut off here`, a `session-timeout` item (`session-timeout-{start,end}` for pressure) says so, everything already captured is kept, and the run carries on as it does when a capture fails. A controller without `timeout` warns and leaves the sessions unbounded;
+- `cal/` — on every `-a` run: `shapes` and `shapes.txt` (the client shapes), `clients` (per shape, the clients its cells ran on), per shape `s<n>/` with the engine cells, each search's history of readings (`hist-<type>-<direction>`), who ran each cell (`ran-<type>-<direction>`, one line per cell: `<cell number> <client> <cells in flight, this one included> <start> <end> <phase> <numjobs> <iodepth> <nrfiles> <value>`, the times in epoch seconds; `ran-engines` for the engine cells), and the tuples it settled, every cell's jobfile and raw JSON (`res-s<n>-<cell number>-<client>-<cell>.json`), and `cal.results`. When a calibration fio run fails — the seed or a cell — its fio output (`res-*.json`), each host's jobfile (`<rung>.<host>.job`) and each host's own `fio --parse-only` verdict (`parse.<host>.out`, every host at once, reported in host order) are filed here before the run stops, and fio's own error lines are repeated on the console; the staging area in tmpfs is wiped on exit, so the bundle is the only place that evidence survives.
+
+At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. When `pigz` is installed on the machine running wekatester, it does the compressing on all cores, writing the same gzip format at the same default level (a large run's bundle otherwise takes several seconds of single-threaded gzip); without it, tar's own gzip does. Either way the archive is a plain `.tgz` that `-s` and `tar -xzf` read. If compression fails, the directory is left uncompressed and the run says so. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
+
+The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency:
+
 ```
-starting test run for job 011-bandwidthR.job on <hostname> with <n> workers:
-    read bandwidth: 9.37 GiB/s
-    total bandwidth: 9.37 GiB/s
-    average bandwidth: 2.34 GiB/s per host
-
-starting test run for job 012-bandwithW.job on <hostname> with <n> workers:
-    write bandwidth: 7.72 GiB/s
-    total bandwidth: 7.72 GiB/s
-    average bandwidth: 1.93 GiB/s per host
-
-starting test run for job 021-latencyR.job on <hostname> with <n> workers:
-    read latency: 237 us
-
-starting test run for job 022-latencyW.job on <hostname> with <n> workers:
-    write latency: 180 us
-
-starting test run for job 031-iopsR.job on <hostname> with <n> workers:
-    read iops: 376,697/s
-    total iops: 376,697/s
-    average iops: 94,174/s per host
-
-starting test run for job 032-iopsW.job on <hostname> with <n> workers:
-    write iops: 302,132/s
-    total iops: 302,132/s
-    average iops: 75,533/s per host
-
-Writing raw fio results to results_2025-10-07_1112.json
+starting test run for job 011-bandwidthR.job on host-1 with 2 workers:
+    read bandwidth: 4.50 GiB/s
+    write bandwidth: 2.50 GiB/s
+    total bandwidth: 7.00 GiB/s
+    average bandwidth: 3.50 GiB/s per host  (min 3.00 GiB/s vega-1, max 4.00 GiB/s vega-2)
+    read latency: 227.3 us  (min 200.0 us vega-1, max 250.0 us vega-2)
+    average latency: 269.7 us (IO-weighted)
 ```
-The raw output is the actual raw JSON output from the FIO commands.
+
+Before the capacity check, each host's line says what its layout will write (`layout: host-1: 3 file(s) missing or short, 30.0 GiB to write (77 reused)`). The layout job that runs first is a sequential write of what the sweep found missing (Workloads), so it reports like a test: its write bandwidth, the per-host average with the min and max hosts, and the bytes it wrote, in total and per host:
+
+```
+laying out files (000-wekatester-layout.job) on 2 host(s)...
+layout: complete in 41s across 2 host(s)
+layout sequential write (000-wekatester-layout.job), the data the sweep found missing, on 2 host(s):
+    write bandwidth: 2.50 GiB/s
+    average bandwidth: 1.25 GiB/s per host  (min 1.20 GiB/s vega-1, max 1.30 GiB/s vega-2)
+    written: 100.00 GiB, 50.00 GiB per host  (min 48.00 GiB vega-1, max 52.00 GiB vega-2)
+```
+
+When every file is already complete no layout runs, and the run says `layout: nothing to write (files reused)`. A set's own layout job still reports only its duration.
+
+Any run can be re-summarized later with `-s` — point it at the bundle (no extraction; it reads the archive in memory) or at a single extracted `.json`:
+
+```
+./wekatester -s results/20260808-231119.tgz
+```
+
+On a bundle, `-s` opens with a synopsis of the run, read only from what the bundle holds: `cmdline`, `settings` and `fs-groups`, each host's `sysinfo/` (`fio`, `weka`, `mounts`), `cal/shapes` and `shapes.txt`, and the staged jobfiles under `fio-jobfiles/`, which are what actually ran. Then come the per-job summaries, unchanged, the layout's sequential write first (`==== 000-wekatester-layout (layout sequential write) ====`, the block above), or `layout: nothing to write (files reused)` when the run recorded that. With `-a`, each client shape shows its representative and the parameters its staged jobs ran, one line per job: the test type and direction (`bw`, `iops`, `lat`, or `lat1m` for the 1MiB latency test, `job` for a jobfile without a `# report` directive; `1job` marks the one-job latency twin), then `numjobs`, `iodepth`, `nrfiles` and `bs` from the job's measured sections. Without `-a`, there is one line per distinct parameter set, with the number of hosts that ran it. A knob the jobfile leaves unset shows `-`, where fio's own default applies. Anything the bundle does not hold says `not recorded`, never a guess. Bundles made before `cmdline`, `settings` and `fs-groups` existed show those fields as `not recorded`, and the master is read from the log instead. `-s` on a single `.json` prints only its summary.
+
+```
+run      2026-10-23 14:10:02 (bundle 20261023-141002.tgz)
+version  wekatester 2026-10-11, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
+command  ./wekatester -a cal -w default h1 h2 h3
+clients  3 (master h1), 2 shapes, 1 filesystem group
+workload default; -a cal (30 s cells); dest /mnt/weka/wt (wekafs)
+
+shape 1: 2 hosts, rep h1, N=26, line rate 400 Gb/s
+  Example CPU, 64 cpus, 512 GiB, weka NICs ens1 ens2: 2 x mlx5_core [0x15b3:0x101d] 200 Gb/s -> line rate 46.57 GiB/s
+  engine libaio
+  bw-read          nj 4     qd 2     nr 1     bs 1Mi     011-bw
+  lat-read 1job    nj 1     qd 1     nr 1     bs 4k      021-lat-1job
+  lat-read         nj 16    qd 1     nr -     bs 4k      021-lat
+shape 2: 1 host, rep h3, N=12, line rate unknown
+  ...
+
+==== 011-bw ====
+    read bandwidth: 2.00 GiB/s
+```
+
+`-s -v` adds what the hosts went through over the run, after the job summaries. **Counters:** per host and NIC, the counters that rose between the `-start` and `-end` captures in `sysinfo/<host>/`: TCP/IP (`tcp`, the nstat or `/proc/net` format), each NIC's `ethtool -S` and its PCIe AER counts. `-v` lists the ones whose name (lowercased) matches `SUMMARY_COUNTER_RE` (drops, discards, errors, retransmits, pauses, timeouts, overflows and the like; set it in the environment to change it) and counts the rest; every AER counter that rose is listed. `-vv` lists every counter that rose. A counter that went down was reset (a driver reload or a reboot), so it is named with both values and never counted as a delta. The TCP gauges (`TcpCurrEstab` and the fixed `Tcp`/`Ip` settings) are skipped. A NIC captured on only one side is named, and a host with nothing to flag says so on one line. Values past 2^53 (a byte counter after weeks at line rate) lose their last digits to awk's doubles.
+
+```
+==== counters over the run: what rose from start to end, per host and NIC ====
+h1
+  tcp: 2 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    TcpRetransSegs                           +1,234
+  eth0: 3 counters, 2 rose; 1 of them match SUMMARY_COUNTER_RE:
+    rx_discards_phy                          +3,000,000,000
+    1 went down, a reset, not counted: rx_out_of_buffer 77 -> 4
+  eth0 aer: 2 counters, 1 rose:
+    correctable.TOTAL_ERR_COR                +2
+  eth1: at the end only, so no delta
+h2: nothing to flag, none matching SUMMARY_COUNTER_RE rose and none went down (tcp 2 counters, 1 rose; eth0 2 counters, 1 rose)
+h3: not recorded (no counter captures in sysinfo/h3)
+```
+
+**Host health:** per host, a flag for each capture that crossed its setting, showing the value that tripped it. Each setting can be changed in the environment:
+
+| Setting | Default | Checks |
+|---|---|---|
+| `SUMMARY_PSI_CPU` | 5 | cpu PSI `some avg10` (%), at the start and at the end |
+| `SUMMARY_PSI_MEMORY` | 1 | memory PSI `some avg10` (%), at the start and at the end |
+| `SUMMARY_PSI_IO` | 10 | io PSI `some avg10` (%), at the start only: a benchmark is io pressure by design |
+| `SUMMARY_LOAD_PER_CPU` | 0.75 | the 1-minute load at the start, per cpu (`lscpu`); the end load is the run's own |
+| `SUMMARY_CLOCK_MS` | 100 | the clock offset `chronyc tracking` reports (ms); not synchronised is flagged too, and `timedatectl` gives only that |
+| `SUMMARY_KLOG_RE` | link down/up, NIC watchdog and transmit timeouts, NIC driver errors, hung and blocked tasks, lockups and RCU stalls, AER, OOM, call traces | kernel-log lines in the run window (lowercased ERE) |
+| `SUMMARY_KLOG_LINES` | 5 | how many matching lines are shown per host; the rest are counted |
+
+A boot inside the run window and a kernel ring that wrapped are flagged too. A host with nothing to flag says so on one line and names what it checked. A capture the bundle lacks is listed under `not recorded`, so a check that could not run never looks clean.
+
+```
+==== host health: pressure, load, kernel log and clock around the run ====
+h1
+  cpu pressure at the end: some avg10 12.50% (over SUMMARY_PSI_CPU 5)
+  load at the start: 14.00 on 16 cpus = 0.88 per cpu (over SUMMARY_LOAD_PER_CPU 0.75)
+  kernel log: 6 of 7 lines in the run window match SUMMARY_KLOG_RE:
+    [  950.000000] mlx5_core 0000:17:00.0 eth0: Link down
+    ...
+    (+1 more; SUMMARY_KLOG_LINES shows 5)
+  clock: 250.0 ms off NTP time (over SUMMARY_CLOCK_MS 100)
+h2: nothing to flag (cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start, kernel log 0 lines, clock 0.01 ms off)
+h3
+  kernel log: this host booted during the run
+  clock: not synchronised to NTP
+  not recorded: cpu PSI start, cpu PSI end, memory PSI start, memory PSI end, io PSI start, load start
+```
+
+# Caveats
+- fio's client/server protocol is version-sensitive: with different fio versions, connections may fail in confusing ways. Preflight reads `fio --version` on every host, the coordinator included, in the session that takes the run lock, and stops the run when they differ, naming each version and its hosts, or when a host's `fio --version` fails or prints nothing. `--allow-fio-mismatch` turns a difference into a warning (Usage). A dry run (`-n`) runs the check too and prints its result with the run details. The comparison is of the printed line only: two builds that print the same version pass.
+- TCP port 8765 (fio's server port) must be open from the coordinator to every worker — ssh working does not imply this; host firewalls commonly allow only port 22. wekatester verifies reachability before running and names any blocked hosts; for each, the teardown that follows prints the lines of that host's fio server log (`fio-server-log-end`, read in its end capture, no extra session) instead of a guess — a server that died on its bind says so there — and only when that log shows nothing that explains it (a `server listening` line explains nothing) does it say so and suggest a host firewall (on loopback: the name resolving to `::1` while fio binds IPv4). It also refuses to summarize results that are missing hosts (fio itself would silently benchmark the survivors). The check is one ssh session to the coordinator that probes every worker in parallel from inside it — one session per worker would pile N sessions onto the coordinator's single multiplexed connection, and sshd's `MaxSessions` (default 10) and `MaxStartups` then refuse the rest, which read as firewalls (seen at 111 workers: 39 false "cannot reach").
+- The per-host min/max spread in the summary only appears with 2 or more workers. A run with no host at all is local mode, not an error.
+- Local mode still needs fio on the local host, `/dev/shm`, and fio's port 8765 reachable on loopback — the same phases run, they just run against this machine. wekatester itself runs only on a Linux controller (the mount guard uses `findmnt`, staging uses `/dev/shm`) and refuses to start elsewhere; `-s`, which only reads a run bundle, works anywhere.
+- `-d` must be on wekafs: wekatester refuses a destination on any other filesystem type (NFS, Lustre, a local disk, ...) before anything is written, naming the type it found. That also catches an unmounted weka, whose mount point is then an empty directory on the root disk. `--any-fs` turns this filesystem-type check off, so wekatester can test any filesystem, a local disk included: the run log then carries a `WARNING` naming the type `-d` is on (one line per type, naming the hosts unless it is all of them), so the bundle says the check was off. Every other destination check still runs: writability, the capacity check, the mount-line recheck below, and on wekafs the `forcedirect` check.
+- If `-d` is a wekafs mount it must be mounted with `forcedirect`; wekatester refuses to run otherwise. fio's `direct=1` alone does not keep the wekafs client cache fully out of the IO path. Under `-r` this is a warning rather than a stop — the numbers then include client-cache effects, and the run log says so.
+- The destination mount that passed the check is the one the run measures: the destination mount's /proc/mounts line, hashed; any change stops the run. In one session, the check finds the mount point holding `-d` with `findmnt -T` and reads its /proc/mounts line (the last line for that mount point, since a mount stacked on the same point is the visible one; the kernel's `\040`-style escapes are decoded first). That one line is what the check classifies (its third field is the filesystem type, its fourth the options), what it keeps with its `cksum`, and what fio writes to: on a stacked mount `findmnt` lists the hidden mount first, and judging that one would pass a local disk stacked over weka. A destination wekatester creates gets the line of the mount it was created on, classified the same way. A host with no such line stops the check. Right before the first measured job, after calibration and the layout, every host reads that line again in one parallel round, and the hashes are compared. Any change to the line (source, mount point, filesystem type, any option, or the dump/pass fields), or a host that cannot read it, stops the run with each such host's old and new line, `-r` included. A dry run (`-n`) ends before the measured run and skips this check.
+- If `-d` does not exist yet, wekatester offers to create it (once, for every worker that lacks it) — but only when the nearest existing parent is a wekafs mount (anywhere under `--any-fs`, below). Without `-r` that takes a terminal and a `y`; with `-r` or `-n` it is a 5-second prompt defaulting to create, or created outright when there is no terminal. Without `--any-fs`, a missing directory anywhere else is a hard stop: with wekafs not mounted, the parent is the root filesystem, and a mistyped `-d` created there would benchmark the boot disk. Each host checks its nearest existing parent again in the same session, right before its `mkdir -p` (the type in that parent's /proc/mounts line must still be wekafs): a weka client that restarted while the prompt waited leaves the mount point on the root disk, and that host then creates nothing. With `--any-fs` the parent may be on any filesystem, and neither parent check runs: the missing `-d` is created with a plain `mkdir -p` after the same question, wherever it is, so a mistyped `-d` is created where it points.
+- The target directory must be writable by the login user on every worker — fio creates its data files there. wekatester probes this before running (one dotfile, created and removed) because fio's client mode reports a worker-side permission failure so quietly that the run would otherwise "succeed" with zero IO. A root-owned mount root is the usual cause; a one-time `chmod` of the root on any host persists in the shared filesystem. A directory wekatester creates is owned by the login user, so it passes this probe by construction.
+- `fio --client` exits 0 even when jobs fail on the workers, so wekatester reads success out of the results themselves: a job whose stats carry an error, or a measured job that moved zero bytes, aborts the run and names the host — it will not print a summary of zeros.
+- The fio coordinator takes every worker on its command line (one `--client=<host> <jobfile>` pair per worker), and the coordinator's shell receives that as a single argument, which Linux caps at 128 KiB (`MAX_ARG_STRLEN`). That is roughly 1,100 workers with 25-character names, or 700 with 60-character FQDNs. wekatester measures the line before anything starts on the hosts (pricing the longest job name the set can stage), again at staging with the real names, and stops with a clear message (a dry run reports it too); past that size, run the fleet as two or more host lists.

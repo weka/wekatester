@@ -1,0 +1,732 @@
+# Shared fixtures for tests/test_wekatester.sh.
+
+# --- probe remote snippet stub (Task 4) ---
+# An empty sysroot has no cgroup to read, so the bindable line is the
+# taskset affinity (0-7), not what taskset -c would accept (3 and 5 refused).
+# sudo always fails, so the escalator sweep is deterministic wherever the
+# suite runs.
+probe_stub() {
+    stub=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho 8\n' > "$stub/getconf"
+    printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
+    printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
+    printf '#!/bin/sh\nexit 1\n' > "$stub/sudo"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$stub/timeout"
+    cat > "$stub/taskset" <<'TASKSETEOF'
+#!/bin/sh
+case "$1" in
+  -cp) echo "pid $2's current affinity list: 0-7"; exit 0 ;;
+  -c)  case "$2" in 3|5) echo "taskset: failed to set affinity: Invalid argument" >&2; exit 1 ;; esac
+       shift 2; exec "$@" ;;
+esac
+TASKSETEOF
+    chmod +x "$stub"/*
+    # an empty sysroot: on Linux the live /sys would otherwise answer for
+    # the cpus this stub fakes
+    mkdir -p "$stub/root"
+    (source ./wekatester; FIO_BIN=fio; WEKATESTER_SYSROOT=$stub/root PATH="$stub:$PATH" bash -c "$(probe_remote_cmd)")
+}
+export -f probe_stub
+
+# --- probe cpuset reads: a fake sysroot, and stubs that log every launch ---
+# cpuset_fixture <dir> <affinity>: <dir>/root is the sysroot, <dir>/bin the
+# stubs, <dir>/calls a line per taskset or sudo launch. taskset -c accepts
+# any cpu and sudo fails, until a test writes its own.
+cpuset_fixture() {
+    local d=$1
+    mkdir -p "$d/bin" "$d/root/proc/self"
+    printf '#!/bin/sh\necho 8\n' > "$d/bin/getconf"
+    printf '#!/bin/sh\nexit 1\n' > "$d/bin/pgrep"
+    printf '#!/bin/sh\necho " io_uring libaio"\n' > "$d/bin/fio"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    printf '#!/bin/sh\necho "sudo $*" >> "%s/calls"\nexit 1\n' "$d" > "$d/bin/sudo"
+    printf '#!/bin/sh\necho "taskset $*" >> "%s/calls"\ncase "$1" in\n  -cp) echo "pid $2'"'"'s current affinity list: %s" ;;\n  -c) shift 2; exec "$@" ;;\nesac\n' "$d" "$2" > "$d/bin/taskset"
+    chmod +x "$d/bin"/*
+}
+cg_file() {   # cg_file <dir> <path> <content>: a file in the fixture's sysroot
+    mkdir -p "$1/root${2%/*}"
+    printf '%s\n' "$3" > "$1/root$2"
+}
+cpuset_probe() {   # cpuset_probe <dir>: the probe's output there, run by bash
+    local cmd
+    cmd=$(source ./wekatester; FIO_BIN=fio; probe_remote_cmd)
+    : > "$1/calls"
+    WEKATESTER_SYSROOT=$1/root PATH="$1/bin:$PATH" bash -c "$cmd" 2>&1
+}
+export -f cpuset_fixture cg_file cpuset_probe
+
+# --- tuner: fabricate probe dir + jobfile, run auto_tune ---
+tuner_fixture() {   # $1 = extra probe content variant
+    FIX=$(mktemp -d)
+    mkdir -p "$FIX/probe" "$FIX/jobs" "$FIX/src"
+    # weka's dedicated io threads are single-CPU task masks (5, 6, 7 here:
+    # weka takes the last cores); the 0,3-4 line is a wide utility-thread
+    # mask and must be ignored. With cpus 0 and 1 the OS reserve, fio gets
+    # 2-4 (N=3).
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n' > "$FIX/probe/h1"
+    printf 'ncpus 8\nweka_allowed 5\nweka_allowed 6\nweka_allowed 7\nweka_allowed 0,3-4\nbindable 0-7\nbindable_priv -\nengines io_uring libaio psync \n' > "$FIX/probe/h2"
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfs 1073741824 0 1073741824 1%% /mnt/weka\n' > "$FIX/probe/_df"
+    printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\n[create]\ncreate_only=1\n[bw]\nstonewall\nrw=read\niodepth=1\n' > "$FIX/src/011-bw.job"
+}
+
+# --- signal handling: park a real run in preflight so it can be signalled ---
+# ssh is stubbed with a script that records that it started and then sleeps, so
+# the run blocks in preflight's `wait` -- where a real run spends most of its
+# time -- with no network and no worker involved.
+signal_fixture() {
+    SIG=$(mktemp -d)
+    printf '#!/bin/sh\ntouch "%s/started"\nexec sleep 5\n' "$SIG" > "$SIG/ssh"
+    chmod +x "$SIG/ssh"
+    PATH="$SIG:$PATH"
+}
+
+# A suite started in the background of a non-interactive shell runs with
+# SIGINT ignored, every child inherits it, and no trap can catch a signal
+# ignored on entry: the signal tests would fail for a reason that is not
+# wekatester's. Say so instead.
+signal_trappable() {   # signal_trappable <INT|TERM>
+    case "$(trap -p "$1")" in
+        (*"'' SIG$1"*) echo "this suite was started with SIG$1 ignored (launched with & from a non-interactive shell?) -- run it in the foreground" >&2; return 1 ;;
+    esac
+}
+
+# Block until the stubbed ssh has run, so a signal cannot race process startup.
+signal_wait_started() {
+    local i=0
+    while [ ! -e "$SIG/started" ] && [ "$i" -lt 500 ]; do
+        sleep 0.01; i=$((i + 1))
+    done
+    [ -e "$SIG/started" ]
+}
+
+# --- local mode: prove the transport never reaches for ssh ---
+# ssh and scp stubs that fail loudly, shadowing the real binaries. Without
+# them, a local-mode test would still pass on any box where ssh-to-localhost
+# happens to work, so the "no sshd required" guarantee would go unverified.
+no_ssh_fixture() {
+    NOSSH=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho "ERROR: %s invoked in local mode" >&2\nexit 99\n' ssh > "$NOSSH/ssh"
+    printf '#!/bin/sh\necho "ERROR: %s invoked in local mode" >&2\nexit 99\n' scp > "$NOSSH/scp"
+    chmod +x "$NOSSH/ssh" "$NOSSH/scp"
+    PATH="$NOSSH:$PATH"
+}
+
+# --- transport: ssh/scp stubs that echo their argv instead of connecting ---
+# Pins the remote command lines the wrappers build, so the local-mode refactor
+# cannot quietly change what a real run sends over the wire.
+#
+# Each argument is bracketed rather than flattened with "$*": argv boundaries
+# are the whole point here. "$*" would render `a b` and `a` `b` identically, so
+# it could not tell a correctly quoted expansion from one that word-splits --
+# exactly the regression these tests exist to catch.
+echo_transport_fixture() {
+    ECHOT=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\nprintf SSH\nprintf "[%%s]" "$@"\nprintf "\\n"\n' > "$ECHOT/ssh"
+    printf '#!/bin/sh\nprintf SCP\nprintf "[%%s]" "$@"\nprintf "\\n"\n' > "$ECHOT/scp"
+    chmod +x "$ECHOT/ssh" "$ECHOT/scp"
+    PATH="$ECHOT:$PATH"
+}
+
+# --- the controller is Linux-only: drive the guard both ways ---
+# main calls plain `uname` so it resolves through PATH.
+uname_fixture() {   # $1 = kernel name to report
+    UNAMED=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\necho %s\n' "$1" > "$UNAMED/uname"
+    chmod +x "$UNAMED/uname"
+    PATH="$UNAMED:$PATH"
+}
+
+# --- summarizer: fabricated fio client-mode results ---
+# client_stats is a flat list of (host, job) entries plus "All clients"
+# aggregates. The create/layout phase runs first in every shipped jobfile, so
+# its entries -- including its own "All clients" -- come first here: the
+# summarizer must report the LAST entry per host and the last aggregate. The
+# create-phase numbers are absurd on purpose, so picking one up is obvious.
+#
+# Figures chosen so every printed number is exact:
+#   bandwidth  vega-1 3.00 + vega-2 4.00 GiB/s -> total 7.00, average 3.50
+#   iops       vega-1 3,000 + vega-2 4,000     -> total 7,000, average 3,500
+#   latency    200us over 3000 read IOs, 400us over 1000 write IOs
+#              -> IO-weighted 250.0us
+fio_json_fixture() {   # $1 = file to write
+    cat > "$1" <<'JSON'
+{
+  "fio version": "fio-3.35",
+  "client_stats": [
+    { "jobname": "create", "hostname": "vega-1",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "create", "hostname": "vega-2",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "All clients",
+      "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "bw_bytes": 214748364800, "iops": 1800000.0, "total_ios": 1800000, "lat_ns": { "mean": 9000000.0 } } },
+    { "jobname": "bw", "hostname": "vega-1",
+      "read":  { "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 1400, "lat_ns": { "mean": 150000.0 } },
+      "write": { "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 400,  "lat_ns": { "mean": 350000.0 } } },
+    { "jobname": "bw", "hostname": "vega-2",
+      "read":  { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1600, "lat_ns": { "mean": 250000.0 } },
+      "write": { "bw_bytes": 1610612736, "iops": 1500.0, "total_ios": 600,  "lat_ns": { "mean": 450000.0 } } },
+    { "jobname": "All clients",
+      "read":  { "bw_bytes": 4831838208, "iops": 4500.0, "total_ios": 3000, "lat_ns": { "mean": 200000.0 } },
+      "write": { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1000, "lat_ns": { "mean": 400000.0 } } }
+  ]
+}
+JSON
+}
+
+# Single-client run: fio emits no "All clients" aggregate at all, so the lone
+# host entry has to serve as the aggregate. Same latency figures -> 250.0us.
+fio_json_single_fixture() {   # $1 = file to write
+    cat > "$1" <<'JSON'
+{
+  "fio version": "fio-3.35",
+  "client_stats": [
+    { "jobname": "bw", "hostname": "vega-1",
+      "read":  { "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 3000, "lat_ns": { "mean": 200000.0 } },
+      "write": { "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 1000, "lat_ns": { "mean": 400000.0 } } }
+  ]
+}
+JSON
+}
+
+# --- README: the fenced block under "# Usage" must equal ./wekatester -h ---
+readme_usage_block() {   # $1 = README path (default README.md)
+    awk '/^# Usage$/ { in_usage = 1; next }
+         in_usage && /^```$/ { fence++; next }
+         in_usage && fence == 1 { print }
+         fence == 2 { exit }' "${1:-README.md}"
+}
+
+
+# --- fan-out: did the per-host work overlap? ---
+# <file> holds "S <host> <usec>" and "E <host> <usec>" lines. True when there
+# are <n> and the last start precedes the first end: one host at a time
+# cannot produce that.
+spans_overlap() {   # spans_overlap <file> <n>
+    local k h t s=0 e=0 n=0
+    while read -r k h t; do
+        n=$((n + 1))
+        case $k in
+            (S) [ "$t" -le "$s" ] || s=$t ;;
+            (E) [ "$e" -ne 0 ] && [ "$t" -ge "$e" ] || e=$t ;;
+        esac
+    done < "$1"
+    [ "$n" -eq "$2" ] && [ "$s" -lt "$e" ] || { echo "no overlap:" >&2; cat "$1" >&2; return 1; }
+}
+export -f spans_overlap
+
+# --- interactive prompts: drive prompt_key over a pipe, capture UI on stdout ---
+# The prompt fds are variables precisely so the suite can point them at a pipe
+# and fd 1 -- no pty involved, nothing blocks waiting for a keystroke.
+key_probe() {   # key_probe <timeout>; keystrokes arrive on stdin
+    (source ./wekatester
+     PROMPT_IN_FD=0
+     PROMPT_OUT_FD=1
+     prompt_key "$1"
+     echo "rc=$? key=$PROMPT_KEY")
+}
+export -f key_probe
+
+# --- editor stub: records each file it was handed, in order ---
+editor_fixture() {   # $1 = exit status for the stub (default 0)
+    ED=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    printf '#!/bin/sh\nbasename "$1" >> "%s/order"\nexit %s\n' "$ED" "${1:-0}" > "$ED/stub-ed"
+    printf '#!/bin/sh\necho VISUAL >> "%s/order"\nexit 0\n' "$ED" > "$ED/stub-visual"
+    chmod +x "$ED/stub-ed" "$ED/stub-visual"
+    EDITOR="$ED/stub-ed"; unset VISUAL
+}
+
+# --- calibration: a fake client that answers every cell from a model ---
+# The planner and the orchestrator are driven against a client whose curve is
+# known, so every verdict can be checked against the answer the model implies.
+# The model, all integers, tuned by CAL_SIM_* variables:
+#   bw    numjobs x effective depth x CAL_SIM_STREAM (1 GiB/s) bytes/s, capped
+#         at CAL_SIM_BWCAP (default 25 GiB/s); psync's effective depth is 1
+#   iops  outstanding x 20,000, capped at CAL_SIM_IOPSCAP (1,000,000), and past
+#         CAL_SIM_IOPSKNEE outstanding (4096) it falls with the overshoot;
+#         nrfiles=CAL_SIM_NRBEST (unset) earns 3%, and every job adds
+#         CAL_SIM_JOBBONUS (0) IOPS -- more jobs at the same outstanding IO win
+#   lat   CAL_SIM_FLOOR us (100) up to CAL_SIM_WIDE jobs (8), then 20us more per
+#         extra job (CAL_SIM_LATSTEP); nrfiles=CAL_SIM_LATNRBEST (unset) takes
+#         10% off; IOPS = numjobs x 1e6 / latency. lat1m the same from
+#         CAL_SIM_FLOOR1M (800)
+# CAL_SIM_ENGINE_BONUS=<engine> gives that engine 5% more throughput (and 5%
+# less latency).
+cal_fake_value() {   # cal_fake_value <type> <engine> <nj> <qd> <nr> -> "<value> [aux]"
+    local t=$1 e=$2 nj=$3 qd=$4 nr=$5 qe v o lat cap
+    case "$e" in (psync|sync|pvsync|pvsync2|vsync) qe=1 ;; (*) qe=$qd ;; esac
+    case "$t" in
+        (bw)
+            v=$(( nj * qe * ${CAL_SIM_STREAM:-1073741824} ))
+            cap=${CAL_SIM_BWCAP:-26843545600}
+            [ "$v" -le "$cap" ] || v=$cap
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || v=$(( v * 105 / 100 ))
+            echo "$v" ;;
+        (iops)
+            o=$(( nj * qe )); v=$(( o * 20000 ))
+            cap=${CAL_SIM_IOPSCAP:-1000000}
+            [ "$v" -le "$cap" ] || v=$cap
+            if [ "$o" -gt "${CAL_SIM_IOPSKNEE:-4096}" ]; then
+                v=$(( v * ${CAL_SIM_IOPSKNEE:-4096} / o ))
+            fi
+            [ "${CAL_SIM_NRBEST:-0}" != "$nr" ] || v=$(( v * 103 / 100 ))
+            v=$(( v + nj * ${CAL_SIM_JOBBONUS:-0} ))
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || v=$(( v * 105 / 100 ))
+            echo "$v" ;;
+        (lat|lat1m)
+            lat=${CAL_SIM_FLOOR:-100}
+            [ "$t" = lat ] || lat=${CAL_SIM_FLOOR1M:-800}
+            [ "$nj" -le "${CAL_SIM_WIDE:-8}" ] || lat=$(( lat + (nj - ${CAL_SIM_WIDE:-8}) * ${CAL_SIM_LATSTEP:-20} ))
+            [ "${CAL_SIM_LATNRBEST:-0}" != "$nr" ] || lat=$(( lat * 90 / 100 ))
+            [ "${CAL_SIM_ENGINE_BONUS:-}" != "$e" ] || lat=$(( lat * 95 / 100 ))
+            echo "$lat $(( nj * 1000000 / lat ))" ;;
+    esac
+}
+export -f cal_fake_value
+
+# fio client JSON for one cell, from the cell jobfile's name
+# (cal-<type>-<dirn>-<engine>-nj<n>-qd<n>-nr<n>-<rt>s.job) on host <host>.
+cal_fake_fio() {   # cal_fake_fio <cell-basename> <host>
+    local b=$1 host=$2 t d e nj qd nr val v a rbw=0 riops=0 rlat=0 wbw=0 wiops=0 wlat=0
+    b=${b%.job}; b=${b#cal-}
+    t=${b%%-*}; b=${b#*-}; d=${b%%-*}; b=${b#*-}
+    e=${b%%-nj*}; b=${b#*-nj}; nj=${b%%-*}; b=${b#*-qd}; qd=${b%%-*}; b=${b#*-nr}; nr=${b%%-*}
+    val=$(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")
+    read -r v a <<<"$val"
+    case "$t:$d" in
+        (bw:read)    rbw=$v; riops=$(( v / 1048576 )) ;;
+        (bw:write)   wbw=$v; wiops=$(( v / 1048576 )) ;;
+        (iops:read)  riops=$v; rbw=$(( v * 4096 )) ;;
+        (iops:write) wiops=$v; wbw=$(( v * 4096 )) ;;
+        (lat:read)   rlat=$(( v * 1000 )); riops=$a; rbw=$(( a * 4096 )) ;;
+        (lat:write)  wlat=$(( v * 1000 )); wiops=$a; wbw=$(( a * 4096 )) ;;
+        (lat1m:read)  rlat=$(( v * 1000 )); riops=$a; rbw=$(( a * 1048576 )) ;;
+        (lat1m:write) wlat=$(( v * 1000 )); wiops=$a; wbw=$(( a * 1048576 )) ;;
+    esac
+    printf '{ "client_stats": [ { "jobname": "cal-%s-%s", "hostname": "%s", "error": 0, "read": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } }, "write": { "bw_bytes": %s, "iops": %s, "total_ios": %s, "io_bytes": %s, "lat_ns": { "mean": %s } } } ] }\n' \
+        "$t" "$d" "$host" "$rbw" "$riops" "$(( riops * 30 ))" "$(( rbw * 30 ))" "$rlat" \
+        "$wbw" "$wiops" "$(( wiops * 30 ))" "$(( wbw * 30 ))" "$wlat"
+}
+export -f cal_fake_fio
+
+# A run_host stand-in for calibration runs: the dataset listing answers
+# "empty, plenty of room", a seed succeeds, a cell answers from the model,
+# everything else (mkdir, rm) succeeds. Every command is appended
+# to $SIMLOG when it is set.
+cal_sim_host() {   # cal_sim_host <host> <command>
+    local jf h
+    [ -z "${SIMLOG:-}" ] || printf '%s|%s\n' "$1" "$2" >> "$SIMLOG"
+    case "$2" in
+        (*WEKATESTER_DF*)
+            echo WEKATESTER_DF; echo "wekafs 999999999 ${CAL_SIM_FREE_MIB:-99999999}" ;;
+        (*cal-seed-*)
+            h=${2#*--client=}; h=${h%% *}
+            printf '{ "client_stats": [ { "jobname": "seed-0-0", "hostname": "%s", "error": 0, "read": { "total_ios": 0, "io_bytes": 0 }, "write": { "total_ios": 10, "io_bytes": 10485760 } } ] }\n' "$h" ;;
+        (*--client=*)
+            h=${2#*--client=}; h=${h%% *}
+            jf=${2##*/}; jf=${jf%\'}
+            # CAL_SIM_CELL_SLEEP: a cell takes this long (the shapes-at-once test)
+            [ -z "${CAL_SIM_CELL_SLEEP:-}" ] || sleep "$CAL_SIM_CELL_SLEEP"
+            cal_fake_fio "$jf" "$h" ;;
+    esac
+    return 0
+}
+export -f cal_sim_host
+
+# A calibration work dir: one probe file per host argument ("h1" or
+# "h1:<ncpus>:<speedMb>"), every host a weka client on one mlx5 NIC with one
+# DPDK core, the last cpu (no topology lines: every cpu is its own core, so
+# with cpus 0 and 1 the OS reserve, an 8-cpu host has N=5, fio on 2-6).
+cal_sim_fixture() {   # cal_sim_fixture <dir> <host[:ncpus[:speed]]>...
+    local d=$1 spec h n sp
+    shift
+    mkdir -p "$d/probe" "$d/auth" "$d/set"
+    for spec in "$@"; do
+        IFS=: read -r h n sp <<<"$spec"
+        { printf 'ncpus %s\nweka_allowed %s\nengines io_uring libaio psync\n' "${n:-4}" "$(( ${n:-4} - 1 ))"
+          printf 'bindable 0-%s\nbindable_priv -\n' "$(( ${n:-4} - 1 ))"
+          printf 'cpu_model Test CPU %s-core\nmemtotal_kb 263921664\n' "${n:-4}"
+          printf 'nic ens1 %sMb/s 0000:3b:00.0 mlx5_core 0x15b3:0x101d\n' "${sp:-100000}"
+          printf 'weka_net client [{"name": "ens1", "identifier": "0000:3b:00.0"}]\n'
+        } > "$d/probe/$h"
+    done
+}
+export -f cal_sim_fixture
+
+# Drive cal_plan to its verdict against the model: prints the verdict line;
+# every cell it asked for lands in <dir>/asked as "<phase> <nj> <qd> <nr>".
+plan_sim() {   # plan_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
+    local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act phase nj qd nr rt n=0 knobs
+    shift 7
+    knobs="exh=0 line=95 band=98.5 thr=3 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 $*"
+    : > "$d/hist"; : > "$d/asked"
+    while [ "$n" -lt 300 ]; do
+        act=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED"; return 1; }
+        case "$act" in
+            ("cell "*) read -r _ phase nj qd nr rt <<<"$act"
+                       echo "$phase $nj $qd $nr" >> "$d/asked"
+                       echo "$phase $e $nj $qd $nr $rt $(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")" >> "$d/hist"
+                       n=$((n + 1)) ;;
+            (*) printf '%s\n' "$act"; return 0 ;;
+        esac
+    done
+    echo "NO VERDICT"; return 1
+}
+export -f plan_sim
+
+# plan_sim with `cal_plan batch`: every cell of a batch gets its reading at
+# once. $d/batches holds one line per batch, "<phase> <nj> <qd> <nr>" cells
+# joined by ";"; $d/asked lists the cells in batch order. Each batch's
+# first line must be what `next` names from the same history.
+batch_sim() {   # batch_sim <dir> <type> <dirn> <engine> <usable> <linerate> <memcap> [k=v...]
+    local d=$1 t=$2 dirn=$3 e=$4 u=$5 lr=$6 mc=$7 act nxt line phase nj qd nr rt n=0 knobs b
+    shift 7
+    knobs="exh=0 line=95 band=98.5 thr=3 stop=2 confirm=3 rt=30 nr=1 nrc=1,2,4 bwqd=1,2,4,8,16 iopsqd=1,2,4,8,16,32,64,128,256,512 $*"
+    : > "$d/hist"; : > "$d/asked"; : > "$d/batches"
+    while [ "$n" -lt 300 ]; do
+        # BATCH_PLAN: a test's stand-in for cal_plan (the mutation control)
+        act=$( (source ./wekatester; ${BATCH_PLAN:-cal_plan} batch "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED"; return 1; }
+        nxt=$( (source ./wekatester; cal_plan next "$t" "$dirn" "$e" "$u" "$lr" "$mc" "$d/hist" $knobs) ) \
+            || { echo "PLANNER FAILED (next)"; return 1; }
+        [ "${act%%$'\n'*}" = "$nxt" ] || { echo "FIRST MISMATCH: batch [${act%%$'\n'*}] next [$nxt]"; return 1; }
+        case "$act" in
+            ("cell "*)
+                b=""
+                while IFS= read -r line; do
+                    read -r _ phase nj qd nr rt <<<"$line"
+                    echo "$phase $nj $qd $nr" >> "$d/asked"
+                    echo "$phase $e $nj $qd $nr $rt $(cal_fake_value "$t" "$e" "$nj" "$qd" "$nr")" >> "$d/hist"
+                    b="$b${b:+;}$phase $nj $qd $nr"
+                done <<<"$act"
+                echo "$b" >> "$d/batches"
+                n=$((n + 1)) ;;
+            (*) printf '%s\n' "$act"; return 0 ;;
+        esac
+    done
+    echo "NO VERDICT"; return 1
+}
+export -f batch_sim
+
+# --- calibration: one ladder step's fio client_stats -------------------------
+# Same shape as fio's client-mode output and the same traps: a create-phase
+# entry per host FIRST with absurd figures, an "All clients" aggregate that is
+# not a client, then the measured entry per host LAST -- the only entry
+# cal_gains may count. Picking up either of the others is unmistakable.
+cal_json_fixture() {   # cal_json_fixture <file> <host:rbw:riops:wbw:wiops>...
+    local out=$1 spec host rbw riops wbw wiops i
+    local e=()
+    shift
+    for spec in "$@"; do
+        host=${spec%%:*}
+        e+=("$(printf '    { "jobname": "create", "hostname": "%s", "error": 0,
+      "read":  { "bw_bytes": 0, "iops": 0.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }' "$host")")
+    done
+    e+=('    { "jobname": "All clients", "error": 0,
+      "read":  { "bw_bytes": 99999999999, "iops": 999999.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }')
+    for spec in "$@"; do
+        IFS=: read -r host rbw riops wbw wiops <<<"$spec"
+        e+=("$(printf '    { "jobname": "cal-step", "hostname": "%s", "error": 0,
+      "read":  { "bw_bytes": %s, "iops": %s },
+      "write": { "bw_bytes": %s, "iops": %s } }' \
+            "$host" "$rbw" "$riops" "$wbw" "$wiops")")
+    done
+    e+=('    { "jobname": "All clients", "error": 0,
+      "read":  { "bw_bytes": 99999999999, "iops": 999999.0 },
+      "write": { "bw_bytes": 99999999999, "iops": 999999.0 } }')
+    {
+        printf '{\n  "fio version": "fio-3.35",\n  "client_stats": [\n'
+        for i in $(seq 0 $(( ${#e[@]} - 1 )) ); do
+            [ "$i" -eq 0 ] || printf ',\n'
+            printf '%s' "${e[$i]}"
+        done
+        printf '\n  ]\n}\n'
+    } > "$out"
+}
+
+# --- a small on-disk workload set for generator tests ---
+set_fixture() {   # creates $SETFIX with two jobfiles in distinct namespaces
+    SETFIX=$(mktemp -d)
+    printf '# report bandwidth\n[global]\nfilesize=10G\nnumjobs=4\ndirectory=/orig\nioengine=libaio\nfilename_format=big/$jobnum\n[create]\ncreate_only=1\n[bw]\nrw=read\niodepth=1\n' > "$SETFIX/011-bw.job"
+    printf '# report iops\n[global]\nfilesize=2G\nnumjobs=8\ndirectory=/orig\nioengine=libaio\nfilename_format=small.$jobnum\nnrfiles=3\n[create]\ncreate_only=1\n[io]\nbs=4k\nrw=randread\niodepth=8\n' > "$SETFIX/031-iops.job"
+}
+
+# --- probe_cores in awk, for one probe file and an optional host-file list ---
+cores_line() {   # cores_line <probe> [cpu-list]: the summary line the logs print
+    (source ./wekatester; awkrun 'BEGIN { np = readlines(ARGV[1], P); probe_cores(P, np, ARGV[2], R, PH, AL); print cores_summary(R, PH, AL) }' "$1" "${2:-}")
+}
+cores_facts() {   # cores_facts <probe> [cpu-list]: "n ncores dpdk catchall unlisted unbound topo weka_core0|phys|all|reserved"
+    (source ./wekatester; awkrun 'BEGIN {
+        np = readlines(ARGV[1], P); probe_cores(P, np, ARGV[2], R, PH, AL)
+        print R["n"], R["ncores"], R["dpdk"], R["catchall"], R["unlisted"], R["unbound"], R["topo"], (R["weka_core0"] ? 1 : 0) "|" join_sorted(PH, ",") "|" join_sorted(AL, ",") "|" R["res"]
+    }' "$1" "${2:-}")
+}
+export -f cores_line cores_facts
+
+# --- run lock: stub pgrep/ps/fio and the escalators. The scan's first look
+# at a pid sees $LK/procs ("<pid> <args>"); later looks see it only while in
+# $LK/alive (pids a kill leaves standing), else as $LK/after has it (a zombie,
+# a reused pid). Escalator calls land in $LK/esc. The pids are past any
+# pid_max, so no real process is ever signalled. ---
+lock_fixture() {
+    LK=$(mktemp -d)   # leaked on purpose; tests are short-lived
+    mkdir -p "$LK/bin" "$LK/w"; : > "$LK/procs"; : > "$LK/alive"; : > "$LK/after"
+    printf '#!/bin/sh\nexit 0\n' > "$LK/bin/fio"
+    cat > "$LK/bin/pgrep" <<EOF
+#!/bin/sh
+[ "\$1" = -x ] || exit 1
+awk '{print \$1; n++} END {exit !n}' "$LK/procs"
+EOF
+    cat > "$LK/bin/ps" <<EOF
+#!/bin/sh
+row() { awk -v p="\$1" '\$1 == p {sub(/^[^ ]+ /, ""); print; f = 1} END {exit !f}' "\$2"; }
+case "\$1" in
+    -o) [ -e "$LK/seen.\$4" ] || { : > "$LK/seen.\$4"; row "\$4" "$LK/procs"; exit; }
+        if grep -qx "\$4" "$LK/alive"; then row "\$4" "$LK/procs"; else row "\$4" "$LK/after"; fi ;;
+    -p) grep -qx "\$2" "$LK/alive" || awk -v p="\$2" '\$1 == p {f = 1} END {exit !f}' "$LK/after" || exit 1
+        echo "\$2" ;;
+esac
+EOF
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$LK/bin/timeout"
+    for e in dzdo pbrun sesu pmrun doas ksu sudo; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$e" "$LK" > "$LK/bin/$e"
+    done
+    chmod +x "$LK/bin"/*
+}
+export -f lock_fixture
+
+# --- fio version check: preflight in remote mode over the lock fixture ---
+# fv_preflight <allow 0|1> <host>=<version|FAIL|EMPTY>..., after a fresh
+# lock_fixture: each session runs here under bash with that host's fio stub
+# and lock dir; $LK/sent.<host> holds what it was sent. Prints the output,
+# FIO_VERSION_NOTE= and settings; returns preflight's status.
+fv_preflight() {
+    local a=$1 kv h; shift
+    export WEKATESTER_SUITE_LOCK_DIR=$LK/lock
+    for kv in "$@"; do
+        h=${kv%%=*}; mkdir -p "$LK/v/$h"
+        case ${kv#*=} in
+            (FAIL)  printf '#!/bin/sh\necho "fio: cannot load libaio" >&2\nexit 3\n' ;;
+            (EMPTY) printf '#!/bin/sh\nexit 0\n' ;;
+            (*)     printf '#!/bin/sh\necho "%s"\n' "${kv#*=}" ;;
+        esac > "$LK/v/$h/fio"
+        chmod +x "$LK/v/$h/fio"
+        printf '%s\n' "$h" >> "$LK/hosts"
+    done
+    (export WEKATESTER_SUITE_TARGET_DIR="$LK/tgt"
+     source ./wekatester
+     mapfile -t HOSTS < "$LK/hosts"
+     LOCAL_MODE=0; MASTER=${HOSTS[0]}; FIO_BIN=fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w; ALLOW_FIO_MISMATCH=$a
+     run_host() { printf '%s\n' "$2" >> "$LK/sent.$1"; PATH="$LK/v/$1:$LK/bin:$PATH" bash -c "${2//"$LOCK_DIR"/"$LOCK_DIR.$1"}"; }
+     preflight 2>&1 || exit
+     echo "FIO_VERSION_NOTE=$FIO_VERSION_NOTE"
+     RUN_DIR=$LK/run; mkdir -p "$RUN_DIR"; record_run; cat "$RUN_DIR/settings")
+}
+export -f fv_preflight
+
+# --- sysinfo receive path: a fake sysroot and a closed PATH ---
+# nic_fixture <dir>: <dir>/root holds eth0 (0000:17:00.0, mlx5_core, numa 1,
+# two MSI irqs, the second with no affinity file, AER correctable and
+# nonfatal but no fatal), lo with no device, sysctls (some conf ones left
+# out), two cpus' governors and an uptime of 1000 s. <dir>/bin is the whole
+# PATH: cat, sort, uniq, readlink, true, date, awk, and stubs: ethtool,
+# mlnx_qos, nstat, chronyc and journalctl echo their arguments, dmesg prints
+# <dir>/dmesg.out, pgrep finds irqbalance, id says uid 1000, timeout just
+# runs, and every escalator logs to <dir>/esc and fails.
+nic_fixture() {
+    local d=$1 r=$1/root p=/sys/devices/pci0000:00/0000:17:00.0 c t
+    mkdir -p "$d/bin" "$r$p/msi_irqs" "$r/sys/class/net/eth0" "$r/sys/class/net/lo" \
+        "$r/sys/bus/pci/drivers/mlx5_core" "$r/proc/irq/101" "$r/proc/sys/net/core" "$r/proc/sys/net/ipv4" \
+        "$r/sys/devices/system/cpu/cpu0/cpufreq" "$r/sys/devices/system/cpu/cpu1/cpufreq"
+    ln -s "$r$p" "$r/sys/class/net/eth0/device"
+    ln -s "$r/sys/bus/pci/drivers/mlx5_core" "$r$p/driver"
+    printf '1\n' > "$r$p/numa_node"
+    printf '16.0 GT/s PCIe\n' > "$r$p/current_link_speed"; printf '8\n' > "$r$p/current_link_width"
+    printf '16.0 GT/s PCIe\n' > "$r$p/max_link_speed"; printf '16\n' > "$r$p/max_link_width"
+    : > "$r$p/msi_irqs/101"; : > "$r$p/msi_irqs/102"
+    printf '4\n' > "$r/proc/irq/101/smp_affinity_list"
+    printf '1000\n' > "$r/proc/sys/net/core/netdev_max_backlog"
+    printf '4096\t131072\t6291456\n' > "$r/proc/sys/net/ipv4/tcp_rmem"
+    for c in 0 1; do printf 'performance\n' > "$r/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor"; done
+    printf 'RxErr 0\nTOTAL_ERR_COR 3\n' > "$r$p/aer_dev_correctable"; printf 'TOTAL_ERR_NONFATAL 0\n' > "$r$p/aer_dev_nonfatal"
+    mkdir -p "$r/proc/sys/net/ipv4/conf/all" "$r/proc/sys/net/ipv4/conf/eth0"
+    printf '1\n' > "$r/proc/sys/net/ipv4/conf/all/rp_filter"; printf '2\n' > "$r/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    printf '1\n' > "$r/proc/sys/net/ipv4/conf/eth0/arp_ignore"
+    printf '1000.00 4000.00\n' > "$r/proc/uptime"
+    printf '[  500.000000] before the run\n[  950.000000] in the run\nno stamp, still in\n[  990.500000] late in the run\n' > "$d/dmesg.out"
+    printf '#!/bin/sh\ncat "%s/dmesg.out"\n' "$d" > "$d/bin/dmesg"
+    printf '#!/bin/sh\necho "journalctl $*"\n' > "$d/bin/journalctl"
+    printf '#!/bin/sh\necho "nstat $*"\n' > "$d/bin/nstat"
+    printf '#!/bin/sh\necho "chronyc $*"\n' > "$d/bin/chronyc"
+    printf '#!/bin/sh\necho "ethtool $*"\n' > "$d/bin/ethtool"
+    printf '#!/bin/sh\necho "mlnx_qos $*"\n' > "$d/bin/mlnx_qos"
+    printf '#!/bin/sh\necho 4321\n' > "$d/bin/pgrep"
+    printf '#!/bin/sh\necho 1000\n' > "$d/bin/id"
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    for t in dzdo pbrun sesu pmrun doas ksu sudo; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$t" "$d" > "$d/bin/$t"
+    done
+    chmod +x "$d/bin"/*
+    # linked after the chmod, which would follow them to the real tools
+    for t in cat sort uniq readlink true date awk; do
+        c=$(type -P "$t") || { echo "no $t on this host" >&2; return 1; }; ln -s "$c" "$d/bin/$t"
+    done
+}
+# nic_virtio <dir>: adds to a nic_fixture eth1, a virtio device (virtio1)
+# under PCI function 0000:00:06.0 (numa 0, link 8.0 GT/s x4 but no
+# max_link_width, irqs 40 and 41, the second with no affinity file, AER
+# correctable), and eth2, a virtio device (virtio2) on a platform device,
+# with no PCI ancestor. Every device, eth0's too, gets its subsystem link.
+nic_virtio() {
+    local r=$1/root p=$1/root/sys/devices/pci0000:00/0000:00:06.0 m=$1/root/sys/devices/platform/a003e00.virtio_mmio b
+    mkdir -p "$p/virtio1" "$p/msi_irqs" "$m/virtio2" "$r/sys/class/net/eth1" "$r/sys/class/net/eth2" "$r/proc/irq/40" \
+        "$r/sys/bus/pci" "$r/sys/bus/platform" "$r/sys/bus/virtio/drivers/virtio_net"
+    for b in "$r/sys/devices/pci0000:00/0000:17:00.0:pci" "$p:pci" "$p/virtio1:virtio" "$m:platform" "$m/virtio2:virtio"; do ln -s "$r/sys/bus/${b##*:}" "${b%:*}/subsystem"; done
+    ln -s "$r/sys/bus/virtio/drivers/virtio_net" "$p/virtio1/driver"; ln -s "$r/sys/bus/virtio/drivers/virtio_net" "$m/virtio2/driver"
+    ln -s "$p/virtio1" "$r/sys/class/net/eth1/device"; ln -s "$m/virtio2" "$r/sys/class/net/eth2/device"
+    printf '0\n' > "$p/numa_node"; printf '8.0 GT/s PCIe\n' > "$p/current_link_speed"; printf '4\n' > "$p/current_link_width"
+    printf '8.0 GT/s PCIe\n' > "$p/max_link_speed"; : > "$p/msi_irqs/40"; : > "$p/msi_irqs/41"
+    printf '0-1\n' > "$r/proc/irq/40/smp_affinity_list"; printf 'TOTAL_ERR_COR 0\n' > "$p/aer_dev_correctable"
+}
+# nic_sysinfo <dir>: snapshot_sysinfo for one host h1, its string run by bash
+# against the fixture; the split lands in <dir>/out/sysinfo/h1.
+nic_sysinfo() {
+    mkdir -p "$1/w" "$1/out"
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; FIO_BIN=fio
+     fx=$1; bash=$(type -P bash)
+     run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
+     snapshot_sysinfo) >>"$SUITE_ASIDE" 2>&1
+}
+# nic_pressure <dir> <start|end> <run-start-epoch> [fio-log]: snapshot_pressure
+# the same way, into <dir>/out/sysinfo/h1/<item>-<label>.
+nic_pressure() {
+    mkdir -p "$1/w" "$1/out"
+    (source ./wekatester; HOSTS=(h1); WORK_DIR=$1/w; RUN_DIR=$1/out; RUN_EPOCH=$3; FIO_BIN=fio
+     fx=$1; bash=$(type -P bash)
+     run_host() { WEKATESTER_SYSROOT=$fx/root PATH=$fx/bin "$bash" -c "$2"; }
+     snapshot_pressure "$2" ${4:+"$4"}) >>"$SUITE_ASIDE" 2>&1
+}
+# bound_capture <dir> <sysinfo|start|end> <host>...: the real run_host, over
+# a fake ssh in <dir>/ctl that runs each host's string under bash against the
+# nic_fixture <dir>/<host>; the controller's own timeout bounds each session.
+# Everything printed, then "carried on", lands in <dir>/console.
+bound_capture() {
+    local d=$1 what=$2 bash; shift 2; bash=$(type -P bash)
+    mkdir -p "$d/ctl" "$d/w" "$d/out"
+    printf '#!%s\nh=${@: -2:1}\nPATH=%s/$h/bin WEKATESTER_SYSROOT=%s/$h/root exec %s -c "${@: -1}"\n' \
+        "$bash" "$d" "$d" "$bash" > "$d/ctl/ssh"
+    chmod +x "$d/ctl/ssh"
+    (source ./wekatester; HOSTS=("$@"); WORK_DIR=$d/w; RUN_DIR=$d/out; RUN_EPOCH=$(( $(date +%s) - 100 )); FIO_BIN=fio
+     LOCAL_MODE=0; SSH_OPTS=; AUTH_DIR=; PATH=$d/ctl:$PATH
+     if [ "$what" = sysinfo ]; then snapshot_sysinfo; else snapshot_pressure "$what"; fi; echo "carried on") > "$d/console" 2>&1
+}
+export -f nic_fixture nic_virtio nic_sysinfo nic_pressure bound_capture
+
+# --- -s synopsis: run bundles to read back ---
+# summ_job <file> <report> <rw> <nj> <qd> <nr|-> <bs> [floor]: a staged jobfile
+summ_job() {
+    { [ -z "${8:-}" ] || printf '# wekatester-floor: %s at numjobs=iodepth=nrfiles=1 on every client, staged by wekatester\n' "$8"
+      printf '# report %s\n[global]\nioengine=libaio\ndirectory=/mnt/weka/wt\nnumjobs=%s\n' "$2" "$4"
+      [ "$6" = - ] || printf 'nrfiles=%s\n' "$6"
+      printf '[fio-createfiles-00]\ncreate_only=1\n[job]\nrw=%s\nbs=%s\niodepth=%s\n' "$3" "$7" "$5"; } > "$1"
+}
+# summ_weka <file> <version|->: weka local ps for one client container, or
+# no weka CLI
+summ_weka() {
+    if [ "$2" = - ]; then echo "weka: not available" > "$1"; return; fi
+    printf '%-11s%-14s%-9s%-8s%-12s%-6s%-6s%-9s%-13s%s\n' CONTAINER "CONTAINER ID" STATE STATUS UPTIME PID PORT VERSION "VALID LEASE" "LAST FAILURE" \
+        client 12 Running Ready 0:08:10h 10807 14000 "$2" True "" > "$1"
+}
+# summ_bundle_fixture <dir> <old|cal|plain>: <dir>/20261023-141002/, a run
+# bundle's tree. old: before cmdline/settings/fs-groups (2 hosts); cal: -a
+# cal with two shapes (h1 h2 rep h1, h3 rep h3); plain: 3 hosts, h3 runs
+# its bandwidth job at nj 8. Every host: fio-3.36 and weka 4.4.2 (cal's h3:
+# no weka CLI), /mnt/weka on wekafs, results for 011-bw and 021-lat.
+summ_bundle_fixture() {
+    local b=$1/20261023-141002 h hosts nj
+    case $2 in (old) hosts="h1 h2" ;; (*) hosts="h1 h2 h3" ;; esac
+    mkdir -p "$b"
+    for h in $hosts; do
+        mkdir -p "$b/sysinfo/$h" "$b/fio-jobfiles/$h"
+        echo fio-3.36 > "$b/sysinfo/$h/fio"
+        summ_weka "$b/sysinfo/$h/weka" 4.4.2
+        printf '/dev/sda1 / ext4 rw 0 0\nbackend/default /mnt/weka wekafs rw,relatime 0 0\n' > "$b/sysinfo/$h/mounts"
+        printf '%s sha256=abc\n[l]\ncreate_only=1\ndirectory=/mnt/weka/wt\n' "# wekatester-layout: generated" > "$b/fio-jobfiles/$h/000-wekatester-layout.job"
+        nj=4; [ "$2:$h" != plain:h3 ] || nj=8
+        [ "$2:$h" != cal:h3 ] || nj=2
+        summ_job "$b/fio-jobfiles/$h/011-bw.job" bandwidth read "$nj" 2 1 1Mi
+        summ_job "$b/fio-jobfiles/$h/021-lat-1job.job" "latency iops" randread 1 1 1 4k 021-lat.job
+        summ_job "$b/fio-jobfiles/$h/021-lat.job" "latency iops" randread 16 1 - 4k
+    done
+    fio_json_single_fixture "$b/results_011-bw.json"
+    fio_json_fixture "$b/results_021-lat.json"
+    printf '14:10:03 starting test run for job 011-bw.job on h1 with 2 workers:\n' > "$b/wekatester.log"
+    [ "$2" != old ] || return 0
+    printf './wekatester %s-w default h1 h2 h3\n' "$([ "$2" = cal ] && echo "-a cal ")" > "$b/cmdline"
+    printf 'version\t2026-10-11\nworkload\tdefault\nauto\t%s\ncal-seconds\t%s\nmaster\th1\nhosts\th1 h2 h3\n' \
+        "$([ "$2" = cal ] && echo cal || echo -)" "$([ "$2" = cal ] && echo 30 || echo -)" > "$b/settings"
+    printf 'h1 1\nh2 1\nh3 1\n' > "$b/fs-groups"
+    [ "$2" = cal ] || return 0
+    summ_weka "$b/sysinfo/h3/weka" -
+    mkdir -p "$b/cal"
+    printf '1\th1\t26\t0-31\t0-63\t50000000000\tio_uring,libaio\t-\t0\t-\t-\th1 h2\n2\th3\t12\t0-15\t0-31\t0\tlibaio\t-\t0\t-\t-\th3\n' > "$b/cal/shapes"
+    printf '%s\n' "shape 1 of 2: 2 host(s), calibrated on h1 -- Example CPU, 64 cpus, 512 GiB, weka NICs ens1 ens2: 2 x mlx5_core [0x15b3:0x101d] 200 Gb/s -> line rate 46.57 GiB/s" \
+        "  cores: N=26" "  hosts: h1 h2" \
+        "shape 2 of 2: 1 host(s), calibrated on h3 -- Example CPU, 32 cpus, 256 GiB, weka NICs: no line rate" "  cores: N=12" "  hosts: h3" > "$b/cal/shapes.txt"
+}
+# summ_counters_fixture <dir>: start/end counters in the plain bundle. h1:
+# nstat, TcpRetransSegs and TcpInSegs rise, the gauge TcpCurrEstab falls;
+# eth0's rx_discards_phy rises past 2^31, rx_packets rises,
+# rx_out_of_buffer falls (a reset), AER correctable 3 -> 5; eth1 only at
+# the end. h2: /proc/net/snmp format, only traffic rises. h3: none.
+summ_counters_fixture() {
+    local s=$1/20261023-141002/sysinfo
+    printf 'eth0\n' > "$s/h1/nics-start"; printf 'eth0 eth1\n' > "$s/h1/nics-end"
+    printf '#kernel\nTcpInSegs 1000 0.0\nTcpRetransSegs 10 0.0\nTcpCurrEstab 9 0.0\n' > "$s/h1/tcp-start"
+    printf '#kernel\nTcpInSegs 900000 0.0\nTcpRetransSegs 1244 0.0\nTcpCurrEstab 2 0.0\n' > "$s/h1/tcp-end"
+    printf 'NIC statistics:\n     rx_packets: 100\n     rx_discards_phy: 5000000000\n     rx_out_of_buffer: 77\n' > "$s/h1/ethtool-S-eth0-start"
+    printf 'NIC statistics:\n     rx_packets: 90000\n     rx_discards_phy: 8000000000\n     rx_out_of_buffer: 4\n' > "$s/h1/ethtool-S-eth0-end"
+    printf 'NIC statistics:\n     rx_packets: 5\n' > "$s/h1/ethtool-S-eth1-end"
+    printf -- '--- aer_dev_correctable\nRxErr 0\nTOTAL_ERR_COR 3\n--- aer_dev_fatal\nnot available: /sys/class/net/eth0/device/aer_dev_fatal not readable\n' > "$s/h1/aer-eth0-start"
+    printf -- '--- aer_dev_correctable\nRxErr 0\nTOTAL_ERR_COR 5\n--- aer_dev_fatal\nnot available: /sys/class/net/eth0/device/aer_dev_fatal not readable\n' > "$s/h1/aer-eth0-end"
+    printf 'eth0\n' > "$s/h2/nics-start"; printf 'eth0\n' > "$s/h2/nics-end"
+    printf 'not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead\nTcp: RtoAlgorithm InSegs RetransSegs CurrEstab\nTcp: 1 50 7 3\n' > "$s/h2/tcp-start"
+    printf 'not available: nstat not installed; /proc/net/snmp and /proc/net/netstat instead\nTcp: RtoAlgorithm InSegs RetransSegs CurrEstab\nTcp: 1 70 7 1\n' > "$s/h2/tcp-end"
+    printf 'NIC statistics:\n     rx_packets: 100\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-start"
+    printf 'NIC statistics:\n     rx_packets: 200\n     rx_discards_phy: 0\n' > "$s/h2/ethtool-S-eth0-end"
+}
+# summ_health_fixture <dir>: health captures in the plain bundle. h1 trips
+# everything: cpu PSI 12.5 at the end, load 14 on 16 cpus, six kernel-log
+# hits of seven lines, a clock 250 ms slow. h2 is clean, its kernel log
+# window empty. h3: no pressure or load capture, a kernel log with no hit
+# but a boot inside the run, timedatectl saying not synchronized.
+summ_health_fixture() {
+    local s=$1/20261023-141002/sysinfo h
+    for h in h1 h2; do
+        for f in cpu memory io; do printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > "$s/$h/pressure-$f-start"; done
+        cp "$s/$h/pressure-cpu-start" "$s/$h/pressure-cpu-end"; cp "$s/$h/pressure-memory-start" "$s/$h/pressure-memory-end"
+        printf 'Architecture:                    x86_64\nCPU(s):                          16\nOn-line CPU(s) list:             0-15\n' > "$s/$h/lscpu"
+    done
+    printf 'some avg10=12.50 avg60=3.00 avg300=1.00 total=99\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > "$s/h1/pressure-cpu-end"
+    printf '14.00 3.00 1.00 2/300 1234\n' > "$s/h1/loadavg-start"; printf '0.50 0.40 0.30 1/300 1234\n' > "$s/h2/loadavg-start"
+    printf '%s\n' "# dmesg, from 900 s after boot (the run start)" "[  950.000000] mlx5_core 0000:17:00.0 eth0: Link down" \
+        "[  951.000000] mlx5_core 0000:17:00.0 eth0: Link up" "[  952.000000] NETDEV WATCHDOG: eth0 (mlx5_core): transmit queue 3 timed out" \
+        "[  953.000000] INFO: task kworker/3:1:123 blocked for more than 120 seconds." "[  954.000000] pcieport 0000:00:01.0: AER: Corrected error received: 0000:17:00.0" \
+        "[  955.000000] systemd[1]: Started Session 4." "[  956.000000] Out of memory: Killed process 4242 (fio)" > "$s/h1/kernel-log-end"
+    printf '%s\n' "# dmesg, from 900 s after boot (the run start)" "(no kernel log line in the window)" > "$s/h2/kernel-log-end"
+    printf '%s\n' "# dmesg, from -20 s after boot (the run start)" "(this host booted after the run start: dmesg holds nothing from before the boot)" \
+        "[    1.000000] Linux version 5.15.0" "[    2.000000] systemd[1]: Started Journal." > "$s/h3/kernel-log-end"
+    printf 'Reference ID    : C0A80001 (ntp1)\nSystem time     : 0.250000000 seconds slow of NTP time\nLeap status     : Normal\n' > "$s/h1/chrony"
+    printf 'Reference ID    : C0A80001 (ntp1)\nSystem time     : 0.000012000 seconds fast of NTP time\nLeap status     : Normal\n' > "$s/h2/chrony"
+    printf 'not available: chronyc not installed; timedatectl instead\n               Local time: Fri 2026-10-23 14:10:02 UTC\nSystem clock synchronized: no\n              NTP service: inactive\n' > "$s/h3/chrony"
+}
+# summ_out <dir> [option...]: the bundle tarred and -s run on it, every line
+summ_out() {
+    tar -czf "$1/b.tgz" -C "$1" 20261023-141002 && ./wekatester "${@:2}" -s "$1/b.tgz" 2>&1
+}
+export -f summ_job summ_weka summ_bundle_fixture summ_counters_fixture summ_health_fixture summ_out fio_json_fixture fio_json_single_fixture
