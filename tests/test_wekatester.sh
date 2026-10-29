@@ -3869,26 +3869,30 @@ t_assert "prompt_password_creds collects n pairs; empty password dies" bash -c '
 # the askpass helper, so the fifo plumbing is exercised, and it logs every
 # invocation so round ordering and the shrinking host pool are provable.
 t_assert "auth rounds: first success per host wins; later rounds skip connected hosts" bash -c '
-    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub"; k1=$d/k1; : > "$k1"
+    # the key lives under a directory named for every host: a stub that
+    # matched host names anywhere in argv (a mktemp suffix "tmp.OdylMph1vp"
+    # once held h1) let the key win for the wrong hosts
+    d=$(mktemp -d); stub=$d/bin; mkdir -p "$stub" "$d/h1h2h3h4h5"; k1=$d/h1h2h3h4h5/k1; : > "$k1"
     cat > "$stub/ssh" <<"EOF"
 #!/bin/bash
-# log the target host as its own leading token: hostnames can occur inside
-# key paths too (macOS mktemp lives under /var/folders/h3/...)
+# the target host is its own token, the last one (or the one before a
+# trailing `true`): only it is matched, never $* (key paths carry names too)
 host=${!#}; [ "$host" != true ] || host=${@:$#-1:1}
 echo "$host $*" >> "$SUITE_TEST_LOG"
 case "$*" in
-    *"-O check"*) case "$*" in (*h4*) exit 0;; (*) exit 1;; esac ;;
+    *"-O check"*) [ "$host" = h4 ] && exit 0 || exit 1 ;;
 esac
 if [ -n "$SSH_ASKPASS" ]; then
     pw=$("$SSH_ASKPASS") || exit 8
     [ "$pw" = "pw1" ] || exit 7
-    case "$*" in (*User=root*h2*) exit 0;; (*) exit 1;; esac
+    [ "$host" = h2 ] && case "$*" in (*User=root*) exit 0;; esac
+    exit 1
 fi
 case "$*" in
-    (*IdentityFile=*) case "$*" in (*User=ubuntu*h1*) exit 0;; (*) exit 1;; esac ;;
-    (*h3*) exit 0 ;;
-    (*) exit 1 ;;
+    (*IdentityFile=*) [ "$host" = h1 ] && case "$*" in (*User=ubuntu*) exit 0;; esac; exit 1 ;;
 esac
+[ "$host" = h3 ] && exit 0
+exit 1
 EOF
     chmod +x "$stub/ssh"
     err=$(printf "root\npw1\n" | (source ./wekatester
