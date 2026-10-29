@@ -651,7 +651,9 @@ main() {
 
     # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
     # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
-    # finalizes the bundle after it so the log holds the teardown.
+    # finalizes the bundle after it so the log holds the teardown. A signal
+    # reaches main alone (background subshells ignore INT), so cleanup stops
+    # calibration's shape subshells itself, first (cal_stop_shapes).
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

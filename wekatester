@@ -2193,6 +2193,9 @@ EVIDEOF
 
 # The calibration scratch namespace, under each host's own destination dir.
 CAL_SCRATCH=".wekatester-cal"
+# The shape subshells calibrate() has running: set after the fork, cleared
+# after the wait, so cleanup (on a signal) stops them and never a reused pid.
+CAL_SHAPE_PIDS=()
 
 # --- calibration: per client shape, solo, one search per test type -----------
 # Per shape: the engine first, then one search per (type, direction); cal_plan
@@ -3730,11 +3733,11 @@ cal_dispatch() {   # cal_dispatch engines|searches
             if [ "$rc" -ne 0 ]; then
                 others=()
                 for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done
-                for p in "${others[@]}"; do kill "$p" 2>&1 || :; done
-                for p in "${others[@]}"; do wait "$p" || :; done
+                [ ${#others[@]} -eq 0 ] || cal_stop_tree "${others[@]}"
                 what="cell"; [ "$mode" != engines ] || what="engine cell"
-                # a stopped cell's fio on the master runs until the teardown
-                # kills the fio servers (cleanup), seconds later
+                # a stopped cell's ssh went with it (cal_stop_tree); its fio
+                # on the master ends with that session, or when the teardown
+                # kills the fio servers, seconds later
                 die "shape $CAL_SID: the ${P_WHAT[$pid]} $what numjobs=$nj iodepth=$qd nrfiles=$nr failed on $c (above); the shape's other cells were stopped (one still running on a client ends when the fio servers are stopped)"
             fi
             [ -s "${P_RF[$pid]}" ] || die "shape $CAL_SID: no reading from the cell numjobs=$nj iodepth=$qd nrfiles=$nr on $c"
@@ -3755,12 +3758,61 @@ cal_dispatch() {   # cal_dispatch engines|searches
     done
 }
 
+# Stop processes and everything under them: TERM, parents before children (a
+# parent left alive would start its next step); up to 2 seconds for the
+# descendants (pgrep -P, Linux procps as the fio kill in connect.sh already
+# assumes) to go, polled with kill -0; then KILL for what is left, a given
+# pid too unless it has exited (ps says zombie: a child answers kill -0 until
+# waited), and a wait on the given pids alone (this shell's children).
+cal_stop_tree() {   # cal_stop_tree <pid>...
+    local p k i live said q=("$@") desc=()
+    if ! said=$(command -v pgrep); then
+        log "WARNING: pgrep is not installed: stopping the calibration processes alone, not what runs under them" >&2
+    else
+        while [ ${#q[@]} -gt 0 ]; do
+            p=${q[0]}; q=("${q[@]:1}")
+            k=$(pgrep -P "$p") || k=""
+            for p in $k; do desc+=("$p"); q+=("$p"); done
+        done
+    fi
+    for p in "$@" ${desc[@]+"${desc[@]}"}; do said=$(kill "$p" 2>&1) || :; done
+    for ((i = 0; i < 40; i++)); do
+        live=""
+        for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || live=1; done
+        [ -n "$live" ] || break
+        sleep 0.05
+    done
+    for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || said=$(kill -9 "$p" 2>&1) || :; done
+    for p in "$@"; do
+        k=$(ps -o stat= -p "$p" 2>&1) || k=""
+        case ${k//[[:space:]]/} in (Z*|"") ;; (*) said=$(kill -9 "$p" 2>&1) || : ;; esac
+        wait "$p" || :
+    done
+}
+
 # A shape's subshell on TERM (calibrate stopping the shapes after one
-# failed): its cells first, by the pids the dispatcher recorded.
+# failed, or cleanup on a signal): its cells still running, each with the
+# ssh under it -- the pids the dispatcher recorded that are still this
+# shape's children (a reaped pid may be another process by now).
 cal_shape_stop() {
-    local n p
-    [ ! -s "$WORK_DIR/cal/s$CAL_SID/pids" ] || while read -r n p; do kill "$p" 2>&1 || :; done < "$WORK_DIR/cal/s$CAL_SID/pids"
+    local n p kids roots=()
+    kids=$(pgrep -P "$BASHPID") || kids=""
+    [ ! -s "$WORK_DIR/cal/s$CAL_SID/pids" ] || while read -r n p; do
+        case " ${kids//$'\n'/ } " in (*" $p "*) roots+=("$p") ;; esac
+    done < "$WORK_DIR/cal/s$CAL_SID/pids"
+    [ ${#roots[@]} -eq 0 ] || cal_stop_tree "${roots[@]}"
     exit 143
+}
+
+# cleanup, on a signal while calibration runs: the shape subshells and
+# everything under them, stopped while the work dir still exists (a shape
+# in a foreground seed takes its TERM only after the seed's ssh ends, so
+# that ssh goes too). Idempotent: the EXIT trap may follow a signal trap.
+cal_stop_shapes() {
+    [ ${#CAL_SHAPE_PIDS[@]} -gt 0 ] || return 0
+    log "stopping calibration: ${#CAL_SHAPE_PIDS[@]} shape(s) still running"
+    cal_stop_tree "${CAL_SHAPE_PIDS[@]}"
+    CAL_SHAPE_PIDS=()
 }
 
 # Whether the newline-separated todo list holds this exact line (was a
@@ -4250,6 +4302,7 @@ calibrate() {
           cal_shape_run "$sid" "$rep" "$usable" "$phys" "$allc" "$linerate" "$engines" "$pinned" "$memcap" "$aio" "$cached" "$ladders" ) &
         pids+=($!); hs+=("$sid ($rep)")
     done 3< "$shapes"
+    CAL_SHAPE_PIDS=("${pids[@]}")   # a signal from here on: cleanup stops them
     for i in "${!pids[@]}"; do
         if [ -n "$failed" ]; then
             kill "${pids[$i]}" 2>&1 || :
@@ -4258,6 +4311,7 @@ calibrate() {
             failed=${hs[$i]}
         fi
     done
+    CAL_SHAPE_PIDS=()
     [ -z "$failed" ] || die "calibration of shape $failed failed (above); the other shapes were stopped"
 
     # One cal.results line per member: engine, then (qd nr fs nj) per
@@ -5136,6 +5190,9 @@ port_fail_report() {
 cleanup() {
     local host f priv pids=() kcmd i fio_ran=$FIO_STARTED
     local -A grm=()
+    # first: calibration's shape subshells, while the work dir they poll
+    # still exists (a signal reached main alone; they would spin forever)
+    cal_stop_shapes
     [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
@@ -9654,7 +9711,9 @@ main() {
 
     # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
     # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
-    # finalizes the bundle after it so the log holds the teardown.
+    # finalizes the bundle after it so the log holds the teardown. A signal
+    # reaches main alone (background subshells ignore INT), so cleanup stops
+    # calibration's shape subshells itself, first (cal_stop_shapes).
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

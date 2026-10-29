@@ -208,6 +208,9 @@ port_fail_report() {
 cleanup() {
     local host f priv pids=() kcmd i fio_ran=$FIO_STARTED
     local -A grm=()
+    # first: calibration's shape subshells, while the work dir they poll
+    # still exists (a signal reached main alone; they would spin forever)
+    cal_stop_shapes
     [ ${#RUN_LOCKS[@]} -eq 0 ] || lock_release_cmd
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
