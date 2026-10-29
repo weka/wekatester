@@ -3759,11 +3759,9 @@ cal_dispatch() {   # cal_dispatch engines|searches
 }
 
 # Stop processes and everything under them: TERM, parents before children (a
-# parent left alive would start its next step); up to 2 seconds for the
-# descendants (pgrep -P, Linux procps as the fio kill in connect.sh already
-# assumes) to go, polled with kill -0; then KILL for what is left, a given
-# pid too unless it has exited (ps says zombie: a child answers kill -0 until
-# waited), and a wait on the given pids alone (this shell's children).
+# parent left alive would start its next step), 2 seconds for the descendants
+# (pgrep -P, Linux procps) to go, KILL for the rest, then a wait on the given
+# pids alone: this shell's children, never a reused pid.
 cal_stop_tree() {   # cal_stop_tree <pid>...
     local p k i live said q=("$@") desc=()
     if ! said=$(command -v pgrep); then
@@ -3784,6 +3782,7 @@ cal_stop_tree() {   # cal_stop_tree <pid>...
     done
     for p in ${desc[@]+"${desc[@]}"}; do ! said=$(kill -0 "$p" 2>&1) || said=$(kill -9 "$p" 2>&1) || :; done
     for p in "$@"; do
+        # one that has exited (a zombie until waited) answers kill -0: no KILL
         k=$(ps -o stat= -p "$p" 2>&1) || k=""
         case ${k//[[:space:]]/} in (Z*|"") ;; (*) said=$(kill -9 "$p" 2>&1) || : ;; esac
         wait "$p" || :
@@ -3795,10 +3794,13 @@ cal_stop_tree() {   # cal_stop_tree <pid>...
 # ssh under it -- the pids the dispatcher recorded that are still this
 # shape's children (a reaped pid may be another process by now).
 cal_shape_stop() {
-    local n p kids roots=()
-    kids=$(pgrep -P "$BASHPID") || kids=""
+    local n p kids all=0 roots=() me=$BASHPID   # inside $( ) BASHPID is the child's
+    # no pgrep: every recorded pid, as before (cal_stop_tree says so once)
+    if ! kids=$(command -v pgrep); then all=1
+    else kids=$(pgrep -P "$me") || kids=""; fi
     [ ! -s "$WORK_DIR/cal/s$CAL_SID/pids" ] || while read -r n p; do
-        case " ${kids//$'\n'/ } " in (*" $p "*) roots+=("$p") ;; esac
+        if [ "$all" -eq 1 ]; then roots+=("$p")
+        else case " ${kids//$'\n'/ } " in (*" $p "*) roots+=("$p") ;; esac; fi
     done < "$WORK_DIR/cal/s$CAL_SID/pids"
     [ ${#roots[@]} -eq 0 ] || cal_stop_tree "${roots[@]}"
     exit 143
