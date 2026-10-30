@@ -1015,7 +1015,8 @@ t_assert "SIGINT during preflight exits 130" bash -c '
 # SIGPID; the run writes its work dir path to <dir>/workdir. The console
 # (stdout and stderr) is the file <dir>/run.out, or with a 5th argument
 # "pipe" a fifo read by a cat (SIGREADER) that copies it there: a pipe into
-# a terminal's `| tee log`, which the test can kill under the run.
+# a terminal's `| tee log`, which the test can kill under the run. A 6th
+# argument is run before main, after the stubs (one of them redefined).
 sigcal_launch() {
     local d=$1 tag=$2 prog console=${5:-file}
     mkdir -p "$d/out"
@@ -1057,10 +1058,12 @@ start_fio_servers() {   # as connect.sh: FIO_STARTED set before any check, so cl
 }
 verify_fio_ports() { :; }
 stage_jobfiles() { echo "calibration finished with no signal"; exit 0; }   # the phase after calibrate
+__PRE__
 main
 EOF
 )
     prog=${prog//__HOOK__/"${3:-}"}   # quoted: bash 5.2 reads an unquoted & as the match
+    prog=${prog//__PRE__/"${6:-}"}    # a 6th argument: lines run before main (a stub redefined)
     SIGSECS=${4:-5}   # the sim cells' seconds; the sleeps read "sleep <secs>.<tag>"
     set -m
     if [ "$console" = pipe ]; then
@@ -1181,6 +1184,71 @@ t_assert "signal: TERM to the controller alone during calibration with cells in 
 t_assert "signal: Ctrl-C with the console pipe already closed (as under | tee) still exits 130, stops every cell and server, and keeps the bundle" bash -c '
     source ./tests/helpers.sh; signal_trappable INT && signal_trappable PIPE || exit 1
     out=$(sigcal_run INT 130 deadconsole 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# A console lost without a signal (the terminal's tee gone, an ssh session
+# dropped) keeps the run going to its end, with everything after the loss
+# in the bundle's log (decided 2026-10-30). consolelost_run: the harness
+# above with the console reader killed mid-calibration and no signal sent;
+# the run holds a lock on every host, so cleanup's release shows in the
+# simlog. Prints what went wrong, with the run's console and log.
+consolelost_run() {
+    local d tag pid i rc t0 took w n1 s1 pre lockdir=/dev/shm/wt-lock-sim
+    d=$(mktemp -d); tag=$$$RANDOM
+    pre="preflight() { LOCK_DIR=$lockdir; LOCK_TOKEN=wtsig; RUN_LOCKS=([h1]=1 [h2]=1 [h3]=1); }"
+    sigcal_launch "$d" "$tag" "" 0 pipe "$pre" || return 1; pid=$SIGPID   # cells of a few tenths of a second
+    # the precondition: a cell in flight on each shape, the console still read
+    i=0
+    until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
+        if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
+            echo "no cell in flight on both shapes after $((i / 10)) s (pid $pid alive: $(sigcal_alive "$pid" && echo yes || echo no))" >&2
+            cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+        fi
+        sleep 0.1; i=$((i + 1))
+    done
+    grep -q "starting fio servers on 3 host(s)" "$d/run.out" || { echo "the console pipe never carried the run's start:" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    # the loss: the reader dies, the run gets no signal
+    kill -TERM "$SIGREADER"; wait "$SIGREADER" 2>&1 || :
+    ! sigcal_alive "$SIGREADER" || { echo "the console reader (pid $SIGREADER) survived its TERM" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    t0=$SECONDS
+    i=0
+    while sigcal_alive "$pid" && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+    took=$(( SECONDS - t0 ))
+    if sigcal_alive "$pid"; then
+        echo "the run (pid $pid) is still alive $took s after its console was lost; its processes:" >&2
+        sigcal_ps "wtsig-$tag|sleep 0\.$tag" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+    fi
+    wait "$pid"; rc=$?
+    w=$(cat "$d/workdir") || w=""
+    # 1. the run ended as a run that was never interrupted does
+    if [ "$rc" -ne 0 ]; then
+        echo "exit $rc, $took s after the console was lost, want 0; the console record's last lines, then the archived log's:" >&2; tail -n 3 "$d/run.out" >&2
+        if sigcal_bundle "$d" && tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log"; then echo "--- $STAMP/wekatester.log:" >&2; tail -n 6 "$d/$STAMP/wekatester.log" >&2; fi
+        return 1
+    fi
+    # 2. nothing of the run survives, the work dir is gone
+    sleep 0.2
+    n1=$(pgrep -f "wtsig-$tag" | grep -cvx "$$"); s1=$(pgrep -fx "sleep 0\.$tag" | wc -l | tr -d ' ')
+    [ "$n1" -eq 0 ] && [ "$s1" -eq 0 ] || { echo "$n1 run processes and $s1 sim cells alive after the run:" >&2; sigcal_ps "wtsig-$tag|sleep 0\.$tag" >&2; pkill -9 -f "wtsig-$tag" 2>&1 || :; return 1; }
+    [ -n "$w" ] && [ ! -e "$w" ] || { echo "the work dir ($w) survived or was never recorded" >&2; return 1; }
+    # 3. the bundle holds what came after the loss: the end of calibration and the teardown, none of it on the console record
+    sigcal_bundle "$d" || return 1
+    tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
+    for l in "calibration finished with no signal" "stopping fio servers..."; do
+        grep -qF "$l" "$d/$STAMP/wekatester.log" || { echo "the archived log lacks \"$l\":" >&2; tail -8 "$d/$STAMP/wekatester.log" >&2; return 1; }
+        ! grep -qF "$l" "$d/run.out" || { echo "\"$l\" reached the console record, so the reader was alive for it: the loss came too late" >&2; return 1; }
+    done
+    # 4. cleanup released the lock on every host and stopped every fio server; nothing else was removed
+    n1=$(grep -c "|o=; .*rm -rf '$lockdir'" "$d/simlog")
+    [ "$n1" -eq 3 ] || { echo "$n1 lock releases in the simlog, want 3 (h1 h2 h3):" >&2; grep "rm " "$d/simlog" >&2; return 1; }
+    for h in h1 h2 h3; do
+        [ "$(grep -c "^$h|.*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")" -eq 1 ] || { echo "no fio-server stop for $h in the simlog" >&2; cat "$d/simlog" >&2; return 1; }
+    done
+    n1=$(grep -c "|.*rm " "$d/simlog")
+    [ "$n1" -eq 6 ] || { echo "$n1 rm commands in the simlog, want cleanup's 6 (3 lock releases, 3 fio-server stops):" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
+}
+export -f consolelost_run
+t_assert "signal: a console lost with no signal (its reader gone mid-calibration) keeps the run going to exit 0, the lock released and the bundle's log holding what came after the loss" bash -c '
+    source ./tests/helpers.sh; signal_trappable PIPE || exit 1
+    out=$(consolelost_run 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 # A shape that fails a cell stops the other shapes (calibrate: kill, wait;
 # cal_shape_stop on TERM stops that shape's own cells). The first cell on h1
 # (shape 1) fails once shape 2 has a cell in flight on h3, plus a second of
