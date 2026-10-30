@@ -693,7 +693,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. When `pigz` is installed on the machine running wekatester, it does the compressing on all cores, writing the same gzip format at the same default level (a large run's bundle otherwise takes several seconds of single-threaded gzip); without it, tar's own gzip does. Either way the archive is a plain `.tgz` that `-s` and `tar -xzf` read. If compression fails, the directory is left uncompressed and the run says so. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 
-The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency. fio writes no "All clients" aggregate when a client's job sections under one group_reporting group outnumber the groups it reports (the layout job's shape, every fio version), and the summary then sums the host entries itself:
+The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency. fio writes no "All clients" aggregate when a client's job sections under one group_reporting group outnumber the groups it reports (the layout job's shape; fio 3.28 and 3.36 behave alike), and the summary then sums the host entries itself:
 
 ```
 starting test run for job 011-bandwidthR.job on host-1 with 2 workers:

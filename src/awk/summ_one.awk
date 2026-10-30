@@ -64,8 +64,8 @@ END {
         else if (nh > 1) {
             # fio writes no "All clients" when a client's job sections under
             # one group_reporting group outnumber the groups it reports (the
-            # layout job's shape, every fio version): sum the host entries as
-            # fio would, the latencies IO-weighted by their IOs
+            # layout job's shape; fio 3.28 and 3.36 alike): sum the host
+            # entries as fio would, the latencies IO-weighted by their IOs
             alls = maxi + 1; seen[alls] = 1
             for (i = 0; i <= maxi; i++) {
                 if (!(i in seen)) continue
