@@ -1012,9 +1012,12 @@ t_assert "SIGINT during preflight exits 130" bash -c '
 # here); the hook is a line run first in run_host (a cell made to fail).
 # Launched in its own process group, as a terminal's foreground job: the
 # group is what Ctrl-C signals, and the $0 tag is what pgrep counts. Sets
-# SIGPID; the run writes its work dir path to <dir>/workdir.
+# SIGPID; the run writes its work dir path to <dir>/workdir. The console
+# (stdout and stderr) is the file <dir>/run.out, or with a 5th argument
+# "pipe" a fifo read by a cat (SIGREADER) that copies it there: a pipe into
+# a terminal's `| tee log`, which the test can kill under the run.
 sigcal_launch() {
-    local d=$1 tag=$2 prog
+    local d=$1 tag=$2 prog console=${5:-file}
     mkdir -p "$d/out"
     prog=$(cat <<'EOF'
 source ./wekatester
@@ -1060,7 +1063,14 @@ EOF
     prog=${prog//__HOOK__/"${3:-}"}   # quoted: bash 5.2 reads an unquoted & as the match
     SIGSECS=${4:-5}   # the sim cells' seconds; the sleeps read "sleep <secs>.<tag>"
     set -m
-    bash -c "$prog" "wtsig-$tag" "$d" "$SIGSECS.$tag" > "$d/run.out" 2>&1 &
+    if [ "$console" = pipe ]; then
+        mkfifo "$d/console" || { set +m; return 1; }
+        cat < "$d/console" > "$d/run.out" &
+        SIGREADER=$!
+        bash -c "$prog" "wtsig-$tag" "$d" "$SIGSECS.$tag" > "$d/console" 2>&1 &
+    else
+        bash -c "$prog" "wtsig-$tag" "$d" "$SIGSECS.$tag" > "$d/run.out" 2>&1 &
+    fi
     SIGPID=$!
     set +m
 }
@@ -1083,13 +1093,18 @@ sigcal_bundle() {
     STAMP=${BUNDLE##*/}; STAMP=${STAMP%.tgz}
 }
 export -f sigcal_bundle
-# sigcal_run <INT|TERM> <rc>: the signal goes to the process group (INT,
-# what a terminal's Ctrl-C does) or to main alone (TERM, what kill or a job
-# scheduler does).
+# sigcal_run <INT|TERM> <rc> [deadconsole]: the signal goes to the process
+# group (INT, what a terminal's Ctrl-C does) or to main alone (TERM, what
+# kill or a job scheduler does). deadconsole: the console is a pipe whose
+# reader is killed just before the signal, as `wekatester ... 2>&1 | tee
+# log` under a Ctrl-C (the tee dies with the tool's group): a write to it
+# raises SIGPIPE, which must end neither the run log's tees nor the
+# teardown. The console record then stops at the reader's death.
 sigcal_run() {
-    local sig=$1 want=$2 d tag pid i n0 s0 n1 s1 rc t0 took left w
+    local sig=$1 want=$2 mode=${3:-} d tag pid i n0 s0 n1 s1 rc t0 took left w console=file
     d=$(mktemp -d); tag=$$$RANDOM
-    sigcal_launch "$d" "$tag"; pid=$SIGPID
+    [ "$mode" != deadconsole ] || console=pipe
+    sigcal_launch "$d" "$tag" "" 5 "$console" || return 1; pid=$SIGPID
     # the precondition: a cell in flight on each shape (h1 and h3), asserted
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
@@ -1102,6 +1117,12 @@ sigcal_run() {
     # the control: the run, its shape subshells and cells, and the sim cells' sleeps are there
     n0=$(pgrep -f "wtsig-$tag" | grep -cvx "$$"); s0=$(pgrep -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
     [ "$n0" -ge 4 ] && [ "$s0" -ge 2 ] || { echo "control: $n0 run processes, $s0 sim cells before the signal (want >= 4 and >= 2)" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    if [ "$console" = pipe ]; then
+        # the console reader saw the run start (the control), then dies
+        grep -q "starting fio servers on 3 host(s)" "$d/run.out" || { echo "the console pipe never carried the run's start:" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+        kill -TERM "$SIGREADER"; wait "$SIGREADER" 2>&1 || :
+        ! sigcal_alive "$SIGREADER" || { echo "the console reader (pid $SIGREADER) survived its TERM" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    fi
     t0=$SECONDS
     case $sig in
         (INT)  kill -INT -- "-$pid" ;;
@@ -1137,7 +1158,8 @@ sigcal_run() {
     sigcal_bundle "$d" || return 1
     tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
     grep -q "stopping fio servers\.\.\." "$d/$STAMP/wekatester.log" || { echo "the archived log does not say the servers were stopped:" >&2; tail -5 "$d/$STAMP/wekatester.log" >&2; return 1; }
-    case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
+    # (a dead console records nothing of the teardown: the log above is its witness)
+    [ "$console" = pipe ] || case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
     # 5. the dataset is untouched: the only removals are cleanup's, one per host
     left=$(grep -c "|.*rm " "$d/simlog")
     [ "$left" -eq 3 ] || { echo "$left rm commands in the simlog, want cleanup's 3:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
@@ -1150,6 +1172,15 @@ t_assert "signal: Ctrl-C (INT to the process group) during calibration with cell
 t_assert "signal: TERM to the controller alone during calibration with cells in flight on two shapes ends every cell and shape, keeps the bundle and exits 143" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
     out=$(sigcal_run TERM 143 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# A lab finding (2026-10-30): `wekatester ... 2>&1 | tee log` under a
+# Ctrl-C exited 141 with no teardown line, the fio servers, the run lock
+# and the unarchived run dir left on every host; the same run without the
+# tee exited 130 and tore down. The mechanism, from the source: the tee dies
+# with the group, the run log's tees die on their next console write, and
+# main's first log line in cleanup hits a readerless fifo (SIGPIPE).
+t_assert "signal: Ctrl-C with the console pipe already closed (as under | tee) still exits 130, stops every cell and server, and keeps the bundle" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT && signal_trappable PIPE || exit 1
+    out=$(sigcal_run INT 130 deadconsole 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 # A shape that fails a cell stops the other shapes (calibrate: kill, wait;
 # cal_shape_stop on TERM stops that shape's own cells). The first cell on h1
 # (shape 1) fails once shape 2 has a cell in flight on h3, plus a second of
