@@ -1401,8 +1401,10 @@ t_assert "summarize: a single-client run needs no All clients aggregate" bash -c
         *"total bandwidth: 3.00 GiB/s"*"average latency: 250.0 us (IO-weighted)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-# fio-3.28 wrote the layout results of a three-client run with one entry per
-# host and no "All clients" aggregate (fio-3.35 adds one); the run died in
+# fio wrote the layout results of a three-client run with one entry per host
+# and no "All clients" aggregate: fio emits one only when the entries it
+# receives equal the jobfile's sections, and sections under one
+# group_reporting group outnumber the groups reported. The run died in
 # summ_one with "no 'All clients' aggregate found". With several hosts and no
 # aggregate the summary sums the host entries itself (bw_bytes, iops,
 # io_bytes, total_ios summed; lat_ns.mean IO-weighted) and reports the same
@@ -4866,6 +4868,29 @@ t_assert "hosts from file: through main, -t with two host lines and no server re
     case "$out" in *"no servers given: running on the local host"*) echo "went local: $out" >&2; exit 1;; esac
     case "$out" in *": 2 worker(s), master c1, workload "*) ;; *) echo "$out" >&2; exit 1;; esac
     [ "$(grep "ssh stub" <<<"$out" | grep -cw c1)" -ge 1 ] && [ "$(grep "ssh stub" <<<"$out" | grep -cw c2)" -ge 1 ] || { echo "$out" >&2; exit 1; }'
+# README (Usage, server): "a name given twice (after `--` too) is a usage
+# error naming every repeated host". The lab ran `-n -t hosts.csv -- c1 c1`
+# with c1 in the file and got no error: hosts_from_file folds every CLI
+# host the file names into that row, both copies, before check_args looks.
+# The control is the same command with a file that does not name c1.
+t_assert "hosts from file: a server named twice on the command line is a usage error even when the file names it" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
+    run() {   # run <host-file-rows>: the dry run with the file, c1 named twice after --
+        printf "host,user_login,ioengine,allowed_cpus,destination_folder\n%b" "$1" > "$d/h.csv"
+        out=$(unset $(compgen -v WT_); [ -w /dev/shm ] || export WT_STAGE_BASE=mktemp
+              PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
+              timeout 30 bash ./wekatester -r -n -t "$d/h.csv" -- c1 c1 2>&1); rc=$?
+    }
+    # the control: a file without c1 is refused, as the command line is without -t
+    run "c2,,,,\n"
+    [ "$rc" -eq 1 ] || { echo "control (file names c2 only): rc=$rc: $out" >&2; exit 1; }
+    case "$out" in *"c1 is named twice on the command line"*) ;; *) echo "control (file names c2 only): $out" >&2; exit 1;; esac
+    run "c1,,,,\nc2,,,,\n"
+    [ "$rc" -eq 1 ] || { echo "file names c1: rc=$rc (want 1): $out" >&2; exit 1; }
+    case "$out" in *"c1 is named twice on the command line"*) ;; *) echo "file names c1, no usage error: $out" >&2; exit 1;; esac
+    case "$out" in *"usage: "*) ;; *) echo "no usage text: $out" >&2; exit 1;; esac'
 t_assert "auth rounds: the host file pins a host's login when the credential has none" bash -c '
     d=$(mktemp -d)
     (source ./wekatester

@@ -191,10 +191,13 @@ fio_json_single_fixture() {   # $1 = file to write
 JSON
 }
 
-# Several clients and no "All clients" entry: the shape fio-3.28 wrote for
-# the layout of a three-client run (the per-host console lines first, one
-# client_stats entry per host, all in group 0), where fio-3.35 adds the
-# aggregate. The summary has to sum the hosts itself. Figures exact:
+# Several clients and no "All clients" entry: the shape fio wrote for the
+# layout of a three-client run (the per-host console lines first, one
+# client_stats entry per host, all in group 0). Every fio version emits the
+# aggregate only when the entries received equal the jobfile's sections, and
+# sections under one group_reporting group outnumber the groups reported,
+# so this layout never gets one. The summary has to sum the hosts itself.
+# Figures exact:
 #   write bw  h1 1.00 + h2 2.00 + h3 3.00 GiB/s -> 6.00, average 2.00
 #   written   10 + 20 + 30 GiB                  -> 60.00, 20.00 per host
 #   iops      1,000 + 2,000 + 3,000             -> 6,000, average 2,000
