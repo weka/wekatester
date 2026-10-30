@@ -8156,17 +8156,30 @@ report_items() {   # report_items <jobfile>
 # substituted process, and finalize must drain the log before archiving.
 TEE_PIDS=()
 start_run_log() {
-    local p="$WORK_DIR/log"
+    local p="$WORK_DIR/log" tp="" _o
+    # coreutils tee -p drops an output that fails and keeps the rest: a
+    # Ctrl-C under `... | tee run.log` kills that tee, and a run-log tee
+    # without -p dies with it (console_lost takes over).
+    if _o=$(printf '' | tee -p 2>&1) && [ -z "$_o" ]; then tp=-p; fi
     mkdir "$p" || die "cannot create log pipe dir $p"
     mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
-    tee -a "$RUN_DIR/wekatester.log" < "$p/out" &
+    tee $tp -a "$RUN_DIR/wekatester.log" < "$p/out" &
     TEE_PIDS+=($!)
-    tee -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
+    tee $tp -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
     TEE_PIDS+=($!)
     # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
     # already closed by the time the run phase starts).
     exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
     debug "logging to $RUN_DIR/wekatester.log"
+}
+
+# main's SIGPIPE trap: stdout or stderr lost its reader, so the console's
+# `| tee` is gone and, without tee -p, the run-log tees with it. Untrapped
+# it ended main inside the EXIT trap: rc 141, no teardown. The teardown
+# goes on, into the file when one is open.
+console_lost() {
+    [ ${#TEE_PIDS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -w "$RUN_DIR/wekatester.log" ] || return 0
+    exec >>"$RUN_DIR/wekatester.log" 2>&1
 }
 
 # What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
@@ -9772,14 +9785,15 @@ main() {
     [ "$LOCAL_MODE" -eq 1 ] || \
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
-    # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
-    # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
-    # finalizes the bundle after it so the log holds the teardown. A signal
-    # reaches main alone (background subshells ignore INT), so cleanup stops
-    # calibration's shape subshells itself, first (cal_stop_shapes).
+    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
+    # trap alone runs cleanup (idempotent), keeps the status, then finalizes
+    # the bundle so the log holds the teardown. INT reaches main alone
+    # (background subshells ignore it): cleanup stops calibration's shapes
+    # first. SIGPIPE: console_lost (run.sh).
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    trap console_lost PIPE
     # After the traps (half-established masters still get torn down), before
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.

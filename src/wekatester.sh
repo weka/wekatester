@@ -657,14 +657,15 @@ main() {
     [ "$LOCAL_MODE" -eq 1 ] || \
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
-    # A bare trap on INT/TERM runs cleanup and RESUMES. Signals exit instead;
-    # the EXIT trap alone runs cleanup (idempotent), keeps the status, and
-    # finalizes the bundle after it so the log holds the teardown. A signal
-    # reaches main alone (background subshells ignore INT), so cleanup stops
-    # calibration's shape subshells itself, first (cal_stop_shapes).
+    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
+    # trap alone runs cleanup (idempotent), keeps the status, then finalizes
+    # the bundle so the log holds the teardown. INT reaches main alone
+    # (background subshells ignore it): cleanup stops calibration's shapes
+    # first. SIGPIPE: console_lost (run.sh).
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    trap console_lost PIPE
     # After the traps (half-established masters still get torn down), before
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.

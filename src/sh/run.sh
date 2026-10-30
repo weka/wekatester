@@ -15,17 +15,30 @@ report_items() {   # report_items <jobfile>
 # substituted process, and finalize must drain the log before archiving.
 TEE_PIDS=()
 start_run_log() {
-    local p="$WORK_DIR/log"
+    local p="$WORK_DIR/log" tp="" _o
+    # coreutils tee -p drops an output that fails and keeps the rest: a
+    # Ctrl-C under `... | tee run.log` kills that tee, and a run-log tee
+    # without -p dies with it (console_lost takes over).
+    if _o=$(printf '' | tee -p 2>&1) && [ -z "$_o" ]; then tp=-p; fi
     mkdir "$p" || die "cannot create log pipe dir $p"
     mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
-    tee -a "$RUN_DIR/wekatester.log" < "$p/out" &
+    tee $tp -a "$RUN_DIR/wekatester.log" < "$p/out" &
     TEE_PIDS+=($!)
-    tee -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
+    tee $tp -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
     TEE_PIDS+=($!)
     # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
     # already closed by the time the run phase starts).
     exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
     debug "logging to $RUN_DIR/wekatester.log"
+}
+
+# main's SIGPIPE trap: stdout or stderr lost its reader, so the console's
+# `| tee` is gone and, without tee -p, the run-log tees with it. Untrapped
+# it ended main inside the EXIT trap: rc 141, no teardown. The teardown
+# goes on, into the file when one is open.
+console_lost() {
+    [ ${#TEE_PIDS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -w "$RUN_DIR/wekatester.log" ] || return 0
+    exec >>"$RUN_DIR/wekatester.log" 2>&1
 }
 
 # What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
