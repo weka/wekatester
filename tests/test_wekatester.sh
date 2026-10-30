@@ -1236,14 +1236,19 @@ consolelost_run() {
         grep -qF "$l" "$d/$STAMP/wekatester.log" || { echo "the archived log lacks \"$l\":" >&2; tail -8 "$d/$STAMP/wekatester.log" >&2; return 1; }
         ! grep -qF "$l" "$d/run.out" || { echo "\"$l\" reached the console record, so the reader was alive for it: the loss came too late" >&2; return 1; }
     done
-    # 4. cleanup released the lock on every host and stopped every fio server; nothing else was removed
-    n1=$(grep -c "|o=; .*rm -rf '$lockdir'" "$d/simlog")
+    # 4. cleanup released the lock on every host (the owner test, then rm) and
+    #    stopped every fio server (the pidfile command, then the target's rm);
+    #    the only other removal is the end-of-calibration step, the master's
+    #    scratch dir
+    n1=$(grep -c "|o=; \[ ! -r '$lockdir/owner' \].*rm -rf '$lockdir'" "$d/simlog")
     [ "$n1" -eq 3 ] || { echo "$n1 lock releases in the simlog, want 3 (h1 h2 h3):" >&2; grep "rm " "$d/simlog" >&2; return 1; }
     for h in h1 h2 h3; do
-        [ "$(grep -c "^$h|.*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")" -eq 1 ] || { echo "no fio-server stop for $h in the simlog" >&2; cat "$d/simlog" >&2; return 1; }
+        [ "$(grep -c "^$h|if \[ -f '/dev/shm/wekatester-fio.pid' \].*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")" -eq 1 ] || { echo "no fio-server stop for $h in the simlog" >&2; cat "$d/simlog" >&2; return 1; }
     done
+    n1=$(grep -c "^h1|rm -rf '/dev/shm/x.cal'$" "$d/simlog")
+    [ "$n1" -eq 1 ] || { echo "$n1 end-of-calibration scratch removals on the master, want 1:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
     n1=$(grep -c "|.*rm " "$d/simlog")
-    [ "$n1" -eq 6 ] || { echo "$n1 rm commands in the simlog, want cleanup's 6 (3 lock releases, 3 fio-server stops):" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
+    [ "$n1" -eq 7 ] || { echo "$n1 rm commands in the simlog, want 7 (3 lock releases, 3 fio-server stops, the master's scratch):" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
 }
 export -f consolelost_run
 t_assert "signal: a console lost with no signal (its reader gone mid-calibration) keeps the run going to exit 0, the lock released and the bundle's log holding what came after the loss" bash -c '
