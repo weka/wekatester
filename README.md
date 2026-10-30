@@ -12,7 +12,7 @@ The idea of wekatester is to bring some order to this chaos. It starts fio on yo
 wekatester uses fio's native client/server mode:
 
 - An `fio --server` daemon is started on every worker (daemonized with a pidfile in `/dev/shm`; on exit it is killed via that pidfile only, and only while that pid is still the server — never by name, so fio jobs that are not ours are untouched). A daemonized server writes its own messages only to syslog: after a failed run, the teardown reads them from each worker's journal into the bundle (Output, `fio-server-log-end`).
-- The **first host on the command line acts as the coordinator**: jobfiles are staged only to that host, and the fio client process runs there, driving all the workers. Aggregation across workers is done by fio itself (the "All clients" totals).
+- The **first host on the command line acts as the coordinator**: jobfiles are staged only to that host, and the fio client process runs there, driving all the workers. Aggregation across workers is done by fio itself (the "All clients" totals), or by the summary itself when fio writes none (Output, below).
 - ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
 - All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
 - With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
@@ -693,7 +693,7 @@ Each job prints a summary block as it completes, and every run leaves one self-c
 
 At exit the directory is compressed to `<date>-<time>.tgz` and removed, leaving only the archive — for every run, failed and interrupted ones included, so a crashed suite still keeps everything already measured. When `pigz` is installed on the machine running wekatester, it does the compressing on all cores, writing the same gzip format at the same default level (a large run's bundle otherwise takes several seconds of single-threaded gzip); without it, tar's own gzip does. Either way the archive is a plain `.tgz` that `-s` and `tar -xzf` read. If compression fails, the directory is left uncompressed and the run says so. Nothing is lost to the fold: `-s` summarizes a bundle directly from the archive, and the log inside records what went wrong.
 
-The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency:
+The summary shows the cluster-wide totals, the per-host average with the min/max hosts called out (straggler visibility), and an IO-weighted average latency. fio writes no "All clients" aggregate when a client's job sections under one group_reporting group outnumber the groups it reports (the layout job's shape, every fio version), and the summary then sums the host entries itself:
 
 ```
 starting test run for job 011-bandwidthR.job on host-1 with 2 workers:

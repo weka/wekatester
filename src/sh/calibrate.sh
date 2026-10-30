@@ -895,8 +895,8 @@ cal_cell_groups_v() {
 
 # cleanup, on a signal while calibration runs: the shape subshells and
 # everything under them, stopped while the work dir still exists (a shape
-# in a foreground seed takes its TERM only after the seed's ssh ends, so
-# that ssh goes too). Idempotent: the EXIT trap may follow a signal trap.
+# in a foreground seed takes its TERM after the seed's ssh ends, so that
+# ssh goes too). Idempotent: the EXIT trap may follow a signal trap.
 cal_stop_shapes() {
     [ ${#CAL_SHAPE_PIDS[@]} -gt 0 ] || return 0
     log "stopping calibration: ${#CAL_SHAPE_PIDS[@]} shape(s) still running"

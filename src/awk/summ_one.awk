@@ -61,6 +61,27 @@ END {
     }
     if (!hasall) {
         if (nh == 1) { for (h in hosts) alls = last[h] }
+        else if (nh > 1) {
+            # fio writes no "All clients" when a client's job sections under
+            # one group_reporting group outnumber the groups it reports (the
+            # layout job's shape, every fio version): sum the host entries as
+            # fio would, the latencies IO-weighted by their IOs
+            alls = maxi + 1; seen[alls] = 1
+            for (i = 0; i <= maxi; i++) {
+                if (!(i in seen)) continue
+                for (k in READS) {
+                    if (!((i "." k) in v)) continue
+                    if (k ~ /lat_ns\.mean$/) {
+                        d = substr(k, 1, index(k, ".") - 1); lhas[d] = 1
+                        lsum[d] += v[i "." k] * (((i "." d ".total_ios") in v) ? v[i "." d ".total_ios"] : 0)
+                    }
+                    else v[alls "." k] += v[i "." k]
+                }
+                if ((i ".read") in dirhas) dirhas[alls ".read"] = 1
+                if ((i ".write") in dirhas) dirhas[alls ".write"] = 1
+            }
+            for (d in lhas) v[alls "." d ".lat_ns.mean"] = v[alls "." d ".total_ios"] ? lsum[d] / v[alls "." d ".total_ios"] : 0
+        }
         else { printf "ERR\t%s: no %sAll clients%s aggregate found\n", label, "\047", "\047"; exit }
     }
     if (expected != "") {
