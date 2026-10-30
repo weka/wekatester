@@ -517,11 +517,11 @@ parse_args() {
     [ -n "${PARSE_PRECHECK:-}" ] || check_args
 }
 
-# Combination checks: in parse_args for every caller (the test suite drives
-# it directly), and once more after the host file's settings.
-check_args() {
-    # A host named twice gave fio two --client= and raced two lock sessions.
-    # Same host = same string: a CLI host is an address (hosts.sh, host identity).
+# A host named twice gave fio two --client= and raced two lock sessions.
+# Same host = same string: a CLI host is an address (hosts.sh, host identity).
+# Under -t, run on the list as typed: hosts_from_file folds both copies of a
+# host the file names into its row.
+check_hosts_once() {
     local h n dups="" rep=()
     local -A count=()
     for h in "${HOSTS[@]}"; do
@@ -533,6 +533,12 @@ check_args() {
         dups="$dups${dups:+, }$h is named $n"
     done
     [ -z "$dups" ] || { usage >&2; die "$dups on the command line"; }
+}
+
+# Combination checks: in parse_args for every caller (the test suite drives
+# it directly), and once more after the host file's settings.
+check_args() {
+    check_hosts_once
     if [ -n "$SUMMARIZE_FILE" ]; then
         # -r used to take a report list: name the change, not demote it to a
         # host.
@@ -624,8 +630,10 @@ main() {
             validate_credentials
             create_targets_file
         fi
+        # the command line's repeats first, as typed; then the file's hosts,
+        # the CLI's after them, and the combinations the file's settings decide
+        check_hosts_once
         settings_from_file
-        # the file's hosts first, so the duplicate check sees the merged list
         hosts_from_file
         check_args
     fi
