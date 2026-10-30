@@ -191,6 +191,43 @@ fio_json_single_fixture() {   # $1 = file to write
 JSON
 }
 
+# Several clients and no "All clients" entry: the shape fio-3.28 wrote for
+# the layout of a three-client run (the per-host console lines first, one
+# client_stats entry per host, all in group 0), where fio-3.35 adds the
+# aggregate. The summary has to sum the hosts itself. Figures exact:
+#   write bw  h1 1.00 + h2 2.00 + h3 3.00 GiB/s -> 6.00, average 2.00
+#   written   10 + 20 + 30 GiB                  -> 60.00, 20.00 per host
+#   iops      1,000 + 2,000 + 3,000             -> 6,000, average 2,000
+#   latency   100us/1000 IOs, 200us/2000, 300us/3000 -> IO-weighted 233.3us
+fio_json_noagg_fixture() {   # $1 = file to write
+    cat > "$1" <<'JSON'
+<h3> lay-0-268435456-a1: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=libaio, iodepth=1
+<h2> lay-0-268435456-a1: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=libaio, iodepth=1
+<h1> lay-0-268435456-a1: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=libaio, iodepth=1
+<h3> Starting 1 process
+<h1> Starting 1 process
+<h2> Starting 1 process
+<h1>
+<h2>
+<h3>
+
+{
+  "fio version" : "fio-3.28",
+  "client_stats" : [
+    { "jobname" : "lay-0-268435456-a1", "groupid" : 0, "error" : 0, "hostname" : "h1",
+      "read":  { "io_bytes": 0, "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "io_bytes": 10737418240, "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 1000, "lat_ns": { "mean": 100000.0 } } },
+    { "jobname" : "lay-0-268435456-a1", "groupid" : 0, "error" : 0, "hostname" : "h2",
+      "read":  { "io_bytes": 0, "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "io_bytes": 21474836480, "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 2000, "lat_ns": { "mean": 200000.0 } } },
+    { "jobname" : "lay-0-268435456-a1", "groupid" : 0, "error" : 0, "hostname" : "h3",
+      "read":  { "io_bytes": 0, "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
+      "write": { "io_bytes": 32212254720, "bw_bytes": 3221225472, "iops": 3000.0, "total_ios": 3000, "lat_ns": { "mean": 300000.0 } } }
+  ]
+}
+JSON
+}
+
 # --- README: the fenced block under "# Usage" must equal ./wekatester -h ---
 readme_usage_block() {   # $1 = README path (default README.md)
     awk '/^# Usage$/ { in_usage = 1; next }

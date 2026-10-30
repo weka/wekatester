@@ -1401,6 +1401,32 @@ t_assert "summarize: a single-client run needs no All clients aggregate" bash -c
         *"total bandwidth: 3.00 GiB/s"*"average latency: 250.0 us (IO-weighted)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+# fio-3.28 wrote the layout results of a three-client run with one entry per
+# host and no "All clients" aggregate (fio-3.35 adds one); the run died in
+# summ_one with "no 'All clients' aggregate found". With several hosts and no
+# aggregate the summary sums the host entries itself (bw_bytes, iops,
+# io_bytes, total_ios summed; lat_ns.mean IO-weighted) and reports the same
+# lines, the per-host average and spread included.
+t_assert "summarize: several hosts and no All clients entry: the layout summary sums the host entries" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_noagg_fixture "$d/r.json"
+    out=$( (source ./wekatester; summ_one "$d/r.json" "$d/r.json" layout "h1 h2 h3" file) 2>&1 )
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc: $out" >&2; false; } &&
+    case "$out" in
+        *"write bandwidth: 6.00 GiB/s"*"average bandwidth: 2.00 GiB/s per host  (min 1.00 GiB/s h1, max 3.00 GiB/s h3)"*"written: 60.00 GiB, 20.00 GiB per host  (min 10.00 GiB h1, max 30.00 GiB h3)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
+t_assert "summarize: -s on several hosts with no All clients entry sums the hosts for every metric group" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_noagg_fixture "$d/r.json"
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "expected zero exit, got $rc: $out" >&2; false; } &&
+    case "$out" in
+        *"write bandwidth: 6.00 GiB/s"*"average bandwidth: 2.00 GiB/s per host  (min 1.00 GiB/s h1, max 3.00 GiB/s h3)"*"write iops: 6,000/s"*"average iops: 2,000/s per host  (min 1,000/s h1, max 3,000/s h3)"*"write latency: 233.3 us  (min 100.0 us h1, max 300.0 us h3)"*) true;;
+        *) echo "$out" >&2; false;;
+    esac'
 # The Python wekatester wrote {jobname: fio JSON, ...}: -s names that format
 # instead of reporting a missing aggregate (review #24).
 t_assert "summarize: a Python wekatester results file is named as such" bash -c '
