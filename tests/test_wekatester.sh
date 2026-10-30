@@ -1006,40 +1006,55 @@ t_assert "SIGINT during preflight exits 130" bash -c '
 # ends with "run bundle: <OUTPUT_DIR>/<RUN_STAMP>.tgz". calibrate() runs
 # every shape in a subshell of its own and the dispatcher every cell in
 # another: a correct stop leaves none of them, nor a sim cell, behind.
-t_assert "signal: main's traps are the three lines the calibration signal tests install" bash -c '
-    for l in "trap '\''rc=\$?; RUN_RC=\$rc; cleanup; finalize_run_dir; exit \$rc'\'' EXIT" "trap '\''exit 130'\'' INT" "trap '\''exit 143'\'' TERM"; do
-        n=$(grep -cF -- "$l" src/wekatester.sh)
-        [ "$n" -eq 1 ] || { echo "[$l] found $n times in src/wekatester.sh" >&2; exit 1; }
-    done'
 # sigcal_launch <dir> <tag> [run_host-hook]: two shapes (h1 h2 rep h1; h3)
-# calibrated at once over two clients each, cells of 5 s, a run bundle, the
-# fio servers "started", main's three trap lines verbatim; the hook is a
-# line run first in run_host (a cell made to fail). Launched in its own
-# process group, as a terminal's foreground job: the group is what Ctrl-C
-# signals, and the $0 tag is what pgrep counts. Sets SIGPID.
+# calibrated at once over two clients each, cells of 5 s, through main
+# itself (its traps, its work dir, its run bundle: nothing of main is copied
+# here); the hook is a line run first in run_host (a cell made to fail).
+# Launched in its own process group, as a terminal's foreground job: the
+# group is what Ctrl-C signals, and the $0 tag is what pgrep counts. Sets
+# SIGPID; the run writes its work dir path to <dir>/workdir.
 sigcal_launch() {
     local d=$1 tag=$2 prog
-    mkdir -p "$d/w" "$d/out"
-    cal_sim_fixture "$d/w" h1:8 h2:8 h3:16:200000
-    printf '# report bandwidth\n[global]\nfilename_format=$filenum/$jobnum\nfilesize=1G\n[a]\nrw=read\n' > "$d/w/set/011-r.job"
+    mkdir -p "$d/out"
     prog=$(cat <<'EOF'
 source ./wekatester
-trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 d=$1
-CAL_CLIENTS=2; AUTO_LEVEL=cal; WORK_DIR=$d/w; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
-TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0; SET_DIR_OVERRIDE=$d/w/set; AUTH_DIR=$d/w/auth
-CAL_SETTLE=0; SIMLOG=$d/simlog; OUTPUT_DIR=$d/out; RUN_STAMP=run; RUN_DIR=$d/out/run
+# the settings of "-a cal h1 h2 h3" with two clients per shape, and the sim
+CAL_CLIENTS=2; AUTO_LEVEL=cal; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio; ENGINE=libaio
+TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
+CAL_SETTLE=0; SIMLOG=$d/simlog; OUTPUT_DIR=$d/out; STAGE_BASE=$d
 export CAL_SIM_CELL_SLEEP=$2 CAL_SIM_BWCAP=12000000000
 copy_to_master() { :; }
 run_host() {
 __HOOK__
 cal_sim_host "$@"; }
-mkdir -p "$RUN_DIR"; start_run_log
-FIO_STARTED=1   # as in a real run: the servers are up before calibration
-calibrate
-echo "calibration finished with no signal"
+# Of the phases main runs before calibrate, those that reach a host or
+# read the controller (ssh masters, preflight, the mount check, the client
+# command-line check, sysinfo, the probe, engines, pinning, fs groups, fio
+# servers and ports) are no-ops that leave the state the real ones leave;
+# the rest (settings, credentials, the work dir, the traps, the jobfile
+# check, record_run, start_run_log, the pressure capture, cal_preflight)
+# runs as written. A phase added to main lands its host command in the
+# simlog, which the rm count below sees, or dies for what the sim lacks.
+make_ctrl_dir() {   # as connect.sh, plus the sim probe/auth/set in main's own work dir
+    CTRL_DIR=$WORK_DIR/c; mkdir -p "$CTRL_DIR"
+    cal_sim_fixture "$WORK_DIR" h1:8 h2:8 h3:16:200000
+    printf '# report bandwidth\n[global]\nfilename_format=$filenum/$jobnum\nfilesize=1G\n[a]\nrw=read\n' > "$WORK_DIR/set/011-r.job"
+    SET_DIR_OVERRIDE=$WORK_DIR/set; AUTH_DIR=$WORK_DIR/auth
+    echo "$WORK_DIR" > "$d/workdir"
+}
+establish_connections() { :; }
+preflight() { :; }; verify_mount_mode() { :; }; early_client_cmdline_check() { :; }
+snapshot_sysinfo() { :; }
+probe_workers() { :; }   # the fixture is the probe
+test_engines() { :; }; finalize_targets() { :; }; discover_engines() { :; }
+check_cpu_pinning() { :; }; collect_fs_groups() { :; }
+start_fio_servers() {   # as connect.sh: FIO_STARTED set before any check, so cleanup stops the servers
+    echo; log "starting fio servers on ${#HOSTS[@]} host(s)..."; FIO_STARTED=1
+}
+verify_fio_ports() { :; }
+stage_jobfiles() { echo "calibration finished with no signal"; exit 0; }   # the phase after calibrate
+main
 EOF
 )
     prog=${prog//__HOOK__/"${3:-}"}   # quoted: bash 5.2 reads an unquoted & as the match
@@ -1059,11 +1074,20 @@ export -f sigcal_ps
 # sigcal_alive <pid>: true while the pid answers; kill's own message kept out of the output
 sigcal_alive() { local _o; _o=$(kill -0 "$1" 2>&1); }
 export -f sigcal_alive
+# sigcal_bundle <dir>: the run bundle main left under <dir>/out, the only
+# entry there (its run dir gone): BUNDLE and its STAMP
+sigcal_bundle() {
+    local n; n=$(ls "$1/out" | wc -l | tr -d ' ')
+    BUNDLE=$(ls "$1/out"/*.tgz 2>&1) && [ "$n" -eq 1 ] && [ -s "$BUNDLE" ] \
+        || { echo "no bundle: $(ls "$1/out" 2>&1 | tr '\n' ' ')" >&2; return 1; }
+    STAMP=${BUNDLE##*/}; STAMP=${STAMP%.tgz}
+}
+export -f sigcal_bundle
 # sigcal_run <INT|TERM> <rc>: the signal goes to the process group (INT,
 # what a terminal's Ctrl-C does) or to main alone (TERM, what kill or a job
 # scheduler does).
 sigcal_run() {
-    local sig=$1 want=$2 d tag pid i n0 s0 n1 s1 rc t0 took left
+    local sig=$1 want=$2 d tag pid i n0 s0 n1 s1 rc t0 took left w
     d=$(mktemp -d); tag=$$$RANDOM
     sigcal_launch "$d" "$tag"; pid=$SIGPID
     # the precondition: a cell in flight on each shape (h1 and h3), asserted
@@ -1107,12 +1131,13 @@ sigcal_run() {
     for h in h1 h2 h3; do
         [ "$(grep -c "^$h|.*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")" -eq 1 ] || { echo "no fio-server stop for $h in the simlog" >&2; cat "$d/simlog" >&2; return 1; }
     done
-    [ ! -e "$d/w" ] || { echo "the work dir survived: $(ls "$d/w" "$d/w/cal" 2>&1 | tr '\n' ' ')" >&2; return 1; }
+    w=$(cat "$d/workdir") && [ -n "$w" ] || { echo "the run never recorded its work dir" >&2; return 1; }
+    [ ! -e "$w" ] || { echo "the work dir survived: $(ls "$w" "$w/cal" 2>&1 | tr '\n' ' ')" >&2; return 1; }
     # 4. the bundle is kept: the archive exists, the dir is gone, the log says the servers were stopped, the console ends with the bundle line
-    [ -s "$d/out/run.tgz" ] && [ ! -d "$d/out/run" ] || { echo "no bundle: $(ls "$d/out" 2>&1 | tr '\n' ' ')" >&2; return 1; }
-    tar -xzf "$d/out/run.tgz" -C "$d" run/wekatester.log || return 1
-    grep -q "stopping fio servers\.\.\." "$d/run/wekatester.log" || { echo "the archived log does not say the servers were stopped:" >&2; tail -5 "$d/run/wekatester.log" >&2; return 1; }
-    case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $d/out/run.tgz") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
+    sigcal_bundle "$d" || return 1
+    tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
+    grep -q "stopping fio servers\.\.\." "$d/$STAMP/wekatester.log" || { echo "the archived log does not say the servers were stopped:" >&2; tail -5 "$d/$STAMP/wekatester.log" >&2; return 1; }
+    case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
     # 5. the dataset is untouched: the only removals are cleanup's, one per host
     left=$(grep -c "|.*rm " "$d/simlog")
     [ "$left" -eq 3 ] || { echo "$left rm commands in the simlog, want cleanup's 3:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
@@ -1189,10 +1214,11 @@ failshape_run() {
     # 1. the run died naming the failed cell and the stopped shapes
     grep -q "FAILING|h1|" "$d/simlog" || { echo "the h1 cell never failed:" >&2; cat "$d/simlog" >&2; return 1; }
     [ "$rc" -eq 1 ] || { echo "exit $rc after $took s, want 1" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
-    tar -xzf "$d/out/run.tgz" -C "$d" run/wekatester.log 2>&1 || { echo "no bundle: $(ls "$d/out" 2>&1 | tr '\n' ' ')" >&2; return 1; }
-    grep -q "ERROR: shape 1: the bw-read cell numjobs=1 iodepth=1 nrfiles=1 failed on h1 (above); the shape's other cells were stopped" "$d/run/wekatester.log" &&
-    grep -q "ERROR: calibration of shape 1 (h1) failed (above); the other shapes were stopped" "$d/run/wekatester.log" ||
-        { echo "the log does not name the failed cell and the stopped shapes:" >&2; grep ERROR "$d/run/wekatester.log" >&2; return 1; }
+    sigcal_bundle "$d" || return 1
+    tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
+    grep -q "ERROR: shape 1: the bw-read cell numjobs=1 iodepth=1 nrfiles=1 failed on h1 (above); the shape's other cells were stopped" "$d/$STAMP/wekatester.log" &&
+    grep -q "ERROR: calibration of shape 1 (h1) failed (above); the other shapes were stopped" "$d/$STAMP/wekatester.log" ||
+        { echo "the log does not name the failed cell and the stopped shapes:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
     # 2. shape 2's cells: with pgrep every process under them is gone; without
     #    it the same (the stop signals process groups, pgrep plays no part)
     sleep 0.3
@@ -1204,8 +1230,8 @@ failshape_run() {
     fi
     if [ "$mode" = nopgrep ]; then
         # no pgrep, no warning about it: the stop above is the control
-        n1=$(grep -c "pgrep is not installed" "$d/run/wekatester.log")
-        [ "$n1" -eq 0 ] || { echo "the log warns about pgrep $n1 time(s) though the stop needs none:" >&2; grep "pgrep is not installed" "$d/run/wekatester.log" >&2; return 1; }
+        n1=$(grep -c "pgrep is not installed" "$d/$STAMP/wekatester.log")
+        [ "$n1" -eq 0 ] || { echo "the log warns about pgrep $n1 time(s) though the stop needs none:" >&2; grep "pgrep is not installed" "$d/$STAMP/wekatester.log" >&2; return 1; }
     fi
     if [ "$mode" = late ]; then
         # the handler did fork its child (the control), and the child is gone
@@ -1213,8 +1239,7 @@ failshape_run() {
         s1=$("$pg" -fx "sleep 7\.$tag" | wc -l | tr -d ' ')
         [ "$s1" -eq 0 ] || { echo "the child the h3 cell forked from its TERM handler is still alive after the run (exit $rc in $took s):" >&2; sigcal_ps "sleep 7\.$tag" >&2; "$pk" -9 -fx "sleep 7\.$tag" 2>&1 || :; return 1; }
     fi
-    # 3. the bundle is kept and nothing was unlinked (cleanup's three rm only)
-    [ -s "$d/out/run.tgz" ] && [ ! -d "$d/out/run" ] || { echo "no bundle: $(ls "$d/out" 2>&1 | tr '\n' ' ')" >&2; return 1; }
+    # 3. the bundle is kept (checked above) and nothing was unlinked (cleanup's three rm only)
     left=$(grep -c "|.*rm " "$d/simlog")
     [ "$left" -eq 3 ] || { echo "$left rm commands in the simlog, want cleanup's 3:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
 }
