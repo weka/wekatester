@@ -1,5 +1,9 @@
 # --- logging -----------------------------------------------------------------
-log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
+# A subshell resets caught traps, so the SIGPIPE trap is set where the write
+# happens: main, a shape, a cell, a seed, a `$( )` whose callee dies.
+# console_lost (run.sh) moves that process's console to the run log. The
+# failed write is retried there.
+log()   { local ts; trap console_lost PIPE; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*" || echo "$ts $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 

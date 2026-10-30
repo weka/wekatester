@@ -659,9 +659,9 @@ main() {
 
     # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
     # trap alone runs cleanup (idempotent), keeps the status, then finalizes
-    # the bundle so the log holds the teardown. INT reaches main alone
-    # (background subshells ignore it): cleanup stops calibration's shapes
-    # first. SIGPIPE: console_lost (run.sh).
+    # the bundle. INT reaches main alone (background subshells ignore it):
+    # cleanup stops calibration's shapes first. SIGPIPE: console_lost
+    # (run.sh), here for main's writes and in log().
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

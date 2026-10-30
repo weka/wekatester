@@ -32,10 +32,10 @@ start_run_log() {
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
-# main's SIGPIPE trap: stdout or stderr lost its reader, so the console's
-# `| tee` is gone and, without tee -p, the run-log tees with it. Untrapped
-# it ended main inside the EXIT trap: rc 141, no teardown. The teardown
-# goes on, into the file when one is open.
+# The SIGPIPE trap, set in log() and in main: stdout or stderr lost its
+# reader (the console's `| tee` died) and, without tee -p, the run-log tees
+# with it. Untrapped it ended the writer: rc 141, no teardown. Writes go
+# on, into the file when one is open.
 console_lost() {
     [ ${#TEE_PIDS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -w "$RUN_DIR/wekatester.log" ] || return 0
     exec >>"$RUN_DIR/wekatester.log" 2>&1
