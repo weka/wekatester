@@ -1296,15 +1296,20 @@ t_assert "a producer that logs into a reader that has quit dies with it (exit 14
 # (shape 1) fails once shape 2 has a cell in flight on h3, plus a second of
 # grace for the control count. 63be8e3 read BASHPID inside a $( ), so
 # cal_shape_stop found no cell and shape 2's cell outlived the run.
-# failshape_run <pgrep|nopgrep|late>: prints the run's console on failure.
+# failshape_run <pgrep|nopgrep|late|shape2>: prints the run's console on failure.
 # late: shape 2's cell forks one more child from its TERM handler (as a
 # process may on its way out) and holds on for 0.2 s, so a stop that walks
 # the descendants once, before its TERM round, never sees it.
+# shape2: the roles swap: shape 2's first cell (h3) fails while shape 1
+# (h1 h2) has a cell in flight, so a calibrate that waits the shapes in
+# order would notice it only when shape 1, cells of 8 s, ends.
 failshape_run() {
-    local mode=$1 d tag pid i n0 s0 n1 s1 rc t0 took left hook pg pk shadow x f
+    local mode=$1 d tag pid i n0 s0 n1 s1 rc t0 took left hook pg pk shadow x f fh=h1 oh=h3 fsid=1 cellre="numjobs=1 iodepth=1 nrfiles=1"
     d=$(mktemp -d); tag=$$$RANDOM
     pg=$(command -v pgrep) || { echo "no pgrep on this host" >&2; return 1; }; pk=${pg%pgrep}pkill
-    hook='case "$2" in (*--client=h1*cal-bw-read-*) i=0; until grep -v cal-seed- "$SIMLOG" | grep -q -- "--client=h3 "; do sleep 0.1; i=$((i + 1)); [ "$i" -lt 100 ] || break; done; sleep 1; printf "FAILING|h1|%s\n" "$2" >> "$SIMLOG"; echo "fio: client: h1: Connection refused"; return 1;; esac'
+    # shape 2's first bw-read cell is its ladder's start, whatever the planner picks for h3
+    [ "$mode" != shape2 ] || { fh=h3; oh=h1; fsid=2; cellre="numjobs=[0-9]+ iodepth=[0-9]+ nrfiles=[0-9]+"; }
+    hook="case \"\$2\" in (*--client=$fh*cal-bw-read-*) i=0; until grep -v cal-seed- \"\$SIMLOG\" | grep -q -- \"--client=$oh \"; do sleep 0.1; i=\$((i + 1)); [ \"\$i\" -lt 100 ] || break; done; sleep 1; printf \"FAILING|$fh|%s\\n\" \"\$2\" >> \"\$SIMLOG\"; echo \"fio: client: $fh: Connection refused\"; return 1;; esac"
     if [ "$mode" = late ]; then
         # the h3 cell's handler: the late child (sleep 7.<tag>), a mark in the sim log, a 0.2 s hold
         hook=$hook$'\n'"case \"\$2\" in (*--client=h3*cal-bw-read-*) trap 'sleep 7.$tag & echo LATE >> \"\$SIMLOG\"; sleep 0.2; exit 143' TERM;; esac"
@@ -1324,21 +1329,21 @@ failshape_run() {
         sigcal_launch "$d" "$tag" "$hook" 8
     fi
     pid=$SIGPID
-    # the precondition: shape 2 has a cell in flight when shape 1 fails
+    # the precondition: the other shape has a cell in flight when this one fails
     i=0
-    until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
+    until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=$oh "; do
         if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
-            echo "no cell in flight on shape 2 after $((i / 10)) s" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+            echo "no cell in flight on $oh after $((i / 10)) s" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
         fi
         sleep 0.1; i=$((i + 1))
     done
-    # the control, inside the grace second: the run, both shapes, shape 2's cell and its sim sleep
+    # the control, inside the grace second: the run, both shapes, the other shape's cell and its sim sleep
     n0=$("$pg" -f "wtsig-$tag" | grep -cvx "$$"); s0=$("$pg" -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
-    [ "$n0" -ge 4 ] && [ "$s0" -ge 1 ] || { echo "control: $n0 run processes, $s0 sim cells with shape 2's cell in flight (want >= 4 and >= 1)" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    [ "$n0" -ge 4 ] && [ "$s0" -ge 1 ] || { echo "control: $n0 run processes, $s0 sim cells with a cell in flight on $oh (want >= 4 and >= 1)" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
     # the failure itself, a second after the control
     i=0
-    until grep -q "FAILING|h1|" "$d/simlog"; do
-        if [ "$i" -ge 100 ] || ! sigcal_alive "$pid"; then echo "the h1 cell never failed:" >&2; cat "$d/simlog" "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; fi
+    until grep -q "FAILING|$fh|" "$d/simlog"; do
+        if [ "$i" -ge 100 ] || ! sigcal_alive "$pid"; then echo "the $fh cell never failed:" >&2; cat "$d/simlog" "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; fi
         sleep 0.1; i=$((i + 1))
     done
     # the bound: 4 s from the failure, well under the 8 s cells (an orphaned
@@ -1348,24 +1353,24 @@ failshape_run() {
     while sigcal_alive "$pid" && [ "$i" -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
     took=$(( SECONDS - t0 ))
     if sigcal_alive "$pid"; then
-        echo "the run (pid $pid) is still alive $took s after shape 1 failed (the bound is 4 s, the cells 8); its processes, the late child included:" >&2
+        echo "the run (pid $pid) is still alive $took s after shape $fsid failed (the bound is 4 s, the cells 8); its processes, the late child included:" >&2
         sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag|sleep 7\.$tag" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep 7\.$tag" 2>&1 || :; return 1
     fi
     wait "$pid"; rc=$?
     # 1. the run died naming the failed cell and the stopped shapes
-    grep -q "FAILING|h1|" "$d/simlog" || { echo "the h1 cell never failed:" >&2; cat "$d/simlog" >&2; return 1; }
+    grep -q "FAILING|$fh|" "$d/simlog" || { echo "the $fh cell never failed:" >&2; cat "$d/simlog" >&2; return 1; }
     [ "$rc" -eq 1 ] || { echo "exit $rc after $took s, want 1" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
     sigcal_bundle "$d" || return 1
     tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
-    grep -q "ERROR: shape 1: the bw-read cell numjobs=1 iodepth=1 nrfiles=1 failed on h1 (above); the shape's other cells were stopped" "$d/$STAMP/wekatester.log" &&
-    grep -q "ERROR: calibration of shape 1 (h1) failed (above); the other shapes were stopped" "$d/$STAMP/wekatester.log" ||
+    grep -qE "ERROR: shape $fsid: the bw-read cell $cellre failed on $fh \(above\); the shape's other cells were stopped" "$d/$STAMP/wekatester.log" &&
+    grep -q "ERROR: calibration of shape $fsid ($fh) failed (above); the other shapes were stopped" "$d/$STAMP/wekatester.log" ||
         { echo "the log does not name the failed cell and the stopped shapes:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
-    # 2. shape 2's cells: with pgrep every process under them is gone; without
-    #    it the same (the stop signals process groups, pgrep plays no part)
+    # 2. the other shape's cells: with pgrep every process under them is gone;
+    #    without it the same (the stop signals process groups, pgrep plays no part)
     sleep 0.3
     n1=$("$pg" -f "wtsig-$tag" | grep -cvx "$$"); s1=$("$pg" -fx "sleep $SIGSECS\.$tag" | wc -l | tr -d ' ')
     if [ "$n1" -ne 0 ] || [ "$s1" -ne 0 ]; then
-        echo "after shape 1 failed (exit $rc in $took s): $n1 run processes and $s1 sim cells still alive (before: $n0 and $s0):" >&2
+        echo "after shape $fsid failed (exit $rc in $took s): $n1 run processes and $s1 sim cells still alive (before: $n0 and $s0):" >&2
         sigcal_ps "wtsig-$tag|sleep $SIGSECS\.$tag" >&2; kill -9 -- "-$pid" 2>&1 || :; "$pk" -9 -fx "sleep $SIGSECS\.$tag" 2>&1 || :
         return 1
     fi
@@ -1394,6 +1399,12 @@ t_assert "signal: without pgrep on PATH the stop still ends every cell and sim s
 t_assert "signal: a child forked by a stopped cell on its way out is stopped too, and the run ends on time" bash -c '
     source ./tests/helpers.sh
     out=$(failshape_run late 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# A review finding (2026-11-02): calibrate waited the shapes in order, so a
+# failure in shape 2 while shape 1 ran was seen only when shape 1 ended.
+# The first test above is the control: there the failing shape is first.
+t_assert "signal: a later shape that fails a cell while an earlier one has cells in flight ends the run on time, naming the failed cell" bash -c '
+    source ./tests/helpers.sh
+    out=$(failshape_run shape2 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 
 # --- staging: jobfiles with no [global] section ---
 # Both insert paths (python override(), the awk non-auto branch) used to match
