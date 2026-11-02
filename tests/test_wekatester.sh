@@ -9677,7 +9677,8 @@ t_assert "build: the committed wekatester is what ./build makes of src/, with no
 t_assert "build: every file under src/ is built in exactly once" bash -c '
     used=$( { grep -rh "^#@include " src | sed "s/^#@include //"
               grep -rhoE "#@awk [A-Za-z0-9_.]+" src | sed -E "s|^#@awk (.*)|awk/\1.awk|"; } | sort)
-    have=$(cd src && find . -type f ! -path ./wekatester.sh ! -name ".*" | sed "s|^\./||" | sort)
+    # a README beside the code is documentation, no build input
+    have=$(cd src && find . -type f ! -path ./wekatester.sh ! -name ".*" ! -name "*.md" | sed "s|^\./||" | sort)
     [ "$used" = "$have" ] || { diff <(printf "%s\n" "$used") <(printf "%s\n" "$have") >&2; false; }'
 t_assert "build: a missing include or awk file stops it by name and leaves the target alone" bash -c '
     d=$(mktemp -d); mkdir -p "$d/src/sh" "$d/src/awk"; cp ./build "$d/"; q=$(printf "\\047")
