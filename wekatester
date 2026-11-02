@@ -4359,7 +4359,9 @@ calibrate() {
             cal_stop_tree ${pids[@]} ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
             live=0; break
         done
-        [ "$live" -eq 0 ] || sleep 0.2
+        # cal_pause, not sleep: the settle test counts every sleep; in main
+        # its TERM check is inert (CAL_SHAPE_TERM is never set here)
+        [ "$live" -eq 0 ] || cal_pause 0.2
     done
     CAL_SHAPE_PIDS=()
     [ -z "$failed" ] || die "calibration of shape $failed failed (above); the other shapes were stopped"
