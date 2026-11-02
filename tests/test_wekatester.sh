@@ -3,12 +3,11 @@
 cd "$(dirname "$0")/.."
 # The suite needs what wekatester needs, bash 4.4 or later -- its own shell
 # and the bash first in PATH, which every bash -c test runs. wekatester is
-# Linux-only; the suite also runs on a development Mac with a newer bash
-# first in PATH (Homebrew's: PATH=/opt/homebrew/bin:$PATH), standing in a
-# Linux kernel name and a staging dir for the /dev/shm macOS lacks.
+# Linux-only, and so is the suite (Frank, 2026-11-02): nothing in it stands
+# in for what another platform lacks.
 for b in "$BASH" "$(command -v bash)"; do
     v=$("$b" -c 'echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))')
-    [ "$v" -ge 404 ] || { echo "the suite needs bash 4.4 or later, and $b is older -- on a Mac: PATH=/opt/homebrew/bin:\$PATH bash tests/test_wekatester.sh" >&2; exit 2; }
+    [ "$v" -ge 404 ] || { echo "the suite needs bash 4.4 or later, and $b is older" >&2; exit 2; }
 done
 # One suite per host (Frank, 2026-10-26): a host-wide mkdir lock, its owner
 # named. A holder that is gone (ps, which sees every user) is reclaimed by
@@ -45,12 +44,6 @@ trap 'echo; echo "TIMEOUT after $SECONDS s: passed ${PASS:-0}, failed ${FAIL:-0}
 # /tmp/tmp.* behind; Frank, 2026-10-11).
 SUITE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/wt-suite.XXXXXX") || exit 1
 export TMPDIR=$SUITE_TMP
-if [ "$(uname -s)" != Linux ]; then
-    SUITE_LINUX_SHIM=$(mktemp -d)
-    printf '#!/bin/sh\necho Linux\n' > "$SUITE_LINUX_SHIM/uname"; chmod +x "$SUITE_LINUX_SHIM/uname"
-    export PATH="$SUITE_LINUX_SHIM:$PATH"
-fi
-[ -w /dev/shm ] || export WT_STAGE_BASE=mktemp
 # A preflight run for real locks this suite's own path, never the host's
 # /dev/shm lock that a real run, or a second suite, may hold.
 export WEKATESTER_SUITE_LOCK_DIR="$(mktemp -d)/wekatester.lock"
@@ -1661,14 +1654,13 @@ EOF
 # With no server on the command line the run happens here, and the transport
 # wrappers must never reach for ssh/scp (no_ssh_fixture enforces that: the
 # stubs shadow the real binaries and exit 99).
-lm() { (uname_fixture Linux
-        source ./wekatester; parse_args "$@"; resolve_local_mode >>$SUITE_ASIDE
+lm() { (source ./wekatester; parse_args "$@"; resolve_local_mode >>$SUITE_ASIDE
         echo "$LOCAL_MODE|$MASTER|${HOSTS[*]-}"); }
 t_assert "local mode defaults off"          bash -c 'source ./wekatester; [ "$LOCAL_MODE" -eq 0 ]'
 t_assert "no servers: local mode on, host and master are localhost" \
     test "$(lm -d /x)" = "1|localhost|localhost"
 t_assert "no servers: the run is announced" bash -c '
-    source ./tests/helpers.sh; uname_fixture Linux
+    source ./tests/helpers.sh
     out=$(source ./wekatester; parse_args; resolve_local_mode)
     case "$out" in *"local host"*) true;; *) echo "$out" >&2; false;; esac'
 t_assert "servers given: local mode stays off, host list untouched" \
@@ -1693,7 +1685,7 @@ t_assert "bash floor: the tool, ./build and the suite stop an older bash with ex
         g=$(grep -m1 -A1 "needs bash 4.4 or later" "$f" | grep -oE "exit [0-9]+" | head -1)
         [ "$g" = "exit 2" ] || { echo "$f: [$g]" >&2; exit 1; }
     done
-    # where an old bash exists (macOS /bin/bash), the tool itself says so
+    # where an old /bin/bash exists beside a newer one, the tool itself says so
     if [ -x /bin/bash ] && ! /bin/bash -c "[ \$(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] )) -ge 404 ]"; then
         out=$(/bin/bash ./wekatester -h 2>&1); rc=$?
         [ "$rc" -eq 2 ] && case "$out" in *"needs bash 4.4 or later"*) true;; *) false;; esac || { echo "rc=$rc $out" >&2; exit 1; }
@@ -3994,7 +3986,7 @@ t_assert "host_name: falls back to \$HOSTNAME first label, then hostname, then t
     [ "$(HOSTNAME=""; local_short_hostname)" = "" ] &&
     [ "$(HOSTNAME=""; LOCAL_MODE=1; host_name localhost)" = localhost ]'
 t_assert "host_name: a local run fixes the name once in resolve_local_mode" bash -c '
-    source ./tests/helpers.sh; uname_fixture Linux
+    source ./tests/helpers.sh
     (source ./wekatester
      hostname() { echo testbox; }
      HOSTS=(); resolve_local_mode >>$SUITE_ASIDE
@@ -4931,10 +4923,10 @@ t_assert "targets file: yes creates the template and uses it" bash -c '
         [ "$TARGETS_FILE" = "$d/new.csv" ]) >>$SUITE_ASIDE
     head -1 "$d/new.csv" | grep -q "^host,user_login"'
 t_assert "targets file: a missing one is created only after the checks that need no file pass (a bad -i key leaves none)" bash -c '
-    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    d=$(mktemp -d); mkdir "$d/bin"
     # the control run goes on past the file: ssh and scp never leave this box
     printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
-    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/ssh" "$d/bin/scp"
     out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
           bash ./wekatester -r -t "$d/new.csv" -i /no/such/key h1 2>&1); rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "$d/new.csv" ] || { echo "rc=$rc new.csv: $(ls "$d"); $out" >&2; exit 1; }
@@ -5004,12 +4996,12 @@ t_assert "hosts from file: a file with no host lines and no server is local mode
      [ "${HOSTS[*]}" = localhost ] && [ "$MASTER" = localhost ] &&
      grep -qF "host file: $d/new.csv (no host lines; running on the local host)" "$d/log2" || { cat "$d/log2" >&2; false; })'
 t_assert "hosts from file: through main, -t with two host lines and no server reaches both over ssh instead of running locally" bash -c '
-    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    d=$(mktemp -d); mkdir "$d/bin"
     # ssh and scp never leave this box
     printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
-    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/ssh" "$d/bin/scp"
     printf "host,user_login,ioengine,allowed_cpus,destination_folder\nc1,,,,\nc2/0123,,,,\n" > "$d/h.csv"
-    out=$(unset $(compgen -v WT_); [ -w /dev/shm ] || export WT_STAGE_BASE=mktemp
+    out=$(unset $(compgen -v WT_)
           PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
           bash ./wekatester -r -n -t "$d/h.csv" 2>&1); rc=$?
     [ "$rc" -ne 0 ] || { echo "rc=$rc: $out" >&2; exit 1; }
@@ -5022,12 +5014,12 @@ t_assert "hosts from file: through main, -t with two host lines and no server re
 # host the file names into that row, both copies, before check_args looks.
 # The control is the same command with a file that does not name c1.
 t_assert "hosts from file: a server named twice on the command line is a usage error even when the file names it" bash -c '
-    d=$(mktemp -d); mkdir "$d/bin"; printf "#!/bin/sh\necho Linux\n" > "$d/bin/uname"
+    d=$(mktemp -d); mkdir "$d/bin"
     printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
-    chmod +x "$d/bin/uname" "$d/bin/ssh" "$d/bin/scp"
+    chmod +x "$d/bin/ssh" "$d/bin/scp"
     run() {   # run <host-file-rows>: the dry run with the file, c1 named twice after --
         printf "host,user_login,ioengine,allowed_cpus,destination_folder\n%b" "$1" > "$d/h.csv"
-        out=$(unset $(compgen -v WT_); [ -w /dev/shm ] || export WT_STAGE_BASE=mktemp
+        out=$(unset $(compgen -v WT_)
               PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty \
               timeout 30 bash ./wekatester -r -n -t "$d/h.csv" -- c1 c1 2>&1); rc=$?
     }
@@ -9315,7 +9307,7 @@ t_assert "session bound: a pressure session past the bound keeps its partial cap
     [ "$(cat "$f/kernel-log-end")" = "not available: the session was cut off here, after 2 s (WT_SYSINFO_TIMEOUT)" ] &&
     [ "$(cat "$f/tcp-end")" = "nstat -asz" ] && [ ! -e "$f/sar-end" ] || { ls "$f"; cat "$c"; exit 1; } >&2'
 t_assert "session bound: WT_SYSINFO_TIMEOUT that is not a whole number of seconds above 0 stops the run before it starts" bash -c '
-    source ./tests/helpers.sh; uname_fixture Linux
+    source ./tests/helpers.sh
     for v in abc 0 -5 1.5; do
         err=$(WT_SYSINFO_TIMEOUT=$v ./wekatester h1 2>&1 >>$SUITE_ASIDE) && { echo "ran with $v" >&2; exit 1; }
         case "$err" in
@@ -9509,7 +9501,7 @@ t_assert "json_flat: fio one-key-per-line and compact JSON flatten alike; string
 t_assert "json_flat: one pass that grows with the file on every awk here (300 clients well inside 10 s); strings across lines, nested and empty arrays, text after the document" bash -c '
     d=$(mktemp -d)
     # 300 clients of 232 keys each, fio one-key-per-line: ~1.7 MB, 70k lines.
-    # The whole-file reader took ~57 s on macOS awk and ~2 s on mawk here.
+    # The whole-file reader took ~57 s on BWK awk and ~2 s on mawk.
     LC_ALL=C awk "BEGIN { print \"fio: log text\"; print \"{\"; print \"  \\\"client_stats\\\" : [\"
         for (c = 1; c <= 300; c++) {
             print \"    {\"; print \"      \\\"jobname\\\" : \\\"bw\\\",\"; printf \"      \\\"hostname\\\" : \\\"h%d\\\",\n\", c
