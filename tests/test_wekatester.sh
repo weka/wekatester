@@ -1022,6 +1022,7 @@ TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
 CAL_SETTLE=0; SIMLOG=$d/simlog; OUTPUT_DIR=$d/out; STAGE_BASE=$d
 export CAL_SIM_CELL_SLEEP=$2 CAL_SIM_BWCAP=12000000000
 copy_to_master() { :; }
+copy_to_host() { printf '%s|copy_to_host %s\n' "$1" "${*:2}" >> "$SIMLOG"; }   # no real scp: logged as run_host logs
 run_host() {
 __HOOK__
 cal_sim_host "$@"; }
