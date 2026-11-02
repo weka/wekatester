@@ -1242,8 +1242,9 @@ calibrate() {
     cal_capacity_check "$shapes" "$ladders"
     # every shape at once, each in a subshell of its own; a failed shape
     # stops the others, whole trees (a foreground seed included), then the
-    # run. The TERM handler only sets a flag (see cal_pause).
-    pids=(); hs=(); local failed=""
+    # run. The TERM handler only sets a flag (see cal_pause). Polled by ps,
+    # not waited in order: the first failure stops the rest.
+    pids=(); hs=(); local failed="" live rc
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
         # set -m for the fork alone: the shape is a process group of its own
         # (cal_stop_tree); main keeps the terminal's group and its traps
@@ -1254,13 +1255,21 @@ calibrate() {
         pids+=($!); hs+=("$sid ($rep)")
         CAL_SHAPE_PIDS+=($!)   # from its fork on, a signal has cleanup stop it
     done 3< "$shapes"
-    for i in "${!pids[@]}"; do
-        if [ -n "$failed" ]; then
-            cal_cell_groups_v
-            cal_stop_tree "${pids[$i]}" ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
-        elif ! wait "${pids[$i]}"; then
+    live=${#pids[@]}
+    while [ "$live" -gt 0 ]; do
+        for i in "${!pids[@]}"; do
+            [ -n "${pids[$i]}" ] || continue
+            ! cal_proc_runs "${pids[$i]}" || continue
+            wait "${pids[$i]}" && rc=0 || rc=$?
+            pids[$i]=""; live=$((live - 1))
+            [ "$rc" -ne 0 ] || continue
             failed=${hs[$i]}
-        fi
+            cal_cell_groups_v
+            # the shapes still running: an emptied slot expands to nothing
+            cal_stop_tree ${pids[@]} ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
+            live=0; break
+        done
+        [ "$live" -eq 0 ] || sleep 0.2
     done
     CAL_SHAPE_PIDS=()
     [ -z "$failed" ] || die "calibration of shape $failed failed (above); the other shapes were stopped"
