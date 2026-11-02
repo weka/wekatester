@@ -60,7 +60,8 @@ function layout_body(L, n,    i, k, out) {   # every non-marker line, trailing b
 }
 # Most aio events one jobfile sets up at once via libaio: numjobs x iodepth
 # per section ([global] inherited), summed per stonewall group, the largest
-# group taken; 0 without libaio.
+# group taken; 0 without libaio. A create_only section (read as job_sections
+# reads it) runs only fio's setup phase, not its job, so it counts nothing.
 function libaio_events(L, n,    i, s, p, k, v, G, sec, insec, ng, GS, GN, best) {
     split("", G); split("", sec); insec = 0; ng = 1; GS[1] = 0; GN[1] = 0
     for (i = 1; i <= n + 1; i++) {
@@ -78,7 +79,7 @@ function libaio_events(L, n,    i, s, p, k, v, G, sec, insec, ng, GS, GN, best) 
             if ((("stonewall" in sec) ? sec["stonewall"] : "0") != "0" && GN[ng] > 0) {
                 ng++; GS[ng] = 0; GN[ng] = 0
             }
-            if (("ioengine" in sec) && sec["ioengine"] == "libaio") {
+            if (("ioengine" in sec) && sec["ioengine"] == "libaio" && (("create_only" in sec) ? sec["create_only"] : "0") == "0") {
                 k = ("numjobs" in sec) && sec["numjobs"] != "" ? py_int(sec["numjobs"]) : 1
                 v = ("iodepth" in sec) && sec["iodepth"] != "" ? py_int(sec["iodepth"]) : 1
                 GS[ng] += (k == "" || v == "") ? 0 : k * v
