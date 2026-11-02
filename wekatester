@@ -8172,9 +8172,9 @@ start_run_log() {
 }
 
 # Each fifo line goes to the log file, and to the console while it has one.
-# The first console write that fails (its `| tee` ended) retires the console
-# with a notice in the file, so no writer meets a dead pipe. Builtins only:
-# ignored SIGPIPE reaches no child.
+# The first console write that fails retires the console with a notice in
+# the file: no writer meets a dead pipe, and the relay exits 1. Builtins
+# only: ignored SIGPIPE reaches no child.
 run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
     local l ts con=1
     trap '' PIPE
@@ -8186,6 +8186,7 @@ run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
             printf '%s console lost (%s): the rest of this log is in the file alone\n' "$ts" "$3" >&7
         }
     done < "$1"
+    [ -n "$con" ]
 }
 
 # What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
@@ -8545,18 +8546,23 @@ snapshot_jobfiles() {
 # gzip at the same level on every core.
 finalize_run_dir() {
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    local zip=-z _o
+    local zip=-z _o out_lost="" err_lost=""
     if _o=$(command -v pigz); then zip=--use-compress-program=pigz; fi
     if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
         # Restore the console and let the relays drain: their pipes EOF when
         # these redirected fds close, and only a drained log may be archived.
+        # A relay exiting 1 lost its console: the closing line below goes to
+        # a stream still read, or nowhere.
         exec 1>&5 2>&6 5>&- 6>&-
-        wait "${RELAY_PIDS[@]}"
+        wait "${RELAY_PIDS[0]}"; [ $? -ne 1 ] || out_lost=1
+        wait "${RELAY_PIDS[1]}"; [ $? -ne 1 ] || err_lost=1
         RELAY_PIDS=()
     fi
     if tar "$zip" -cf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
         rm -rf "$RUN_DIR"
-        log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz"
+        if [ -z "$out_lost" ]; then log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz"
+        elif [ -z "$err_lost" ]; then log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz" >&2
+        fi
     else
         log "ERROR: could not compress $RUN_DIR; leaving it uncompressed" >&2
     fi
