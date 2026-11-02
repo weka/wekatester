@@ -7577,6 +7577,25 @@ t_assert "check_aio_room: a staged libaio job past its host's aio room stops the
     err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1 h2); check_aio_room) 2>&1 ) && { echo "no stop: $err" >&2; exit 1; }
     case "$err" in *"ERROR: 032-iopsW.job: libaio sets up 96256 aio events at once (numjobs x iodepth) on h1, and the kernel has room for 65536"*"raise fs.aio-max-nr"*"nothing was run and the host file is unchanged"*) ;; *) echo "$err" >&2; exit 1;; esac
     case "$err" in *"011-bw.job"*|*" on h2"*|*"h1 h2"*) echo "$err" >&2; false;; *) true;; esac'
+# PR #47 review (jobfiles.awk): a create_only section lays files out and
+# opens no aio context, so it is no part of a job's aio events, read as
+# job_sections reads it (create_only=1, or the bare word). The control: the
+# same numbers on a measured section, or behind create_only=0, still stop.
+t_assert "check_aio_room: a create_only section past the aio room is not counted, the measured section that fits passes; the same numbers measured still stop" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/probe" "$d/jobs/h1"
+    printf "aio_max_nr 65536\naio_nr 0\n" > "$d/probe/h1"
+    printf "[global]\nioengine=libaio\n[create]\ncreate_only=1\nnumjobs=188\niodepth=512\n[io]\nstonewall\nnumjobs=4\niodepth=16\n" > "$d/jobs/h1/041-co.job"
+    printf "[global]\nioengine=libaio\n[create]\ncreate_only\nnumjobs=188\niodepth=512\n[io]\nstonewall\nnumjobs=4\niodepth=16\n" > "$d/jobs/h1/042-bare.job"
+    err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); check_aio_room) 2>&1 ) || { echo "stopped with only create_only sections past the room: $err" >>$SUITE_ASIDE; exit 1; }
+    case "$err" in *ERROR*|*WARNING*) echo "$err" >>$SUITE_ASIDE; exit 1;; esac
+    # the control: past the room on the measured section, and behind create_only=0
+    printf "[global]\nioengine=libaio\n[create]\ncreate_only=1\nnumjobs=4\n[io]\nstonewall\nnumjobs=188\niodepth=512\n" > "$d/jobs/h1/043-io.job"
+    printf "[global]\nioengine=libaio\n[create]\ncreate_only=0\nnumjobs=188\niodepth=512\n[io]\nstonewall\nnumjobs=4\niodepth=16\n" > "$d/jobs/h1/044-zero.job"
+    err=$( (source ./wekatester; WORK_DIR=$d; HOSTS=(h1); check_aio_room) 2>&1 ) && { echo "the control did not stop: $err" >>$SUITE_ASIDE; exit 1; }
+    for j in 043-io.job 044-zero.job; do
+        case "$err" in *"ERROR: $j: libaio sets up 96256 aio events at once (numjobs x iodepth) on h1, and the kernel has room for 65536"*) ;; *) echo "the control does not name $j: $err" >>$SUITE_ASIDE; exit 1;; esac
+    done
+    case "$err" in *041-co.job*|*042-bare.job*) echo "a create_only section was counted: $err" >>$SUITE_ASIDE; false;; *) true;; esac'
 t_assert "tuner: a catch-all cpu list the OS reserve empties says so, and how to keep an own reserve" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     # 8 cores, 6 of them weka DPDK: 0-15 covers every cpu fio could use, so
