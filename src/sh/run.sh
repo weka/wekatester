@@ -628,6 +628,15 @@ early_client_cmdline_check() {
     check_client_cmdline "the fio command line for the longest job name this set can stage"
 }
 
+# A job whose fio run passed but whose summary did not: the measurement
+# is in the bundle, so the run goes on to the next job and main exits 1
+# at its end, naming the count (SUMM_FAILED).
+SUMM_FAILED=0
+summ_job_failed() {   # summ_job_failed <job>
+    SUMM_FAILED=$((SUMM_FAILED + 1))
+    log "ERROR: could not summarize $1 (its raw results are in the bundle: results_${1%.job}.json)" >&2
+}
+
 run_jobs() {
     local job outfile report cmd t0 lclients=()
     echo
@@ -665,7 +674,7 @@ run_jobs() {
                 # a sequential write of what was missing: reported as a test
                 log "layout sequential write ($job), the data the sweep found missing, on ${#lclients[@]} host(s):"
                 summ_one "$outfile" "$outfile" layout "${lclients[*]}" file \
-                    || die "failed to summarize $outfile"
+                    || summ_job_failed "$job"
                 continue
             fi
             echo
@@ -702,7 +711,7 @@ run_jobs() {
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
         summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
-            || die "failed to summarize $outfile"
+            || summ_job_failed "$job"
     done
     log "raw fio results: $RUN_DIR/"
     echo

@@ -752,6 +752,10 @@ main() {
     check_mounts_unchanged
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
+    # every job ran; a summary that failed (summ_job_failed) makes the
+    # run's status 1, the bundle kept as always
+    [ "$SUMM_FAILED" -eq 0 ] \
+        || die "$SUMM_FAILED job(s) could not be summarized (above); their raw results are in the bundle"
 }
 
 # run only when executed, not when sourced (tests source this file)
