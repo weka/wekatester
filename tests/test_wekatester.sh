@@ -1015,8 +1015,8 @@ t_assert "SIGINT during preflight exits 130" bash -c '
 # SIGPID; the run writes its work dir path to <dir>/workdir. The console
 # (stdout and stderr) is the file <dir>/run.out, or with a 5th argument
 # "pipe" a fifo read by a cat (SIGREADER) that copies it there: a pipe into
-# a terminal's `| tee log`, which the test can kill under the run. A 6th
-# argument is run before main, after the stubs (one of them redefined).
+# a terminal's `2>&1 | tee log`, which the test can kill under the run. A
+# 6th argument is run before main, after the stubs (one of them redefined).
 sigcal_launch() {
     local d=$1 tag=$2 prog console=${5:-file}
     mkdir -p "$d/out"
@@ -1096,6 +1096,33 @@ sigcal_bundle() {
     STAMP=${BUNDLE##*/}; STAMP=${STAMP%.tgz}
 }
 export -f sigcal_bundle
+# The run log's relays (start_run_log, PR #47 review): one per stream, each
+# copies its fifo to wekatester.log and to the console while it has one;
+# at the first failed console write it stops writing there and puts one
+# notice in the log. sigcal_notices <archived log> <want> <console record>...:
+# the notice count is <want> (one per lost stream); bash's "write error:
+# Broken pipe" line, the relay's own failed console write, is exactly one
+# per lost stream in the log, before the notices (a later one is a writer
+# that met the dead pipe itself); no console record carries one.
+export SIG_NOTICE="console lost (std"   # "... (stdout): the rest of this log is in the file alone", or (stderr)
+# A relay notices the loss at its first failed write, so a stream nobody
+# writes after the loss gets no notice: this run_host hook raises a stderr
+# WARNING once the test has marked the loss (<dir>/lost), from the cells
+# and from cleanup's host commands.
+export SIG_LOSTHOOK='[ ! -e "$d/lost" ] || log "WARNING: raised after the console loss" >&2'
+sigcal_notices() {
+    local log=$1 want=$2 n f last; shift 2
+    n=$(grep -c "$SIG_NOTICE" "$log")
+    [ "$n" -eq "$want" ] || { echo "$n \"$SIG_NOTICE...\" notice lines in the archived log, want $want (one per lost stream); the log's console/write-error lines:" >&2; grep -n 'console lost\|write error' "$log" >&2; return 1; }
+    n=$(grep -c "write error: Broken pipe" "$log"); last=$(grep -n "$SIG_NOTICE" "$log" | tail -n 1 | cut -d: -f1)
+    [ "$n" -eq "$want" ] && ! tail -n +"$last" "$log" | grep -q "write error: Broken pipe" \
+        || { echo "$n \"write error: Broken pipe\" lines in the archived log, want $want (the relays' own, one per lost stream) and none after the last notice (line $last):" >&2; grep -n "write error" "$log" >&2; return 1; }
+    for f in "$@"; do
+        n=$(grep -c "write error: Broken pipe" "$f")
+        [ "$n" -eq 0 ] || { echo "$n \"write error: Broken pipe\" lines in the console record ${f##*/} (a writer met the dead pipe itself), want 0:" >&2; grep -n "write error" "$f" >&2; return 1; }
+    done
+}
+export -f sigcal_notices
 # sigcal_run <INT|TERM> <rc> [deadconsole]: the signal goes to the process
 # group (INT, what a terminal's Ctrl-C does) or to main alone (TERM, what
 # kill or a job scheduler does). deadconsole: the console is a pipe whose
@@ -1107,7 +1134,7 @@ sigcal_run() {
     local sig=$1 want=$2 mode=${3:-} d tag pid i n0 s0 n1 s1 rc t0 took left w console=file
     d=$(mktemp -d); tag=$$$RANDOM
     [ "$mode" != deadconsole ] || console=pipe
-    sigcal_launch "$d" "$tag" "" 5 "$console" || return 1; pid=$SIGPID
+    sigcal_launch "$d" "$tag" "$SIG_LOSTHOOK" 5 "$console" || return 1; pid=$SIGPID
     # the precondition: a cell in flight on each shape (h1 and h3), asserted
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
@@ -1125,6 +1152,7 @@ sigcal_run() {
         grep -q "starting fio servers on 3 host(s)" "$d/run.out" || { echo "the console pipe never carried the run's start:" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
         kill -TERM "$SIGREADER"; wait "$SIGREADER" 2>&1 || :
         ! sigcal_alive "$SIGREADER" || { echo "the console reader (pid $SIGREADER) survived its TERM" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+        : > "$d/lost"   # cleanup's host commands now raise the stderr WARNING (the hook)
     fi
     t0=$SECONDS
     case $sig in
@@ -1161,8 +1189,10 @@ sigcal_run() {
     sigcal_bundle "$d" || return 1
     tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
     grep -q "stopping fio servers\.\.\." "$d/$STAMP/wekatester.log" || { echo "the archived log does not say the servers were stopped:" >&2; tail -5 "$d/$STAMP/wekatester.log" >&2; return 1; }
-    # (a dead console records nothing of the teardown: the log above is its witness)
-    [ "$console" = pipe ] || case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
+    # (a dead console records nothing of the teardown: the log above is its witness,
+    # with one notice per lost stream, both here)
+    if [ "$console" = pipe ]; then sigcal_notices "$d/$STAMP/wekatester.log" 2 "$d/run.out" || return 1
+    else case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac; fi
     # 5. the dataset is untouched: the only removals are cleanup's, one per host
     left=$(grep -c "|.*rm " "$d/simlog")
     [ "$left" -eq 3 ] || { echo "$left rm commands in the simlog, want cleanup's 3:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
@@ -1181,7 +1211,7 @@ t_assert "signal: TERM to the controller alone during calibration with cells in 
 # tee exited 130 and tore down. The mechanism, from the source: the tee dies
 # with the group, the run log's tees die on their next console write, and
 # main's first log line in cleanup hits a readerless fifo (SIGPIPE).
-t_assert "signal: Ctrl-C with the console pipe already closed (as under | tee) still exits 130, stops every cell and server, and keeps the bundle" bash -c '
+t_assert "signal: Ctrl-C with the console pipe already closed (as under | tee) still exits 130, stops every cell and server, keeps the bundle, one notice per lost stream" bash -c '
     source ./tests/helpers.sh; signal_trappable INT && signal_trappable PIPE || exit 1
     out=$(sigcal_run INT 130 deadconsole 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 # A console lost without a signal (the terminal's tee gone, an ssh session
@@ -1194,7 +1224,7 @@ consolelost_run() {
     local d tag pid i rc t0 took w n1 s1 pre lockdir=/dev/shm/wt-lock-sim
     d=$(mktemp -d); tag=$$$RANDOM
     pre="preflight() { LOCK_DIR=$lockdir; LOCK_TOKEN=wtsig; RUN_LOCKS=([h1]=1 [h2]=1 [h3]=1); }"
-    sigcal_launch "$d" "$tag" "" 0 pipe "$pre" || return 1; pid=$SIGPID   # cells of a few tenths of a second
+    sigcal_launch "$d" "$tag" "$SIG_LOSTHOOK" 0 pipe "$pre" || return 1; pid=$SIGPID   # cells of a few tenths of a second
     # the precondition: a cell in flight on each shape, the console still read
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
@@ -1208,6 +1238,7 @@ consolelost_run() {
     # the loss: the reader dies, the run gets no signal
     kill -TERM "$SIGREADER"; wait "$SIGREADER" 2>&1 || :
     ! sigcal_alive "$SIGREADER" || { echo "the console reader (pid $SIGREADER) survived its TERM" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    : > "$d/lost"   # the hook's stderr WARNING from now on
     t0=$SECONDS
     i=0
     while sigcal_alive "$pid" && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
@@ -1249,11 +1280,24 @@ consolelost_run() {
     [ "$n1" -eq 1 ] || { echo "$n1 end-of-calibration scratch removals on the master, want 1:" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
     n1=$(grep -c "|.*rm " "$d/simlog")
     [ "$n1" -eq 7 ] || { echo "$n1 rm commands in the simlog, want 7 (3 lock releases, 3 fio-server stops, the master's scratch):" >&2; grep "|.*rm " "$d/simlog" >&2; return 1; }
+    # 5. the relays noticed the loss once each (both streams went through the one dead fifo)
+    sigcal_notices "$d/$STAMP/wekatester.log" 2 "$d/run.out"
 }
 export -f consolelost_run
-t_assert "signal: a console lost with no signal (its reader gone mid-calibration) keeps the run going to exit 0, the lock released and the bundle's log holding what came after the loss" bash -c '
+t_assert "signal: a console lost with no signal (its reader gone mid-calibration) keeps the run going to exit 0, the lock released and the bundle's log holding what came after the loss, with one notice per lost stream" bash -c '
     source ./tests/helpers.sh; signal_trappable PIPE || exit 1
     out=$(consolelost_run 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# PR #47 review, finding 1: a log() that traps SIGPIPE in the writer keeps
+# a producer alive after its reader is gone (`f | head -1` ran f to its end,
+# its output into the run log). The plain log() dies with its reader, 141.
+# The lines exceed a pipe buffer, so the write after head's exit fails.
+t_assert "a producer that logs into a reader that has quit dies with it (exit 141), not on to the end" bash -c '
+    source ./tests/helpers.sh; signal_trappable PIPE || exit 1
+    err=$(mktemp)
+    (source ./wekatester; printf -v big "%*s" 200000 ""; i=0; while [ "$i" -lt 20 ]; do log "$big"; i=$((i + 1)); done) 2>"$err" | head -n 1 > "$err.out"
+    rc=${PIPESTATUS[0]}
+    [ "$rc" -eq 141 ] || { { echo "the producer exited $rc after its reader quit, want 141 (SIGPIPE); its stderr:"; head -3 "$err"; } >>$SUITE_ASIDE; rm -f "$err" "$err.out"; exit 1; }
+    rm -f "$err" "$err.out"'
 # A shape that fails a cell stops the other shapes (calibrate: kill, wait;
 # cal_shape_stop on TERM stops that shape's own cells). The first cell on h1
 # (shape 1) fails once shape 2 has a cell in flight on h3, plus a second of
