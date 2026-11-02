@@ -30,13 +30,13 @@ start_run_log() {
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
-# Each fifo line goes to the log file, and to the console while it has one.
-# The first console write that fails retires the console with a notice in
-# the file: no writer meets a dead pipe, and the relay exits 1. Builtins
-# only: ignored SIGPIPE reaches no child.
+# Each fifo line goes to the log file and to a live console. A failed console
+# write retires it with a notice; the relay exits 1. Group signals ignored,
+# EOF ends it (a group INT was seen to end an async subshell). Builtins
+# only: no child inherits that.
 run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
     local l ts con=1
-    trap '' PIPE
+    trap '' INT TERM HUP QUIT PIPE
     exec 7>>"$RUN_DIR/wekatester.log"
     while IFS= read -r l || [ -n "$l" ]; do
         printf '%s\n' "$l" >&7
