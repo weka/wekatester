@@ -226,7 +226,7 @@ cleanup() {
             run_host "$host" "$kcmd" &
             pids+=($!)
         done
-        # These pids only: a bare wait also waits on the run-log tees, which
+        # These pids only: a bare wait also waits on the run-log relays, which
         # exit only after cleanup returns. That is a deadlock.
         wait "${pids[@]}" || true
     fi

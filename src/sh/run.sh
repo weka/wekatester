@@ -11,34 +11,40 @@ report_items() {   # report_items <jobfile>
 # outcome (README, Output).
 
 # Everything printed is also written to $RUN_DIR/wekatester.log. Two fifos
-# and two tees, not process substitution: bash before 5.1 cannot wait on a
-# substituted process, and finalize must drain the log before archiving.
-TEE_PIDS=()
+# and two relays (below), not process substitution: bash before 5.1 cannot
+# wait on a substituted process, and finalize must drain the log before
+# archiving.
+RELAY_PIDS=()
 start_run_log() {
-    local p="$WORK_DIR/log" tp="" _o
-    # coreutils tee -p drops an output that fails and keeps the rest: a
-    # Ctrl-C under `... | tee run.log` kills that tee, and a run-log tee
-    # without -p dies with it (console_lost takes over).
-    if _o=$(printf '' | tee -p 2>&1) && [ -z "$_o" ]; then tp=-p; fi
+    local p="$WORK_DIR/log"
     mkdir "$p" || die "cannot create log pipe dir $p"
     mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
-    tee $tp -a "$RUN_DIR/wekatester.log" < "$p/out" &
-    TEE_PIDS+=($!)
-    tee $tp -a "$RUN_DIR/wekatester.log" >&2 < "$p/err" &
-    TEE_PIDS+=($!)
+    # Forked before the exec, so each relay inherits the console it writes.
+    run_log_relay "$p/out" 1 stdout &
+    RELAY_PIDS+=($!)
+    run_log_relay "$p/err" 2 stderr &
+    RELAY_PIDS+=($!)
     # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
     # already closed by the time the run phase starts).
     exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
-# The SIGPIPE trap, set in log() and in main: stdout or stderr lost its
-# reader (the console's `| tee` died) and, without tee -p, the run-log tees
-# with it. Untrapped it ended the writer: rc 141, no teardown. Writes go
-# on, into the file when one is open.
-console_lost() {
-    [ ${#TEE_PIDS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -w "$RUN_DIR/wekatester.log" ] || return 0
-    exec >>"$RUN_DIR/wekatester.log" 2>&1
+# Each fifo line goes to the log file, and to the console while it has one.
+# The first console write that fails (its `| tee` ended) retires the console
+# with a notice in the file, so no writer meets a dead pipe. Builtins only:
+# ignored SIGPIPE reaches no child.
+run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
+    local l ts con=1
+    trap '' PIPE
+    exec 7>>"$RUN_DIR/wekatester.log"
+    while IFS= read -r l || [ -n "$l" ]; do
+        printf '%s\n' "$l" >&7
+        [ -z "$con" ] || printf '%s\n' "$l" >&"$2" 2>&7 || {
+            con=""; printf -v ts '%(%H:%M:%S)T' -1
+            printf '%s console lost (%s): the rest of this log is in the file alone\n' "$ts" "$3" >&7
+        }
+    done < "$1"
 }
 
 # What started the run, for -s: cmdline is the argv shell-quoted, $0 first;
@@ -398,12 +404,12 @@ finalize_run_dir() {
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
     local zip=-z _o
     if _o=$(command -v pigz); then zip=--use-compress-program=pigz; fi
-    if [ ${#TEE_PIDS[@]} -gt 0 ]; then
-        # Restore the console and let the tees drain: their pipes EOF when
+    if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
+        # Restore the console and let the relays drain: their pipes EOF when
         # these redirected fds close, and only a drained log may be archived.
         exec 1>&5 2>&6 5>&- 6>&-
-        wait "${TEE_PIDS[@]}"
-        TEE_PIDS=()
+        wait "${RELAY_PIDS[@]}"
+        RELAY_PIDS=()
     fi
     if tar "$zip" -cf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
         rm -rf "$RUN_DIR"
@@ -462,7 +468,7 @@ ensure_layout_dirs() {   # ensure_layout_dirs <staged layout jobref>
         run_host "$host" "$cmd" &
         pids+=($!); hs+=("$host")
     done < "$out"
-    # scoped wait, as always: the run-log tees are siblings here
+    # scoped wait, as always: the run-log relays are siblings here
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" || die "cannot pre-create layout directories on ${hs[$i]}"
     done

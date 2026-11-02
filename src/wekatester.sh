@@ -658,14 +658,14 @@ main() {
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
     # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
-    # trap alone runs cleanup (idempotent), keeps the status, then finalizes
-    # the bundle. INT reaches main alone (background subshells ignore it):
-    # cleanup stops calibration's shapes first. SIGPIPE: console_lost
-    # (run.sh), here for main's writes and in log().
+    # trap alone runs cleanup, keeps the status, finalizes the bundle. INT
+    # reaches main alone (background subshells ignore it): cleanup stops
+    # calibration's shapes first. PIPE caught, not ignored: a lost console
+    # fails main's write; children keep the default.
     trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    trap console_lost PIPE
+    trap ':' PIPE
     # After the traps (half-established masters still get torn down), before
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.

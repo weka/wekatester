@@ -152,7 +152,7 @@ test_engines() {
         prove_host_engines "${HOSTS[$i]}" "${HOST_DIRS[$i]}" all $cand &
         et_pids+=($!)
     done
-    # SCOPED wait: a bare wait also waits on the run-log tees, which exit only
+    # SCOPED wait: a bare wait also waits on the run-log relays, which exit only
     # after finalize; it hangs silently here.
     for _p in "${et_pids[@]}"; do wait "$_p"; done
     # rewrite each probe's engines line to the proven subset (untested
@@ -249,7 +249,7 @@ discover_engines() {
         prove_host_engines "$host" "${dir_of[$host]}" first "$@" &
         et_pids+=($!)
     done
-    # SCOPED wait, as in test_engines: the run-log tees never exit here
+    # SCOPED wait, as in test_engines: the run-log relays never exit here
     for _p in ${et_pids[@]+"${et_pids[@]}"}; do wait "$_p"; done
     known=()
     while read -r host c r; do [ "$r" != ok ] || known[$host $c]=ok; done < "$results"

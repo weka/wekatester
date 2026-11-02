@@ -75,7 +75,7 @@ postmortem_hosts() {   # postmortem_hosts <what> <jobfile> <local-dir> <remote-d
           fio_parse_postmortem "$what" "$h" "$dst/$h/$jf" "$pre.$h.out" ) > "$td/$i.out" 2> "$td/$i.err" &
         pids+=($!); i=$((i + 1))
     done
-    # SCOPED wait: a bare wait also waits on the run-log tees and hangs
+    # SCOPED wait: a bare wait also waits on the run-log relays and hangs
     for i in "${!pids[@]}"; do wait "${pids[$i]}" || :; done
     for i in "${!pids[@]}"; do
         cat -- "$td/$i.out"; cat -- "$td/$i.err" >&2
