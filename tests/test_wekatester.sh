@@ -1121,7 +1121,7 @@ export -f sigcal_notices
 # kill or a job scheduler does). deadconsole: the console is a pipe whose
 # reader is killed just before the signal, as `wekatester ... 2>&1 | tee
 # log` under a Ctrl-C (the tee dies with the tool's group): a write to it
-# raises SIGPIPE, which must end neither the run log's tees nor the
+# raises SIGPIPE, which must end neither the run log's relays nor the
 # teardown. The console record then stops at the reader's death.
 sigcal_run() {
     local sig=$1 want=$2 mode=${3:-} d tag pid i n0 s0 n1 s1 rc t0 took left w console=file
@@ -2562,11 +2562,11 @@ t_assert "run bundle: the console keeps working after finalize restores it" bash
         *"run bundle: $d/res/20260101-000001.tgz"*) true;;
         *) echo "$out" >&2; false;;
     esac'
-t_assert "run bundle: cleanup returns while the log tees still run (bare-wait deadlock)" bash -c '
+t_assert "run bundle: cleanup returns while the run log's relays still run (bare-wait deadlock)" bash -c '
     d=$(mktemp -d)
-    # cleanup runs BEFORE finalize_run_dir in the EXIT trap, so the two tee
+    # cleanup runs BEFORE finalize_run_dir in the EXIT trap, so the two relay
     # processes are still alive when it waits for its teardown sshs. A bare
-    # `wait` there waits on the tees too -- and they cannot EOF until finalize
+    # `wait` there waits on the relays too -- and they cannot EOF until finalize
     # restores the fds after cleanup returns: a deadlock, seen live on shrw
     # when a failed auto-tune died with the run log active. timeout is the
     # assertion: the deadlocked version never returns.
@@ -5158,7 +5158,7 @@ EOF
         *) echo "$out" >&2; false;;
     esac'
 t_assert "engines: test_engines returns while unrelated background children live (bare-wait)" bash -c '
-    # the run-log tees are alive while test_engines runs; a bare `wait`
+    # the run-log relays are alive while test_engines runs; a bare `wait`
     # there deadlocks on them -- seen live as a silent hang right after the
     # last per-engine warning, with no fio running and no D state
     d=$(mktemp -d); mkdir -p "$d/probe" "$d/dest"; stub=$d/bin; mkdir -p "$stub"
@@ -6509,7 +6509,7 @@ t_assert "prerun warnings: logged live, kept deduplicated, replayed into the run
     (source ./wekatester; RUN_DIR=""; replay_prerun_warnings) &&
     x=$( (source ./wekatester; RUN_DIR=$d/nope; warn_prerun x; replay_prerun_warnings) 2>&1 ) &&
     [ ! -e "$d/nope" ] &&
-    # the run dir exists but the tee has not created the log yet: the replay
+    # the run dir exists but the relay has not created the log yet: the replay
     # must create it rather than skip -- the race a real run has every time
     e=$(mktemp -d) && [ ! -e "$e/wekatester.log" ] &&
     y=$( (source ./wekatester; RUN_DIR=$e; warn_prerun "e f"; replay_prerun_warnings) 2>&1 ) &&
