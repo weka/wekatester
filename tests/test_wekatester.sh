@@ -4317,21 +4317,32 @@ t_assert "run_jobs: a failed layout's postmortem prints in host order when the h
 # but whose summary failed died the run, and every later job was lost. Now
 # the run logs the error, keeps the raw results, runs on, and exits 1 at
 # the end naming how many jobs could not be summarized.
-# summfail_run <bad|good>: main through the run phase on the signal
+# summfail_run <bad|layout|good>: main through the run phase on the signal
 # harness (sigcal_launch, no -a; the phases between calibrate and run_jobs
 # no-ops), two measured jobs whose fio results the run_host hook returns.
 # bad: job 1's results carry "bw_bytez" for "bw_bytes", which the error
-# check never reads and the summary needs. good, the control: both intact.
+# check never reads and the summary needs. layout: a staged layout job
+# runs first, its sequential write (summarized as a test) carries the
+# renamed key, the two measured jobs are intact. good, the control: no
+# layout, both intact.
 summfail_run() {
-    local mode=$1 d tag pid i rc pre hook n
+    local mode=$1 d tag pid i rc pre hook n fj=011-a wantsum=1
     d=$(mktemp -d); tag=$$$RANDOM
     source ./tests/helpers.sh
     fio_json_noagg_fixture "$d/b.json"
-    if [ "$mode" = bad ]; then sed "s/\"bw_bytes\"/\"bw_bytez\"/g" "$d/b.json" > "$d/a.json"; else cp "$d/b.json" "$d/a.json"; fi
-    [ "$mode" = good ] || ! grep -q bw_bytes "$d/a.json" && grep -q bw_bytes "$d/b.json" || { echo "the fixtures are wrong: bw_bytes in a.json $(grep -c bw_bytes "$d/a.json"), in b.json $(grep -c bw_bytes "$d/b.json")" >&2; return 1; }
-    hook="case \"\$2\" in (*\"/011-a.job'\"*) printf '%s|%s\\n' \"\$1\" \"\$2\" >> \"\$SIMLOG\"; cat \"\$d/a.json\"; return 0;; (*\"/012-b.job'\"*) printf '%s|%s\\n' \"\$1\" \"\$2\" >> \"\$SIMLOG\"; cat \"\$d/b.json\"; return 0;; esac"
+    sed "s/\"bw_bytes\"/\"bw_bytez\"/g" "$d/b.json" > "$d/bad.json"
+    ! grep -q bw_bytes "$d/bad.json" && grep -q bw_bytes "$d/b.json" || { echo "the fixtures are wrong: bw_bytes in bad.json $(grep -c bw_bytes "$d/bad.json"), in b.json $(grep -c bw_bytes "$d/b.json")" >&2; return 1; }
+    if [ "$mode" = bad ]; then cp "$d/bad.json" "$d/a.json"; else cp "$d/b.json" "$d/a.json"; fi
+    [ "$mode" != layout ] || { : > "$d/layoutmode"; fj=000-wekatester-layout; wantsum=2; }
+    [ "$mode" != good ] || wantsum=2
+    hook="case \"\$2\" in (*\"/000-wekatester-layout.job'\"*) printf '%s|%s\\n' \"\$1\" \"\$2\" >> \"\$SIMLOG\"; cat \"\$d/bad.json\"; return 0;; (*\"/011-a.job'\"*) printf '%s|%s\\n' \"\$1\" \"\$2\" >> \"\$SIMLOG\"; cat \"\$d/a.json\"; return 0;; (*\"/012-b.job'\"*) printf '%s|%s\\n' \"\$1\" \"\$2\" >> \"\$SIMLOG\"; cat \"\$d/b.json\"; return 0;; esac"
     pre='AUTO_LEVEL=""
-stage_jobfiles() { SET_DIR=$WORK_DIR/rset; mkdir -p "$SET_DIR"; printf "# report bandwidth\n[global]\n[a]\nrw=write\n" > "$SET_DIR/011-a.job"; cp "$SET_DIR/011-a.job" "$SET_DIR/012-b.job"; JOBFILES=(011-a.job 012-b.job); }
+stage_jobfiles() { SET_DIR=$WORK_DIR/rset; mkdir -p "$SET_DIR"; printf "# report bandwidth\n[global]\n[a]\nrw=write\n" > "$SET_DIR/011-a.job"; cp "$SET_DIR/011-a.job" "$SET_DIR/012-b.job"; JOBFILES=(011-a.job 012-b.job)
+    if [ -e "$d/layoutmode" ]; then
+        printf "[global]\ndirectory=/mnt/weka\n[lay]\nrw=write\nfilesize=1G\n" > "$SET_DIR/$LAYOUT_JOB"
+        for h in "${HOSTS[@]}"; do mkdir -p "$WORK_DIR/jobs/$h"; cp "$SET_DIR/$LAYOUT_JOB" "$WORK_DIR/jobs/$h/"; done
+        JOBFILES=("$LAYOUT_JOB" "${JOBFILES[@]}")
+    fi; }
 sweep_layout_grid() { :; }; stage_layout_writes() { :; }; check_capacity() { :; }; push_jobfiles() { :; }
 writeback_targets() { :; }; snapshot_jobfiles() { :; }; check_mounts_unchanged() { :; }'
     sigcal_launch "$d" "$tag" "$hook" 0 file "$pre" || return 1; pid=$SIGPID
@@ -4339,24 +4350,29 @@ writeback_targets() { :; }; snapshot_jobfiles() { :; }; check_mounts_unchanged()
     while sigcal_alive "$pid" && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
     if sigcal_alive "$pid"; then echo "the run (pid $pid) is still alive after 30 s:" >&2; tail -n 5 "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; fi
     wait "$pid"; rc=$?
-    # 1. job 2 ran after job 1's summary failed (its fio command in the simlog)
-    n=$(grep -c "/012-b.job'" "$d/simlog")
-    [ "$n" -eq 1 ] || { echo "job 2 (012-b.job) ran $n times, want 1 (exit $rc); the console's last lines:" >&2; tail -n 4 "$d/run.out" >&2; return 1; }
+    # 1. the measured jobs ran after the failed summary (their fio commands in the simlog)
+    for j in 011-a 012-b; do
+        n=$(grep -c "/$j.job'" "$d/simlog")
+        [ "$n" -eq 1 ] || { echo "$j.job ran $n times, want 1 (exit $rc); the console's last lines:" >&2; tail -n 4 "$d/run.out" >&2; return 1; }
+    done
+    if [ "$mode" = layout ]; then
+        n=$(grep -c "/000-wekatester-layout.job'" "$d/simlog")
+        [ "$n" -eq 1 ] || { echo "the layout ran $n times, want 1:" >&2; tail -n 4 "$d/run.out" >&2; return 1; }
+    fi
     sigcal_bundle "$d" || return 1
     tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
-    # 2. job 2 was summarized either way (the one summary line a write job prints first)
+    # 2. every job whose results were intact was summarized (the one summary line a write job prints first)
     n=$(grep -c "write bandwidth: " "$d/$STAMP/wekatester.log")
+    [ "$n" -eq "$wantsum" ] || { echo "$n job summaries in the log, want $wantsum:" >&2; tail -n 8 "$d/$STAMP/wekatester.log" >&2; return 1; }
     if [ "$mode" = good ]; then
         [ "$rc" -eq 0 ] || { echo "exit $rc with both results intact, want 0:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
-        [ "$n" -eq 2 ] || { echo "$n job summaries in the log, want 2:" >&2; tail -n 8 "$d/$STAMP/wekatester.log" >&2; return 1; }
         n=$(grep -c "ERROR" "$d/$STAMP/wekatester.log")
         [ "$n" -eq 0 ] || { echo "$n ERROR lines with both results intact:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
         return 0
     fi
-    [ "$n" -eq 1 ] || { echo "$n job summaries in the log, want 1 (job 2's):" >&2; tail -n 8 "$d/$STAMP/wekatester.log" >&2; return 1; }
-    # 3. the error names job 1's raw results, which the bundle keeps; the run exits 1 at the end
-    grep -qF "ERROR: could not summarize 011-a.job (its raw results are in the bundle: results_011-a.json)" "$d/$STAMP/wekatester.log" || { echo "no \"could not summarize\" line naming results_011-a.json:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
-    tar -tzf "$BUNDLE" | grep -q "^$STAMP/results_011-a\.json$" || { echo "the bundle lacks results_011-a.json:" >&2; tar -tzf "$BUNDLE" >&2; return 1; }
+    # 3. the error names the failed job's raw results, which the bundle keeps; the run exits 1 at the end
+    grep -qF "ERROR: could not summarize $fj.job (its raw results are in the bundle: results_$fj.json)" "$d/$STAMP/wekatester.log" || { echo "no \"could not summarize\" line naming results_$fj.json:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
+    tar -tzf "$BUNDLE" | grep -qF "$STAMP/results_$fj.json" || { echo "the bundle lacks results_$fj.json:" >&2; tar -tzf "$BUNDLE" >&2; return 1; }
     [ "$rc" -eq 1 ] || { echo "exit $rc after a failed summary, want 1" >&2; return 1; }
     grep -qF "ERROR: 1 job(s) could not be summarized (above); their raw results are in the bundle" "$d/$STAMP/wekatester.log" || { echo "no closing line naming 1 job; the log's last lines:" >&2; tail -n 4 "$d/$STAMP/wekatester.log" >&2; return 1; }
 }
@@ -4364,6 +4380,9 @@ export -f summfail_run
 t_assert "run_jobs: a job whose summary fails logs it, keeps its raw results, runs the next job and ends the run with exit 1 naming 1 job" bash -c '
     source ./tests/helpers.sh
     out=$(summfail_run bad 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "run_jobs: a layout whose sequential-write summary fails logs it, keeps its raw results, runs the measured jobs and ends the run with exit 1 naming 1 job" bash -c '
+    source ./tests/helpers.sh
+    out=$(summfail_run layout 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 t_assert "run_jobs: with every summary intact the same two jobs end the run with exit 0 and no error" bash -c '
     source ./tests/helpers.sh
     out=$(summfail_run good 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
