@@ -9637,6 +9637,55 @@ t_assert "session bound: a pressure session past the bound keeps its partial cap
     [ "$(tail -n 1 "$c")" = "carried on" ] && [ "$(cat "$f/session-timeout-end")" = "pressure (end) cut off after 2 s (WT_SYSINFO_TIMEOUT)" ] &&
     [ "$(cat "$f/kernel-log-end")" = "not available: the session was cut off here, after 2 s (WT_SYSINFO_TIMEOUT)" ] &&
     [ "$(cat "$f/tcp-end")" = "nstat -asz" ] && [ ! -e "$f/sar-end" ] || { ls "$f"; cat "$c"; exit 1; } >&2'
+# A failed run's end capture is the teardown's: bounded by TEARDOWN_CAPTURE_S,
+# not the 300 s of WT_SYSINFO_TIMEOUT (Frank, 2026-11-03). Through cleanup
+# itself, the real run_host over a fake ssh that runs only the capture
+# string, against each host's fixture; h1's kernel log never returns.
+t_assert "session bound: a failed run's end capture is cut off at TEARDOWN_CAPTURE_S, the hung host named, the other complete, nothing of it left alive" bash -c '
+    source ./tests/helpers.sh; d=$(mktemp -d); nic_fixture "$d/h1" && nic_fixture "$d/h2" || exit 1
+    tag=$$$RANDOM; b=2; bash=$(type -P bash)
+    printf "#!/bin/sh\nexec %s 120.%s\n" "$(type -P sleep)" "$tag" > "$d/h1/bin/dmesg"
+    mkdir "$d/ctl"
+    cat > "$d/ctl/ssh" <<EOF
+#!$bash
+h=\${@: -2:1}; c=\${@: -1}
+case \$c in (*WEKATESTER_SYSINFO*) PATH=$d/\$h/bin WEKATESTER_SYSROOT=$d/\$h/root exec $bash -c "\$c" ;; esac
+printf "%s|%s\n" "\$h" "\$c" >> $d/simlog
+EOF
+    chmod +x "$d/ctl/ssh"
+    t0=${EPOCHREALTIME//[!0-9]/}
+    set -m
+    ( export WTSIG_MARK=$tag; source ./wekatester
+      HOSTS=(h1 h2); WORK_DIR=$d/w; RUN_DIR=$d/out; mkdir -p "$WORK_DIR" "$RUN_DIR"; RUN_EPOCH=$(( $(date +%s) - 100 ))
+      FIO_BIN=fio; TARGET_DIR=/dev/shm/x; RUN_RC=1; FIO_STARTED=1; LOCAL_MODE=0; SSH_OPTS=; AUTH_DIR=; PATH=$d/ctl:$PATH
+      TEARDOWN_CAPTURE_S=$b; cleanup; echo "carried on" ) > "$d/console" 2>&1 &
+    p=$!; set +m
+    i=0
+    while _o=$(kill -0 "$p" 2>&1) && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+    ms=$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))
+    if _o=$(kill -0 "$p" 2>&1); then
+        echo "TIMEOUT after $(( ms / 1000 )) s: the teardown has not ended; its last lines:" >&2; tail -n 5 "$d/console" >&2
+        kill -9 -- "-$p" $(marked_pids "$tag") 2>&1; exit 1
+    fi
+    wait "$p"
+    f=$d/out/sysinfo; c=$d/console
+    [ "$ms" -le $(( 2 * b * 1000 )) ] || { echo "the teardown took $ms ms, want within $(( 2 * b )) s" >&2; exit 1; }
+    n=$(grep -c "WARNING: .*h1.*(TEARDOWN_CAPTURE_S)" "$c")
+    [ "$n" -eq 1 ] && ! grep -q "WARNING: .*h2.*cut off" "$c" && [ "$(tail -n 1 "$c")" = "carried on" ] ||
+        { echo "$n cut-off warnings naming h1 and TEARDOWN_CAPTURE_S, want 1 and none for h2:" >&2; cat "$c" >&2; exit 1; }
+    grep -q "(TEARDOWN_CAPTURE_S)" "$f/h1/session-timeout-end" ||
+        { echo "h1 session-timeout-end: $(cat "$f/h1/session-timeout-end" 2>&1)" >&2; exit 1; }
+    [ ! -e "$f/h2/session-timeout-end" ] && [ -s "$f/h2/sar-end" ] || { echo "h2 incomplete:" >&2; ls "$f/h2" >&2; exit 1; }
+    # nothing of the teardown outlives it; a planted survivor is the count'"'"'s control
+    WTSIG_MARK=$tag sleep 30 & pl=$!
+    i=0
+    until marked_pids "$tag" | grep -qx "$pl"; do
+        [ "$i" -lt 50 ] || { echo "the planted survivor $pl is not counted" >&2; kill "$pl"; exit 1; }
+        sleep 0.1; i=$((i + 1))
+    done
+    n=$(marked_pids "$tag" | grep -cvx "$pl")
+    [ "$n" -eq 0 ] || { echo "$n process(es) of the teardown outlived it:" >&2; ps -o pid=,ppid=,command= -p "$(marked_pids "$tag" | grep -vx "$pl" | paste -sd, -)" >&2; kill "$pl"; exit 1; }
+    kill "$pl"; wait "$pl"; true'
 t_assert "session bound: WT_SYSINFO_TIMEOUT that is not a whole number of seconds above 0 stops the run before it starts" bash -c '
     source ./tests/helpers.sh
     for v in abc 0 -5 1.5; do
