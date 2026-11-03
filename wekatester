@@ -9879,14 +9879,33 @@ summ_one() {
             if (kind == "bytes") return "  (min " fz(lo) " " loh ", max " fz(hi) " " hih ")"
             return "  (min " fl(lo) " " loh ", max " fl(hi) " " hih ")"
         }
+        # add entry i into entry d as fio sums entries, the latencies IO-weighted
+        # by their IOs; sumend(d) turns the weighted sums into means
+        function sumin(d, i,   k, x) {
+            for (k in READS) {
+                if (!((i "." k) in v)) continue
+                if (k ~ /lat_ns\.mean$/) {
+                    x = substr(k, 1, index(k, ".") - 1); lhas[d "." x] = 1
+                    lsum[d "." x] += v[i "." k] * (((i "." x ".total_ios") in v) ? v[i "." x ".total_ios"] : 0)
+                }
+                else v[d "." k] += v[i "." k]
+            }
+            if ((i ".read") in dirhas) dirhas[d ".read"] = 1
+            if ((i ".write") in dirhas) dirhas[d ".write"] = 1
+        }
+        function sumend(d,   x) {
+            for (x in DIRS) if ((d "." x) in lhas) v[d "." x ".lat_ns.mean"] = v[d "." x ".total_ios"] ? lsum[d "." x] / v[d "." x ".total_ios"] : 0
+        }
         # only the leaves val() reads are kept: an entry has ~240
-        BEGIN { split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios write.io_bytes", kk, " "); for (j in kk) READS[kk[j]] = 1 }
+        BEGIN { DIRS["read"] = 1; DIRS["write"] = 1
+                split("read.bw_bytes write.bw_bytes read.iops write.iops read.lat_ns.mean write.lat_ns.mean read.total_ios write.total_ios write.io_bytes", kk, " "); for (j in kk) READS[kk[j]] = 1 }
         $1 ~ /^client_stats\.[0-9]+\./ {
             n = split($1, a, "."); i = a[2]; k = a[3]
             for (j = 4; j <= n; j++) k = k "." a[j]
             if (i > maxi) maxi = i
             if (k == "jobname") job[i] = $2
             else if (k == "hostname") host[i] = $2
+            else if (k == "groupid") grp[i] = $2
             else {
                 if (a[3] == "read" || a[3] == "write") dirhas[i "." a[3]] = 1
                 if (k in READS) v[i "." k] = $2 + 0
@@ -9905,7 +9924,20 @@ summ_one() {
                 if (job[i] == "All clients") { alls = i; hasall = 1; continue }
                 h = (i in host) ? host[i] : ((i in job) ? job[i] : "?")
                 if (!(h in hosts)) { hosts[h] = 1; nh++ }
-                last[h] = i
+                last[h] = i; hostof[i] = h
+            }
+            # a host'\''s figures sum its sections in the reported group (that of the
+            # "All clients" entry; with none, all of them): the layout has several
+            # per host, and a measured test'\''s create phase is another group
+            for (i = 0; i <= maxi; i++)
+                if ((i in hostof) && (!hasall || grp[i] == grp[alls])) { h = hostof[i]; sec[h, ++ns[h]] = i }
+            nx = maxi
+            for (h in hosts) {
+                if (ns[h] == 1) last[h] = sec[h, 1]
+                if (ns[h] < 2) continue
+                last[h] = ++nx; seen[nx] = 1
+                for (j = 1; j <= ns[h]; j++) sumin(nx, sec[h, j])
+                sumend(nx)
             }
             if (!hasall) {
                 if (nh == 1) { for (h in hosts) alls = last[h] }
@@ -9913,22 +9945,10 @@ summ_one() {
                     # fio writes no "All clients" when a client'\''s job sections under
                     # one group_reporting group outnumber the groups it reports (the
                     # layout job'\''s shape; fio 3.28 and 3.36 alike): sum the host
-                    # entries as fio would, the latencies IO-weighted by their IOs
-                    alls = maxi + 1; seen[alls] = 1
-                    for (i = 0; i <= maxi; i++) {
-                        if (!(i in seen)) continue
-                        for (k in READS) {
-                            if (!((i "." k) in v)) continue
-                            if (k ~ /lat_ns\.mean$/) {
-                                d = substr(k, 1, index(k, ".") - 1); lhas[d] = 1
-                                lsum[d] += v[i "." k] * (((i "." d ".total_ios") in v) ? v[i "." d ".total_ios"] : 0)
-                            }
-                            else v[alls "." k] += v[i "." k]
-                        }
-                        if ((i ".read") in dirhas) dirhas[alls ".read"] = 1
-                        if ((i ".write") in dirhas) dirhas[alls ".write"] = 1
-                    }
-                    for (d in lhas) v[alls "." d ".lat_ns.mean"] = v[alls "." d ".total_ios"] ? lsum[d] / v[alls "." d ".total_ios"] : 0
+                    # entries as fio would
+                    alls = ++nx; seen[alls] = 1
+                    for (i = 0; i <= maxi; i++) if (i in seen) sumin(alls, i)
+                    sumend(alls)
                 }
                 else { printf "ERR\t%s: no %sAll clients%s aggregate found\n", label, "\047", "\047"; exit }
             }

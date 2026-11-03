@@ -153,22 +153,22 @@ fio_json_fixture() {   # $1 = file to write
 {
   "fio version": "fio-3.35",
   "client_stats": [
-    { "jobname": "create", "hostname": "vega-1",
+    { "jobname": "create", "groupid": 0, "hostname": "vega-1",
       "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
       "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
-    { "jobname": "create", "hostname": "vega-2",
+    { "jobname": "create", "groupid": 0, "hostname": "vega-2",
       "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
       "write": { "bw_bytes": 107374182400, "iops": 900000.0, "total_ios": 900000, "lat_ns": { "mean": 9000000.0 } } },
-    { "jobname": "All clients",
+    { "jobname": "All clients", "groupid": 0,
       "read":  { "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },
       "write": { "bw_bytes": 214748364800, "iops": 1800000.0, "total_ios": 1800000, "lat_ns": { "mean": 9000000.0 } } },
-    { "jobname": "bw", "hostname": "vega-1",
+    { "jobname": "bw", "groupid": 1, "hostname": "vega-1",
       "read":  { "bw_bytes": 2147483648, "iops": 2000.0, "total_ios": 1400, "lat_ns": { "mean": 150000.0 } },
       "write": { "bw_bytes": 1073741824, "iops": 1000.0, "total_ios": 400,  "lat_ns": { "mean": 350000.0 } } },
-    { "jobname": "bw", "hostname": "vega-2",
+    { "jobname": "bw", "groupid": 1, "hostname": "vega-2",
       "read":  { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1600, "lat_ns": { "mean": 250000.0 } },
       "write": { "bw_bytes": 1610612736, "iops": 1500.0, "total_ios": 600,  "lat_ns": { "mean": 450000.0 } } },
-    { "jobname": "All clients",
+    { "jobname": "All clients", "groupid": 1,
       "read":  { "bw_bytes": 4831838208, "iops": 4500.0, "total_ios": 3000, "lat_ns": { "mean": 200000.0 } },
       "write": { "bw_bytes": 2684354560, "iops": 2500.0, "total_ios": 1000, "lat_ns": { "mean": 400000.0 } } }
   ]
