@@ -2347,14 +2347,25 @@ t_assert "tuner: a pristine layout is re-derived per host at every level, coveri
         grep -qx "numjobs=4" "$v2" && ! grep -qx "numjobs=3" "$v2" && ! grep -q "^nrfiles=" "$v2" ||
             { echo "-a $lvl:" >&2; cat "$v1" "$v2" >&2; exit 1; }
     done'
-t_assert "tuner: edited layout at max is staged as-is with a warning" bash -c '
-    source ./tests/helpers.sh; tuner_fixture
-    (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$SUITE_ASIDE
-    echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
-    err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$SUITE_ASIDE )
-    v="$FIX/jobs/h1/000-wekatester-layout.job"
-    grep -q "# operator note" "$v" && ! grep -q "re-derived" "$v" &&
-    case "$err" in *"user-edited layout staged as-is"*) true;; *) echo "$err" >&2; false;; esac'
+# One warning per run, not per host or per layer; a pristine layout is
+# re-derived and warns of nothing (review C01, 2026-11-03).
+t_assert "tuner: edited layout at max is staged as-is with one warning; a pristine one with none" bash -c '
+    source ./tests/helpers.sh
+    for kind in edited pristine; do
+        tuner_fixture
+        (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$SUITE_ASIDE
+        [ "$kind" = pristine ] || echo "# operator note" >> "$FIX/src/000-wekatester-layout.job"
+        err=$( (source ./wekatester; auto_tune "$FIX/src" "$FIX" max /mnt/weka 0 - h1 h2) 2>&1 >>$SUITE_ASIDE )
+        w=$(printf "%s\n" "$err" | grep -c "WARNING")
+        v="$FIX/jobs/h1/000-wekatester-layout.job"
+        if [ "$kind" = edited ]; then
+            grep -q "# operator note" "$v" && ! grep -q "re-derived" "$v" && [ "$w" = 1 ] &&
+            case "$err" in *"user-edited layout staged as-is"*) true;; *) false;; esac || { echo "edited: $w warning(s): $err" >&2; exit 1; }
+        else
+            grep -q "re-derived" "$v" && [ "$w" = 0 ] || { echo "pristine: $w warning(s): $err" >&2; exit 1; }
+        fi
+    done
+    [ "$(printf "x\nWARNING: a\n" | grep -c "WARNING")" = 1 ] || { echo "control: the count missed a planted warning" >&2; exit 1; }'
 # The layout lays out where the measured jobs will run: a host-file dir is
 # that host's destination for the layout too, never the global -d.
 t_assert "tuner: the re-derived layout is marked and lays out at each host's own destination" bash -c '
@@ -5862,7 +5873,7 @@ t_assert "writeback: the host file is replaced whole or not at all -- a writebac
     : > "$f.tmp.ctl"; compgen -G "$f.tmp.*" >>$SUITE_ASIDE || { echo "control: the temp glob missed a planted file" >&2; exit 1; }'
 # Frank (2026-11-03): the host file is written into, never moved over: a
 # symlink given to -t stays a symlink and its target takes the rows; only
-# the file own permissions count, never its directory. A root run writes
+# the file's own permissions count, never its directory. A root run writes
 # a 444 file anyway, so that case is skipped as root.
 t_assert "writeback: the host file is written in place -- a symlink stays a symlink, a read-only directory is no bar, a read-only file stops it untouched" bash -c '
     rows="host,user_login,ioengine\nh1,,psync,,,,,\n"
