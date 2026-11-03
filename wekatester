@@ -145,12 +145,40 @@ host_ssh_opts() {   # host_ssh_opts <host>
     printf '%s' "$HOST_SSH_OPTS"
 }
 
-# RUN_HOST_TIMEOUT=<s> bounds the whole session with timeout(1), which
-# signals only its own process group: exit 124 (137 when TERM was ignored)
-# means the bound fired.
+# timeout -k 5 <s>, with or without timeout(1). Without it, the command and
+# a watchdog each fork as a process group: TERM to the command's group at
+# <s>, KILL 5 s later; the watchdog and its sleep end with the command.
+# 124 (137 after the KILL): the bound fired.
+run_bounded() {   # run_bounded <seconds> <command> [<arg>]...
+    local jc=$- p w st said
+    if said=$(command -v timeout); then
+        timeout -k 5 "$@"
+        return
+    fi
+    set -m
+    "${@:2}" &
+    p=$!
+    ( st=0
+      trap 'exit $st' TERM
+      command sleep "$1" & wait "$!"
+      st=124; said=$(kill -TERM -- "-$p" 2>&1)
+      command sleep 5 & wait "$!"
+      st=137; said=$(kill -KILL -- "-$p" 2>&1)
+      exit $st ) &
+    w=$!
+    case $jc in (*m*) ;; (*) set +m ;; esac
+    wait_through "$p"
+    said=$(kill -TERM -- "-$w" 2>&1) || :
+    wait "$w" && st=0 || st=$?
+    case $st in (124|137) return "$st" ;; esac
+    return "$WAIT_RC"
+}
+
+# RUN_HOST_TIMEOUT=<s> bounds the whole session (run_bounded): exit 124
+# (137 when TERM was ignored) means the bound fired.
 run_host() {   # run_host <host> <command-string>
     local b=()
-    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(timeout -k 5 "$RUN_HOST_TIMEOUT")
+    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(run_bounded "$RUN_HOST_TIMEOUT")
     if [ "$LOCAL_MODE" -eq 1 ]; then
         "${b[@]}" bash -c "$2" </dev/null
     else
@@ -5236,14 +5264,13 @@ port_fail_report() {
     PORT_FAILED=()
 }
 
-# The teardown's remote rounds: each host's session bounded (timeout -k
-# 5) and forked as a process group of its own, so a second Ctrl-C reaches
-# main alone and no stop or release is cut short by it. A failed run's
-# end capture has its own bound, WT_SYSINFO_TIMEOUT.
+# The teardown's remote rounds: each host's session bounded (run_bounded,
+# with or without timeout(1)) and forked as a process group of its own, so
+# a second Ctrl-C reaches main alone and no stop or release is cut short by
+# it. A failed run's end capture has its own bound, WT_SYSINFO_TIMEOUT.
 TEARDOWN_STOP_S=10    # the fio stop and staging removal
 TEARDOWN_LOCK_S=10    # the lock release
 TEARDOWN_MUX_S=5      # each ssh -O exit
-TEARDOWN_TMO=""       # timeout's path, "" when the controller has none
 TEARDOWN_ABORT=0      # a second INT or TERM came during the teardown
 
 # A run ending on a signal says what it does next, once.
@@ -5269,16 +5296,14 @@ teardown_wait() {   # teardown_wait <what happened> <pid> <host> [<pid> <host>].
     shift
     while [ $# -ge 2 ]; do
         wait_through "$1"
-        [ -z "$TEARDOWN_TMO" ] || { [ "$WAIT_RC" -ne 124 ] && [ "$WAIT_RC" -ne 137 ]; } \
-            || log "WARNING: $2: $what" >&2
+        [ "$WAIT_RC" -ne 124 ] && [ "$WAIT_RC" -ne 137 ] || log "WARNING: $2: $what" >&2
         shift 2
     done
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED tmo=() ph=()
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=()
     local -A grm=()
-    TEARDOWN_TMO=$(command -v timeout) || TEARDOWN_TMO=""
     # first: calibration's shape subshells, while the work dir they poll
     # still exists (a signal reached main alone; they would spin forever)
     cal_stop_shapes
@@ -5295,7 +5320,7 @@ cleanup() {
             # the run lock stays until after the end capture, below
             kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
             set -m
-            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_STOP_S} run_host "$host" "$kcmd" &
+            RUN_HOST_TIMEOUT=$TEARDOWN_STOP_S run_host "$host" "$kcmd" &
             set +m
             ph+=($! "$host")
         done
@@ -5332,7 +5357,7 @@ cleanup() {
         fi
         for host in "${!RUN_LOCKS[@]}"; do
             set -m
-            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_LOCK_S} run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
+            RUN_HOST_TIMEOUT=$TEARDOWN_LOCK_S run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
             set +m
             ph+=($! "$host")
         done
@@ -5344,11 +5369,10 @@ cleanup() {
         # hundred hosts), then drop the work dir. -q silences the banner; a
         # failed -O exit still reports on stderr.
         pids=()
-        [ -z "$TEARDOWN_TMO" ] || tmo=("$TEARDOWN_TMO" -k 5 "$TEARDOWN_MUX_S")
         for f in "${CTRL_DIR:-$WORK_DIR/c}"/*; do
             [ -S "$f" ] || continue
             set -m
-            ${tmo[@]+"${tmo[@]}"} ssh -q -O exit -o ControlPath="$f" unused-host-arg &
+            run_bounded "$TEARDOWN_MUX_S" ssh -q -O exit -o ControlPath="$f" unused-host-arg &
             set +m
             pids+=($!)
         done
@@ -8322,11 +8346,7 @@ $(sysinfo_nic_cmd)"
 # WT_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
 # capture, which says where it stopped plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc o f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
-    if ! o=$(command -v timeout); then
-        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WT_SYSINFO_TIMEOUT)" >&2
-        t=
-    fi
+    local host i rc f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
     for host in "${HOSTS[@]}"; do
         ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
         pids+=($!); hs+=("$host")
@@ -8334,7 +8354,7 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" && continue
         rc=$?
-        if [ -z "$t" ] || { [ $rc -ne 124 ] && [ $rc -ne 137 ]; }; then
+        if [ $rc -ne 124 ] && [ $rc -ne 137 ]; then
             log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
         fi
         log "WARNING: $1 on ${hs[$i]} cut off after $t s (WT_SYSINFO_TIMEOUT); the partial capture is kept" >&2

@@ -51,12 +51,40 @@ host_ssh_opts() {   # host_ssh_opts <host>
     printf '%s' "$HOST_SSH_OPTS"
 }
 
-# RUN_HOST_TIMEOUT=<s> bounds the whole session with timeout(1), which
-# signals only its own process group: exit 124 (137 when TERM was ignored)
-# means the bound fired.
+# timeout -k 5 <s>, with or without timeout(1). Without it, the command and
+# a watchdog each fork as a process group: TERM to the command's group at
+# <s>, KILL 5 s later; the watchdog and its sleep end with the command.
+# 124 (137 after the KILL): the bound fired.
+run_bounded() {   # run_bounded <seconds> <command> [<arg>]...
+    local jc=$- p w st said
+    if said=$(command -v timeout); then
+        timeout -k 5 "$@"
+        return
+    fi
+    set -m
+    "${@:2}" &
+    p=$!
+    ( st=0
+      trap 'exit $st' TERM
+      command sleep "$1" & wait "$!"
+      st=124; said=$(kill -TERM -- "-$p" 2>&1)
+      command sleep 5 & wait "$!"
+      st=137; said=$(kill -KILL -- "-$p" 2>&1)
+      exit $st ) &
+    w=$!
+    case $jc in (*m*) ;; (*) set +m ;; esac
+    wait_through "$p"
+    said=$(kill -TERM -- "-$w" 2>&1) || :
+    wait "$w" && st=0 || st=$?
+    case $st in (124|137) return "$st" ;; esac
+    return "$WAIT_RC"
+}
+
+# RUN_HOST_TIMEOUT=<s> bounds the whole session (run_bounded): exit 124
+# (137 when TERM was ignored) means the bound fired.
 run_host() {   # run_host <host> <command-string>
     local b=()
-    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(timeout -k 5 "$RUN_HOST_TIMEOUT")
+    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(run_bounded "$RUN_HOST_TIMEOUT")
     if [ "$LOCAL_MODE" -eq 1 ]; then
         "${b[@]}" bash -c "$2" </dev/null
     else

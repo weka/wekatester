@@ -205,14 +205,13 @@ port_fail_report() {
     PORT_FAILED=()
 }
 
-# The teardown's remote rounds: each host's session bounded (timeout -k
-# 5) and forked as a process group of its own, so a second Ctrl-C reaches
-# main alone and no stop or release is cut short by it. A failed run's
-# end capture has its own bound, WT_SYSINFO_TIMEOUT.
+# The teardown's remote rounds: each host's session bounded (run_bounded,
+# with or without timeout(1)) and forked as a process group of its own, so
+# a second Ctrl-C reaches main alone and no stop or release is cut short by
+# it. A failed run's end capture has its own bound, WT_SYSINFO_TIMEOUT.
 TEARDOWN_STOP_S=10    # the fio stop and staging removal
 TEARDOWN_LOCK_S=10    # the lock release
 TEARDOWN_MUX_S=5      # each ssh -O exit
-TEARDOWN_TMO=""       # timeout's path, "" when the controller has none
 TEARDOWN_ABORT=0      # a second INT or TERM came during the teardown
 
 # A run ending on a signal says what it does next, once.
@@ -238,16 +237,14 @@ teardown_wait() {   # teardown_wait <what happened> <pid> <host> [<pid> <host>].
     shift
     while [ $# -ge 2 ]; do
         wait_through "$1"
-        [ -z "$TEARDOWN_TMO" ] || { [ "$WAIT_RC" -ne 124 ] && [ "$WAIT_RC" -ne 137 ]; } \
-            || log "WARNING: $2: $what" >&2
+        [ "$WAIT_RC" -ne 124 ] && [ "$WAIT_RC" -ne 137 ] || log "WARNING: $2: $what" >&2
         shift 2
     done
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED tmo=() ph=()
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=()
     local -A grm=()
-    TEARDOWN_TMO=$(command -v timeout) || TEARDOWN_TMO=""
     # first: calibration's shape subshells, while the work dir they poll
     # still exists (a signal reached main alone; they would spin forever)
     cal_stop_shapes
@@ -264,7 +261,7 @@ cleanup() {
             # the run lock stays until after the end capture, below
             kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
             set -m
-            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_STOP_S} run_host "$host" "$kcmd" &
+            RUN_HOST_TIMEOUT=$TEARDOWN_STOP_S run_host "$host" "$kcmd" &
             set +m
             ph+=($! "$host")
         done
@@ -301,7 +298,7 @@ cleanup() {
         fi
         for host in "${!RUN_LOCKS[@]}"; do
             set -m
-            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_LOCK_S} run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
+            RUN_HOST_TIMEOUT=$TEARDOWN_LOCK_S run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
             set +m
             ph+=($! "$host")
         done
@@ -313,11 +310,10 @@ cleanup() {
         # hundred hosts), then drop the work dir. -q silences the banner; a
         # failed -O exit still reports on stderr.
         pids=()
-        [ -z "$TEARDOWN_TMO" ] || tmo=("$TEARDOWN_TMO" -k 5 "$TEARDOWN_MUX_S")
         for f in "${CTRL_DIR:-$WORK_DIR/c}"/*; do
             [ -S "$f" ] || continue
             set -m
-            ${tmo[@]+"${tmo[@]}"} ssh -q -O exit -o ControlPath="$f" unused-host-arg &
+            run_bounded "$TEARDOWN_MUX_S" ssh -q -O exit -o ControlPath="$f" unused-host-arg &
             set +m
             pids+=($!)
         done

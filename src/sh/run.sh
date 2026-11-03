@@ -108,11 +108,7 @@ $(sysinfo_nic_cmd)"
 # WT_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
 # capture, which says where it stopped plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc o f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
-    if ! o=$(command -v timeout); then
-        log "WARNING: timeout is not installed on this controller: the $1 sessions are not bounded (WT_SYSINFO_TIMEOUT)" >&2
-        t=
-    fi
+    local host i rc f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
     for host in "${HOSTS[@]}"; do
         ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
         pids+=($!); hs+=("$host")
@@ -120,7 +116,7 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" && continue
         rc=$?
-        if [ -z "$t" ] || { [ $rc -ne 124 ] && [ $rc -ne 137 ]; }; then
+        if [ $rc -ne 124 ] && [ $rc -ne 137 ]; then
             log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
         fi
         log "WARNING: $1 on ${hs[$i]} cut off after $t s (WT_SYSINFO_TIMEOUT); the partial capture is kept" >&2
