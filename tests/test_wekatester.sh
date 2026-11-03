@@ -5407,11 +5407,11 @@ t_assert "hosts from file: spellings: a name that does not resolve, or whose loo
     [ "$(cat "$d/rc")" = 0 ] && grep -qF "(node1: 192.0.2.1; Node1.lab: getent ahosts node1.lab was cut off after 2 s): fold them? [y/N] no" "$d/out" &&
     [ "$(tr "\n" " " < "$d/hosts")" = "node1 Node1.lab " ] || { h02_show "$d"; exit 1; }
     [ "$ms" -le 4000 ] || { echo "the cut-off lookup took $ms ms, want within 4 s" >&2; exit 1; }'
-t_assert "hosts from file: spellings: a command-line spelling of a file host folds into its row with no row check, counted as given" bash -c '
+t_assert "hosts from file: spellings: a command-line spelling of a file host folds into its row with no row check, the count line counting what runs" bash -c '
     d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1
     h02_run "$d" enter "node1,ubuntu,,,\n" NODE1.lab
     [ "$(cat "$d/rc")" = 0 ] && grep -qF "host NODE1.lab is node1 (same address): folded" "$d/out" &&
-    grep -qF "(1 host(s) from the file, 1 more from the command line)" "$d/out" && ! grep -q "settings differ" "$d/out" &&
+    grep -qF "(1 host(s) from the file, 0 more from the command line)" "$d/out" && ! grep -q "settings differ" "$d/out" &&
     [ "$(tr "\n" " " < "$d/hosts")" = "node1 " ] || { h02_show "$d"; exit 1; }'
 t_assert "hosts from file: spellings: three spellings make one fold and one question; an exact duplicate row still stops resolution, nothing looked up" bash -c '
     d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1; h02_dns "$d" node1.b 192.0.2.2
