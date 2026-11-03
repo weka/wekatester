@@ -160,8 +160,11 @@ run_bounded() {   # run_bounded <seconds> <command> [<arg>]...
     set -m
     "${@:2}" &
     p=$!
+    # the TERM below may land before a sleep here is forked and the group
+    # TERM reaches it: the trap ends the current sleep itself, or that sleep
+    # would hold the caller's fds (the run-log fifos, a $( ) pipe) to its end
     ( st=0
-      trap 'exit $st' TERM
+      trap 'said=$(kill -- "$!" 2>&1); exit $st' TERM
       command sleep "$1" & wait "$!"
       st=124; said=$(kill -TERM -- "-$p" 2>&1)
       command sleep 5 & wait "$!"

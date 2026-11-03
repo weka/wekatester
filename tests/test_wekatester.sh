@@ -4595,6 +4595,29 @@ t_assert "signal: with no timeout(1) on the controller, Ctrl-C with one host's f
 t_assert "signal: a second Ctrl-C during the teardown lets every fio stop and lock release finish, skips the bundle naming the uncompressed run dir, and exits 130" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
     out=$(teardown_run second 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# With no timeout(1), the watchdog's 5 s grace sleep could miss the group TERM
+# that ends the watchdog and outlive it, holding the caller's fds: a run ended
+# 5 s late, its run-log fifos still open. Here the grace sleep leaves the group
+# (setsid) and each kill -TERM lingers 0.3 s, so the watchdog forks it first.
+t_assert "run_bounded: with no timeout(1), a grace sleep the group TERM missed ends with the watchdog, not holding a \$( ) pipe" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); tag=rb$$$RANDOM; rs=$(type -P sleep); ss=$(type -P setsid) || { echo "no setsid on the PATH" >&2; exit 1; }
+    mkdir "$d/bin"; ln -s "$(type -P bash)" "$d/bin/bash"
+    printf "#!/usr/bin/env bash\n[ \"\$1\" != 5 ] || exec %s %s 5\nexec %s \"\$@\"\n" "$ss" "$rs" "$rs" > "$d/bin/sleep"; chmod +x "$d/bin/sleep"
+    source ./wekatester
+    kill() { [ "$1" != -TERM ] || "$rs" 0.3; builtin kill "$@"; }
+    op=$PATH; PATH=$d/bin
+    if o=$(command -v timeout); then echo "timeout still on the PATH: $o" >&2; exit 1; fi
+    t0=${EPOCHREALTIME//[!0-9]/}
+    out=$(WTSIG_MARK=$tag run_bounded 1 "$rs" 37 2>&1); rc=$?
+    ms=$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))
+    PATH=$op; unset -f kill
+    left=$(marked_pids "$tag" | paste -sd, -)
+    [ -z "$left" ] || { ps -o pid=,pgid=,command= -p "$left" >&2; for p in ${left//,/ }; do kill -9 "$p"; done; }
+    [ "$rc" -eq 124 ] || { echo "rc $rc, want 124: $out" >&2; exit 1; }
+    [ "$ms" -le 2500 ] || { echo "the \$( ) took $ms ms, want within 2.5 s (1 s bound, 0.6 s of lingering kills)" >&2; exit 1; }
+    [ -z "$left" ] || { echo "processes outlived run_bounded: $left" >&2; exit 1; }
+    rm -rf -- "${d:?}"'
 # The sweep deleted every file short of its size, so an interrupted layout
 # started that file over; now it lists sizes and the layout extends.
 t_assert "sweep: one listing per namespace into the host's sizes file, nothing deleted" bash -c '
