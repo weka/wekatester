@@ -4616,7 +4616,7 @@ check_fio_versions() {
         for k in "${!rows[@]}"; do log "ERROR:   ${rows[$k]}" >&2; done
     fi
     [ ${#bad[@]} -eq 0 ] \
-        || die "cannot read the fio version on ${#bad[@]} of ${#HOSTS[@]} host(s), so there is nothing to compare: the run stopped before any fio server started"
+        || die "cannot read the fio version on ${#bad[@]} of ${#HOSTS[@]} host(s): the run stopped before any fio server started"
     die "fio differs across the hosts (${#vers[@]} versions): the run stopped before any fio server started -- install one fio version on every host, or --allow-fio-mismatch runs anyway"
 }
 
