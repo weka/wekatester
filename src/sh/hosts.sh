@@ -232,13 +232,22 @@ writeback_targets() {
     # as empty: the merge's own-row protection rests on them.
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
         > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
-    local h ident=""
+    local h ident="" tmp="$WORK_DIR/hostfile.writeback"
+    [ -w "$wb" ] || die "host file writeback: $wb is not writable; nothing was recorded"
     ident=$(host_idents)
+    # The awk writes the whole new content to our temp and checks it; only
+    # then does one write go into the host file itself (its inode, mode,
+    # owner and any symlink kept). "nothing to record" writes no temp.
     list_staged "$WORK_DIR/staged.list" &&
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
-    WEKATESTER_HOST_IDENT=$ident \
+    WEKATESTER_HOST_IDENT=$ident WEKATESTER_WB_TMP=$tmp \
     awkrun '
-    #@awk writeback_targets' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" || die "host file writeback failed ($wb)"
+    #@awk writeback_targets' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" \
+        || { rm -f -- "${tmp:?}"; die "host file writeback failed ($wb)"; }
+    [ -e "$tmp" ] || return 0
+    cat -- "$tmp" > "$wb" \
+        || die "host file writeback: writing $wb failed, it may be cut short; the intended content is in $tmp until the run exits"
+    rm -f -- "${tmp:?}"
 }
 
 # The host's destination dir: the finished resolution when it exists, the

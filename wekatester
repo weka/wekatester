@@ -6557,11 +6557,15 @@ writeback_targets() {
     # as empty: the merge's own-row protection rests on them.
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
         > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
-    local h ident=""
+    local h ident="" tmp="$WORK_DIR/hostfile.writeback"
+    [ -w "$wb" ] || die "host file writeback: $wb is not writable; nothing was recorded"
     ident=$(host_idents)
+    # The awk writes the whole new content to our temp and checks it; only
+    # then does one write go into the host file itself (its inode, mode,
+    # owner and any symlink kept). "nothing to record" writes no temp.
     list_staged "$WORK_DIR/staged.list" &&
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
-    WEKATESTER_HOST_IDENT=$ident \
+    WEKATESTER_HOST_IDENT=$ident WEKATESTER_WB_TMP=$tmp \
     awkrun '
     function slurp(path,    L, n, i, v) {   # open(path).read().strip(); slurped: it exists
         slurped = (n = readlines(path, L)) >= 0; v = ""
@@ -6727,9 +6731,18 @@ writeback_targets() {
             if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
         }
         for (a = 5; a < ARGC; a++) if ((ARGV[a] in WANTED) && !(ARGV[a] in PLACED)) O[++no] = render(ARGV[a])
-        writelines(wb, O, no)
+        # into the shell'\''s temp under the work dir, never the host file: the
+        # shell copies it into the file only after this exits 0
+        if ((tmp = ENVIRON["WEKATESTER_WB_TMP"]) == "") awk_fail("no temp path for the host file writeback")
+        writelines(tmp, O, no)
+        if (readlines(tmp, CHK) != no) awk_fail("could not write " tmp)
         print "host file: recorded " nup " host line(s) in " wb " (" mode ")"
-    }' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" || die "host file writeback failed ($wb)"
+    }' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" \
+        || { rm -f -- "${tmp:?}"; die "host file writeback failed ($wb)"; }
+    [ -e "$tmp" ] || return 0
+    cat -- "$tmp" > "$wb" \
+        || die "host file writeback: writing $wb failed, it may be cut short; the intended content is in $tmp until the run exits"
+    rm -f -- "${tmp:?}"
 }
 
 # The host's destination dir: the finished resolution when it exists, the

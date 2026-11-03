@@ -162,6 +162,10 @@ BEGIN {
         if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
     }
     for (a = 5; a < ARGC; a++) if ((ARGV[a] in WANTED) && !(ARGV[a] in PLACED)) O[++no] = render(ARGV[a])
-    writelines(wb, O, no)
+    # into the shell's temp under the work dir, never the host file: the
+    # shell copies it into the file only after this exits 0
+    if ((tmp = ENVIRON["WEKATESTER_WB_TMP"]) == "") awk_fail("no temp path for the host file writeback")
+    writelines(tmp, O, no)
+    if (readlines(tmp, CHK) != no) awk_fail("could not write " tmp)
     print "host file: recorded " nup " host line(s) in " wb " (" mode ")"
 }
