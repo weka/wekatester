@@ -516,7 +516,8 @@ export -f cores_line cores_facts
 lock_fixture() {
     LK=$(mktemp -d)   # leaked on purpose; tests are short-lived
     mkdir -p "$LK/bin" "$LK/w"; : > "$LK/procs"; : > "$LK/alive"; : > "$LK/after"
-    printf '#!/bin/sh\nexit 0\n' > "$LK/bin/fio"
+    # a one-host preflight reads fio --version and stops on a silent one
+    printf '#!/bin/sh\n[ "$1" != --version ] || echo fio-3.35\nexit 0\n' > "$LK/bin/fio"
     cat > "$LK/bin/pgrep" <<EOF
 #!/bin/sh
 [ "\$1" = -x ] || exit 1
