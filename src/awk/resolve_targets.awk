@@ -14,7 +14,8 @@ BEGIN {
         if (!CN[r] || strip(all) == "") continue
         if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
         if (is_setting_cell(CV[r, 1])) continue   # read_settings reads these
-        if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
+        # the header: the first row past blanks, comments and settings
+        if (!seen_row++ && tolower(strip(CV[r, 1])) == "host") continue
         # an unquoted cpu list ("0-3, 8") splits into cells and shifts every
         # later column; trailing empty cells (spreadsheet padding) are fine
         for (w = CN[r]; w > ncols && strip(CV[r, w]) == ""; w--) ;

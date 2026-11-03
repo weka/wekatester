@@ -648,6 +648,15 @@ main() {
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     echo
 
+    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
+    # trap alone runs cleanup (shapes first: INT reaches main alone) and
+    # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
+    # fio still stops, no bundle. PIPE caught, not ignored: children keep
+    # the default. Set before the work dir exists, so no stop leaks it.
+    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap ':' PIPE
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
     make_ctrl_dir
     mkdir -p "$WORK_DIR/jobs"
@@ -659,15 +668,6 @@ main() {
     [ "$LOCAL_MODE" -eq 1 ] || \
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
-    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
-    # trap alone runs cleanup (shapes first: INT reaches main alone) and
-    # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
-    # fio still stops, no bundle. PIPE caught, not ignored: children keep
-    # the default.
-    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap ':' PIPE
     # After the traps (half-established masters still get torn down), before
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.

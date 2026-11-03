@@ -823,6 +823,7 @@ function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
         if (index(P[i], "-")) {
             if (lsplit(P[i], ab, "-") != 2) return 0
             if ((a = py_int(ab[1])) == "" || (b = py_int(ab[2])) == "") return 0
+            if (a + 0 > b + 0) return 0   # backwards, 4-2: bad, not empty
             for (c = a; c <= b; c++) S[c] = 1
         } else if (P[i] != "") {
             if ((a = py_int(P[i])) == "") return 0
@@ -4450,7 +4451,8 @@ calibrate() {
 declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
 LOCK_TOKEN=""
 lock_token() {   # lock_token -> LOCK_TOKEN
-    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S)T' \
+    # the stamp carries its UTC offset: another machine reads it in its own zone
+    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S %z)T' \
         "$(local_short_hostname)" "$$" "$(id -un)" -1
     LOCK_TOKEN=${LOCK_TOKEN//\'/}
 }
@@ -4504,8 +4506,8 @@ lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
 
 # Every host reachable over ssh with $FIO_BIN, checked in parallel, every
 # failure reported. Each check opens the host ControlMaster for the run, and
-# takes the run lock. With two hosts or more the same session first prints
-# fio --version as "fio-version <rc> <first line>", for check_fio_versions.
+# takes the run lock. The same session first prints fio --version as
+# "fio-version <rc> <first line>", for check_fio_versions.
 FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
@@ -4518,8 +4520,7 @@ preflight() {
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
     load_host_dirs
-    [ ${#HOSTS[@]} -lt 2 ] \
-        || fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
+    fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
     FIO_VERSIONS=()
     for i in "${!HOSTS[@]}"; do
         run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
@@ -4571,11 +4572,6 @@ preflight() {
 # (a warning). FIO_VERSION_NOTE says what was found.
 FIO_VERSION_NOTE=""
 check_fio_versions() {
-    if [ ${#HOSTS[@]} -lt 2 ]; then
-        FIO_VERSION_NOTE="one host, nothing to compare"
-        debug "fio version: $FIO_VERSION_NOTE"
-        return 0
-    fi
     local i k v rc bad=() vers=() cnt=() who=() rows=() why
     for i in "${!HOSTS[@]}"; do
         if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
@@ -4599,6 +4595,7 @@ check_fio_versions() {
     done
     if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
         FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
+        [ ${#HOSTS[@]} -gt 1 ] || FIO_VERSION_NOTE="${vers[0]} on the one host"
         log "fio version: $FIO_VERSION_NOTE"
         return 0
     fi
@@ -7001,7 +6998,8 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                 if (!CN[r] || strip(all) == "") continue
                 if (substr(strip(CV[r, 1]), 1, 1) == "#") continue
                 if (is_setting_cell(CV[r, 1])) continue   # read_settings reads these
-                if (r == 1 && tolower(strip(CV[r, 1])) == "host") continue   # the header
+                # the header: the first row past blanks, comments and settings
+                if (!seen_row++ && tolower(strip(CV[r, 1])) == "host") continue
                 # an unquoted cpu list ("0-3, 8") splits into cells and shifts every
                 # later column; trailing empty cells (spreadsheet padding) are fine
                 for (w = CN[r]; w > ncols && strip(CV[r, w]) == ""; w--) ;
@@ -7437,9 +7435,11 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
     local job LC_ALL=C
     JOBFILES=()
     for job in "$1"/[0-9]*; do
-        [ -f "$job" ] || die "no jobfiles found in $1"
-        JOBFILES+=("${job##*/}")
+        if [ -f "$job" ]; then JOBFILES+=("${job##*/}")
+        elif [ -e "$job" ] || [ -L "$job" ]; then log "WARNING: skipping $job: not a regular file" >&2
+        fi   # else the pattern itself: nothing matched
     done
+    [ ${#JOBFILES[@]} -gt 0 ] || die "no jobfiles found in $1 (a jobfile's name starts with a digit)"
 }
 
 # A filename_format with a blank is refused (Frank, 2026-10-11): the seed,
@@ -8271,7 +8271,7 @@ stage_jobfiles() {
             fi
             has_layout=1
         fi
-        cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
+        cp "$JOBFILE_SRC/$job" "$SET_DIR/$job" || die "cannot copy jobfile $job into the staged set"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins
@@ -10002,6 +10002,15 @@ main() {
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     echo
 
+    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
+    # trap alone runs cleanup (shapes first: INT reaches main alone) and
+    # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
+    # fio still stops, no bundle. PIPE caught, not ignored: children keep
+    # the default. Set before the work dir exists, so no stop leaks it.
+    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap ':' PIPE
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
     make_ctrl_dir
     mkdir -p "$WORK_DIR/jobs"
@@ -10013,15 +10022,6 @@ main() {
     [ "$LOCAL_MODE" -eq 1 ] || \
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
-    # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
-    # trap alone runs cleanup (shapes first: INT reaches main alone) and
-    # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
-    # fio still stops, no bundle. PIPE caught, not ignored: children keep
-    # the default.
-    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap ':' PIPE
     # After the traps (half-established masters still get torn down), before
     # preflight (every later ssh rides the winning session). -t: the pre-auth
     # phase supplies the per-host logins the auth rounds use.

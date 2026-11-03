@@ -151,6 +151,7 @@ function parse_cpulist(s, S,    n, P, i, ab, a, b, c) {
         if (index(P[i], "-")) {
             if (lsplit(P[i], ab, "-") != 2) return 0
             if ((a = py_int(ab[1])) == "" || (b = py_int(ab[2])) == "") return 0
+            if (a + 0 > b + 0) return 0   # backwards, 4-2: bad, not empty
             for (c = a; c <= b; c++) S[c] = 1
         } else if (P[i] != "") {
             if ((a = py_int(P[i])) == "") return 0

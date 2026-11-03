@@ -13,9 +13,11 @@ discover_jobfiles() {   # discover_jobfiles <dir>; sets JOBFILES in run order
     local job LC_ALL=C
     JOBFILES=()
     for job in "$1"/[0-9]*; do
-        [ -f "$job" ] || die "no jobfiles found in $1"
-        JOBFILES+=("${job##*/}")
+        if [ -f "$job" ]; then JOBFILES+=("${job##*/}")
+        elif [ -e "$job" ] || [ -L "$job" ]; then log "WARNING: skipping $job: not a regular file" >&2
+        fi   # else the pattern itself: nothing matched
     done
+    [ ${#JOBFILES[@]} -gt 0 ] || die "no jobfiles found in $1 (a jobfile's name starts with a digit)"
 }
 
 # A filename_format with a blank is refused (Frank, 2026-10-11): the seed,
@@ -294,7 +296,7 @@ stage_jobfiles() {
             fi
             has_layout=1
         fi
-        cp "$JOBFILE_SRC/$job" "$SET_DIR/$job"
+        cp "$JOBFILE_SRC/$job" "$SET_DIR/$job" || die "cannot copy jobfile $job into the staged set"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins

@@ -5,7 +5,8 @@
 declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
 LOCK_TOKEN=""
 lock_token() {   # lock_token -> LOCK_TOKEN
-    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S)T' \
+    # the stamp carries its UTC offset: another machine reads it in its own zone
+    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S %z)T' \
         "$(local_short_hostname)" "$$" "$(id -un)" -1
     LOCK_TOKEN=${LOCK_TOKEN//\'/}
 }
@@ -59,8 +60,8 @@ lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
 
 # Every host reachable over ssh with $FIO_BIN, checked in parallel, every
 # failure reported. Each check opens the host ControlMaster for the run, and
-# takes the run lock. With two hosts or more the same session first prints
-# fio --version as "fio-version <rc> <first line>", for check_fio_versions.
+# takes the run lock. The same session first prints fio --version as
+# "fio-version <rc> <first line>", for check_fio_versions.
 FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
@@ -73,8 +74,7 @@ preflight() {
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
     load_host_dirs
-    [ ${#HOSTS[@]} -lt 2 ] \
-        || fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
+    fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
     FIO_VERSIONS=()
     for i in "${!HOSTS[@]}"; do
         run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
@@ -126,11 +126,6 @@ preflight() {
 # (a warning). FIO_VERSION_NOTE says what was found.
 FIO_VERSION_NOTE=""
 check_fio_versions() {
-    if [ ${#HOSTS[@]} -lt 2 ]; then
-        FIO_VERSION_NOTE="one host, nothing to compare"
-        debug "fio version: $FIO_VERSION_NOTE"
-        return 0
-    fi
     local i k v rc bad=() vers=() cnt=() who=() rows=() why
     for i in "${!HOSTS[@]}"; do
         if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
@@ -154,6 +149,7 @@ check_fio_versions() {
     done
     if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
         FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
+        [ ${#HOSTS[@]} -gt 1 ] || FIO_VERSION_NOTE="${vers[0]} on the one host"
         log "fio version: $FIO_VERSION_NOTE"
         return 0
     fi
