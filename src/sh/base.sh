@@ -59,7 +59,9 @@ run_bounded() {   # run_bounded <seconds> <command> [<arg>]...
     local jc=$- p w st said
     if said=$(command -v timeout); then
         timeout -k 5 "$@"
-        return
+        # $?, not a bare return: in a subshell of the EXIT trap, bash 5.1's
+        # bare return gave the trap's 130 instead of timeout's 124
+        return $?
     fi
     set -m
     "${@:2}" &
