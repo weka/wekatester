@@ -707,31 +707,19 @@ cal_search_ask() {   # cal_search_ask <search-index>
     esac
 }
 
-# A pause with no process: a read that times out on a fifo nobody writes
-# (the settle test counts every sleep the cells make).
+# A pause: a child sleep and a wait on it, which a trapped signal returns
+# at once. Not `read -t`: a handler inside it was seen abandoned (bash 5.3),
+# crashing bash (5.1), a shape stuck in it. `command`: the settle test
+# stubs sleep, counting only settles.
 cal_pause() {   # cal_pause <seconds>
-    local said
-    [ -n "${CAL_PAUSE_FD:-}" ] || {
-        # two shapes may make it at once: the loser finds the winner's
-        [ -p "$WORK_DIR/cal/.pause" ] || said=$(mkfifo "$WORK_DIR/cal/.pause" 2>&1) || [ -p "$WORK_DIR/cal/.pause" ] \
-            || die "cannot create $WORK_DIR/cal/.pause: $said"
-        exec {CAL_PAUSE_FD}<>"$WORK_DIR/cal/.pause"
-    }
-    read -r -t "$1" -u "$CAL_PAUSE_FD" _ || :
-    # a TERM that landed in the read, or anywhere before: the stop runs here,
-    # never in the handler -- a handler entered from this read was seen
-    # abandoned, the shape resuming its loop, once a command substitution in
-    # it outlived the read's timeout (bash 5.3.20, traced 2026-10-29)
+    local p said
+    command sleep "$1" &
+    p=$!
+    # a wait a signal cut short leaves the sleep running: it goes too
+    wait "$p" || said=$(kill "$p" 2>&1) || :
+    # a TERM that landed in the wait, or anywhere before: the stop runs here,
+    # never in the handler
     [ "${CAL_SHAPE_TERM:-0}" -eq 0 ] || cal_shape_stop
-}
-
-# main's pause: the timed read runs in a child, main sits in wait, which
-# a trapped INT or TERM returns at once, the trap run at command level (a
-# handler run inside `read -t`, its alarm armed, crashed bash 5.1). No
-# sleep: the settle test counts those.
-cal_wait_pause() {   # cal_wait_pause <seconds>
-    ( cal_pause "$1" ) &
-    wait "$!" || :
 }
 
 cal_dispatch() {   # cal_dispatch engines|searches
@@ -832,7 +820,7 @@ cal_dispatch() {   # cal_dispatch engines|searches
             others=(); for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done; pids=("${others[@]}")
             any=1
         done
-        [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.05
+        [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.1
     done
 }
 
@@ -1278,7 +1266,7 @@ calibrate() {
             cal_stop_tree ${pids[@]} ${CAL_CELL_GROUPS[@]+"${CAL_CELL_GROUPS[@]}"}
             live=0; break
         done
-        [ "$live" -eq 0 ] || cal_wait_pause 0.2
+        [ "$live" -eq 0 ] || cal_pause 0.2
     done
     CAL_SHAPE_PIDS=()
     [ -z "$failed" ] || die "calibration of shape $failed failed (above); the other shapes were stopped"
