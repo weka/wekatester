@@ -138,6 +138,7 @@ host_alias_env() {   # host_alias_env <host>... -> "name=addr,name=addr"
 HOST_FOLD_NEEDS_SAME_ROWS=1   # two file rows fold only when their own settings match
 HOST_LOOKUP_S=30              # the getent bound; every name looks up at once
 declare -gA HOST_FOLDED_INTO=() HOST_ADDRS_OF=() HOST_ADDRS_WHY_OF=()
+HOST_FOLD_ROWS=""   # "<b>=<a>,..." per folded-away FILE row: an -a writeback comments it out
 
 # One name as one line: name, its sorted getent ahosts addresses (of what the
 # run dials: ssh -G's hostname, ~/.ssh/config and SSH_OPTS applied), and the
@@ -221,7 +222,11 @@ fold_spellings() {
                 k=$a; break
             fi
         done
-        if [ -n "$k" ]; then HOST_FOLDED_INTO[$b]=$k; continue; fi
+        if [ -n "$k" ]; then
+            HOST_FOLDED_INTO[$b]=$k
+            [ -z "${isfile[$b]:-}" ] || HOST_FOLD_ROWS+=${HOST_FOLD_ROWS:+,}$b=$k
+            continue
+        fi
         FOLDED+=("$b"); bylab[$lb]+=" $b"
     done
 }
@@ -341,7 +346,7 @@ writeback_targets() {
     # owner and any symlink kept). "nothing to record" writes no temp.
     list_staged "$WORK_DIR/staged.list" &&
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
-    WEKATESTER_HOST_IDENT=$ident WEKATESTER_WB_TMP=$tmp \
+    WEKATESTER_HOST_IDENT=$ident WEKATESTER_WB_TMP=$tmp WEKATESTER_HOST_FOLD=$HOST_FOLD_ROWS \
     awkrun '
     #@awk writeback_targets' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" \
         || { rm -f -- "${tmp:?}"; die "host file writeback failed ($wb)"; }

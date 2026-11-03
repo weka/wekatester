@@ -41,9 +41,18 @@ function own_line(line,    F, h) {   # the address of the host whose own line th
     OWN_CELL = h
     return host_addr(h, ALIAS)
 }
+function folded_line(line,    F, h) {   # the address of a folded-away host whose line this is, or ""
+    if (!csv_line(line, F)) return ""
+    h = strip(F[1])
+    if (h == "" || substr(h, 1, 1) == "#" || is_glob_cell(h) || is_setting_cell(h)) return ""
+    h = host_addr(h, ALIAS)
+    return (h in FOLD) ? h : ""
+}
 BEGIN {
     wb = ARGV[1]; mode = ARGV[2]; work = ARGV[3]; line_gbps = ARGV[4]
     kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); kv_map(ENVIRON["WEKATESTER_HOST_IDENT"], IDENT)
+    kv_map(ENVIRON["WEKATESTER_HOST_FOLD"], FOLD); nfold = 0   # folded-away row -> the host it is
+    for (h in FOLD) nfold++
     nslot = split(geom_slots(), SLOT, " "); split("nj fs nr qd", TUPLE, " ")
     split("login engine cpus dir", FIELD, " "); nfield = 4
     for (s = 1; s <= nslot; s++) for (q = 1; q <= 4; q++) FIELD[++nfield] = SLOT[s] "_" TUPLE[q]
@@ -149,12 +158,14 @@ BEGIN {
         }
         if (any && !same && !(h in WANTED)) { WANTED[h] = 1; nup++ }
     }
-    if (!nup) { print "host file: nothing to record"; exit 0 }
+    if (!nup && !nfold) { print "host file: nothing to record"; exit 0 }
     # only ever added to: the host own line commented out with its new
-    # version below it, or appended; generic rows untouched
+    # version below it, or appended; a folded-away host's line commented
+    # out; generic rows untouched
     if ((n = readlines(wb, L)) < 0) awk_fail("cannot read " wb)
-    no = 0
+    no = 0; nfd = 0
     for (i = 1; i <= n; i++) {
+        if (nfold && (addr = folded_line(L[i])) != "") { O[++no] = "# folded into " FOLD[addr] ": same host: " L[i]; nfd++; continue }
         if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
         # render reads only its own host's first spelling, set here first
         if (!(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
@@ -162,10 +173,12 @@ BEGIN {
         if (!(addr in PLACED)) { O[++no] = render(addr); PLACED[addr] = 1 }
     }
     for (a = 5; a < ARGC; a++) if ((ARGV[a] in WANTED) && !(ARGV[a] in PLACED)) O[++no] = render(ARGV[a])
+    if (!nup && !nfd) { print "host file: nothing to record"; exit 0 }
     # into the shell's temp under the work dir, never the host file: the
     # shell copies it into the file only after this exits 0
     if ((tmp = ENVIRON["WEKATESTER_WB_TMP"]) == "") awk_fail("no temp path for the host file writeback")
     writelines(tmp, O, no)
     if (readlines(tmp, CHK) != no) awk_fail("could not write " tmp)
-    print "host file: recorded " nup " host line(s) in " wb " (" mode ")"
+    if (nup) print "host file: recorded " nup " host line(s) in " wb " (" mode ")"
+    if (nfd) print "host file: commented out " nfd " folded host line(s) in " wb
 }
