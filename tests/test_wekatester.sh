@@ -4407,17 +4407,39 @@ t_assert "run_jobs: with every summary intact the same two jobs end the run with
 # bounds each host's session and names a host cut off; a second Ctrl-C
 # lets the stops and releases finish and skips only the bundle, the run
 # dir left uncompressed (Frank, 2026-11-03).
-# teardown_run <hang|second>: INT to the group with cells in
+# teardown_run <hang|notimeout|second>: INT to the group with cells in
 # flight on the signal harness, every host holding a run lock. hang: h2's
 # fio stop goes through the real run_host to an ssh that never returns,
-# the bound lowered to 2 s. second: each fio stop takes 2 s and a second
+# the bound lowered to 3 s; notimeout: the same with timeout(1) off the
+# PATH (Frank, 2026-11-03). second: each fio stop takes 2 s and a second
 # INT reaches the group 1 s into the teardown.
+# marked_pids <tag>: the processes carrying WTSIG_MARK=<tag>, which every
+# process of a launched run inherits, a forked one or an exec'd sleep
+marked_pids() { grep -alzx "WTSIG_MARK=$1" /proc/[0-9]*/environ 2>&1 | sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p'; }
+export -f marked_pids
 teardown_run() {
-    local mode=$1 d tag pid i rc t0 took n hook="" pre log rd
+    local mode=$1 d tag pid i rc t0 took ms n hook="" pre log rd stop=3 tpath=$PATH np p f pd fs pl
     d=$(mktemp -d); tag=$$$RANDOM
-    pre='preflight() { LOCK_DIR=/dev/shm/wt-lock-sim; LOCK_TOKEN=wtsig; RUN_LOCKS=([h1]=1 [h2]=1 [h3]=1); }
-TEARDOWN_STOP_S=2'
-    if [ "$mode" = hang ]; then
+    pre='preflight() { LOCK_DIR=/dev/shm/wt-lock-sim; LOCK_TOKEN=wtsig; RUN_LOCKS=([h1]=1 [h2]=1 [h3]=1); }'$'\n'"TEARDOWN_STOP_S=$stop"
+    if [ "$mode" = notimeout ]; then
+        # each PATH dir holding a timeout becomes a dir of links to all but it
+        type -P timeout > "$d/tmo" || { echo "no timeout on the PATH to take away (the control)" >&2; return 1; }
+        np=""; IFS=: read -ra pd <<< "$PATH"
+        for i in "${!pd[@]}"; do
+            p=${pd[$i]}
+            if [ -x "$p/timeout" ]; then
+                fs=(); for f in "$p"/*; do [ "${f##*/}" = timeout ] || fs+=("$f"); done
+                mkdir "$d/nots$i" && ln -s "${fs[@]}" "$d/nots$i/" || return 1
+                p=$d/nots$i
+            fi
+            np+=${np:+:}$p
+        done
+        tpath=$np
+        # inside the run, after the tool is sourced: the mask's positive control
+        pre+='
+if _o=$(command -v timeout); then echo "timeout still on the PATH: $_o" >&2; exit 97; fi; : > "$d/masked"'
+    fi
+    if [ "$mode" != second ]; then
         mkdir "$d/bin"
         printf '#!/usr/bin/env bash\nprintf "h2|ssh-hang %%s\\n" "$*" >> "%s/simlog"\nexec sleep 120.%s\n' "$d" "$tag" > "$d/bin/ssh"
         chmod +x "$d/bin/ssh"
@@ -4428,7 +4450,7 @@ run_host() { case "$1|$2" in ("h2|"*"rm -rf '"'/dev/shm/x' "'"*) PATH=$d/bin:$PA
     else
         hook="case \"\$2\" in (*\"rm -rf '/dev/shm/x' \"*) sleep 2 ;; esac"
     fi
-    sigcal_launch "$d" "$tag" "$hook" 5 file "$pre" || return 1; pid=$SIGPID
+    WTSIG_MARK=$tag PATH=$tpath sigcal_launch "$d" "$tag" "$hook" 5 file "$pre" || return 1; pid=$SIGPID
     # the precondition: a cell in flight on each shape
     i=0
     until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
@@ -4437,7 +4459,7 @@ run_host() { case "$1|$2" in ("h2|"*"rm -rf '"'/dev/shm/x' "'"*) PATH=$d/bin:$PA
         fi
         sleep 0.1; i=$((i + 1))
     done
-    t0=$SECONDS
+    t0=${EPOCHREALTIME//[!0-9]/}
     kill -INT -- "-$pid"
     if [ "$mode" = second ]; then
         i=0
@@ -4449,10 +4471,10 @@ run_host() { case "$1|$2" in ("h2|"*"rm -rf '"'/dev/shm/x' "'"*) PATH=$d/bin:$PA
         sigcal_alive "$pid" || { echo "the run ended before the second INT (the stops take 2 s)" >&2; return 1; }
         kill -INT -- "-$pid"
     fi
-    # the bound: the 2 s stops, timeout's 5 s KILL grace and the cells' end
+    # the outer bound: the stops, a 5 s KILL grace and the cells' end
     i=0
     while sigcal_alive "$pid" && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
-    took=$(( SECONDS - t0 ))
+    ms=$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 )); took=$(( ms / 1000 ))
     if sigcal_alive "$pid"; then
         echo "TIMEOUT after $took s: the teardown has not ended; its last lines:" >&2; tail -n 5 "$d/run.out" >&2
         kill -9 -- "-$pid" 2>&1 || :; pkill -9 -fx "sleep 120\.$tag" 2>&1 || :; return 1
@@ -4483,12 +4505,22 @@ run_host() { case "$1|$2" in ("h2|"*"rm -rf '"'/dev/shm/x' "'"*) PATH=$d/bin:$PA
     # cleanup went on past the stops: the lock released on every host
     n=$(grep -c "|o=; \[ ! -r '/dev/shm/wt-lock-sim/owner' \].*rm -rf '/dev/shm/wt-lock-sim'" "$d/simlog")
     [ "$n" -eq 3 ] || { echo "$n lock releases in the simlog, want 3 (h1 h2 h3)" >&2; return 1; }
-    [ "$mode" = hang ] || return 0
+    [ "$mode" != second ] || return 0
+    [ "$mode" = hang ] || [ -e "$d/masked" ] || { echo "the run never checked its PATH for timeout" >&2; return 1; }
     # the hung session was h2's (the control), it was cut off, and the cut is named for h2 alone
     n=$(grep -c "^h2|ssh-hang " "$d/simlog")
     [ "$n" -eq 1 ] || { echo "$n hung ssh sessions for h2, want 1" >&2; return 1; }
-    n=$(pgrep -fx "sleep 120\.$tag" | wc -l | tr -d " ")
-    [ "$n" -eq 0 ] || { echo "the hung session outlived the run" >&2; pkill -9 -fx "sleep 120\.$tag" 2>&1 || :; return 1; }
+    [ "$ms" -le $(( 2 * stop * 1000 )) ] || { echo "the run ended $ms ms after the INT, want within $(( 2 * stop )) s" >&2; return 1; }
+    # nothing of the run outlives it; a planted survivor is the count's control
+    WTSIG_MARK=$tag sleep 30 & pl=$!
+    i=0
+    until marked_pids "$tag" | grep -qx "$pl"; do
+        [ "$i" -lt 50 ] || { echo "the planted survivor $pl is not counted" >&2; kill "$pl"; return 1; }
+        sleep 0.1; i=$((i + 1))
+    done
+    n=$(marked_pids "$tag" | grep -cvx "$pl")
+    [ "$n" -eq 0 ] || { echo "$n process(es) of the run outlived it:" >&2; ps -o pid=,ppid=,command= -p "$(marked_pids "$tag" | grep -vx "$pl" | paste -sd, -)" >&2; kill "$pl"; pkill -9 -fx "sleep 120\.$tag" 2>&1 || :; return 1; }
+    kill "$pl"; wait "$pl"
     n=$(grep -c "WARNING: h2: .*cut off" "$log")
     [ "$n" -eq 1 ] && ! grep -q "WARNING: h[13]: .*cut off" "$log" || { echo "$n cut-off warnings for h2, want 1 and none for h1 or h3:" >&2; grep WARNING "$log" >&2; return 1; }
 }
@@ -4496,6 +4528,9 @@ export -f teardown_run
 t_assert "signal: Ctrl-C with one host's fio stop hung ends on time, naming that host, releasing every lock, keeping the bundle and exiting 130, the teardown notice once" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
     out=$(teardown_run hang 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: with no timeout(1) on the controller, Ctrl-C with one host's fio stop hung still ends on time, naming that host, releasing every lock, leaving no process behind and exiting 130" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    out=$(teardown_run notimeout 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 t_assert "signal: a second Ctrl-C during the teardown lets every fio stop and lock release finish, skips the bundle naming the uncompressed run dir, and exits 130" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
     out=$(teardown_run second 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
