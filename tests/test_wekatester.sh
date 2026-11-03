@@ -1884,7 +1884,7 @@ t_assert "fio version: a host whose fio --version fails or prints nothing stops 
     source ./tests/helpers.sh
     for a in 0 1; do
         lock_fixture; out=$(fv_preflight $a h1=fio-3.35 h2=FAIL h3=EMPTY h4=fio-3.35) && { echo "allow=$a passed: $out" >&2; exit 1; }
-        case "$out" in *"ERROR: h2: fio --version exited 3: fio: cannot load libaio"*"ERROR: h3: fio --version printed nothing"*"cannot read the fio version on 2 of 4 host(s), so there is nothing to compare"*) ;;
+        case "$out" in *"ERROR: h2: fio --version exited 3: fio: cannot load libaio"*"ERROR: h3: fio --version printed nothing"*"cannot read the fio version on 2 of 4 host(s): the run stopped before any fio server started"*) ;;
             *) echo "allow=$a: $out" >&2; exit 1;; esac
         case "$out" in *h1:*|*h4:*|*"fio differs"*) echo "allow=$a: $out" >&2; exit 1;; esac
     done'
@@ -1900,18 +1900,26 @@ t_assert "fio version: past eight hosts a version names eight and counts the res
     lock_fixture; out=$(fv_preflight 0 "${hs[@]}" g1=fio-3.28) && { echo "passed: $out" >&2; exit 1; }
     printf "%s\n" "$out" | grep -q "ERROR:   fio-3.35 on 11 host(s): h1 h2 h3 h4 h5 h6 h7 h8 (+3 more)$" &&
     printf "%s\n" "$out" | grep -q "ERROR:   fio-3.28 on 1 host(s): g1$" || { echo "$out" >&2; false; }'
-t_assert "fio version: local mode and a single host read no version and compare nothing" bash -c '
-    source ./tests/helpers.sh; lock_fixture; export WEKATESTER_SUITE_LOCK_DIR=$LK/lock
+t_assert "fio version: a single host and local mode read the version and say it; a failing or silent one stops the run" bash -c '
+    source ./tests/helpers.sh
+    lock_fixture; out=$(fv_preflight 0 h1=fio-3.35) || { echo "one host stopped: $out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -q "fio version: fio-3.35 on the one host$" && printf "%s\n" "$out" | grep -qx "FIO_VERSION_NOTE=fio-3.35 on the one host" &&
+    [ "$(grep -c -- "--version" "$LK/sent.h1")" -eq 1 ] || { echo "one host: $out" >&2; exit 1; }
+    for v in FAIL EMPTY; do
+        lock_fixture; out=$(fv_preflight 0 h1=$v) && { echo "$v passed: $out" >&2; exit 1; }
+        case "$v:$out" in
+            (FAIL:*"ERROR: h1: fio --version exited 3: fio: cannot load libaio"*|EMPTY:*"ERROR: h1: fio --version printed nothing"*) ;;
+            (*) echo "$v: $out" >&2; exit 1 ;;
+        esac
+    done
+    # local mode: the local fio, the same line
+    lock_fixture; export WEKATESTER_SUITE_LOCK_DIR=$LK/lock
+    printf "#!/bin/sh\necho fio-3.36\n" > "$LK/bin/fio"
     out=$( (export PATH="$LK/bin:$PATH" WEKATESTER_SUITE_TARGET_DIR="$LK/tgt"; source ./wekatester
             LOCAL_MODE=1; HOSTS=(localhost); FIO_BIN=$LK/bin/fio; FIO_PIDFILE=$LK/fio.pid; WORK_DIR=$LK/w
             run_host() { printf "%s\n" "$2" >> "$LK/sent"; bash -c "$2"; }
             preflight 2>&1; echo "N=$FIO_VERSION_NOTE") ) || { echo "$out" >&2; exit 1; }
-    printf "%s\n" "$out" | grep -qx "N=one host, nothing to compare" || { echo "local: $out" >&2; exit 1; }
-    [ -s "$LK/sent" ] && ! grep -q -- "--version" "$LK/sent" || { echo "local mode read a version, or sent nothing" >&2; exit 1; }
-    # one remote host whose fio prints nothing: nothing to compare, no stop
-    lock_fixture; out=$(fv_preflight 0 h1=EMPTY) || { echo "one host stopped: $out" >&2; exit 1; }
-    printf "%s\n" "$out" | grep -qx "FIO_VERSION_NOTE=one host, nothing to compare" &&
-    [ -s "$LK/sent.h1" ] && ! grep -q -- "--version" "$LK/sent.h1" || { echo "one host: $out" >&2; false; }'
+    printf "%s\n" "$out" | grep -qx "N=fio-3.36 on the one host" && printf "%s\n" "$out" | grep -q "fio version: fio-3.36 on the one host$" || { echo "local: $out" >&2; false; }'
 t_assert "fio version: a dry run runs the check (preflight, before the dry-run branch) and its report prints the result" bash -c '
     sed -n "/^preflight() {/,/^}/p" ./wekatester | grep -q "^    check_fio_versions$" &&
     sed -n "/^main() {/,/^}/p" ./wekatester | awk "/^    preflight$/ {p = NR} /DRY_RUN\" -eq 1/ {d = NR} END {exit !(p && d > p)}" || { echo "check not on the dry-run path" >&2; exit 1; }
@@ -5193,6 +5201,59 @@ t_assert "targets file: bare -t prefers the source set hostfile, else ./hostlist
     (source "$OLDPWD/wekatester"; SCRIPT_DIR=$d
      TARGETS=1; WORKLOAD=nosuchset; resolve_targets_file
      [ "$TARGETS_FILE" = "./hostlist.csv" ]) >>$SUITE_ASIDE'
+# --- small fixes before the merge (Frank, 2026-11-03) ---
+t_assert "host file: a header on line 2 or 3, after a comment or a blank line, is no host" bash -c '
+    d=$(mktemp -d)
+    for pre in "# lab hosts\n" "\n" "# lab hosts\n\n"; do
+        printf "${pre}host,user_login,ioengine,allowed_cpus,destination_folder\nc1,,,,\n" > "$d/h.csv"
+        out=$( (source ./wekatester; resolve_targets hosts "$d/h.csv" - - -) 2>&1 ) || { echo "$out" >&2; exit 1; }
+        [ "$out" = c1 ] || { echo "with [$pre] first: $(tr "\n" " " <<<"$out")" >&2; exit 1; }
+    done'
+t_assert "cpu lists: a range that runs backwards (8-3) is refused; 3-8 is six cpus" bash -c '
+    r=$(source ./wekatester; awkrun "BEGIN { print parse_cpulist(\"8-3\", A); n = parse_cpulist(\"3-8\", B); c = 0; for (k in B) c++; print n, c }")
+    [ "$(tr "\n" " " <<<"$r")" = "0 1 6 " ] || { echo "$r" >&2; false; }'
+t_assert "jobfile sets: 2x400Gb names its write bandwidth job 012-bandwidthW.job" bash -c '
+    [ -f fio-jobfiles/2x400Gb/012-bandwidthW.job ] && [ ! -e fio-jobfiles/2x400Gb/012-bandwithW.job ] || { ls fio-jobfiles/2x400Gb >&2; false; }'
+t_assert "jobfile sets: every shipped jobfile names directory=/mnt/weka" bash -c '
+    a=$(ls fio-jobfiles/*/[0-9]*.job | wc -l | tr -d " ")
+    m=$(grep -l "^directory=" fio-jobfiles/*/[0-9]*.job | wc -l | tr -d " ")
+    n=$(grep -lx "directory=/mnt/weka" fio-jobfiles/*/[0-9]*.job | wc -l | tr -d " ")
+    [ "$a" -gt 0 ] && [ "$m" -eq "$a" ] && [ "$n" -eq "$m" ] || { echo "$n of $m directory lines are /mnt/weka, $a jobfiles:" >&2; grep -H "^directory=" fio-jobfiles/*/[0-9]*.job >&2; false; }'
+t_assert "jobfiles: a digit-named directory in the set is skipped with a warning; a set with nothing but directories stops the run" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/a/020-sub" "$d/b/011-sub"
+    printf "[global]\n[j]\nrw=read\n" > "$d/a/011-r.job"; cp "$d/a/011-r.job" "$d/a/031-r.job"
+    out=$( (source ./wekatester; discover_jobfiles "$d/a"; echo "JOBS ${JOBFILES[*]}") 2>&1 )
+    grep -qF "WARNING: skipping $d/a/020-sub: not a regular file" <<<"$out" && grep -qx "JOBS 011-r.job 031-r.job" <<<"$out" ||
+        { echo "$out" >&2; exit 1; }
+    out=$( (source ./wekatester; discover_jobfiles "$d/b"; echo reached) 2>&1 ) && { echo "$out" >&2; exit 1; }
+    grep -qF "no jobfiles found in $d/b (a jobfile'"'"'s name starts with a digit)" <<<"$out" && ! grep -q reached <<<"$out" || { echo "$out" >&2; exit 1; }'
+t_assert "staging: a jobfile that cannot be copied into the staged set stops the run, naming it" bash -c '
+    source ./tests/helpers.sh; set_fixture; no_ssh_fixture
+    w=$(mktemp -d); mkdir -p "$w/jobs" "$w/set"
+    # the staged copy of 031-iops.job is a link into a directory that does not exist: its cp fails
+    ln -s "$w/no/such/dir/x" "$w/set/031-iops.job"
+    out=$( (source ./wekatester
+            LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w
+            TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
+            stage_jobfiles; echo "STAGED ${JOBFILES[*]}") 2>&1 ) && { echo "went on: $out" >&2; exit 1; }
+    grep -qF "cannot copy jobfile 031-iops.job into the staged set" <<<"$out" && ! grep -q "^STAGED" <<<"$out" || { echo "$out" >&2; exit 1; }'
+t_assert "run lock: the owner line'"'"'s stamp carries its zone, +hhmm or -hhmm" bash -c '
+    t=$(source ./wekatester; lock_token; printf "%s" "$LOCK_TOKEN")
+    [[ $t =~ \ since\ [0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || { echo "$t" >&2; false; }'
+# A die between the staging dir'"'"'s mktemp and the traps left the dir behind;
+# the traps now come first. The hook: a mkdir that refuses the control dir.
+t_assert "staging dir: a run that dies making its control dir leaves no wt.* in the stage base" bash -c '
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/base" "$d/ctl/wt.planted"
+    printf "#!/bin/sh\necho \"\$0 stub: \$*\" >&2; exit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
+    printf "#!/bin/sh\ncase \"\$*\" in (*/wt.*/c) echo \"mkdir stub: refusing \$*\" >&2; exit 1 ;; esac\nexec %s \"\$@\"\n" "$(type -P mkdir)" > "$d/bin/mkdir"
+    chmod +x "$d/bin/ssh" "$d/bin/scp" "$d/bin/mkdir"
+    # the count'"'"'s control: a planted wt.* is counted
+    [ "$(compgen -G "$d/ctl/wt.*" | wc -l | tr -d " ")" -eq 1 ] || exit 1
+    out=$(unset $(compgen -v WT_); PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty WT_STAGE_BASE=mktemp TMPDIR=$d/base \
+          timeout 60 bash ./wekatester -r -n h1 2>&1) && { echo "ran: $out" >&2; exit 1; }
+    grep -q "mkdir stub: refusing .*$d/base/wt\..*/c" <<<"$out" || { echo "the hook never fired: $out" >&2; exit 1; }
+    n=$(compgen -G "$d/base/wt.*" | wc -l | tr -d " ")
+    [ "$n" -eq 0 ] || { echo "$n wt.* left in the stage base: $(ls -A "$d/base")" >&2; echo "$out" >&2; exit 1; }'
 # --- hosts from the host file (Frank, 2026-10-29) ---
 t_assert "hosts from file: resolve_targets hosts prints the file's host lines as addresses in file order; pattern, selector, setting, comment and header lines add none" bash -c '
     d=$(mktemp -d)
