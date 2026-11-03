@@ -5237,10 +5237,10 @@ t_assert "staging: a jobfile that cannot be copied into the staged set stops the
             TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$SETFIX
             stage_jobfiles; echo "STAGED ${JOBFILES[*]}") 2>&1 ) && { echo "went on: $out" >&2; exit 1; }
     grep -qF "cannot copy jobfile 031-iops.job into the staged set" <<<"$out" && ! grep -q "^STAGED" <<<"$out" || { echo "$out" >&2; exit 1; }'
-t_assert "run lock: the owner line'"'"'s stamp carries its zone, +hhmm or -hhmm" bash -c '
+t_assert "run lock: the owner line's stamp carries its zone, +hhmm or -hhmm" bash -c '
     t=$(source ./wekatester; lock_token; printf "%s" "$LOCK_TOKEN")
     [[ $t =~ \ since\ [0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || { echo "$t" >&2; false; }'
-# A die between the staging dir'"'"'s mktemp and the traps left the dir behind;
+# A die between the staging dir's mktemp and the traps left the dir behind;
 # the traps now come first. The hook: a mkdir that refuses the control dir.
 t_assert "staging dir: a run that dies making its control dir leaves no wt.* in the stage base" bash -c '
     d=$(mktemp -d); mkdir -p "$d/bin" "$d/base" "$d/ctl/wt.planted"
