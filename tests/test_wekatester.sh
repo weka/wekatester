@@ -5818,6 +5818,68 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
     tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,$" &&
     (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >>$SUITE_ASIDE)'
+# A review finding (2026-11-02): the writeback rewrote the host file in
+# place, so an interruption mid-write left it truncated. The new rows go to
+# a temp file under WORK_DIR, checked, then copied into the host file.
+# wb_run <file>, how=ok|cut: a writeback; cut stages an awk stopped mid-write
+# (what it wrote halved, rc 1). The temp it saw is recorded in $d/tmpseen.
+wb_run() {
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$1; FAST_TRACK=1
+     host_machine_id() { :; }
+     eval "real_awkrun()$(declare -f awkrun | tail -n +2)"
+     awkrun() {
+         real_awkrun "$@" || return
+         [[ $1 == *"superseded by -a: "* ]] || return 0
+         printf "%s\n" "${WEKATESTER_WB_TMP:-}" >> "$d/tmpseen"
+         [ "$how" = cut ] || return 0
+         local w s
+         for w in "$TARGETS_FILE" "${WEKATESTER_WB_TMP:-}"; do
+             [ -n "$w" ] && [ -e "$w" ] && ! cmp -s "$w" "$d/orig" || continue
+             s=$(cat "$w"); printf "%s" "${s:0:$((${#s} / 2))}" > "$w"
+         done
+         return 1
+     }
+     writeback_targets) 2>&1
+}
+export -f wb_run
+t_assert "writeback: the host file is replaced whole or not at all -- a writeback that fails mid-write leaves it byte-identical, no temp file either way" bash -c '
+    for how in ok cut; do
+        d=$(wb_fixture); f="$d/host.csv"
+        printf "host,user_login,ioengine\nh1,,psync,,,,,\nh9,,,,\n" > "$f"; cp "$f" "$d/orig"
+        out=$(how=$how wb_run "$f"); rc=$?; printf "%s\n" "$out" >>$SUITE_ASIDE
+        left=$(compgen -G "$f.tmp.*") && { echo "$how: temp left beside the file: $left" >&2; exit 1; }
+        while read -r t; do
+            [ -z "$t" ] || [ ! -e "$t" ] || { echo "$how: temp left: $t" >&2; exit 1; }
+        done < "$d/tmpseen"
+        if [ "$how" = ok ]; then
+            [ "$rc" = 0 ] && grep -q "^# superseded by -a: h1,,psync" "$f" && grep -q "^h9,,,,$" "$f" || { echo "ok: rc=$rc" >&2; cat "$f" >&2; exit 1; }
+        else
+            [ "$rc" != 0 ] || { echo "cut: rc=0" >&2; exit 1; }
+            cmp -s "$d/orig" "$f" || { echo "cut: the host file changed:" >&2; cat "$f" >&2; exit 1; }
+        fi
+    done
+    : > "$f.tmp.ctl"; compgen -G "$f.tmp.*" >>$SUITE_ASIDE || { echo "control: the temp glob missed a planted file" >&2; exit 1; }'
+# Frank (2026-11-03): the host file is written into, never moved over: a
+# symlink given to -t stays a symlink and its target takes the rows; only
+# the file own permissions count, never its directory. A root run writes
+# a 444 file anyway, so that case is skipped as root.
+t_assert "writeback: the host file is written in place -- a symlink stays a symlink, a read-only directory is no bar, a read-only file stops it untouched" bash -c '
+    rows="host,user_login,ioengine\nh1,,psync,,,,,\n"
+    d=$(wb_fixture); mkdir "$d/other"; printf "$rows" > "$d/other/real.csv"; cp "$d/other/real.csv" "$d/orig"
+    ln -s "$d/other/real.csv" "$d/link.csv"
+    out=$(how=ok wb_run "$d/link.csv") || { echo "symlink: $out" >&2; exit 1; }
+    [ -L "$d/link.csv" ] || { echo "symlink: the -t path is no longer a symlink" >&2; exit 1; }
+    grep -q "^# superseded by -a: h1,,psync" "$d/other/real.csv" || { echo "symlink: the target lacks the rows" >&2; exit 1; }
+    d=$(wb_fixture); mkdir "$d/ro"; printf "$rows" > "$d/ro/host.csv"; cp "$d/ro/host.csv" "$d/orig"; chmod 644 "$d/ro/host.csv"; chmod 555 "$d/ro"
+    out=$(how=ok wb_run "$d/ro/host.csv"); rc=$?; chmod 755 "$d/ro"
+    [ "$rc" = 0 ] && grep -q "^# superseded by -a: h1,,psync" "$d/ro/host.csv" || { echo "read-only dir: rc=$rc $out" >&2; exit 1; }
+    if [ "$(id -u)" = 0 ]; then echo "skip: the 444 case, root writes a read-only file" >>$SUITE_ASIDE; exit 0; fi
+    d=$(wb_fixture); f="$d/host.csv"; printf "$rows" > "$f"; cp "$f" "$d/orig"; chmod 444 "$f"
+    out=$(how=ok wb_run "$f"); rc=$?
+    [ "$rc" != 0 ] || { echo "read-only file: rc=0" >&2; exit 1; }
+    cmp -s "$d/orig" "$f" || { echo "read-only file: changed" >&2; exit 1; }
+    case "$out" in *"$f"*) ;; *) echo "read-only file: the message does not name it: $out" >&2; exit 1;; esac'
 # A review finding (2026-11-02): the writeback read what each host's own
 # row provides with `resolve_targets hostonly ... || : >` an empty set, so a
 # host file made malformed after the run read it (a row past the column
