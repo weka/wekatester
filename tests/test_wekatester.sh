@@ -4379,6 +4379,9 @@ writeback_targets() { :; }; snapshot_jobfiles() { :; }; check_mounts_unchanged()
         [ "$rc" -eq 0 ] || { echo "exit $rc with both results intact, want 0:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
         n=$(grep -c "ERROR" "$d/$STAMP/wekatester.log")
         [ "$n" -eq 0 ] || { echo "$n ERROR lines with both results intact:" >&2; grep ERROR "$d/$STAMP/wekatester.log" >&2; return 1; }
+        # no signal, no teardown notice (teardown_run, below, is its control)
+        n=$(cat "$d/$STAMP/wekatester.log" "$d/run.out" | grep -c "tearing down (Ctrl-C again")
+        [ "$n" -eq 0 ] || { echo "$n teardown notices in a run that ended on its own" >&2; return 1; }
         return 0
     fi
     # 3. the error names the failed job's raw results, which the bundle keeps; the run exits 1 at the end
@@ -4394,9 +4397,108 @@ t_assert "run_jobs: a job whose summary fails logs it, keeps its raw results, ru
 t_assert "run_jobs: a layout whose sequential-write summary fails logs it, keeps its raw results, runs the measured jobs and ends the run with exit 1 naming 1 job" bash -c '
     source ./tests/helpers.sh
     out=$(summfail_run layout 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
-t_assert "run_jobs: with every summary intact the same two jobs end the run with exit 0 and no error" bash -c '
+t_assert "run_jobs: with every summary intact the same two jobs end the run with exit 0, no error and no teardown notice" bash -c '
     source ./tests/helpers.sh
     out=$(summfail_run good 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# A review finding (2026-11-02): a Ctrl-C's teardown ran each host's fio
+# stop and lock release unbounded, so one hung host held the run for
+# good, and a second Ctrl-C during it re-ran the INT trap's exit inside
+# the EXIT trap: no bundle. Now the teardown says once what it does,
+# bounds each host's session and names a host cut off; a second Ctrl-C
+# lets the stops and releases finish and skips only the bundle, the run
+# dir left uncompressed (Frank, 2026-11-03).
+# teardown_run <hang|second>: INT to the group with cells in
+# flight on the signal harness, every host holding a run lock. hang: h2's
+# fio stop goes through the real run_host to an ssh that never returns,
+# the bound lowered to 2 s. second: each fio stop takes 2 s and a second
+# INT reaches the group 1 s into the teardown.
+teardown_run() {
+    local mode=$1 d tag pid i rc t0 took n hook="" pre log rd
+    d=$(mktemp -d); tag=$$$RANDOM
+    pre='preflight() { LOCK_DIR=/dev/shm/wt-lock-sim; LOCK_TOKEN=wtsig; RUN_LOCKS=([h1]=1 [h2]=1 [h3]=1); }
+TEARDOWN_STOP_S=2'
+    if [ "$mode" = hang ]; then
+        mkdir "$d/bin"
+        printf '#!/usr/bin/env bash\nprintf "h2|ssh-hang %%s\\n" "$*" >> "%s/simlog"\nexec sleep 120.%s\n' "$d" "$tag" > "$d/bin/ssh"
+        chmod +x "$d/bin/ssh"
+        pre+='
+eval "real_$(source ./wekatester; declare -f run_host)"
+eval "sim_$(declare -f run_host)"
+run_host() { case "$1|$2" in ("h2|"*"rm -rf '"'/dev/shm/x' "'"*) PATH=$d/bin:$PATH real_run_host "$@" ;; (*) sim_run_host "$@" ;; esac; }'
+    else
+        hook="case \"\$2\" in (*\"rm -rf '/dev/shm/x' \"*) sleep 2 ;; esac"
+    fi
+    sigcal_launch "$d" "$tag" "$hook" 5 file "$pre" || return 1; pid=$SIGPID
+    # the precondition: a cell in flight on each shape
+    i=0
+    until [ -s "$d/simlog" ] && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h1 " && grep -v cal-seed- "$d/simlog" | grep -q -- "--client=h3 "; do
+        if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
+            echo "no cell in flight on both shapes after $((i / 10)) s" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+        fi
+        sleep 0.1; i=$((i + 1))
+    done
+    t0=$SECONDS
+    kill -INT -- "-$pid"
+    if [ "$mode" = second ]; then
+        i=0
+        until grep -q "stopping fio servers\.\.\." "$d/run.out"; do
+            [ "$i" -lt 100 ] && sigcal_alive "$pid" || { echo "the teardown never began its fio stop:" >&2; tail -n 5 "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+            sleep 0.1; i=$((i + 1))
+        done
+        sleep 1
+        sigcal_alive "$pid" || { echo "the run ended before the second INT (the stops take 2 s)" >&2; return 1; }
+        kill -INT -- "-$pid"
+    fi
+    # the bound: the 2 s stops, timeout's 5 s KILL grace and the cells' end
+    i=0
+    while sigcal_alive "$pid" && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+    took=$(( SECONDS - t0 ))
+    if sigcal_alive "$pid"; then
+        echo "TIMEOUT after $took s: the teardown has not ended; its last lines:" >&2; tail -n 5 "$d/run.out" >&2
+        kill -9 -- "-$pid" 2>&1 || :; pkill -9 -fx "sleep 120\.$tag" 2>&1 || :; return 1
+    fi
+    wait "$pid"; rc=$?
+    [ "$rc" -eq 130 ] || { echo "exit $rc after $took s, want 130:" >&2; tail -n 5 "$d/run.out" >&2; return 1; }
+    if [ "$mode" = second ]; then
+        # no archive; the run dir is left whole and its path said
+        n=$(ls "$d/out" | grep -c "\.tgz$")
+        [ "$n" -eq 0 ] || { echo "$n bundles after a second Ctrl-C, want 0: $(ls "$d/out" | tr "\n" " ")" >&2; return 1; }
+        rd=$(sed -n "s/.*run bundle skipped (Ctrl-C during the teardown): the run directory is left uncompressed at //p" "$d/run.out" | tail -n 1)
+        [ -n "$rd" ] && [ -d "$rd" ] && [ "${rd%/*}" = "$d/out" ] || { echo "no \"run bundle skipped\" line naming a run dir under $d/out ([$rd]); the console ends:" >&2; tail -n 3 "$d/run.out" >&2; return 1; }
+        log=$rd/wekatester.log
+        # the second INT cut no fio stop short: one per host
+        for h in h1 h2 h3; do
+            n=$(grep -c "^$h|.*rm -rf '/dev/shm/x' '/dev/shm/x.cal'" "$d/simlog")
+            [ "$n" -eq 1 ] || { echo "$n fio stops for $h in the simlog, want 1" >&2; return 1; }
+        done
+    else
+        sigcal_bundle "$d" || return 1
+        tar -xzf "$BUNDLE" -C "$d" "$STAMP/wekatester.log" || return 1
+        log=$d/$STAMP/wekatester.log
+        case "$(tail -n 1 "$d/run.out")" in (*" run bundle: $BUNDLE") ;; (*) echo "the console ends with: $(tail -n 1 "$d/run.out")" >&2; return 1 ;; esac
+    fi
+    n=$(grep -c "tearing down (Ctrl-C again skips the bundle): stopping fio, releasing the locks" "$log")
+    [ "$n" -eq 1 ] || { echo "$n teardown notices in the log, want 1" >&2; return 1; }
+    grep -q "stopping fio servers\.\.\." "$log" || { echo "the log does not say the servers were stopped" >&2; return 1; }
+    # cleanup went on past the stops: the lock released on every host
+    n=$(grep -c "|o=; \[ ! -r '/dev/shm/wt-lock-sim/owner' \].*rm -rf '/dev/shm/wt-lock-sim'" "$d/simlog")
+    [ "$n" -eq 3 ] || { echo "$n lock releases in the simlog, want 3 (h1 h2 h3)" >&2; return 1; }
+    [ "$mode" = hang ] || return 0
+    # the hung session was h2's (the control), it was cut off, and the cut is named for h2 alone
+    n=$(grep -c "^h2|ssh-hang " "$d/simlog")
+    [ "$n" -eq 1 ] || { echo "$n hung ssh sessions for h2, want 1" >&2; return 1; }
+    n=$(pgrep -fx "sleep 120\.$tag" | wc -l | tr -d " ")
+    [ "$n" -eq 0 ] || { echo "the hung session outlived the run" >&2; pkill -9 -fx "sleep 120\.$tag" 2>&1 || :; return 1; }
+    n=$(grep -c "WARNING: h2: .*cut off" "$log")
+    [ "$n" -eq 1 ] && ! grep -q "WARNING: h[13]: .*cut off" "$log" || { echo "$n cut-off warnings for h2, want 1 and none for h1 or h3:" >&2; grep WARNING "$log" >&2; return 1; }
+}
+export -f teardown_run
+t_assert "signal: Ctrl-C with one host's fio stop hung ends on time, naming that host, releasing every lock, keeping the bundle and exiting 130, the teardown notice once" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    out=$(teardown_run hang 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: a second Ctrl-C during the teardown lets every fio stop and lock release finish, skips the bundle naming the uncompressed run dir, and exits 130" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    out=$(teardown_run second 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 # The sweep deleted every file short of its size, so an interrupted layout
 # started that file over; now it lists sizes and the layout extends.
 t_assert "sweep: one listing per namespace into the host's sizes file, nothing deleted" bash -c '
