@@ -292,7 +292,7 @@ kernel_log_cmd() {   # kernel_log_cmd <run-start-epoch>
         echo "# $_kw, from $_kr s after boot (the run start)"; printf "%s\n" "$_x" | _kring "$_kr"
     else
         echo "# journalctl -k --since @$_ks (the run start)"
-        _x=$(_T=60 _nc journalctl -k --no-pager -o short-iso --since "@$_ks"); printf "%s\n" "$_x" | _kring ""
+        _x=$(_nc journalctl -k --no-pager -o short-iso --since "@$_ks"); printf "%s\n" "$_x" | _kring ""
     fi; true'
 }
 
@@ -308,7 +308,7 @@ fio_server_log_cmd() {
         elif _priv; then _fw="$_pv journalctl"
         else echo "# read as a non-root user and no passwordless escalator works: only this user'"'"'s entries show, a root fio server'"'"'s are missing"; fi
         echo "# $_fw -t fio --since @$_ks (the run start): every fio that logged in the window, not only this run'"'"'s"
-        _x=$(_T=60 _nc $_fw -q -t fio --no-pager -o short-iso --since "@$_ks")
+        _x=$(_nc $_fw -q -t fio --no-pager -o short-iso --since "@$_ks")
         if [ -n "$_x" ]; then printf "%s\n" "$_x" | _kring ""; else echo "(no fio server log line in the window)"; fi
     fi; true'
 }
