@@ -105,10 +105,12 @@ $(sysinfo_nic_cmd)"
 }
 
 # One session per host in parallel, each bounded as a whole at
-# WT_SYSINFO_TIMEOUT (300 s). A host cut off keeps its partial
-# capture, which says where it stopped plus a session-timeout item.
+# WT_SYSINFO_TIMEOUT (300 s), or at the variable CAPTURE_BOUND names. A host
+# cut off keeps its partial capture, which says where it stopped and which
+# bound, plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc f pids=() hs=() t=${WT_SYSINFO_TIMEOUT:-300}
+    local host i rc f pids=() hs=() k=${CAPTURE_BOUND:-WT_SYSINFO_TIMEOUT} t
+    t=${!k:-300}
     for host in "${HOSTS[@]}"; do
         ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
         pids+=($!); hs+=("$host")
@@ -119,12 +121,12 @@ capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string
         if [ $rc -ne 124 ] && [ $rc -ne 137 ]; then
             log "WARNING: could not capture $1 on ${hs[$i]}" >&2; continue
         fi
-        log "WARNING: $1 on ${hs[$i]} cut off after $t s (WT_SYSINFO_TIMEOUT); the partial capture is kept" >&2
+        log "WARNING: $1 on ${hs[$i]} cut off after $t s ($k); the partial capture is kept" >&2
         f=$2${hs[$i]}
         # a cut can land mid-line: the marker must start one
         [ ! -s "$f" ] || [ -z "$(tail -c 1 "$f")" ] || echo >> "$f"
-        printf 'not available: the session was cut off here, after %s s (WT_SYSINFO_TIMEOUT)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (WT_SYSINFO_TIMEOUT)\n' \
-            "$t" "$1" "$t" >> "$f"
+        printf 'not available: the session was cut off here, after %s s (%s)\n=== WEKATESTER_SYSINFO session-timeout ===\n%s cut off after %s s (%s)\n' \
+            "$t" "$k" "$1" "$t" "$k" >> "$f"
     done
 }
 

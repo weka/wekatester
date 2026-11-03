@@ -40,7 +40,7 @@ own_setting_help() {   # own_setting_help <name>
         (WT_DIRECTORY) echo "the default target directory for test files (default ${SETTING_DEFAULT[WT_DIRECTORY]}); a host-file line's destination_folder beats it, and -d beats both" ;;
         (WT_ENGINE) echo "the default fio ioengine (empty: the jobfile's own, else, outside -a, the first of io_uring, libaio, psync that passes its test); a host-file line's ioengine beats it, and -e beats both" ;;
         (WT_ENGINE_TEST_TIMEOUT) echo "seconds an ioengine's test job may run before it is killed and counts as a failure (default 15)" ;;
-        (WT_SYSINFO_TIMEOUT) echo "seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300)" ;;
+        (WT_SYSINFO_TIMEOUT) echo "seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300; a failed run's end capture is bounded at 30 s instead)" ;;
         (WT_SETTLE) echo "seconds to wait after the fio servers start before the first connection to them (default 2)" ;;
         (WT_STAGE_BASE) echo "where the controller keeps its working files: shm (/dev/shm, the default) or mktemp (\$TMPDIR, else /tmp)" ;;
     esac

@@ -208,8 +208,10 @@ port_fail_report() {
 # The teardown's remote rounds: each host's session bounded (run_bounded,
 # with or without timeout(1)) and forked as a process group of its own, so
 # a second Ctrl-C reaches main alone and no stop or release is cut short by
-# it. A failed run's end capture has its own bound, WT_SYSINFO_TIMEOUT.
+# it. A failed run's end capture is bounded per host at TEARDOWN_CAPTURE_S
+# (a clean run's at WT_SYSINFO_TIMEOUT).
 TEARDOWN_STOP_S=10    # the fio stop and staging removal
+TEARDOWN_CAPTURE_S=30 # a failed run's end capture
 TEARDOWN_LOCK_S=10    # the lock release
 TEARDOWN_MUX_S=5      # each ssh -O exit
 TEARDOWN_ABORT=0      # a second INT or TERM came during the teardown
@@ -277,11 +279,11 @@ cleanup() {
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
         if [ "$RUN_RC" -eq 0 ]; then snapshot_pressure end
-        elif [ "$fio_ran" -eq 1 ]; then snapshot_pressure end fio-log
+        elif [ "$fio_ran" -eq 1 ]; then CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end fio-log
         else
             [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] \
                 || log "note: no fio server log to read: the run stopped before the fio servers started"
-            snapshot_pressure end
+            CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end
         fi
         port_fail_report
     fi

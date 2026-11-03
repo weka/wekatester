@@ -106,7 +106,7 @@ WT_VERBOSE=0
 # WT_ENGINE_TEST_TIMEOUT: seconds an ioengine's test job may run before it is killed and counts as a failure (default 15)
 WT_ENGINE_TEST_TIMEOUT=15
 #
-# WT_SYSINFO_TIMEOUT: seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300)
+# WT_SYSINFO_TIMEOUT: seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300; a failed run's end capture is bounded at 30 s instead)
 WT_SYSINFO_TIMEOUT=300
 #
 # WT_SETTLE: seconds to wait after the fio servers start before the first connection to them (default 2)
