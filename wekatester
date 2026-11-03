@@ -6552,9 +6552,11 @@ writeback_targets() {
     # resolved.
     [ "$REGEN_LAYOUT" -eq 0 ] || mode=overwrite
     # --line-rate measured the bandwidth slots again: their tuples replace the
-    # row in fill mode too. What does each host OWN row provide?
+    # row in fill mode too. What does each host OWN row provide? A file that
+    # no longer resolves (edited mid-run) stops here, its rows never taken
+    # as empty: the merge's own-row protection rests on them.
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
-        > "$WORK_DIR/targets.hostrows" || : > "$WORK_DIR/targets.hostrows"
+        > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
     local h ident=""
     ident=$(host_idents)
     list_staged "$WORK_DIR/staged.list" &&
