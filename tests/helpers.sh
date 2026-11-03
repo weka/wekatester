@@ -11,7 +11,7 @@ probe_stub() {
     printf '#!/bin/sh\nexit 1\n' > "$stub/pgrep"     # no wekanode procs
     printf '#!/bin/sh\necho " io_uring libaio"\n' > "$stub/fio"
     printf '#!/bin/sh\nexit 1\n' > "$stub/sudo"
-    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$stub/timeout"
+    printf '#!/bin/sh\nwhile :; do case $1 in -k|-s) shift 2 ;; -*) shift ;; *) break ;; esac; done\nshift\nexec "$@"\n' > "$stub/timeout"
     cat > "$stub/taskset" <<'TASKSETEOF'
 #!/bin/sh
 case "$1" in
@@ -38,7 +38,7 @@ cpuset_fixture() {
     printf '#!/bin/sh\necho 8\n' > "$d/bin/getconf"
     printf '#!/bin/sh\nexit 1\n' > "$d/bin/pgrep"
     printf '#!/bin/sh\necho " io_uring libaio"\n' > "$d/bin/fio"
-    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    printf '#!/bin/sh\nwhile :; do case $1 in -k|-s) shift 2 ;; -*) shift ;; *) break ;; esac; done\nshift\nexec "$@"\n' > "$d/bin/timeout"
     printf '#!/bin/sh\necho "sudo $*" >> "%s/calls"\nexit 1\n' "$d" > "$d/bin/sudo"
     printf '#!/bin/sh\necho "taskset $*" >> "%s/calls"\ncase "$1" in\n  -cp) echo "pid $2'"'"'s current affinity list: %s" ;;\n  -c) shift 2; exec "$@" ;;\nesac\n' "$d" "$2" > "$d/bin/taskset"
     chmod +x "$d/bin"/*
@@ -532,7 +532,7 @@ case "\$1" in
         echo "\$2" ;;
 esac
 EOF
-    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$LK/bin/timeout"
+    printf '#!/bin/sh\nwhile :; do case $1 in -k|-s) shift 2 ;; -*) shift ;; *) break ;; esac; done\nshift\nexec "$@"\n' > "$LK/bin/timeout"
     for e in dzdo pbrun sesu pmrun doas ksu sudo; do
         printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$e" "$LK" > "$LK/bin/$e"
     done
@@ -607,7 +607,7 @@ nic_fixture() {
     printf '#!/bin/sh\necho "mlnx_qos $*"\n' > "$d/bin/mlnx_qos"
     printf '#!/bin/sh\necho 4321\n' > "$d/bin/pgrep"
     printf '#!/bin/sh\necho 1000\n' > "$d/bin/id"
-    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d/bin/timeout"
+    printf '#!/bin/sh\nwhile :; do case $1 in -k|-s) shift 2 ;; -*) shift ;; *) break ;; esac; done\nshift\nexec "$@"\n' > "$d/bin/timeout"
     for t in dzdo pbrun sesu pmrun doas ksu sudo; do
         printf '#!/bin/sh\necho "%s $*" >> "%s/esc"\nexit 1\n' "$t" "$d" > "$d/bin/$t"
     done

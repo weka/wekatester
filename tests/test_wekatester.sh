@@ -9475,7 +9475,7 @@ t_assert "fio server log: a host without journalctl says not available and reads
     [ "$(cat "$f")" = "not available: journalctl not installed, so this host keeps no journal to read" ] || { cat "$f"; exit 1; } >&2'
 t_assert "fio server log: only a failed run reads it at teardown, and one that stopped before the servers started says it has none" bash -c '
     d=$(mktemp -d)
-    grep -q "trap '\''rc=\$?; RUN_RC=\$rc; cleanup; " ./wekatester || { echo "the EXIT trap does not hand cleanup the status" >&2; exit 1; }
+    grep -q "trap '\''rc=\$?; RUN_RC=\$rc; .*cleanup; .*'\'' EXIT" ./wekatester || { echo "the EXIT trap does not hand cleanup the status" >&2; exit 1; }
     t() {   # t <tag> <RUN_RC> <FIO_STARTED>: cleanup, its end capture string in end.<tag>
         (source ./wekatester
          WORK_DIR=$d/work; RUN_DIR=$d/run; mkdir -p "$WORK_DIR" "$RUN_DIR"
