@@ -1582,6 +1582,59 @@ t_assert "summarize: -s on several hosts with no All clients entry sums the host
         *"write bandwidth: 6.00 GiB/s"*"average bandwidth: 2.00 GiB/s per host  (min 1.00 GiB/s h1, max 3.00 GiB/s h3)"*"write iops: 6,000/s"*"average iops: 2,000/s per host  (min 1,000/s h1, max 3,000/s h3)"*"write latency: 233.3 us  (min 100.0 us h1, max 300.0 us h3)"*) true;;
         *) echo "$out" >&2; false;;
     esac'
+# Every layout result has several job sections per host: a host's figures are
+# the sum of its sections (latency IO-weighted), never its last section's.
+# Sections in the order h1 h2 h1 h2, so the last sections name the opposite
+# hosts (h1 1.00 GiB/s max, h2 0.50 GiB/s min):
+#   section       bw MiB/s  ios   lat us  written MiB
+#   h1 a          1024      1000  100     10240
+#   h2 a          3072      3000   50     30720
+#   h1 b          1024      1000  300     10240
+#   h2 b           512       500  400      5120
+# per host: h1 2048 MiB/s = 2.00 GiB/s, 2,000 IOs, 20.00 GiB,
+#             (100*1000 + 300*1000) / 2000 = 200.0 us
+#           h2 3584 MiB/s = 3.50 GiB/s, 3,500 IOs, 35.00 GiB,
+#             (50*3000 + 400*500) / 3500 = 100.0 us
+# fleet:  5632 MiB/s = 5.50 GiB/s, 2.75 per host; 5,500 IOs, 2,750 per host;
+#         55.00 GiB, 27.50 per host; 750000 / 5500 = 136.4 us
+# (no "average latency" line: it needs read and write latency both)
+SUMM_SECTIONS='h1:1024:1000:100000:10240 h2:3072:3000:50000:30720 h1:1024:1000:300000:10240 h2:512:500:400000:5120'
+# a case pattern from a variable: quotes in it would be literal, so none
+SUMM_SPREAD='*write bandwidth: 5.50 GiB/s*average bandwidth: 2.75 GiB/s per host  (min 2.00 GiB/s h1, max 3.50 GiB/s h2)*write iops: 5,500/s*average iops: 2,750/s per host  (min 2,000/s h1, max 3,500/s h2)*write latency: 136.4 us  (min 100.0 us h2, max 200.0 us h1)*'
+export SUMM_SECTIONS SUMM_SPREAD
+t_assert "summarize: several job sections per host and no All clients entry: the spread is each host's summed sections" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_sections_fixture "$d/r.json" $SUMM_SECTIONS
+    lay=$( (source ./wekatester; summ_one "$d/r.json" "$d/r.json" layout "h1 h2" file) 2>&1 )
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$lay" in
+        *"write bandwidth: 5.50 GiB/s"*"average bandwidth: 2.75 GiB/s per host  (min 2.00 GiB/s h1, max 3.50 GiB/s h2)"*"written: 55.00 GiB, 27.50 GiB per host  (min 20.00 GiB h1, max 35.00 GiB h2)"*) ;;
+        *) echo "layout: $lay" >&2; exit 1;;
+    esac
+    case "$out" in $SUMM_SPREAD) true;; *) echo "-s: $out" >&2; false;; esac'
+# The same sections with fio's "All clients" aggregate last (the fleet figures
+# above): the fleet lines read the aggregate, the spread still the host sums.
+t_assert "summarize: several job sections per host with an All clients entry: the spread is each host's summed sections" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_sections_fixture "$d/r.json" $SUMM_SECTIONS ALL:5632:5500:136363.636:56320
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$out" in $SUMM_SPREAD) true;; *) echo "$out" >&2; false;; esac'
+# One host, h1's two sections above, no aggregate: 2.00 GiB/s, 2,000 IOs,
+# 20.00 GiB and 200.0 us, not the last section's 1.00 GiB/s and 300.0 us.
+t_assert "summarize: one host with several job sections and no All clients entry: the totals sum its sections" bash -c '
+    source ./tests/helpers.sh
+    d=$(mktemp -d); fio_json_sections_fixture "$d/r.json" h1:1024:1000:100000:10240 h1:1024:1000:300000:10240
+    lay=$( (source ./wekatester; summ_one "$d/r.json" "$d/r.json" layout "h1" file) 2>&1 )
+    out=$(./wekatester -s "$d/r.json" 2>&1)
+    case "$lay" in
+        *"write bandwidth: 2.00 GiB/s"*"average bandwidth: 2.00 GiB/s per host"*"written: 20.00 GiB, 20.00 GiB per host"*) ;;
+        *) echo "layout: $lay" >&2; exit 1;;
+    esac
+    case "$out" in
+        *"(min "*) echo "-s: a spread for one host: $out" >&2; false;;
+        *"write bandwidth: 2.00 GiB/s"*"write iops: 2,000/s"*"write latency: 200.0 us"*) true;;
+        *) echo "-s: $out" >&2; false;;
+    esac'
 # The Python wekatester wrote {jobname: fio JSON, ...}: -s names that format
 # instead of reporting a missing aggregate (review #24).
 t_assert "summarize: a Python wekatester results file is named as such" bash -c '

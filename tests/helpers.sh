@@ -231,6 +231,27 @@ fio_json_noagg_fixture() {   # $1 = file to write
 JSON
 }
 
+# Write-only client_stats entries from figures, one per job section, in the
+# order given: "host:bw_MiB/s:ios:lat_ns:written_MiB" (iops = total_ios =
+# ios). Host ALL writes an "All clients" aggregate with those figures.
+fio_json_sections_fixture() {   # $1 = file to write, then one entry per section
+    local f=$1 e h bw io lat z name sep=""; shift
+    {
+        printf '{\n  "fio version" : "fio-3.28",\n  "client_stats" : [\n'
+        for e in "$@"; do
+            IFS=: read -r h bw io lat z <<< "$e"
+            name='"jobname" : "lay-0-268435456-a1", "groupid" : 0, "error" : 0, "hostname" : "'$h'"'
+            [ "$h" != ALL ] || name='"jobname" : "All clients", "groupid" : 0, "error" : 0'
+            printf '%s    { %s,\n' "$sep" "$name"
+            printf '      "read":  { "io_bytes": 0, "bw_bytes": 0, "iops": 0.0, "total_ios": 0, "lat_ns": { "mean": 0.0 } },\n'
+            printf '      "write": { "io_bytes": %d, "bw_bytes": %d, "iops": %d.0, "total_ios": %d, "lat_ns": { "mean": %s } } }' \
+                $((z * 1048576)) $((bw * 1048576)) "$io" "$io" "$lat"
+            sep=$',\n'
+        done
+        printf '\n  ]\n}\n'
+    } > "$f"
+}
+
 # --- README: the fenced block under "# Usage" must equal ./wekatester -h ---
 readme_usage_block() {   # $1 = README path (default README.md)
     awk '/^# Usage$/ { in_usage = 1; next }
