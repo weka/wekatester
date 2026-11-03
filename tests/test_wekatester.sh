@@ -5302,6 +5302,125 @@ t_assert "hosts from file: through main, -t with two host lines and no server re
     case "$out" in *"no servers given: running on the local host"*) echo "went local: $out" >&2; exit 1;; esac
     case "$out" in *": 2 worker(s), master c1, workload "*) ;; *) echo "$out" >&2; exit 1;; esac
     [ "$(grep "ssh stub" <<<"$out" | grep -cw c1)" -ge 1 ] && [ "$(grep "ssh stub" <<<"$out" | grep -cw c2)" -ge 1 ] || { echo "$out" >&2; exit 1; }'
+# --- hosts from file: spellings of one host (Frank, 2026-11-03) ---
+# Names that share a lower-cased first label fold into one host when ssh
+# -G's hostname resolves to the same addresses; otherwise the operator is
+# asked, and with no terminal the run stops.
+# h02_dns <dir> <target> <addr>: getent ahosts' answer for <target>
+h02_dns() {
+    mkdir -p "$1/dns"
+    printf '%s STREAM %s\n%s DGRAM\n' "$3" "$2" "$3" > "$1/dns/$2"
+}
+# h02_run <dir> <y|n|enter|notty> <host-file rows> [cli host...]:
+# hosts_from_file over stubs that log every call to <dir>/calls (ssh -G
+# names the host lower-cased; getent prints <dir>/dns/<target>, sleeps
+# with <target>.sleep, exits 2 with neither; H02_LOUD=1: both fail loudly).
+# The answer comes on the preset prompt fds, or no terminal. Console to
+# <dir>/out, status to <dir>/rc, HOSTS to <dir>/hosts, phase1 and phase2
+# for them to <dir>/phases. H02_LOOKUP_S lowers the lookup bound.
+h02_run() {
+    local d=$1 ans=$2 rows=$3 key loud=""; shift 3
+    mkdir -p "$d/bin" "$d/dns"; : > "$d/calls"
+    [ -z "${H02_LOUD:-}" ] || loud='echo "$0 called with no candidate pair" >&2; exit 99'
+    cat > "$d/bin/ssh" <<EOF
+#!/bin/sh
+echo "ssh \$*" >> $d/calls
+$loud
+for a; do n=\$a; done
+printf 'user u\nhostname %s\nport 22\n' "\$(printf %s "\$n" | tr A-Z a-z)"
+EOF
+    cat > "$d/bin/getent" <<EOF
+#!/bin/sh
+echo "getent \$*" >> $d/calls
+$loud
+f=$d/dns/\$2
+[ ! -e "\$f.sleep" ] || exec sleep 30
+[ -e "\$f" ] || exit 2
+cat "\$f"
+EOF
+    chmod +x "$d/bin/ssh" "$d/bin/getent"
+    printf 'host,user_login,ioengine,allowed_cpus,destination_folder\n%b' "$rows" > "$d/h.csv"
+    case $ans in (y|n) key=$ans ;; (*) key=$'\n' ;; esac
+    printf '%s' "$key" | (
+        export WEKATESTER_PROMPT_TTY=$d/no-tty; source ./wekatester
+        TARGETS=1; TARGETS_FILE=$d/h.csv; LOCAL_MODE=0; HOSTS=("$@"); PATH=$d/bin:$PATH
+        [ -z "${H02_LOOKUP_S:-}" ] || HOST_LOOKUP_S=$H02_LOOKUP_S
+        [ "$ans" = notty ] || { PROMPT_IN_FD=0; PROMPT_OUT_FD=1; }
+        hosts_from_file || exit
+        printf '%s\n' "${HOSTS[@]}" > "$d/hosts"
+        for h in "${HOSTS[@]}"; do echo "$h libaio ok"; done > "$d/engine.results"
+        { resolve_targets phase1 "$d/h.csv" - - - "${HOSTS[@]}"
+          resolve_targets phase2 "$d/h.csv" - - "$d/engine.results" "${HOSTS[@]}"; } > "$d/phases"
+    ) > "$d/out" 2>&1
+    echo $? > "$d/rc"
+}
+# h02_show <dir>: what a failing check prints
+h02_show() { { echo "rc $(cat "$1/rc"); hosts: $(tr "\n" " " < "$1/hosts" 2>&1)"; cat "$1/out" "$1/calls"; } >&2; }
+export -f h02_dns h02_run h02_show
+t_assert "hosts from file: spellings: names with no shared first label look nothing up; a pair is looked up, 2 ssh -G and 2 getent" bash -c '
+    d=$(mktemp -d)
+    H02_LOUD=1 h02_run "$d/a" enter "node1,ubuntu,,,\nnode2,ubuntu,,,\n"
+    [ "$(cat "$d/a/rc")" = 0 ] && [ "$(grep -c "" "$d/a/calls")" -eq 0 ] && [ "$(tr "\n" " " < "$d/a/hosts")" = "node1 node2 " ] || { h02_show "$d/a"; exit 1; }
+    # the control: a pair calls each stub once per name
+    h02_dns "$d/b" node1 192.0.2.1; h02_dns "$d/b" node1.lab 192.0.2.1
+    h02_run "$d/b" enter "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+    [ "$(grep -c "^ssh .*-G " "$d/b/calls")" -eq 2 ] && [ "$(grep -c "^getent ahosts " "$d/b/calls")" -eq 2 ] || { h02_show "$d/b"; exit 1; }'
+t_assert "hosts from file: spellings: node1 and Node1.lab on one address with equal rows fold into node1, said once, and no later phase names Node1.lab" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1
+    h02_run "$d" enter "node1,ubuntu,,,/mnt/a\nh2,ubuntu,,,/mnt/a\nNode1.lab,ubuntu,,,/mnt/a\n"
+    [ "$(cat "$d/rc")" = 0 ] && [ "$(grep -cF "host Node1.lab is node1 (same address): folded" "$d/out")" -eq 1 ] &&
+    ! grep -q "fold them?" "$d/out" && [ "$(tr "\n" " " < "$d/hosts")" = "node1 h2 " ] || { h02_show "$d"; exit 1; }
+    # the phases see node1 (the control) and never the folded spelling
+    n=$(grep -ic "node1\.lab" "$d/phases"); c=$(grep -c "^node1[[:space:]]" "$d/phases")
+    [ "$n" -eq 0 ] && [ "$c" -gt 0 ] || { echo "$n lines naming Node1.lab, $c naming node1:" >&2; cat "$d/phases" >&2; exit 1; }'
+t_assert "hosts from file: spellings: one address but differing rows stops the run, naming both rows" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1
+    h02_run "$d" enter "node1,ubuntu,,,\nNode1.lab,root,,,\n"
+    [ "$(cat "$d/rc")" = 1 ] && grep -qF "ERROR: host file $d/h.csv: the rows for node1 and Node1.lab name one host but their settings differ; keep one row" "$d/out" || { h02_show "$d"; exit 1; }'
+t_assert "hosts from file: spellings: different addresses ask the operator, naming both; y folds them" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.2
+    h02_run "$d" y "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+    [ "$(cat "$d/rc")" = 0 ] && grep -qF "node1 and Node1.lab look like one host but resolve differently (node1: 192.0.2.1; Node1.lab: 192.0.2.2): fold them? [y/N] yes" "$d/out" &&
+    grep -qF "host Node1.lab is node1 (the operator'"'"'s answer): folded" "$d/out" && [ "$(tr "\n" " " < "$d/hosts")" = "node1 " ] || { h02_show "$d"; exit 1; }'
+t_assert "hosts from file: spellings: different addresses, n or Enter keeps both" bash -c '
+    for a in n enter; do
+        d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.2
+        h02_run "$d" "$a" "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+        [ "$(cat "$d/rc")" = 0 ] && grep -qF "(node1: 192.0.2.1; Node1.lab: 192.0.2.2): fold them? [y/N] no" "$d/out" &&
+        ! grep -q ": folded" "$d/out" && [ "$(tr "\n" " " < "$d/hosts")" = "node1 Node1.lab " ] || { echo "answer $a:" >&2; h02_show "$d"; exit 1; }
+    done'
+t_assert "hosts from file: spellings: different addresses with no terminal stop the run, saying what to do" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.2
+    h02_run "$d" notty "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+    [ "$(cat "$d/rc")" = 1 ] && [ ! -e "$d/hosts" ] &&
+    grep -qF "ERROR: node1 and Node1.lab look like one host but resolve differently: choosing to fold or keep them needs a terminal; drop one of the two rows, or spell the names apart" "$d/out" || { h02_show "$d"; exit 1; }'
+t_assert "hosts from file: spellings: a name that does not resolve, or whose lookup is cut off at the bound, is asked about with that reason; Enter keeps both" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1
+    h02_run "$d" enter "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+    [ "$(cat "$d/rc")" = 0 ] && grep -qF "(node1: 192.0.2.1; Node1.lab: node1.lab does not resolve): fold them? [y/N] no" "$d/out" &&
+    [ "$(tr "\n" " " < "$d/hosts")" = "node1 Node1.lab " ] || { h02_show "$d"; exit 1; }
+    # a hung resolver: cut off at the bound, named, the run on within twice it
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; : > "$d/dns/node1.lab.sleep"
+    t0=${EPOCHREALTIME//[!0-9]/}
+    H02_LOOKUP_S=2 h02_run "$d" enter "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
+    ms=$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))
+    [ "$(cat "$d/rc")" = 0 ] && grep -qF "(node1: 192.0.2.1; Node1.lab: getent ahosts node1.lab was cut off after 2 s): fold them? [y/N] no" "$d/out" &&
+    [ "$(tr "\n" " " < "$d/hosts")" = "node1 Node1.lab " ] || { h02_show "$d"; exit 1; }
+    [ "$ms" -le 4000 ] || { echo "the cut-off lookup took $ms ms, want within 4 s" >&2; exit 1; }'
+t_assert "hosts from file: spellings: a command-line spelling of a file host folds into its row with no row check, counted as given" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1
+    h02_run "$d" enter "node1,ubuntu,,,\n" NODE1.lab
+    [ "$(cat "$d/rc")" = 0 ] && grep -qF "host NODE1.lab is node1 (same address): folded" "$d/out" &&
+    grep -qF "(1 host(s) from the file, 1 more from the command line)" "$d/out" && ! grep -q "settings differ" "$d/out" &&
+    [ "$(tr "\n" " " < "$d/hosts")" = "node1 " ] || { h02_show "$d"; exit 1; }'
+t_assert "hosts from file: spellings: three spellings make one fold and one question; an exact duplicate row still stops resolution, nothing looked up" bash -c '
+    d=$(mktemp -d); h02_dns "$d" node1 192.0.2.1; h02_dns "$d" node1.lab 192.0.2.1; h02_dns "$d" node1.b 192.0.2.2
+    h02_run "$d" enter "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\nnode1.b,ubuntu,,,\n"
+    [ "$(cat "$d/rc")" = 0 ] && [ "$(grep -c ": folded" "$d/out")" -eq 1 ] && [ "$(grep -c "fold them? \[y/N\]" "$d/out")" -eq 1 ] &&
+    grep -qF "host Node1.lab is node1 (same address): folded" "$d/out" && [ "$(tr "\n" " " < "$d/hosts")" = "node1 node1.b " ] || { h02_show "$d"; exit 1; }
+    d=$(mktemp -d)
+    h02_run "$d" enter "node1,ubuntu,,,\nnode1,ubuntu,,,\n"
+    [ "$(cat "$d/rc")" = 1 ] && grep -q "duplicate definition for host .node1. (first at line 2)" "$d/out" && [ "$(grep -c "" "$d/calls")" -eq 0 ] || { h02_show "$d"; exit 1; }'
 # README (Usage, server): "a name given twice (after `--` too) is a usage
 # error naming every repeated host". The lab ran `-n -t hosts.csv -- c1 c1`
 # with c1 in the file and got no error: hosts_from_file folds every CLI
