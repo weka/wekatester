@@ -5818,6 +5818,35 @@ t_assert "writeback: fill mode records derived values, keeps what the file provi
     grep -q "^# superseded by -a: h1,,psync" "$f" &&
     tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,$" &&
     (source ./wekatester; resolve_targets phase1 "$f" - - - h1 >>$SUITE_ASIDE)'
+# A review finding (2026-11-02): the writeback read what each host's own
+# row provides with `resolve_targets hostonly ... || : >` an empty set, so a
+# host file made malformed after the run read it (a row past the column
+# count, a relative destination) had its rows rewritten as if no host
+# owned one (psync became libaio here). The failure stops the writeback
+# with the resolver's message, the file untouched.
+t_assert "writeback: a host file the resolver now refuses stops the writeback with its message, the file byte-identical; the intact file writes back" bash -c '
+    ncols=$(source ./wekatester; set -- $GEOM_SLOTS; echo $((5 + $#)))
+    extra=$(printf "%*s" "$((ncols - 2))" "" | tr " " ","); extra="h1,,psync${extra}x"   # ncols + 1 cells, the last one set
+    for row in "$extra" "h1,,psync,,rel/dir,,,"; do
+        d=$(wb_fixture); f="$d/host.csv"
+        printf "host,user_login,ioengine\n%s\n" "$row" > "$f"; cp "$f" "$d/before"
+        err=$( (source ./wekatester
+                WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+                host_machine_id() { :; }   # no ssh to a fixture host
+                writeback_targets) 2>&1 ) && { printf "the writeback went on with [%s]: %s\n" "$row" "$err" >>$SUITE_ASIDE; cat "$f" >>$SUITE_ASIDE; exit 1; }
+        cmp -s "$d/before" "$f" || { printf "the file changed with [%s]:\n" "$row" >>$SUITE_ASIDE; cat "$f" >>$SUITE_ASIDE; exit 1; }
+        case "$err" in *"$f:2: "*) ;; *) printf "the message does not name %s:2: %s\n" "$f" "$err" >>$SUITE_ASIDE; exit 1;; esac
+    done
+    # the control: the cell count at the limit (positive control for the extra cell), then the intact row, both write back
+    [ "$(printf "%s\n" "$extra" | awk -F, "{print NF}")" -eq "$((ncols + 1))" ] || { echo "the extra row has the wrong cell count" >>$SUITE_ASIDE; exit 1; }
+    d=$(wb_fixture); f="$d/host.csv"
+    printf "host,user_login,ioengine\nh1,,psync,,,,,\n" > "$f"
+    (source ./wekatester
+     WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1
+     host_machine_id() { :; }
+     writeback_targets) >>$SUITE_ASIDE 2>&1 || exit 1
+    grep -q "^# superseded by -a: h1,,psync" "$f" && tail -1 "$f" | grep -q "^h1,ubuntu,psync,0-3,/mnt/w," ||
+        { cat "$f" >>$SUITE_ASIDE; false; }'
 t_assert "writeback: nothing to record leaves the file untouched" bash -c '
     d=$(wb_fixture); f="$d/host.csv"
     printf "h1,ubuntu,libaio,0-3,/mnt/w,,,,,4/1G/8/32,\n" > "$f"
