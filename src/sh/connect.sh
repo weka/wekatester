@@ -205,9 +205,49 @@ port_fail_report() {
     PORT_FAILED=()
 }
 
+# The teardown's remote rounds: each host's session bounded (timeout -k
+# 5) and forked as a process group of its own, so a second Ctrl-C reaches
+# main alone and no stop or release is cut short by it. A failed run's
+# end capture has its own bound, WT_SYSINFO_TIMEOUT.
+TEARDOWN_STOP_S=10    # the fio stop and staging removal
+TEARDOWN_LOCK_S=10    # the lock release
+TEARDOWN_MUX_S=5      # each ssh -O exit
+TEARDOWN_TMO=""       # timeout's path, "" when the controller has none
+TEARDOWN_ABORT=0      # a second INT or TERM came during the teardown
+
+# A run ending on a signal says what it does next, once.
+teardown_notice() {   # teardown_notice <exit status>
+    case $1 in (130|143) ;; (*) return 0 ;; esac
+    log "tearing down (Ctrl-C again skips the bundle): stopping fio, releasing the locks" >&2
+}
+
+# wait for a pid even when a caught signal cuts a wait short: until the
+# kernel no longer has it -> WAIT_RC
+wait_through() {   # wait_through <pid>
+    local said
+    while :; do
+        wait "$1" && WAIT_RC=0 || WAIT_RC=$?
+        said=$(kill -0 "$1" 2>&1) || return 0
+    done
+}
+
+# Wait the teardown's per-host sessions; a cut-off (124, or 137 when the
+# KILL ended it) is named with <what happened> for that host.
+teardown_wait() {   # teardown_wait <what happened> <pid> <host> [<pid> <host>]...
+    local what=$1
+    shift
+    while [ $# -ge 2 ]; do
+        wait_through "$1"
+        [ -z "$TEARDOWN_TMO" ] || { [ "$WAIT_RC" -ne 124 ] && [ "$WAIT_RC" -ne 137 ]; } \
+            || log "WARNING: $2: $what" >&2
+        shift 2
+    done
+}
+
 cleanup() {
-    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED tmo=() ph=()
     local -A grm=()
+    TEARDOWN_TMO=$(command -v timeout) || TEARDOWN_TMO=""
     # first: calibration's shape subshells, while the work dir they poll
     # still exists (a signal reached main alone; they would spin forever)
     cal_stop_shapes
@@ -223,16 +263,20 @@ cleanup() {
             kill_fio_cmd_v "$priv"
             # the run lock stays until after the end capture, below
             kcmd="$KILL_FIO_CMD; rm -rf '$TARGET_DIR' '$TARGET_DIR.cal'"
-            run_host "$host" "$kcmd" &
-            pids+=($!)
+            set -m
+            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_STOP_S} run_host "$host" "$kcmd" &
+            set +m
+            ph+=($! "$host")
         done
         # These pids only: a bare wait also waits on the run-log relays, which
         # exit only after cleanup returns. That is a deadlock.
-        wait "${pids[@]}" || true
+        teardown_wait "the fio stop was cut off after $TEARDOWN_STOP_S s; its server may still run" "${ph[@]}"
     fi
     # fio stops first: an aborted run's servers must not load the cluster
     # through this fleet-wide pressure/sar round trip. It rides the masters,
-    # which close only at the end of this function.
+    # which close only at the end of this function. A run stopped by a
+    # signal collects nothing more.
+    case $RUN_RC in (130|143) PRESSURE_END_DONE=1 ;; esac
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
         if [ "$RUN_RC" -eq 0 ]; then snapshot_pressure end
@@ -248,7 +292,7 @@ cleanup() {
     # slice; with this run's group file when collect_fs_groups has not removed
     # it (every host holds a lock by then; fio starts after it)
     if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
-        pids=()
+        ph=()
         if [ -n "$GROUP_FILE" ] && [ "$GROUP_FILE_REMOVED" -eq 0 ]; then
             load_host_dirs
             for i in "${!HOSTS[@]}"; do
@@ -256,23 +300,28 @@ cleanup() {
             done
         fi
         for host in "${!RUN_LOCKS[@]}"; do
-            run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
-            pids+=($!)
+            set -m
+            RUN_HOST_TIMEOUT=${TEARDOWN_TMO:+$TEARDOWN_LOCK_S} run_host "$host" "${grm[$host]:-}$LOCK_RELEASE" &
+            set +m
+            ph+=($! "$host")
         done
         RUN_LOCKS=()
-        wait "${pids[@]}" || true
+        teardown_wait "the lock release was cut off after $TEARDOWN_LOCK_S s; the next run there needs --break-lock" "${ph[@]}"
     fi
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         # Close every ControlMaster at once (one at a time was seconds at a few
         # hundred hosts), then drop the work dir. -q silences the banner; a
         # failed -O exit still reports on stderr.
         pids=()
+        [ -z "$TEARDOWN_TMO" ] || tmo=("$TEARDOWN_TMO" -k 5 "$TEARDOWN_MUX_S")
         for f in "${CTRL_DIR:-$WORK_DIR/c}"/*; do
             [ -S "$f" ] || continue
-            ssh -q -O exit -o ControlPath="$f" unused-host-arg &
+            set -m
+            ${tmo[@]+"${tmo[@]}"} ssh -q -O exit -o ControlPath="$f" unused-host-arg &
+            set +m
             pids+=($!)
         done
-        [ ${#pids[@]} -eq 0 ] || wait "${pids[@]}" || true
+        for f in ${pids[@]+"${pids[@]}"}; do wait_through "$f"; done
         rm -rf "$WORK_DIR"
     fi
 }

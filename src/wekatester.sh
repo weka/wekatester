@@ -65,7 +65,9 @@ STAGE_BASE=/dev/shm
 
 # Control opts are per host (host_ssh_opts): a host on a user-owned master
 # must not get our ControlPath.
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+# ServerAlive: a master whose host dropped off the network fails in about
+# 60 s, not the kernel's retransmit limit (about 15 min).
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 CONTROL_OPTS=""
 CTRL_DIR=""   # the ssh master sockets' directory (make_ctrl_dir)
 
@@ -658,11 +660,11 @@ main() {
         CONTROL_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_DIR/%C -o ControlPersist=yes"
 
     # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
-    # trap alone runs cleanup, keeps the status, finalizes the bundle. INT
-    # reaches main alone (background subshells ignore it): cleanup stops
-    # calibration's shapes first. PIPE caught, not ignored: a lost console
-    # fails main's write; children keep the default.
-    trap 'rc=$?; RUN_RC=$rc; cleanup; finalize_run_dir; exit $rc' EXIT
+    # trap alone runs cleanup (shapes first: INT reaches main alone) and
+    # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
+    # fio still stops, no bundle. PIPE caught, not ignored: children keep
+    # the default.
+    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap ':' PIPE

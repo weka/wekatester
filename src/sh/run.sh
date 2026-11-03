@@ -415,6 +415,13 @@ finalize_run_dir() {
         wait "${RELAY_PIDS[1]}"; [ $? -ne 1 ] || err_lost=1
         RELAY_PIDS=()
     fi
+    if [ "${TEARDOWN_ABORT:-0}" -eq 1 ]; then
+        # a second INT or TERM during the teardown: no archive, the dir stays
+        if [ -z "$out_lost" ]; then log "run bundle skipped (Ctrl-C during the teardown): the run directory is left uncompressed at $RUN_DIR"
+        elif [ -z "$err_lost" ]; then log "run bundle skipped (Ctrl-C during the teardown): the run directory is left uncompressed at $RUN_DIR" >&2
+        fi
+        return 0
+    fi
     if tar "$zip" -cf "$OUTPUT_DIR/$RUN_STAMP.tgz" -C "$OUTPUT_DIR" "$RUN_STAMP"; then
         rm -rf "$RUN_DIR"
         if [ -z "$out_lost" ]; then log "run bundle: $OUTPUT_DIR/$RUN_STAMP.tgz"
