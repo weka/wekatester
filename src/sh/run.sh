@@ -415,7 +415,7 @@ finalize_run_dir() {
             for f in "/proc/$$/fd/"*; do
                 fd=${f##*/}
                 [ "$fd" -gt 9 ] && t=$(readlink "$f") || continue
-                case $t in ("$WORK_DIR/log/out"*|"$WORK_DIR/log/err"*) exec {fd}>&- ;; esac
+                case $t in (*"/${WORK_DIR##*/}/log/out"*|*"/${WORK_DIR##*/}/log/err"*) exec {fd}>&- ;; esac
             done
         fi
         wait "${RELAY_PIDS[0]}"; [ $? -ne 1 ] || out_lost=1
