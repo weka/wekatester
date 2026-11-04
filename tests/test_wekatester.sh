@@ -7709,6 +7709,35 @@ t_assert "check_fio_errors: an empty client_stats list is a failed run, not a pa
         *"no per-job stats"*) true;;
         *) echo "rc=$rc $err" >&2; false;;
     esac'
+# A signal can end the layout fio early with error 0 on every client: given
+# the tool's own plan, a layout whose clients wrote fewer bytes fails. Two
+# clients past 2^31 bytes each (the awk's sum must stay whole under mawk),
+# and an "All clients" entry carrying the sum, which must not count twice.
+# Rows: plan|LAYOUT_OWN|want rc|want stderr ("-" no plan, "" nothing).
+t_assert "check_fio_errors: a layout that wrote fewer bytes than the tool's own plan fails, naming both; equal, no plan, or the set's own layout passes" bash -c '
+    tmp=$(mktemp -d)
+    cat > "$tmp/r.json" <<"JSON"
+{ "client_stats": [
+    { "jobname": "layout", "hostname": "vega-1", "error": 0,
+      "read": { "io_bytes": 0, "total_ios": 0 }, "write": { "io_bytes": 3298534883328, "total_ios": 3145728 } },
+    { "jobname": "layout", "hostname": "vega-2", "error": 0,
+      "read": { "io_bytes": 0, "total_ios": 0 }, "write": { "io_bytes": 3298534883327, "total_ios": 3145727 } },
+    { "jobname": "All clients", "error": 0,
+      "read": { "io_bytes": 0, "total_ios": 0 }, "write": { "io_bytes": 6597069766655, "total_ios": 6291455 } } ] }
+JSON
+    (source ./wekatester
+     while IFS="|" read -r plan own want msg; do
+         LAYOUT_OWN=$own
+         if [ "$plan" = - ]; then err=$(check_fio_errors "$tmp/r.json" layout 2>&1 >>$SUITE_ASIDE); rc=$?
+         else err=$(check_fio_errors "$tmp/r.json" layout "$plan" 2>&1 >>$SUITE_ASIDE); rc=$?; fi
+         [ "$rc" -eq "$want" ] && [ "$err" = "$msg" ] || { echo "plan $plan LAYOUT_OWN $own: rc $rc (want $want), stderr [$err] (want [$msg])" >&2; exit 1; }
+     done <<"ROWS"
+6597069766656|0|1|ERROR: layout cut short: fio wrote 6597069766655 of 6597069766656 bytes (a signal or a dropped worker ended it early)
+6597069766655|0|0|
+-|0|0|
+6597069766656|1|0|
+ROWS
+    )'
 
 # --- calibration: per client shape, solo, one search per test type ---------
 # Rulings (2026-09-23): bandwidth = line rate on 1M IO (95% counts), iops =
