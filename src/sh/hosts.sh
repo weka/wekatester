@@ -193,16 +193,20 @@ fold_rows_check() {   # fold_rows_check <a> <b> <b-is-a-file-row:0|1> <a-is-a-fi
 # rows. Each name meets the kept names with its label, in order.
 fold_spellings() {
     local nf=$1 i=0 a b lb k ka kb fa fb cands names=()
-    local -A bylab=() isfile=() nlab=()
+    local -A bylab=() isfile=() nlab=() lab=()
     shift
     FOLDED=()
-    # host names are ASCII: ${,,} needs no lower() fork per host
-    for b in "$@"; do lb=${b%%.*}; lb=${lb,,}; nlab[$lb]=$(( ${nlab[$lb]:-0} + 1 )); done
-    for b in "$@"; do lb=${b%%.*}; lb=${lb,,}; [ "${nlab[$lb]}" -lt 2 ] || names+=("$b"); done
+    # host names are ASCII: ${,,} needs no lower() fork per host. An IPv4
+    # address is its own label: 192.0.2.11 and 192.0.2.12 are two hosts.
+    for b in "$@"; do
+        if [[ $b =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then lb=$b; else lb=${b%%.*}; lb=${lb,,}; fi
+        lab[$b]=$lb; nlab[$lb]=$(( ${nlab[$lb]:-0} + 1 ))
+    done
+    for b in "$@"; do [ "${nlab[${lab[$b]}]}" -lt 2 ] || names+=("$b"); done
     [ ${#names[@]} -eq 0 ] || host_addrs_all "${names[@]}"
     for b in "$@"; do
         i=$((i + 1)); [ "$i" -gt "$nf" ] || isfile[$b]=1
-        lb=${b%%.*}; lb=${lb,,}
+        lb=${lab[$b]}
         k=""
         read -ra cands <<<"${bylab[$lb]-}"
         for a in ${cands[@]+"${cands[@]}"}; do
