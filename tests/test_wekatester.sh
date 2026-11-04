@@ -2503,6 +2503,35 @@ t_assert "staging: without -g a hand-edited own layout is staged as written" bas
      stage_jobfiles) >>$SUITE_ASIDE || exit 1
     cmp "$o" "$l" >>$SUITE_ASIDE && cmp "$o" "$w/set/000-wekatester-layout.job" >>$SUITE_ASIDE &&
     grep -qx "# operator note" "$w/jobs/localhost/000-wekatester-layout.job"'
+# fallocate other than none makes a layout's files full size at once, so a
+# cut layout would pass the post-layout sweep (Frank, 2026-11-04): the
+# STAGED copy of a set's own layout job gets fallocate=none, added under
+# [global] (made if missing) unless a line already sets none, and every
+# other fallocate value set to none in place; the source stays byte-identical.
+# Rows: source|staged ("=" the source)|the NOTE's verb ("-" no NOTE).
+t_assert "staging: a set's own layout job is staged with fallocate=none added or set, saying which; the source is untouched" bash -c '
+    while IFS="|" read -r src want verb; do
+        s=$(mktemp -d); w=$(mktemp -d); mkdir -p "$w/jobs"
+        printf "%b" "$src" > "$s/000-wekatester-layout.job"; cp "$s/000-wekatester-layout.job" "$w/orig"
+        printf "# report bandwidth\n[global]\n[a]\nrw=read\n" > "$s/011-bw.job"
+        out=$( (source ./wekatester
+         LOCAL_MODE=1; HOSTS=(localhost); MASTER=localhost; WORK_DIR=$w; REGEN_LAYOUT=0; DRY_RUN=1
+         TARGET_DIR="$w/target"; DIRECTORY=/mnt/x; SET_DIR_OVERRIDE=$s
+         stage_jobfiles) 2>&1 ) || { echo "[$src]: $out" >&2; exit 1; }
+        [ "$want" = "=" ] && want=$src
+        printf "%b" "$want" > "$w/want"
+        n=$(grep -c "NOTE: 000-wekatester-layout.job: fallocate=" <<<"$out")
+        cmp "$w/orig" "$s/000-wekatester-layout.job" >>$SUITE_ASIDE && cmp "$w/want" "$w/set/000-wekatester-layout.job" >>$SUITE_ASIDE &&
+        if [ "$verb" = - ]; then [ "$n" -eq 0 ]
+        else [ "$n" -eq 1 ] && grep -qF "NOTE: 000-wekatester-layout.job: fallocate=none $verb in the set'"'"'s own layout job, so an interrupted layout leaves short files the sweep catches, never full-size hollow ones" <<<"$out"; fi ||
+            { { echo "[$src]: staged:"; cat "$w/set/000-wekatester-layout.job"; echo "want:"; cat "$w/want"; echo "console:"; echo "$out"; } >&2; exit 1; }
+    done <<"ROWS"
+[global]\ndirectory=/orig\n[lay]\ncreate_only=1\nfilesize=1M\n|[global]\nfallocate=none\ndirectory=/orig\n[lay]\ncreate_only=1\nfilesize=1M\n|added
+[global]\nfallocate=none\n[lay]\ncreate_only=1\nfilesize=1M\n|=|-
+[lay]\ncreate_only=1\nfilesize=1M\n|[global]\nfallocate=none\n[lay]\ncreate_only=1\nfilesize=1M\n|added
+[global]\ndirectory=/orig\n[lay]\nfallocate=native\ncreate_only=1\nfilesize=1M\n|[global]\nfallocate=none\ndirectory=/orig\n[lay]\nfallocate=none\ncreate_only=1\nfilesize=1M\n|added and set in 1 line(s)
+[global]\nfallocate=native\n[lay]\ncreate_only=1\nfilesize=1M\n|[global]\nfallocate=none\n[lay]\ncreate_only=1\nfilesize=1M\n|set in 1 line(s)
+ROWS'
 t_assert "staging -a -g: a hand-edited own layout is regenerated and re-derived per host, with no edited-layout warning" bash -c '
     source ./tests/helpers.sh; tuner_fixture
     (source ./wekatester; generate_layout "$FIX/src" "$FIX/src") >>$SUITE_ASIDE || exit 1
