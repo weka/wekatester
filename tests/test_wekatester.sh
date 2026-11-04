@@ -1313,7 +1313,7 @@ s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("0.0.0.0", 8765)); s.listen(64)
 while True:
     c, _ = s.accept(); c.close()' >> "$STUB_LOG.srv" 2>&1 < "$STUB_LOG.srv" &
-         echo $! > "${2#--daemonize=}")
+         echo $! > "${2#--daemonize=}"; echo $! > "$STUB_LOG.pid")
         exit 0 ;;
 esac
 for a; do case $a in (--client=*) exec sleep 30 ;; esac; done
@@ -1330,21 +1330,21 @@ EOF
     i=0
     until grep -q "laying out files" "$d/run.out" && [ -e "$d/stub.log" ] && grep -q -- "--client=" "$d/stub.log"; do
         if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
-            echo "no layout in flight after $((i / 10)) s:" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+            echo "no layout in flight after $((i / 10)) s:" >&2; cat "$d/run.out" >&2; stophang_kill "$pid" "$d"; return 1
         fi
         sleep 0.1; i=$((i + 1))
     done
     sleep 2
     # the control: the tool and the layout fio are in its group
     n0=$(pgrep -g "$pid" | grep -c .)
-    [ "$n0" -ge 2 ] || { echo "control: $n0 processes in group $pid before the signal, want >= 2" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    [ "$n0" -ge 2 ] || { echo "control: $n0 processes in group $pid before the signal, want >= 2" >&2; stophang_kill "$pid" "$d"; return 1; }
     case $to in (pid) kill -"$sig" "$pid" ;; (group) kill -"$sig" -- "-$pid" ;; esac
     i=0
     while sigcal_alive "$pid" && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
     if sigcal_alive "$pid"; then
         echo "TIMEOUT after 15 s: $sig to the $to, the tool (pid $pid) still alive; its group:" >&2
-        ps -o pid=,stat=,wchan:20=,args= -g "$pid" | cut -c1-140 >&2; echo "--- console, last lines:" >&2; tail -n 3 "$d/run.out" >&2
-        kill -9 -- "-$pid" 2>&1 || :; return 1
+        ps -o pid=,stat=,wchan:20=,args= -p "$(pgrep -g "$pid" | paste -sd, -)" | cut -c1-140 >&2; echo "--- console, last lines:" >&2; tail -n 3 "$d/run.out" >&2
+        stophang_kill "$pid" "$d"; return 1
     fi
     took=$((i / 10))
     wait "$pid"; rc=$?
@@ -1354,9 +1354,18 @@ EOF
     [ -s "${last##* run bundle: }" ] || { echo "no bundle at ${last##* run bundle: }: $(ls "$d/out" 2>&1 | tr "\n" " ")" >&2; return 1; }
     sleep 0.2
     n1=$(pgrep -g "$pid" | grep -c .)
-    [ "$n1" -eq 0 ] || { echo "$n1 processes left in group $pid (before the signal: $n0):" >&2; ps -o pid=,args= -g "$pid" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    [ "$n1" -eq 0 ] || { echo "$n1 processes left in group $pid (before the signal: $n0):" >&2; ps -o pid=,args= -p "$(pgrep -g "$pid" | paste -sd, -)" >&2; stophang_kill "$pid" "$d"; return 1; }
 }
 export -f stophang_run
+# stophang_kill <pid> <dir>: a row cut short kills the tool's group, and the
+# fixed fio pidfile goes only while it still holds this row's stub server
+stophang_kill() {
+    local p s; kill -9 -- "-$1" 2>&1 || :
+    if p=$(cat /dev/shm/wekatester-fio.pid 2>&1) && s=$(cat "$2/stub.log.pid" 2>&1) && [ "$p" = "$s" ]; then
+        rm -f /dev/shm/wekatester-fio.pid
+    fi
+}
+export -f stophang_kill
 # stophang_row <stophang_run args>: its output (job-control notices are
 # noise) shown only by a failing or skipped row, its status passed on
 stophang_row() {
