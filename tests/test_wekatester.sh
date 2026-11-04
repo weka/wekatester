@@ -5531,6 +5531,77 @@ t_assert "auth rounds: the host file pins a host's login when the credential has
      grep -qx "h1:ubuntu" "$d/log" && grep -qx "h2:" "$d/log" &&
      [ "$(cat "$AUTH_DIR/h1.user")" = ubuntu ] && test ! -f "$AUTH_DIR/h2.user")'
 
+# --- host ranges (Frank, 2026-11-04) ---
+# One row per line: the names given to one source, then the names they
+# give, "#count first last", or "ERR fragment" (the run stops naming the
+# source and the name). Lists keep their order; [a,b] is a list (20:57Z).
+RANGE_ROWS='h[0-0]|h0
+h[a-a]|ha
+h{a..c}|ha hb hc
+h{1..3}|h1 h2 h3
+h{01..3}|h01 h02 h03
+h[1-03]|h1 h2 h3
+h[001-3]|h001 h002 h003
+h[9-11]|h9 h10 h11
+h[01-1]|h01
+n[1-10]|#10 n1 n10
+n[01-10]|#10 n01 n10
+n[10-100]|#91 n10 n100
+my-gpu-0[01-03]|my-gpu-001 my-gpu-002 my-gpu-003
+192.0.2.[10-12]|192.0.2.10 192.0.2.11 192.0.2.12
+192.0.2.{10,11,13}|192.0.2.10 192.0.2.11 192.0.2.13
+h{c,a,b}|hc ha hb
+h[1,2]|h1 h2
+h[c,a]|hc ha
+h[1-2]{a,b}|h1a h1b h2a h2b
+[1-2]h|1h 2h
+h{a,b}.{1..2}|ha.1 ha.2 hb.1 hb.2
+h{a..c}x[1-1]|hax1 hbx1 hcx1
+n[1-3].[a-b].lab|n1.a.lab n1.b.lab n2.a.lab n2.b.lab n3.a.lab n3.b.lab
+h{1..3}{1..3}|h11 h12 h13 h21 h22 h23 h31 h32 h33
+h[0-9][0-9]|#100 h00 h99
+n[1-7].[1-11].[1-13]|#1001 n1.1.1 n7.11.13
+h[1-2] h[2-3]|h1 h2 h2 h3
+h[1-2].lab plain|h1.lab h2.lab plain
+a,b|a,b
+h{c..a}|ERR runs backwards
+h[10-9]|ERR runs backwards
+h[z-a]|ERR runs backwards
+h{a,,b}|ERR empty
+h{a,}|ERR empty
+h{,a}|ERR empty
+h[a,,b]|ERR empty
+h{a,{b,c}}|ERR nest
+h{a,[1-2]}|ERR nest
+h[1-3|ERR never closed
+h{a,b|ERR never closed
+h1-3]|ERR closes no range
+h}a{|ERR closes no range
+h[a-C]|ERR
+h[1-c]|ERR
+h[-1-3]|ERR
+h{-1..2}|ERR
+h{1..5..2}|ERR
+h[]|ERR
+h{}|ERR
+h[ab]|ERR
+h[!a]|ERR'
+export RANGE_ROWS
+t_assert "host ranges: each row of names expands to its hosts, or stops the run naming the source and the name" bash -c '
+    source ./wekatester; bad=0
+    while IFS="|" read -r args want; do
+        read -ra a <<<"$args"
+        out=$( (expand_host_ranges "command line" "${a[@]}"; printf "%s\n" "${EXPANDED[@]}") 2>&1 ); rc=$?
+        case $want in
+            ERR*) f=${want#ERR}; f=${f# }
+                  [ "$rc" -ne 0 ] && [[ $out == *"command line: host range '\''$args'\'': "*"$f"* ]] ;;
+            "#"*) read -r n first last <<<"$want"; mapfile -t got <<<"$out"
+                  [ "$rc" -eq 0 ] && [ "${#got[@]}" -eq "${n#\#}" ] && [ "${got[0]}" = "$first" ] && [ "${got[-1]}" = "$last" ] ;;
+            *) [ "$rc" -eq 0 ] && [ "$(printf "%s " $out)" = "$want " ] ;;
+        esac || { echo "[$args] want [$want], rc $rc: $(printf "%s" "$out" | head -3)" >&2; bad=$((bad + 1)); }
+    done <<<"$RANGE_ROWS"
+    [ "$bad" -eq 0 ]'
+
 # --- engine proving, pinning enforcement, priv lifecycle ---
 t_assert "engines: candidates are proven with a real job; auto probe list is rewritten" bash -c '
     d=$(mktemp -d); mkdir -p "$d/probe"
