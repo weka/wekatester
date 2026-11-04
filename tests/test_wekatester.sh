@@ -1327,7 +1327,10 @@ esac
 for a; do case $a in (--client=*) c=1 ;; esac; done
 [ -n "${c:-}" ] || exit 0
 [ -n "${STUB_LAYOUT:-}" ] || exec sleep 8
-case ${@: -1} in (*/000-wekatester-layout.job) eval "$STUB_LAYOUT" ;; esac
+# lay <jobnum> <size>: the staged job's file for that job, at that size
+lay() { local f; f=$(sed -n 's/^filename_format=//p' "$job" | head -n 1); truncate -s "$2" "$STUB_DATA/${f//\$jobnum/$1}"; }
+job=${@: -1}
+case $job in (*/000-wekatester-layout.job) eval "$STUB_LAYOUT" ;; esac
 echo '{ "client_stats": [ { "jobname": "j", "hostname": "localhost", "error": 0, "read": { "total_ios": 1, "io_bytes": 4096, "bw_bytes": 4096 }, "write": { "total_ios": 0, "io_bytes": 0, "bw_bytes": 0 } } ] }'
 EOF
     chmod +x "$d/bin/fio"; : > "$d/stub.log.srv"
@@ -5043,9 +5046,10 @@ numjobs=2"
 # again once it ends (Frank, 2026-11-04): a sized file still missing or short
 # stops the run before any measured job. ownlay_run <dir> <sized|unsized>
 # <STUB_LAYOUT command>: a copy of the built tool beside a set "own" (its own
-# layout job, two 64 KiB files lay.0 and lay.1, or one unsized section; one
-# measured job), local mode over localrun_fixture's stub, whose layout run
-# leaves what the command writes into $STUB_DATA. Console in <dir>/run.out,
+# layout job, two 64 KiB files, or one unsized section; one measured job),
+# local mode over localrun_fixture's stub, whose layout run runs the command
+# ("lay <jobnum> <size>" makes the staged job's file, host-prefixed, at that
+# size). Console in <dir>/run.out,
 # status in <dir>/rc, the stub's calls in <dir>/stub.log.
 ownlay_run() {
     local d=$1 size=$2
@@ -5065,14 +5069,14 @@ ownlay_run() {
 export -f ownlay_run
 t_assert "layout: a set's own layout job that leaves a file short stops the run naming the host and the job, before any measured job; full files go on" bash -c '
     d=$(mktemp -d)
-    ownlay_run "$d/short" sized "truncate -s 64K \"\$STUB_DATA/lay.0\"; truncate -s 1000 \"\$STUB_DATA/lay.1\"" 2>>$SUITE_ASIDE || exit
+    ownlay_run "$d/short" sized "lay 0 64K; lay 1 1000" 2>>$SUITE_ASIDE || exit
     o=$(cat "$d/short/run.out")
     [ "$(cat "$d/short/rc")" -ne 0 ] &&
     case "$o" in *"ERROR: localhost: 1 layout file(s) missing or short after the layout ("*"ERROR: layout 000-wekatester-layout.job left files short -- the set'"'"'s own layout job did not finish (a signal or a dropped worker)"*) true;; *) false;; esac &&
     ! grep -q -- "--client=.*011-own-readbw" "$d/short/stub.log" ||
         { { echo "short: rc $(cat "$d/short/rc")"; cat "$d/short/run.out" "$d/short/stub.log"; } >&2; exit 1; }
     # the control: both files full, the layout completes and the measured job runs
-    ownlay_run "$d/full" sized "truncate -s 64K \"\$STUB_DATA/lay.0\" \"\$STUB_DATA/lay.1\"" 2>>$SUITE_ASIDE || exit
+    ownlay_run "$d/full" sized "lay 0 64K; lay 1 64K" 2>>$SUITE_ASIDE || exit
     grep -q "layout: complete" "$d/full/run.out" && ! grep -q "missing or short after the layout" "$d/full/run.out" &&
     grep -q -- "--client=.*011-own-readbw" "$d/full/stub.log" ||
         { { echo "full: rc $(cat "$d/full/rc")"; cat "$d/full/run.out" "$d/full/stub.log"; } >&2; exit 1; }'
