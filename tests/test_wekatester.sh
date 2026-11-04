@@ -1297,11 +1297,13 @@ t_assert "signal: a console lost with no signal (its reader gone mid-calibration
 # bundle: <tgz>", the tgz kept, nothing left in its process group. A signal to
 # the pid alone waits for the layout fio (bash runs a trap once its foreground
 # child exits), so those rows allow the layout's 8 s. Local mode's port check probes
-# localhost:8765: where localhost does not resolve each row is a SKIP (rc
+# localhost:8765: where localhost does not resolve promptly each row is a SKIP (rc
 # 77), and a listener already on 8765 is a FAIL (a host left unclean).
 stophang_run() {
     local sig=$1 to=$2 want=$3 bound=$4 ign=${5:-} d pid i rc took n0 n1 last _o
-    _o=$(getent hosts localhost) || { echo "precondition: localhost does not resolve here, so local mode stops at its port check" >&2; return 77; }
+    # the port check gives localhost 3 s: a name answered only by a slow DNS fails it
+    _o=$(timeout 2 getent ahostsv4 localhost) && [[ $_o == 127.0.0.1[[:space:]]* ]] ||
+        { echo "precondition: localhost does not resolve to 127.0.0.1 within 2 s here, so local mode stops at its port check" >&2; return 77; }
     if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "host not clean: something already listens on 8765 (a fio server left behind?)" >&2; return 1; fi
     d=$(mktemp -d); mkdir -p "$d/bin" "$d/data" "$d/out"
     cat > "$d/bin/fio" <<'EOF'
