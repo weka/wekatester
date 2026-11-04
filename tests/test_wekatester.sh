@@ -64,14 +64,20 @@ suite_now_us_v() {   # the clock, in microseconds, into NOW_US (no subshell)
     if [ -n "${EPOCHREALTIME:-}" ]; then NOW_US=${EPOCHREALTIME//[!0-9]/}
     else NOW_US=${SECONDS}000000; fi
 }
+# A test that exits 77 with "precondition: <why>" as its SUITE_ASIDE's first
+# line is a printed, counted SKIP (this host cannot run it); any other 77 fails.
 t_assert() {   # t_assert <description> <command...>
-    local aside l t0 took
+    local aside l t0 took rc
     if [ -n "${SUITE_ONLY:-}" ] && ! [[ $1 =~ $SUITE_ONLY ]]; then SKIP=$((SKIP+1)); return 0; fi
     : > "$SUITE_ASIDE"
     suite_now_us_v; t0=$NOW_US
-    if "${@:2}"; then suite_now_us_v; took=$(( NOW_US - t0 )); PASS=$((PASS+1))
+    "${@:2}"; rc=$?
+    suite_now_us_v; took=$(( NOW_US - t0 ))
+    if [ "$rc" -eq 0 ]; then PASS=$((PASS+1))
          printf 'ok - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
-    else suite_now_us_v; took=$(( NOW_US - t0 )); FAIL=$((FAIL+1))
+    elif [ "$rc" -eq 77 ] && IFS= read -r l < "$SUITE_ASIDE" && [[ $l == "precondition: "* ]]; then SKIP=$((SKIP+1))
+         printf 'SKIP - %s (%s) (%d.%ds)\n' "$1" "$l" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
+    else FAIL=$((FAIL+1))
          printf 'FAIL - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
          aside=$(<"$SUITE_ASIDE")
          [ -z "$aside" ] || while IFS= read -r l; do printf '    | %s\n' "$l"; done <<<"$aside"
@@ -1288,12 +1294,13 @@ t_assert "signal: a console lost with no signal (its reader gone mid-calibration
 # mode, -w smoke -r --any-fs, over a stub fio (a server listening on the fio
 # port; a --client run sleeping 30 s), signalled 2 s into the layout. Within
 # 15 s it must exit <want rc>, the console ending "run bundle: <tgz>", the tgz
-# kept, nothing left in its process group. Needs localhost to resolve and
-# the fio port free: local mode's port check probes localhost:8765.
+# kept, nothing left in its process group. Local mode's port check probes
+# localhost:8765: where localhost does not resolve each row is a SKIP (rc
+# 77), and a listener already on 8765 is a FAIL (a host left unclean).
 stophang_run() {
     local sig=$1 to=$2 want=$3 ign=${4:-} d pid i rc took n0 n1 last _o
-    getent hosts localhost >>$SUITE_ASIDE || { echo "precondition: localhost does not resolve here, so local mode stops at its port check" >&2; return 1; }
-    if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "precondition: something already listens on 8765 (a real fio server?)" >&2; return 1; fi
+    _o=$(getent hosts localhost) || { echo "precondition: localhost does not resolve here, so local mode stops at its port check" >&2; return 77; }
+    if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "host not clean: something already listens on 8765 (a fio server left behind?)" >&2; return 1; fi
     d=$(mktemp -d); mkdir -p "$d/bin" "$d/data" "$d/out"
     cat > "$d/bin/fio" <<'EOF'
 #!/usr/bin/env bash
@@ -1350,21 +1357,29 @@ EOF
     [ "$n1" -eq 0 ] || { echo "$n1 processes left in group $pid (before the signal: $n0):" >&2; ps -o pid=,args= -g "$pid" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
 }
 export -f stophang_run
+# stophang_row <stophang_run args>: its output (job-control notices are
+# noise) shown only by a failing or skipped row, its status passed on
+stophang_row() {
+    local out rc; out=$(stophang_run "$@" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || printf "%s\n" "$out" >>$SUITE_ASIDE
+    return "$rc"
+}
+export -f stophang_row
 t_assert "signal: a local run stopped mid-layout by INT to the tool alone exits 130 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
-    out=$(stophang_run INT pid 130 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+    stophang_row INT pid 130'
 t_assert "signal: a local run stopped mid-layout by INT to its group (Ctrl-C) exits 130 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
-    out=$(stophang_run INT group 130 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+    stophang_row INT group 130'
 t_assert "signal: a local run stopped mid-layout by TERM to the tool alone exits 143 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    out=$(stophang_run TERM pid 143 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+    stophang_row TERM pid 143'
 t_assert "signal: a local run stopped mid-layout by TERM to its group exits 143 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    out=$(stophang_run TERM group 143 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+    stophang_row TERM group 143'
 t_assert "signal: a local run started with INT ignored and stopped mid-layout by TERM to the tool exits 143 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    out=$(stophang_run TERM pid 143 intignored 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+    stophang_row TERM pid 143 intignored'
 # PR #47 review, finding 1: a log() that traps SIGPIPE in the writer keeps
 # a producer alive after its reader is gone (`f | head -1` ran f to its end,
 # its output into the run log). The plain log() dies with its reader, 141.
