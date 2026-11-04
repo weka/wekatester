@@ -6461,6 +6461,36 @@ t_assert "writeback: the host file is written in place -- a symlink stays a syml
     [ "$rc" != 0 ] || { echo "read-only file: rc=0" >&2; exit 1; }
     cmp -s "$d/orig" "$f" || { echo "read-only file: changed" >&2; exit 1; }
     case "$out" in *"$f"*) ;; *) echo "read-only file: the message does not name it: $out" >&2; exit 1;; esac'
+# Host ranges (Frank, 2026-11-04): a range row with a host to record or to
+# fold becomes one line per host, the row kept as "# expanded: <row>"; a
+# range row with neither stays as written.
+t_assert "writeback: a range row holding a recorded or folded host expands to a line per host under its comment; one with neither is untouched" bash -c '
+    wb() {   # wb <fold rows> <host-file rows>: the writeback over the fixture, the file after
+        d=$(wb_fixture); f=$d/host.csv
+        printf "host,user_login,ioengine\n%b" "$2" > "$f"
+        (source ./wekatester
+         WORK_DIR=$d; HOSTS=(h1); AUTO_LEVEL=max; TARGETS_FILE=$f; FAST_TRACK=1; HOST_FOLD_ROWS=$1
+         host_machine_id() { :; }
+         writeback_targets) >>$SUITE_ASIDE 2>&1 || { echo "writeback failed: $(<"$f")" >&2; return 1; }
+        tail -n +2 "$f"
+    }
+    got=$(wb "" "h[1-2],,psync,,\n") || exit 1
+    want="# expanded: h[1-2],,psync,,
+h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,
+h2,,psync,,"
+    [ "$got" = "$want" ] || { echo "recorded: [$got]" >&2; exit 1; }
+    got=$(wb "" "h1,,psync,,\nn[1-2],,psync,,\n") || exit 1
+    want="# superseded by -a: h1,,psync,,
+h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,
+n[1-2],,psync,,"
+    [ "$got" = "$want" ] || { echo "neither: [$got]" >&2; exit 1; }
+    got=$(wb "n2=h1" "h1,,psync,,\nn[1-2],,psync,,\n") || exit 1
+    want="# superseded by -a: h1,,psync,,
+h1,ubuntu,psync,0-3,/mnt/w,,,,,/1G/8/32,
+# expanded: n[1-2],,psync,,
+n1,,psync,,
+# folded into h1: same host: n2,,psync,,"
+    [ "$got" = "$want" ] || { echo "folded: [$got]" >&2; exit 1; }'
 # A review finding (2026-11-02): the writeback read what each host's own
 # row provides with `resolve_targets hostonly ... || : >` an empty set, so a
 # host file made malformed after the run read it (a row past the column
