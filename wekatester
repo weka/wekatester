@@ -2064,17 +2064,25 @@ parse_args() {
 # Under -t, run on the list as typed: hosts_from_file folds both copies of a
 # host the file names into its row.
 check_hosts_once() {
-    local h n dups="" rep=()
-    local -A count=()
+    local h n w dups="" other="" rep=()
+    local -A count=() wc=()
     for h in "${HOSTS[@]}"; do
         n=${count["h:$h"]:-0}; count["h:$h"]=$((n + 1))
         [ "$n" -ne 1 ] || rep+=("$h")
     done
-    for h in "${rep[@]}"; do
-        n=${count["h:$h"]}; [ "$n" -eq 2 ] && n=twice || n="$n times"
-        dups="$dups${dups:+, }$h is named $n"
+    # WT_CLIENTS' hosts (hosts.sh) are named apart from the typed ones
+    for h in ${CLIENT_HOSTS[@]+"${CLIENT_HOSTS[@]}"}; do wc["h:$h"]=$(( ${wc["h:$h"]:-0} + 1 )); done
+    for h in ${rep[@]+"${rep[@]}"}; do
+        n=${count["h:$h"]}; w=${wc["h:$h"]:-0}
+        if [ "$w" -gt 0 ] && [ "$n" -gt "$w" ]; then
+            other="$other${other:+; }$h is named by WT_CLIENTS and the command line"; continue
+        fi
+        [ "$n" -eq 2 ] && n=twice || n="$n times"
+        if [ "$w" -gt 0 ]; then other="$other${other:+; }$h is named $n in WT_CLIENTS"
+        else dups="$dups${dups:+, }$h is named $n"; fi
     done
-    [ -z "$dups" ] || { usage >&2; die "$dups on the command line"; }
+    [ -z "$dups" ] || dups="$dups on the command line"
+    [ -z "$dups$other" ] || { usage >&2; die "$dups${dups:+${other:+; }}$other"; }
 }
 
 # Combination checks: in parse_args for every caller (the test suite drives
