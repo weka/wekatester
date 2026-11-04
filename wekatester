@@ -1394,10 +1394,81 @@ function csv_line(s, F,    L, CN, CV, k) {   # one line, as csv.reader([line]) p
 function is_setting_cell(cell) {
     return tolower(strip(cell)) ~ /^wt_/
 }
-# A host cell with *, ? or [ before any /<machine-id> is a pattern row.
+# A host cell with *, ? or [ before any /<machine-id> is a pattern row,
+# unless it is a range row.
 function is_glob_cell(cell,    name) {
     name = cell; sub(/\/.*/, "", name)
-    return name ~ /[*?[]/
+    return name ~ /[*?[]/ && !is_range_cell(cell)
+}
+# A range row: no * or ?, and a {..} or only range-shaped [..] ([N-M],
+# [a-z]); [ab] or [!a] stays a glob class.
+function is_range_cell(cell,    s, k, b) {
+    s = cell; sub(/\/.*/, "", s)
+    if (s ~ /[*?]/) return 0
+    if (index(s, "{")) return 1
+    if (!index(s, "[")) return 0
+    while ((k = index(s, "["))) {
+        s = substr(s, k + 1)
+        if (!(k = index(s, "]"))) return 0
+        b = substr(s, 1, k - 1); s = substr(s, k + 1)
+        if (b !~ /^[0-9]+-[0-9]+$/ && b !~ /^[a-z]-[a-z]$/ && b !~ /^[A-Z]-[A-Z]$/) return 0
+    }
+    return 1
+}
+# A host name's ranges multiplied out, left to right: [N-M] and {N..M}
+# zero-padded to the left side's width, [a-f] and {a..f}, {a,b,c}. -> the
+# count, the names in X; -1 and RANGE_ERR when one is malformed or backwards.
+function expand_ranges(s, X,    n, i, j, k, q, c, cl, lit, nv, V, m, Y) {
+    split("", X); X[1] = ""; n = 1; lit = ""
+    while (s != "") {
+        c = substr(s, 1, 1)
+        if (c == "]" || c == "}") { RANGE_ERR = "\047" c "\047 closes no range"; return -1 }
+        if (c != "[" && c != "{") { lit = lit c; s = substr(s, 2); continue }
+        cl = c == "[" ? "]" : "}"
+        if (!(j = index(s, cl))) { RANGE_ERR = "\047" c "\047 is never closed"; return -1 }
+        if ((nv = range_values(substr(s, 1, j), V)) < 0) return -1
+        s = substr(s, j + 1); m = 0; split("", Y)
+        for (k = 1; k <= n; k++) for (q = 1; q <= nv; q++) Y[++m] = X[k] lit V[q]
+        split("", X); for (k = 1; k <= m; k++) X[k] = Y[k]
+        n = m; lit = ""
+    }
+    for (k = 1; k <= n; k++) X[k] = X[k] lit
+    return n
+}
+# One [..] or {..} as its values, in order -> the count, the values in V.
+function range_values(t, V,    b, a, z, k, w, AL, ia, iz, n, sep, ok) {
+    split("", V); b = substr(t, 2, length(t) - 2)
+    if (index(b, "[") || index(b, "]") || index(b, "{") || index(b, "}")) {
+        RANGE_ERR = t " holds a bracket or brace: ranges do not nest"; return -1 }
+    sep = substr(t, 1, 1) == "[" ? "-" : ".."
+    if (sep == ".." && !index(b, "..")) {   # a list
+        n = split(b, V, ",")
+        if (n < 1) { RANGE_ERR = t " is empty"; return -1 }
+        return n
+    }
+    if (sep == "-") ok = b ~ /^([0-9]+-[0-9]+|[a-z]-[a-z]|[A-Z]-[A-Z])$/
+    else ok = b ~ /^([0-9]+[.][.][0-9]+|[a-z][.][.][a-z]|[A-Z][.][.][A-Z])$/
+    if (!ok) {
+        RANGE_ERR = t " is not a range: " (sep == "-" ? "[N-M] or [a-z]" : "{N..M}, {a..z} or {a,b,c}"); return -1 }
+    k = index(b, sep); a = substr(b, 1, k - 1); z = substr(b, k + length(sep))
+    if (a ~ /^[0-9]/) {
+        w = length(a); a = dnorm(a); z = dnorm(z)
+        if (length(a) > length(z) || length(a) == length(z) && a > z) { RANGE_ERR = t " runs backwards"; return -1 }
+        for (n = 0; ; a = dinc(a)) { V[++n] = a; while (length(V[n]) < w) V[n] = "0" V[n]; if (a == z) break }
+        return n
+    }
+    AL = a ~ /[a-z]/ ? "abcdefghijklmnopqrstuvwxyz" : "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ia = index(AL, a); iz = index(AL, z)
+    if (ia > iz) { RANGE_ERR = t " runs backwards"; return -1 }
+    for (n = 0; ia <= iz; ia++) V[++n] = substr(AL, ia, 1)
+    return n
+}
+# decimal strings, so no awk's number formatting limits a range
+function dnorm(s) { sub(/^0+/, "", s); return s == "" ? "0" : s }
+function dinc(s,    i, z) {
+    z = ""
+    for (i = length(s); i > 0 && substr(s, i, 1) == "9"; i--) z = z "0"
+    return i ? substr(s, 1, i - 1) (substr(s, i, 1) + 1) z : "1" z
 }
 # Shell glob to an anchored ERE, lowercased: * and ? cross dots, [..] and
 # [!..] are classes, every other character is literal. "" for a class that
@@ -1975,6 +2046,11 @@ parse_args() {
             *)  HOSTS+=("$1"); shift ;;
         esac
     done
+    # quoted ranges reach us whole (hosts.sh, host ranges)
+    if [ ${#HOSTS[@]} -gt 0 ]; then
+        expand_host_ranges "command line" "${HOSTS[@]}"
+        HOSTS=(${EXPANDED[@]+"${EXPANDED[@]}"})
+    fi
     MASTER=${HOSTS[0]:-}
     trim_directory
     [ "$DIRECTORY_EXPLICIT" -eq 0 ] || CLI_DIR=$DIRECTORY
@@ -6623,6 +6699,60 @@ fold_spellings() {
     done
 }
 
+# --- host ranges -----------------------------------------------------------------
+# A source's names with their ranges multiplied out, through the awk the host
+# file's range rows use; a malformed range stops the run naming the source.
+expand_host_ranges() {   # expand_host_ranges <source> <name>... -> EXPANDED
+    local src=$1 out k i
+    shift
+    EXPANDED=("$@")
+    case "$*" in (*[][{}]*) ;; (*) return 0 ;; esac
+    out=$(awkrun '# Host names from one source (ARGV[1], for messages): how many held a
+    # range, a line per such name with its count, then every name in order.
+    # A malformed range prints only the error and exits 2.
+    BEGIN {
+        src = ARGV[1]; nn = 0; nr = 0
+        for (a = 2; a < ARGC; a++) {
+            s = ARGV[a]
+            if (!index(s, "[") && !index(s, "]") && !index(s, "{") && !index(s, "}")) { N[++nn] = s; continue }
+            if ((n = expand_ranges(s, X)) < 0) { print src ": host range \047" s "\047: " RANGE_ERR; exit 2 }
+            R[++nr] = src ": host range \047" s "\047 gives " n " host(s)"
+            for (i = 1; i <= n; i++) N[++nn] = X[i]
+        }
+        print nr
+        for (i = 1; i <= nr; i++) print R[i]
+        for (i = 1; i <= nn; i++) print N[i]
+    }' "$src" "$@") || die "${out:-$src: the host ranges could not be expanded}"
+    mapfile -t EXPANDED <<<"$out"
+    k=${EXPANDED[0]}
+    for ((i = 1; i <= k; i++)); do debug "${EXPANDED[i]}"; done
+    EXPANDED=("${EXPANDED[@]:k+1}")
+}
+
+# WT_CLIENTS (settings.sh): servers placed before the command line's, read
+# once, from the environment or else the host file.
+CLIENT_HOSTS=(); CLIENTS_READ=""
+clients_setting() {
+    [ -z "$CLIENTS_READ" ] && [ -n "${WT_CLIENTS-}" ] || return 0
+    local names=() src from
+    CLIENTS_READ=1
+    setting_where WT_CLIENTS; src=${SETTING_WHERE%: }
+    case $src in
+        ("") src=WT_CLIENTS; from="" ;;
+        (environment*) from=" (the environment)" ;;
+        (*) from=" (${src%: WT_CLIENTS})" ;;
+    esac
+    read -ra names <<<"$WT_CLIENTS"
+    expand_host_ranges "$src" ${names[@]+"${names[@]}"}
+    CLIENT_HOSTS=(${EXPANDED[@]+"${EXPANDED[@]}"})
+    HOSTS=(${CLIENT_HOSTS[@]+"${CLIENT_HOSTS[@]}"} ${HOSTS[@]+"${HOSTS[@]}"})
+    MASTER=${HOSTS[0]:-}
+    check_hosts_once
+    # under -t the host file's count line carries them
+    [ "$TARGETS" -eq 1 ] \
+        || log "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
+}
+
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
     targets_path
@@ -6635,12 +6765,14 @@ resolve_targets_file() {
 # that row, and the rest follow in CLI order (README, Host files). The
 # master is the merged list's first. No host anywhere: local mode, as ever.
 hosts_from_file() {
-    local out h nf=0 nc=0 merged=()
-    local -A infile=()
+    local out h nf=0 nc=0 nw=0 w="" merged=()
+    local -A infile=() isclient=()
     out=$(resolve_targets hosts "$TARGETS_FILE" - - -) \
         || die "host file resolution failed ($TARGETS_FILE)"
     while IFS= read -r h; do
         [ -n "$h" ] || continue
+        # a range row's count, ahead of its hosts
+        case $h in ('#'*) debug "${h#\#}"; continue ;; esac
         merged+=("$h"); infile[$h]=1; nf=$((nf + 1))
     done <<<"$out"
     for h in "${HOSTS[@]}"; do
@@ -6653,13 +6785,20 @@ hosts_from_file() {
     fi
     fold_spellings "$nf" "${merged[@]}"
     nf=0; nc=0
+    for h in ${CLIENT_HOSTS[@]+"${CLIENT_HOSTS[@]}"}; do isclient[$h]=1; done
     for h in ${FOLDED[@]+"${FOLDED[@]}"}; do
-        if [ -n "${infile[$h]+set}" ]; then nf=$((nf + 1)); else nc=$((nc + 1)); fi
+        if [ -n "${infile[$h]+set}" ]; then nf=$((nf + 1))
+        elif [ -n "${isclient[$h]+set}" ]; then nw=$((nw + 1))
+        else nc=$((nc + 1)); fi
     done
     HOSTS=(${FOLDED[@]+"${FOLDED[@]}"})
     MASTER=${HOSTS[0]:-}
+    # the WT_CLIENTS clause only when it added a host
     if [ "$nf" -gt 0 ]; then
-        log "host file: $TARGETS_FILE ($nf host(s) from the file, $nc more from the command line)"
+        [ "$nw" -eq 0 ] || w="$nw from WT_CLIENTS, "
+        log "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
+    elif [ "$nw" -gt 0 ]; then
+        log "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
     else
         log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
     fi
@@ -6790,6 +6929,18 @@ writeback_targets() {
         h = host_addr(h, ALIAS)
         return (h in FOLD) ? h : ""
     }
+    # a range row'\''s hosts: RX[k] the addresses, RNAME[k] the names, RREST the
+    # row past its host cell; 0 for any other line
+    function range_line(line,    F, h, nf, k, nx, X) {
+        if (!(nf = csv_line(line, F))) return 0
+        h = strip(F[1])
+        if (h == "" || substr(h, 1, 1) == "#" || is_setting_cell(h) || !is_range_cell(h)) return 0
+        sub(/\/.*/, "", h); h = strip(h)
+        if ((nx = expand_ranges(h, X)) < 0) awk_fail(wb ": host range \047" h "\047: " RANGE_ERR)
+        RREST = ""; for (k = 2; k <= nf; k++) RREST = RREST "," csv_field(F[k])
+        for (k = 1; k <= nx; k++) { RNAME[k] = X[k]; RX[k] = host_addr(X[k], ALIAS) }
+        return nx
+    }
     BEGIN {
         wb = ARGV[1]; mode = ARGV[2]; work = ARGV[3]; line_gbps = ARGV[4]
         kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); kv_map(ENVIRON["WEKATESTER_HOST_IDENT"], IDENT)
@@ -6908,6 +7059,21 @@ writeback_targets() {
         no = 0; nfd = 0
         for (i = 1; i <= n; i++) {
             if (nfold && (addr = folded_line(L[i])) != "") { O[++no] = "# folded into " FOLD[addr] ": same host: " L[i]; nfd++; continue }
+            if ((nx = range_line(L[i]))) {
+                # a range row with a host to record or fold: every host on its
+                # own line in its place, the row kept as a comment
+                for (k = 1; k <= nx && !(RX[k] in WANTED) && !(RX[k] in FOLD); k++) ;
+                if (k > nx) { O[++no] = L[i]; continue }
+                O[++no] = "# expanded: " L[i]
+                for (k = 1; k <= nx; k++) {
+                    addr = RX[k]
+                    if (addr in FOLD) { O[++no] = "# folded into " FOLD[addr] ": same host: " csv_field(RNAME[k]) RREST; nfd++; continue }
+                    if (!(addr in WANTED)) O[++no] = csv_field(RNAME[k]) RREST
+                    else { SEEN_CELL[addr] = RNAME[k]; O[++no] = render(addr) }
+                    PLACED[addr] = 1
+                }
+                continue
+            }
             if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
             # render reads only its own host'\''s first spelling, set here first
             if (!(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL
@@ -7003,7 +7169,16 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
     local de=$DEFAULT_ENGINE
     [ -z "$ENGINE" ] || de=""
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") WEKATESTER_DEFAULT_ENGINE=$de \
-        awkrun 'BEGIN {
+        awkrun 'function host_line(h, cell, r, e,    extra) {   # host h'\''s own line: row r, entry e
+            if (h in HLINE) {
+                # two spellings of one machine, most likely one short name
+                # with two machine ids, both resolving to the same address
+                extra = HCELL[h] == cell ? "" : "; \047" HCELL[h] "\047 and \047" cell "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
+                awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
+            }
+            HLINE[h] = r; HCELL[h] = cell; HENT[h] = e; HO[++nho] = h   # the host lines, in file order
+        }
+        BEGIN {
             phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
             kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); def_engine = ENVIRON["WEKATESTER_DEFAULT_ENGINE"]
             nslot = split(geom_slots(), SLOT, " "); split(geom_names(), GNAME, " ")
@@ -7057,16 +7232,18 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                     if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
                     EPAT[ne] = pat; ENSEL[ne] = pat == "*" ? 3 : 4
                     GL[++ngl] = ne   # the pattern rows, in file order
+                } else if (is_range_cell(C[1])) {
+                    # a range row: a host line for every name it gives, each with
+                    # the row'\''s settings
+                    if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
+                    pat = C[1]; sub(/\/.*/, "", pat); pat = strip(pat)
+                    if ((nx = expand_ranges(pat, X)) < 0) awk_fail(path ":" r ": host range \047" pat "\047: " RANGE_ERR)
+                    if (phase == "hosts") print "#" path ":" r ": host range \047" pat "\047 gives " nx " host(s)"
+                    for (x = 1; x <= nx; x++) host_line(host_addr(X[x], ALIAS), C[1], r, ne)
+                    ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
                 } else if ((EHOST[ne] = host_addr(C[1], ALIAS)) != "") {
                     if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
-                    h = EHOST[ne]
-                    if (h in HLINE) {
-                        # two spellings of one machine, most likely one short name
-                        # with two machine ids, both resolving to the same address
-                        extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
-                        awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
-                    }
-                    HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne; HO[++nho] = h   # the host lines, in file order
+                    host_line(EHOST[ne], C[1], r, ne)
                     ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
                 } else {
                     # host-less: login and engine are SELECTORS; login is never assigned
@@ -7174,7 +7351,8 @@ WT_VERBOSE count -v verbose
 WT_ENGINE_TEST_TIMEOUT env - -
 WT_SYSINFO_TIMEOUT env - -
 WT_SETTLE env - -
-WT_STAGE_BASE env - -"
+WT_STAGE_BASE env - -
+WT_CLIENTS env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
@@ -7193,6 +7371,7 @@ own_setting_help() {   # own_setting_help <name>
         (WT_SYSINFO_TIMEOUT) echo "seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300; a failed run's end capture is bounded at 30 s instead)" ;;
         (WT_SETTLE) echo "seconds to wait after the fio servers start before the first connection to them (default 2)" ;;
         (WT_STAGE_BASE) echo "where the controller keeps its working files: shm (/dev/shm, the default) or mktemp (\$TMPDIR, else /tmp)" ;;
+        (WT_CLIENTS) echo "hosts to run on, space-separated, placed before the command line's; ranges multiply out: h[01-12], 10.0.0.{1..4}, n{a,b} (quote a line whose value holds a comma); the environment's value replaces this line whole" ;;
     esac
 }
 
@@ -7290,6 +7469,8 @@ settings_parse() {   # settings_parse <arg>...
     PARSE_PRECHECK=1 parse_args "${args[@]}" "$@"
     set -- "${defs[@]}"
     while [ $# -gt 0 ]; do setting_default "$1" "$2"; shift 2; done
+    # -s reads no hosts; a WT_CLIENTS from the host file waits for main
+    [ -n "$SUMMARIZE_FILE" ] || clients_setting
     # a host file still to read checks them in main
     [ "$TARGETS" -eq 1 ] && [ -z "$SUMMARIZE_FILE" ] || check_args
 }
@@ -7320,7 +7501,11 @@ settings_from_file() {
         || die "host file settings failed ($TARGETS_FILE)"
     while IFS=$'\t' read -r line name v; do
         [ -n "$name" ] || continue
-        [ -z "${CLI_SET[$name]:-}" ] && [ -z "${SETTING_SRC[$name]:-}" ] || continue
+        if [ -n "${CLI_SET[$name]:-}" ] || [ -n "${SETTING_SRC[$name]:-}" ]; then
+            [ "$name" != WT_CLIENTS ] \
+                || log "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
+            continue
+        fi
         SETTING_SRC[$name]="$TARGETS_FILE:$line"
         read -r _ kind opt key < <(grep "^$name " <<<"$SETTINGS_TABLE")
         case $kind in
@@ -7362,6 +7547,7 @@ settings_check_env() {
                                 (mktemp) STAGE_BASE=${TMPDIR:-/tmp}; STAGE_BASE=${STAGE_BASE%/} ;;
                                 (*) die "$src: $name takes shm or mktemp, not '$v'" ;;
                             esac ;;
+            (WT_CLIENTS) ;;   # host names, checked as they expand (clients_setting)
             (*) case $v in (*[!0-9]*|0*) die "$src: $name must be a whole number of seconds above 0, not '$v'" ;; esac ;;
         esac
     done <<<"$SETTINGS_TABLE"
@@ -10031,6 +10217,7 @@ main() {
         # the CLI's after them, and the combinations the file's settings decide
         check_hosts_once
         settings_from_file
+        clients_setting
         hosts_from_file
         check_args
     fi

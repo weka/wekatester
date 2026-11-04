@@ -1,3 +1,12 @@
+function host_line(h, cell, r, e,    extra) {   # host h's own line: row r, entry e
+    if (h in HLINE) {
+        # two spellings of one machine, most likely one short name
+        # with two machine ids, both resolving to the same address
+        extra = HCELL[h] == cell ? "" : "; \047" HCELL[h] "\047 and \047" cell "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
+        awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
+    }
+    HLINE[h] = r; HCELL[h] = cell; HENT[h] = e; HO[++nho] = h   # the host lines, in file order
+}
 BEGIN {
     phase = ARGV[1]; path = ARGV[2]; cli_engine = ARGV[3]; cli_dir = ARGV[4]; results = ARGV[5]
     kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); def_engine = ENVIRON["WEKATESTER_DEFAULT_ENGINE"]
@@ -52,16 +61,18 @@ BEGIN {
             if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
             EPAT[ne] = pat; ENSEL[ne] = pat == "*" ? 3 : 4
             GL[++ngl] = ne   # the pattern rows, in file order
+        } else if (is_range_cell(C[1])) {
+            # a range row: a host line for every name it gives, each with
+            # the row's settings
+            if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
+            pat = C[1]; sub(/\/.*/, "", pat); pat = strip(pat)
+            if ((nx = expand_ranges(pat, X)) < 0) awk_fail(path ":" r ": host range \047" pat "\047: " RANGE_ERR)
+            if (phase == "hosts") print "#" path ":" r ": host range \047" pat "\047 gives " nx " host(s)"
+            for (x = 1; x <= nx; x++) host_line(host_addr(X[x], ALIAS), C[1], r, ne)
+            ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
         } else if ((EHOST[ne] = host_addr(C[1], ALIAS)) != "") {
             if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
-            h = EHOST[ne]
-            if (h in HLINE) {
-                # two spellings of one machine, most likely one short name
-                # with two machine ids, both resolving to the same address
-                extra = HCELL[h] == C[1] ? "" : "; \047" HCELL[h] "\047 and \047" C[1] "\047 both resolve to \047" h "\047 -- keep the row for this machine and drop the other"
-                awk_fail(path ":" r ": duplicate definition for host \047" h "\047 (first at line " HLINE[h] ")" extra)
-            }
-            HLINE[h] = r; HCELL[h] = C[1]; HENT[h] = ne; HO[++nho] = h   # the host lines, in file order
+            host_line(EHOST[ne], C[1], r, ne)
             ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
         } else {
             # host-less: login and engine are SELECTORS; login is never assigned

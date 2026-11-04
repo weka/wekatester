@@ -231,6 +231,45 @@ fold_spellings() {
     done
 }
 
+# --- host ranges -----------------------------------------------------------------
+# A source's names with their ranges multiplied out, through the awk the host
+# file's range rows use; a malformed range stops the run naming the source.
+expand_host_ranges() {   # expand_host_ranges <source> <name>... -> EXPANDED
+    local src=$1 out k i
+    shift
+    EXPANDED=("$@")
+    case "$*" in (*[][{}]*) ;; (*) return 0 ;; esac
+    out=$(awkrun '#@awk expand_ranges' "$src" "$@") || die "${out:-$src: the host ranges could not be expanded}"
+    mapfile -t EXPANDED <<<"$out"
+    k=${EXPANDED[0]}
+    for ((i = 1; i <= k; i++)); do debug "${EXPANDED[i]}"; done
+    EXPANDED=("${EXPANDED[@]:k+1}")
+}
+
+# WT_CLIENTS (settings.sh): servers placed before the command line's, read
+# once, from the environment or else the host file.
+CLIENT_HOSTS=(); CLIENTS_READ=""
+clients_setting() {
+    [ -z "$CLIENTS_READ" ] && [ -n "${WT_CLIENTS-}" ] || return 0
+    local names=() src from
+    CLIENTS_READ=1
+    setting_where WT_CLIENTS; src=${SETTING_WHERE%: }
+    case $src in
+        ("") src=WT_CLIENTS; from="" ;;
+        (environment*) from=" (the environment)" ;;
+        (*) from=" (${src%: WT_CLIENTS})" ;;
+    esac
+    read -ra names <<<"$WT_CLIENTS"
+    expand_host_ranges "$src" ${names[@]+"${names[@]}"}
+    CLIENT_HOSTS=(${EXPANDED[@]+"${EXPANDED[@]}"})
+    HOSTS=(${CLIENT_HOSTS[@]+"${CLIENT_HOSTS[@]}"} ${HOSTS[@]+"${HOSTS[@]}"})
+    MASTER=${HOSTS[0]:-}
+    check_hosts_once
+    # under -t the host file's count line carries them
+    [ "$TARGETS" -eq 1 ] \
+        || log "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
+}
+
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
     targets_path
@@ -243,12 +282,14 @@ resolve_targets_file() {
 # that row, and the rest follow in CLI order (README, Host files). The
 # master is the merged list's first. No host anywhere: local mode, as ever.
 hosts_from_file() {
-    local out h nf=0 nc=0 merged=()
-    local -A infile=()
+    local out h nf=0 nc=0 nw=0 w="" merged=()
+    local -A infile=() isclient=()
     out=$(resolve_targets hosts "$TARGETS_FILE" - - -) \
         || die "host file resolution failed ($TARGETS_FILE)"
     while IFS= read -r h; do
         [ -n "$h" ] || continue
+        # a range row's count, ahead of its hosts
+        case $h in ('#'*) debug "${h#\#}"; continue ;; esac
         merged+=("$h"); infile[$h]=1; nf=$((nf + 1))
     done <<<"$out"
     for h in "${HOSTS[@]}"; do
@@ -261,13 +302,20 @@ hosts_from_file() {
     fi
     fold_spellings "$nf" "${merged[@]}"
     nf=0; nc=0
+    for h in ${CLIENT_HOSTS[@]+"${CLIENT_HOSTS[@]}"}; do isclient[$h]=1; done
     for h in ${FOLDED[@]+"${FOLDED[@]}"}; do
-        if [ -n "${infile[$h]+set}" ]; then nf=$((nf + 1)); else nc=$((nc + 1)); fi
+        if [ -n "${infile[$h]+set}" ]; then nf=$((nf + 1))
+        elif [ -n "${isclient[$h]+set}" ]; then nw=$((nw + 1))
+        else nc=$((nc + 1)); fi
     done
     HOSTS=(${FOLDED[@]+"${FOLDED[@]}"})
     MASTER=${HOSTS[0]:-}
+    # the WT_CLIENTS clause only when it added a host
     if [ "$nf" -gt 0 ]; then
-        log "host file: $TARGETS_FILE ($nf host(s) from the file, $nc more from the command line)"
+        [ "$nw" -eq 0 ] || w="$nw from WT_CLIENTS, "
+        log "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
+    elif [ "$nw" -gt 0 ]; then
+        log "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
     else
         log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
     fi

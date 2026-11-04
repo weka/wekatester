@@ -48,6 +48,18 @@ function folded_line(line,    F, h) {   # the address of a folded-away host whos
     h = host_addr(h, ALIAS)
     return (h in FOLD) ? h : ""
 }
+# a range row's hosts: RX[k] the addresses, RNAME[k] the names, RREST the
+# row past its host cell; 0 for any other line
+function range_line(line,    F, h, nf, k, nx, X) {
+    if (!(nf = csv_line(line, F))) return 0
+    h = strip(F[1])
+    if (h == "" || substr(h, 1, 1) == "#" || is_setting_cell(h) || !is_range_cell(h)) return 0
+    sub(/\/.*/, "", h); h = strip(h)
+    if ((nx = expand_ranges(h, X)) < 0) awk_fail(wb ": host range \047" h "\047: " RANGE_ERR)
+    RREST = ""; for (k = 2; k <= nf; k++) RREST = RREST "," csv_field(F[k])
+    for (k = 1; k <= nx; k++) { RNAME[k] = X[k]; RX[k] = host_addr(X[k], ALIAS) }
+    return nx
+}
 BEGIN {
     wb = ARGV[1]; mode = ARGV[2]; work = ARGV[3]; line_gbps = ARGV[4]
     kv_map(ENVIRON["WEKATESTER_HOST_ALIAS"], ALIAS); kv_map(ENVIRON["WEKATESTER_HOST_IDENT"], IDENT)
@@ -166,6 +178,21 @@ BEGIN {
     no = 0; nfd = 0
     for (i = 1; i <= n; i++) {
         if (nfold && (addr = folded_line(L[i])) != "") { O[++no] = "# folded into " FOLD[addr] ": same host: " L[i]; nfd++; continue }
+        if ((nx = range_line(L[i]))) {
+            # a range row with a host to record or fold: every host on its
+            # own line in its place, the row kept as a comment
+            for (k = 1; k <= nx && !(RX[k] in WANTED) && !(RX[k] in FOLD); k++) ;
+            if (k > nx) { O[++no] = L[i]; continue }
+            O[++no] = "# expanded: " L[i]
+            for (k = 1; k <= nx; k++) {
+                addr = RX[k]
+                if (addr in FOLD) { O[++no] = "# folded into " FOLD[addr] ": same host: " csv_field(RNAME[k]) RREST; nfd++; continue }
+                if (!(addr in WANTED)) O[++no] = csv_field(RNAME[k]) RREST
+                else { SEEN_CELL[addr] = RNAME[k]; O[++no] = render(addr) }
+                PLACED[addr] = 1
+            }
+            continue
+        }
         if ((addr = own_line(L[i])) == "") { O[++no] = L[i]; continue }
         # render reads only its own host's first spelling, set here first
         if (!(addr in SEEN_CELL)) SEEN_CELL[addr] = OWN_CELL

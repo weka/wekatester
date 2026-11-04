@@ -511,6 +511,11 @@ parse_args() {
             *)  HOSTS+=("$1"); shift ;;
         esac
     done
+    # quoted ranges reach us whole (hosts.sh, host ranges)
+    if [ ${#HOSTS[@]} -gt 0 ]; then
+        expand_host_ranges "command line" "${HOSTS[@]}"
+        HOSTS=(${EXPANDED[@]+"${EXPANDED[@]}"})
+    fi
     MASTER=${HOSTS[0]:-}
     trim_directory
     [ "$DIRECTORY_EXPLICIT" -eq 0 ] || CLI_DIR=$DIRECTORY
@@ -636,6 +641,7 @@ main() {
         # the CLI's after them, and the combinations the file's settings decide
         check_hosts_once
         settings_from_file
+        clients_setting
         hosts_from_file
         check_args
     fi

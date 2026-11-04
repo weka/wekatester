@@ -24,7 +24,8 @@ WT_VERBOSE count -v verbose
 WT_ENGINE_TEST_TIMEOUT env - -
 WT_SYSINFO_TIMEOUT env - -
 WT_SETTLE env - -
-WT_STAGE_BASE env - -"
+WT_STAGE_BASE env - -
+WT_CLIENTS env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
@@ -43,6 +44,7 @@ own_setting_help() {   # own_setting_help <name>
         (WT_SYSINFO_TIMEOUT) echo "seconds each host's system-information and pressure capture may run before it is cut off; the run carries on (default 300; a failed run's end capture is bounded at 30 s instead)" ;;
         (WT_SETTLE) echo "seconds to wait after the fio servers start before the first connection to them (default 2)" ;;
         (WT_STAGE_BASE) echo "where the controller keeps its working files: shm (/dev/shm, the default) or mktemp (\$TMPDIR, else /tmp)" ;;
+        (WT_CLIENTS) echo "hosts to run on, space-separated, placed before the command line's; ranges multiply out: h[01-12], 10.0.0.{1..4}, n{a,b} (quote a line whose value holds a comma); the environment's value replaces this line whole" ;;
     esac
 }
 
@@ -140,6 +142,8 @@ settings_parse() {   # settings_parse <arg>...
     PARSE_PRECHECK=1 parse_args "${args[@]}" "$@"
     set -- "${defs[@]}"
     while [ $# -gt 0 ]; do setting_default "$1" "$2"; shift 2; done
+    # -s reads no hosts; a WT_CLIENTS from the host file waits for main
+    [ -n "$SUMMARIZE_FILE" ] || clients_setting
     # a host file still to read checks them in main
     [ "$TARGETS" -eq 1 ] && [ -z "$SUMMARIZE_FILE" ] || check_args
 }
@@ -152,7 +156,11 @@ settings_from_file() {
         || die "host file settings failed ($TARGETS_FILE)"
     while IFS=$'\t' read -r line name v; do
         [ -n "$name" ] || continue
-        [ -z "${CLI_SET[$name]:-}" ] && [ -z "${SETTING_SRC[$name]:-}" ] || continue
+        if [ -n "${CLI_SET[$name]:-}" ] || [ -n "${SETTING_SRC[$name]:-}" ]; then
+            [ "$name" != WT_CLIENTS ] \
+                || log "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
+            continue
+        fi
         SETTING_SRC[$name]="$TARGETS_FILE:$line"
         read -r _ kind opt key < <(grep "^$name " <<<"$SETTINGS_TABLE")
         case $kind in
@@ -194,6 +202,7 @@ settings_check_env() {
                                 (mktemp) STAGE_BASE=${TMPDIR:-/tmp}; STAGE_BASE=${STAGE_BASE%/} ;;
                                 (*) die "$src: $name takes shm or mktemp, not '$v'" ;;
                             esac ;;
+            (WT_CLIENTS) ;;   # host names, checked as they expand (clients_setting)
             (*) case $v in (*[!0-9]*|0*) die "$src: $name must be a whole number of seconds above 0, not '$v'" ;; esac ;;
         esac
     done <<<"$SETTINGS_TABLE"

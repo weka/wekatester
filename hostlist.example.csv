@@ -115,6 +115,9 @@ WT_SETTLE=2
 # WT_STAGE_BASE: where the controller keeps its working files: shm (/dev/shm, the default) or mktemp ($TMPDIR, else /tmp)
 WT_STAGE_BASE=shm
 #
+# WT_CLIENTS: hosts to run on, space-separated, placed before the command line's; ranges multiply out: h[01-12], 10.0.0.{1..4}, n{a,b} (quote a line whose value holds a comma); the environment's value replaces this line whole
+WT_CLIENTS=
+#
 # One host per line: the run uses every host named here, with that line's
 # settings; lines without a host apply to the hosts their login and/or
 # ioengine select. Quote cpu lists: "22,24,26".
