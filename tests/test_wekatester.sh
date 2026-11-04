@@ -52,7 +52,7 @@ export WEKATESTER_SUITE_LOCK_DIR="$(mktemp -d)/wekatester.lock"
 # (Frank, 2026-10-09).
 SUITE_ASIDE=$(mktemp "${TMPDIR:-/tmp}/wt-aside.XXXXXX"); export SUITE_ASIDE
 source ./tests/helpers.sh
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0; SKIP=0; PSKIP=0   # PSKIP: the skips a precondition made
 
 # SUITE_ONLY=<ERE>: run only the tests whose description matches (a fast
 # tier); the rest are counted as skipped.
@@ -75,7 +75,7 @@ t_assert() {   # t_assert <description> <command...>
     suite_now_us_v; took=$(( NOW_US - t0 ))
     if [ "$rc" -eq 0 ]; then PASS=$((PASS+1))
          printf 'ok - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
-    elif [ "$rc" -eq 77 ] && IFS= read -r l < "$SUITE_ASIDE" && [[ $l == "precondition: "* ]]; then SKIP=$((SKIP+1))
+    elif [ "$rc" -eq 77 ] && IFS= read -r l < "$SUITE_ASIDE" && [[ $l == "precondition: "* ]]; then SKIP=$((SKIP+1)); PSKIP=$((PSKIP+1))
          printf 'SKIP - %s (%s) (%d.%ds)\n' "$1" "$l" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
     else FAIL=$((FAIL+1))
          printf 'FAIL - %s (%d.%ds)\n' "$1" "$(( took / 1000000 ))" "$(( took % 1000000 / 100000 ))"
@@ -10717,7 +10717,7 @@ if [ -z "${SUITE_ONLY:-}" ]; then
 else
     echo; echo "passed $PASS, failed $FAIL, skipped $SKIP"
     # a typo in the pattern must not pass as a clean run
-    [ $((PASS + FAIL)) -gt 0 ] || { echo "SUITE_ONLY matched no test: $SUITE_ONLY"; FAIL=1; }
+    [ $((PASS + FAIL + PSKIP)) -gt 0 ] || { echo "SUITE_ONLY matched no test: $SUITE_ONLY"; FAIL=1; }
 fi
 if [ "$FAIL" -eq 0 ]; then
     out=$(rm -rf -- "${SUITE_TMP:?}" 2>&1) || echo "could not remove $SUITE_TMP: $out"
