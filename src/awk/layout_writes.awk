@@ -3,7 +3,8 @@
 # pass and the capacity check), probe/<host>.laidout (the bytes present) and,
 # when converting, the run's layout: a dense sequential write of each file
 # missing or short of its size. Prints per host "<host> <files> <bytes>
-# <reused> <kept-sections>", tab-separated.
+# <reused> <kept-sections>", tab-separated. Mode "check" (after a set's own
+# layout) prints the same lines and writes nothing.
 function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
     b = 1048576
     while (b > 1 && v % b) b /= 2
@@ -12,7 +13,7 @@ function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
 function esc_colon(s) { gsub(/:/, "\\:", s); return s }
 function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
     if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
-    writelines(work "/grid/" h "/" lay, L, n)
+    if (!check) writelines(work "/grid/" h "/" lay, L, n)
     if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
     split("", SZ)
     for (i = 1; i <= m; i++)
@@ -61,7 +62,7 @@ function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt,
         if (!(g in GC)) { GK[++ng] = g; GC[g] = 0 }
         GN[g, ++GC[g]] = esc_colon(WN[path])
     }
-    printf "%.0f\n", credit > (work "/probe/" h ".laidout"); close(work "/probe/" h ".laidout")
+    if (!check) { printf "%.0f\n", credit > (work "/probe/" h ".laidout"); close(work "/probe/" h ".laidout") }
     kept = 0
     for (s = 1; s <= ns; s++) if (WHY[s]) kept++
     printf "%s\t%d\t%.0f\t%d\t%d\n", h, nwrite, bytes, reused, kept
@@ -111,6 +112,6 @@ function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt,
     writelines(work "/jobs/" h "/" lay, O, no)
 }
 BEGIN {
-    work = ARGV[1]; lay = ARGV[2]; convert = ARGV[3] == "1"
+    work = ARGV[1]; lay = ARGV[2]; convert = ARGV[3] == "1"; check = ARGV[3] == "check"
     for (a = 4; a < ARGC; a++) do_host(ARGV[a], convert)
 }

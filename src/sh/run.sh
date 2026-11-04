@@ -513,8 +513,8 @@ layout_grid_spec() {
 # in its layout grid, into probe/<host>.sizes ("<bytes> <path>"); nothing is
 # deleted, so a short file is extended, not rewritten (stage_layout_writes).
 # A dry run lists too, which changes nothing, so it can say what would be written.
-sweep_layout_grid() {
-    local lay=${JOBFILES[0]}
+sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were said
+    local lay=${JOBFILES[0]} again=${1:-}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
     local host hd spec cmd sz glob depth tot pids hs i args=() nofa lit dep sl
@@ -525,6 +525,7 @@ sweep_layout_grid() {
     nofa=$(layout_grid_spec -o "$WORK_DIR/probe" "${args[@]}") \
         || die "cannot derive the layout grid"
     # a kept layout job without fallocate=none can leave full-size hollow files
+    [ -z "$again" ] || nofa=""
     for host in $nofa; do
         log "WARNING: $host: the staged layout job does not set fallocate=none; an interrupted layout could leave full-size hollow files this sweep would credit as complete" >&2
     done
@@ -561,6 +562,11 @@ sweep_layout_grid() {
     done
 }
 
+# One copy of the awk in the built tool for both callers
+layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
+    awkrun '#@awk layout_writes' "$WORK_DIR" "$1" "$2" "${HOSTS[@]}"
+}
+
 # After the sweep, before the capacity check and the push: each host's
 # layout becomes the run's own, a dense sequential write of exactly what is
 # missing (layout_writes); its grid is kept under grid/ for the directory
@@ -572,7 +578,7 @@ stage_layout_writes() {
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     for host in "${HOSTS[@]}"; do dirs+=("$WORK_DIR/grid/$host"); done
     mkdir -p "${dirs[@]}" || die "cannot create the layout grid dirs under $WORK_DIR/grid"
-    out=$(awkrun '#@awk layout_writes' "$WORK_DIR" "$lay" "$((1 - LAYOUT_OWN))" "${HOSTS[@]}") \
+    out=$(layout_writes "$lay" "$((1 - LAYOUT_OWN))") \
         || die "cannot stage the layout from the sweep"
     while IFS=$'\t' read -r h nf by re kept; do
         [ -n "$h" ] || continue
@@ -590,6 +596,22 @@ stage_layout_writes() {
     else what="$tf file(s), $tb bytes to write on $nh host(s)"; fi
     [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] || printf 'layout\t%s\n' "$what" >> "$RUN_DIR/settings" \
         || log "WARNING: could not record the layout in $RUN_DIR/settings" >&2
+}
+
+# A set's own layout job reports no write bytes (create_only), so the sweep
+# runs again once it ends: a file it sized still missing or short means the
+# layout was cut. One more find per host, LAYOUT_OWN=1 only.
+check_own_layout() {   # check_own_layout <layout job>
+    local out h nf by re kept short=0
+    sweep_layout_grid again
+    out=$(layout_writes "$1" check) \
+        || die "cannot check the layout against the sweep"
+    while IFS=$'\t' read -r h nf by re kept; do
+        [ -n "$h" ] && [ "$nf" -gt 0 ] || continue
+        log "ERROR: $h: $nf layout file(s) missing or short after the layout ($by bytes)" >&2
+        short=1
+    done <<<"$out"
+    [ "$short" -eq 0 ] || die "layout $1 left files short -- the set's own layout job did not finish (a signal or a dropped worker)"
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
@@ -687,6 +709,7 @@ run_jobs() {
                     "$RUN_DIR/parse.${job%.job}" "${lclients[@]}"
                 die "layout $job failed -- the files were not created (raw output in $outfile)"
             fi
+            [ "$LAYOUT_OWN" -eq 0 ] || check_own_layout "$job"
             log "layout: complete in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
             if [ "$LAYOUT_OWN" -eq 0 ]; then
                 # a sequential write of what was missing: reported as a test
