@@ -50,8 +50,8 @@ function is_glob_cell(cell,    name) {
     return name ~ /[*?[]/ && !is_range_cell(cell)
 }
 # A range row: no * or ?, and a {..} or only range-shaped [..] ([N-M],
-# [a-z]); a [..] holding a comma, or a [ never closed, is one too, so it
-# stops as no range. [ab] or [!a] stays a glob class.
+# [a-z], [a,b]); a [ never closed is one too, so it stops as no range.
+# [ab] or [!a] stays a glob class.
 function is_range_cell(cell,    s, k, b, glob) {
     s = cell; sub(/\/.*/, "", s)
     if (s ~ /[*?]/) return 0
@@ -68,7 +68,7 @@ function is_range_cell(cell,    s, k, b, glob) {
     return !glob
 }
 # A host name's ranges multiplied out, left to right: [N-M] and {N..M}
-# zero-padded to the left side's width, [a-f] and {a..f}, {a,b,c}. -> the
+# zero-padded to the left side's width, [a-f] and {a..f}, [a,b] and {a,b}. -> the
 # count, the names in X; -1 and RANGE_ERR when one is malformed or backwards.
 function expand_ranges(s, X,    n, i, j, k, q, c, cl, lit, nv, V, m, Y) {
     split("", X); X[1] = ""; n = 1; lit = ""
@@ -93,7 +93,7 @@ function range_values(t, V,    b, a, z, k, w, AL, ia, iz, n, sep, ok) {
     if (index(b, "[") || index(b, "]") || index(b, "{") || index(b, "}")) {
         RANGE_ERR = t " holds a bracket or brace: ranges do not nest"; return -1 }
     sep = substr(t, 1, 1) == "[" ? "-" : ".."
-    if (sep == ".." && !index(b, "..")) {   # a list
+    if (sep == ".." ? !index(b, "..") : index(b, ",") > 0) {   # a list
         n = split(b, V, ",")
         if (n < 1) { RANGE_ERR = t " is empty"; return -1 }
         for (k = 1; k <= n; k++) if (V[k] == "") { RANGE_ERR = t " has an empty element"; return -1 }
@@ -102,7 +102,7 @@ function range_values(t, V,    b, a, z, k, w, AL, ia, iz, n, sep, ok) {
     if (sep == "-") ok = b ~ /^([0-9]+-[0-9]+|[a-z]-[a-z]|[A-Z]-[A-Z])$/
     else ok = b ~ /^([0-9]+[.][.][0-9]+|[a-z][.][.][a-z]|[A-Z][.][.][A-Z])$/
     if (!ok) {
-        RANGE_ERR = t " is not a range: " (sep == "-" ? "[N-M] or [a-z]" : "{N..M}, {a..z} or {a,b,c}"); return -1 }
+        RANGE_ERR = t " is not a range: " (sep == "-" ? "[N-M], [a-z] or [a,b,c]" : "{N..M}, {a..z} or {a,b,c}"); return -1 }
     k = index(b, sep); a = substr(b, 1, k - 1); z = substr(b, k + length(sep))
     if (a ~ /^[0-9]/) {
         w = length(a); a = dnorm(a); z = dnorm(z)
