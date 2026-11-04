@@ -50,19 +50,22 @@ function is_glob_cell(cell,    name) {
     return name ~ /[*?[]/ && !is_range_cell(cell)
 }
 # A range row: no * or ?, and a {..} or only range-shaped [..] ([N-M],
-# [a-z]); [ab] or [!a] stays a glob class.
-function is_range_cell(cell,    s, k, b) {
+# [a-z]); a [..] holding a comma, or a [ never closed, is one too, so it
+# stops as no range. [ab] or [!a] stays a glob class.
+function is_range_cell(cell,    s, k, b, glob) {
     s = cell; sub(/\/.*/, "", s)
     if (s ~ /[*?]/) return 0
     if (index(s, "{")) return 1
     if (!index(s, "[")) return 0
+    glob = 0
     while ((k = index(s, "["))) {
         s = substr(s, k + 1)
-        if (!(k = index(s, "]"))) return 0
+        if (!(k = index(s, "]"))) return 1   # unclosed: most likely a [1,2] the CSV cut
         b = substr(s, 1, k - 1); s = substr(s, k + 1)
-        if (b !~ /^[0-9]+-[0-9]+$/ && b !~ /^[a-z]-[a-z]$/ && b !~ /^[A-Z]-[A-Z]$/) return 0
+        if (index(b, ",")) return 1
+        if (b !~ /^[0-9]+-[0-9]+$/ && b !~ /^[a-z]-[a-z]$/ && b !~ /^[A-Z]-[A-Z]$/) glob = 1
     }
-    return 1
+    return !glob
 }
 # A host name's ranges multiplied out, left to right: [N-M] and {N..M}
 # zero-padded to the left side's width, [a-f] and {a..f}, {a,b,c}. -> the

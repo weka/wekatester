@@ -1401,19 +1401,22 @@ function is_glob_cell(cell,    name) {
     return name ~ /[*?[]/ && !is_range_cell(cell)
 }
 # A range row: no * or ?, and a {..} or only range-shaped [..] ([N-M],
-# [a-z]); [ab] or [!a] stays a glob class.
-function is_range_cell(cell,    s, k, b) {
+# [a-z]); a [..] holding a comma, or a [ never closed, is one too, so it
+# stops as no range. [ab] or [!a] stays a glob class.
+function is_range_cell(cell,    s, k, b, glob) {
     s = cell; sub(/\/.*/, "", s)
     if (s ~ /[*?]/) return 0
     if (index(s, "{")) return 1
     if (!index(s, "[")) return 0
+    glob = 0
     while ((k = index(s, "["))) {
         s = substr(s, k + 1)
-        if (!(k = index(s, "]"))) return 0
+        if (!(k = index(s, "]"))) return 1   # unclosed: most likely a [1,2] the CSV cut
         b = substr(s, 1, k - 1); s = substr(s, k + 1)
-        if (b !~ /^[0-9]+-[0-9]+$/ && b !~ /^[a-z]-[a-z]$/ && b !~ /^[A-Z]-[A-Z]$/) return 0
+        if (index(b, ",")) return 1
+        if (b !~ /^[0-9]+-[0-9]+$/ && b !~ /^[a-z]-[a-z]$/ && b !~ /^[A-Z]-[A-Z]$/) glob = 1
     }
-    return 1
+    return !glob
 }
 # A host name's ranges multiplied out, left to right: [N-M] and {N..M}
 # zero-padded to the left side's width, [a-f] and {a..f}, {a,b,c}. -> the
@@ -7247,8 +7250,8 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                     if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
                     pat = C[1]; sub(/\/.*/, "", pat); pat = strip(pat)
                     if ((nx = expand_ranges(pat, X)) < 0) {
-                        # an unquoted {a,b} is cut at its comma by the CSV
-                        if (RANGE_ERR == "\047{\047 is never closed") RANGE_ERR = RANGE_ERR " (quote a cell whose value holds a comma)"
+                        # an unquoted {a,b} or [1,2] is cut at its comma by the CSV
+                        if (RANGE_ERR == "\047{\047 is never closed" || RANGE_ERR == "\047[\047 is never closed") RANGE_ERR = RANGE_ERR " (quote a cell whose value holds a comma)"
                         awk_fail(path ":" r ": host range \047" pat "\047: " RANGE_ERR)
                     }
                     if (phase == "hosts") print "#" path ":" r ": host range \047" pat "\047 gives " nx " host(s)"
