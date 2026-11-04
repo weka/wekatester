@@ -1302,7 +1302,7 @@ t_assert "signal: a console lost with no signal (its reader gone mid-calibration
 # localrun_fixture <dir>: the preconditions of a local run here, and the stub
 # fio in <dir>/bin. A --client run sleeps 8 s; with STUB_LAYOUT set, a layout
 # run runs it as a command instead (files it leaves) and every client run
-# prints one moved-data client_stats entry and exits.
+# prints one moved-data client_stats entry, write.io_bytes $STUB_WBYTES (0).
 localrun_fixture() {
     local d=$1 _o
     # the port check gives localhost 3 s: a name answered only by a slow DNS fails it
@@ -1331,7 +1331,7 @@ for a; do case $a in (--client=*) c=1 ;; esac; done
 lay() { local f; f=$(sed -n 's/^filename_format=//p' "$job" | head -n 1); truncate -s "$2" "$STUB_DATA/${f//\$jobnum/$1}"; }
 job=${@: -1}
 case $job in (*/000-wekatester-layout.job) eval "$STUB_LAYOUT" ;; esac
-echo '{ "client_stats": [ { "jobname": "j", "hostname": "localhost", "error": 0, "read": { "total_ios": 1, "io_bytes": 4096, "bw_bytes": 4096 }, "write": { "total_ios": 0, "io_bytes": 0, "bw_bytes": 0 } } ] }'
+printf '{ "client_stats": [ { "jobname": "j", "hostname": "localhost", "error": 0, "read": { "total_ios": 1, "io_bytes": 4096, "bw_bytes": 4096 }, "write": { "total_ios": 0, "io_bytes": %s, "bw_bytes": 0 } } ] }\n' "${STUB_WBYTES:-0}"
 EOF
     chmod +x "$d/bin/fio"; : > "$d/stub.log.srv"
 }
@@ -5067,6 +5067,31 @@ ownlay_run() {
     echo $? > "$d/rc"
 }
 export -f ownlay_run
+# The tool's own layout carries its plan: one that a signal cut with error 0
+# everywhere wrote fewer bytes, and the run must stop there (dcd3a4b), not
+# log it complete and measure over short files (17b36a0, field fleet).
+# cutrun <dir> <write bytes>: the smoke set in local mode over the stub,
+# whose layout run reports that many write bytes.
+cutrun() {
+    local d=$1
+    localrun_fixture "$d" || return
+    STUB_LOG=$d/stub.log STUB_DATA=$d/data STUB_LAYOUT=: STUB_WBYTES=$2 WT_FIO_BIN=$d/bin/fio WT_SETTLE=1 WT_STAGE_BASE=mktemp TMPDIR=$d \
+        WEKATESTER_SUITE_TARGET_DIR=$d/target WEKATESTER_SUITE_LOCK_DIR=$d/lock \
+        timeout -k 5 90 ./wekatester -w smoke -r --any-fs -d "$d/data" -o "$d/out" > "$d/run.out" 2>&1
+    echo $? > "$d/rc"
+}
+export -f cutrun
+t_assert "layout: the tool's own layout that wrote fewer bytes than its plan stops the run with the cut-short line, before any measured job; one that wrote its plan goes on" bash -c '
+    d=$(mktemp -d)
+    cutrun "$d/cut" 1000 2>>$SUITE_ASIDE || exit
+    [ "$(cat "$d/cut/rc")" -ne 0 ] && grep -qE "ERROR: layout cut short: fio wrote 1000 of [0-9]+ bytes \(a signal or a dropped worker ended it early\)" "$d/cut/run.out" &&
+    ! grep -q "layout: complete" "$d/cut/run.out" && ! grep -q -- "--client=.*011-" "$d/cut/stub.log" ||
+        { { echo "cut: rc $(cat "$d/cut/rc")"; cat "$d/cut/run.out" "$d/cut/stub.log"; } >&2; exit 1; }
+    # the control: 1 TiB reported, above any smoke plan
+    cutrun "$d/full" 1099511627776 2>>$SUITE_ASIDE || exit
+    grep -q "layout: complete" "$d/full/run.out" && ! grep -q "layout cut short" "$d/full/run.out" &&
+    grep -q -- "--client=.*011-" "$d/full/stub.log" ||
+        { { echo "full: rc $(cat "$d/full/rc")"; cat "$d/full/run.out" "$d/full/stub.log"; } >&2; exit 1; }'
 t_assert "layout: a set's own layout job that leaves a file short stops the run naming the host and the job, before any measured job; full files go on" bash -c '
     d=$(mktemp -d)
     ownlay_run "$d/short" sized "lay 0 64K; lay 1 1000" 2>>$SUITE_ASIDE || exit
