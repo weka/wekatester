@@ -1299,13 +1299,17 @@ t_assert "signal: a console lost with no signal (its reader gone mid-calibration
 # child exits), so those rows allow the layout's 8 s. Local mode's port check probes
 # localhost:8765: where localhost does not resolve promptly each row is a SKIP (rc
 # 77), and a listener already on 8765 is a FAIL (a host left unclean).
-stophang_run() {
-    local sig=$1 to=$2 want=$3 bound=$4 ign=${5:-} d pid i rc took n0 n1 last _o
+# localrun_fixture <dir>: the preconditions of a local run here, and the stub
+# fio in <dir>/bin. A --client run sleeps 8 s; with STUB_LAYOUT set, a layout
+# run runs it as a command instead (files it leaves) and every client run
+# prints one moved-data client_stats entry and exits.
+localrun_fixture() {
+    local d=$1 _o
     # the port check gives localhost 3 s: a name answered only by a slow DNS fails it
     _o=$(timeout 2 getent ahostsv4 localhost) && [[ $_o == 127.0.0.1[[:space:]]* ]] ||
         { echo "precondition: localhost does not resolve to 127.0.0.1 within 2 s here, so local mode stops at its port check" >&2; return 77; }
     if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "host not clean: something already listens on 8765 (a fio server left behind?)" >&2; return 1; fi
-    d=$(mktemp -d); mkdir -p "$d/bin" "$d/data" "$d/out"
+    mkdir -p "$d/bin" "$d/data" "$d/out"
     cat > "$d/bin/fio" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG"
@@ -1320,10 +1324,18 @@ while True:
          echo $! > "${2#--daemonize=}"; echo $! > "$STUB_LOG.pid")
         exit 0 ;;
 esac
-for a; do case $a in (--client=*) exec sleep 8 ;; esac; done
-exit 0
+for a; do case $a in (--client=*) c=1 ;; esac; done
+[ -n "${c:-}" ] || exit 0
+[ -n "${STUB_LAYOUT:-}" ] || exec sleep 8
+case ${@: -1} in (*/000-wekatester-layout.job) eval "$STUB_LAYOUT" ;; esac
+echo '{ "client_stats": [ { "jobname": "j", "hostname": "localhost", "error": 0, "read": { "total_ios": 1, "io_bytes": 4096, "bw_bytes": 4096 }, "write": { "total_ios": 0, "io_bytes": 0, "bw_bytes": 0 } } ] }'
 EOF
     chmod +x "$d/bin/fio"; : > "$d/stub.log.srv"
+}
+export -f localrun_fixture
+stophang_run() {
+    local sig=$1 to=$2 want=$3 bound=$4 ign=${5:-} d pid i rc took n0 n1 last _o
+    d=$(mktemp -d); localrun_fixture "$d" || return
     set -m
     STUB_LOG=$d/stub.log WT_FIO_BIN=$d/bin/fio WT_SETTLE=1 WT_STAGE_BASE=mktemp TMPDIR=$d \
         WEKATESTER_SUITE_TARGET_DIR=$d/target WEKATESTER_SUITE_LOCK_DIR=$d/lock \
@@ -4998,6 +5010,49 @@ numjobs=2"
      stage_layout_writes) 2>&1 ) || { echo "$out" >&2; exit 1; }
     [ "$(cat "$d/jobs/h1/000-wekatester-layout.job")" = "$lay" ] && [ "$(cat "$d/probe/h1.laidout")" = 4096 ] &&
     [ ! -s "$d/run/settings" ] || { echo "$out" >&2; cat "$d/jobs/h1/000-wekatester-layout.job" >&2; false; }'
+# A set's own layout job (create_only, no write bytes to count) is swept
+# again once it ends (Frank, 2026-11-04): a sized file still missing or short
+# stops the run before any measured job. ownlay_run <dir> <sized|unsized>
+# <STUB_LAYOUT command>: a copy of the built tool beside a set "own" (its own
+# layout job, two 64 KiB files lay.0 and lay.1, or one unsized section; one
+# measured job), local mode over localrun_fixture's stub, whose layout run
+# leaves what the command writes into $STUB_DATA. Console in <dir>/run.out,
+# status in <dir>/rc, the stub's calls in <dir>/stub.log.
+ownlay_run() {
+    local d=$1 size=$2
+    localrun_fixture "$d" || return
+    cp ./wekatester "$d/wt" && mkdir -p "$d/fio-jobfiles/own" || return 1
+    if [ "$size" = sized ]; then
+        printf "[global]\nfallocate=none\nioengine=psync\n[lay]\ncreate_only=1\nfilename_format=lay.\$jobnum\nfilesize=64K\nnumjobs=2\n" > "$d/fio-jobfiles/own/000-wekatester-layout.job"
+    else
+        printf "[global]\nfallocate=none\nioengine=psync\n[lay]\ncreate_only=1\nfilename_format=lay.\$jobnum\nnumjobs=2\n" > "$d/fio-jobfiles/own/000-wekatester-layout.job"
+    fi
+    printf "# report bandwidth\n[global]\nioengine=psync\nfilename_format=lay.\$jobnum\nfilesize=64K\n[a]\nrw=read\nbs=1M\nnumjobs=2\n" > "$d/fio-jobfiles/own/011-own-readbw.job"
+    STUB_LOG=$d/stub.log STUB_DATA=$d/data STUB_LAYOUT=$3 WT_FIO_BIN=$d/bin/fio WT_SETTLE=1 WT_STAGE_BASE=mktemp TMPDIR=$d \
+        WEKATESTER_SUITE_TARGET_DIR=$d/target WEKATESTER_SUITE_LOCK_DIR=$d/lock \
+        timeout -k 5 90 "$d/wt" -w own -r --any-fs -d "$d/data" -o "$d/out" > "$d/run.out" 2>&1
+    echo $? > "$d/rc"
+}
+export -f ownlay_run
+t_assert "layout: a set's own layout job that leaves a file short stops the run naming the host and the job, before any measured job; full files go on" bash -c '
+    d=$(mktemp -d)
+    ownlay_run "$d/short" sized "truncate -s 64K \"\$STUB_DATA/lay.0\"; truncate -s 1000 \"\$STUB_DATA/lay.1\"" 2>>$SUITE_ASIDE || exit
+    o=$(cat "$d/short/run.out")
+    [ "$(cat "$d/short/rc")" -ne 0 ] &&
+    case "$o" in *"ERROR: localhost: 1 layout file(s) missing or short after the layout ("*"ERROR: layout 000-wekatester-layout.job left files short -- the set'"'"'s own layout job did not finish (a signal or a dropped worker)"*) true;; *) false;; esac &&
+    ! grep -q -- "--client=.*011-own-readbw" "$d/short/stub.log" ||
+        { { echo "short: rc $(cat "$d/short/rc")"; cat "$d/short/run.out" "$d/short/stub.log"; } >&2; exit 1; }
+    # the control: both files full, the layout completes and the measured job runs
+    ownlay_run "$d/full" sized "truncate -s 64K \"\$STUB_DATA/lay.0\" \"\$STUB_DATA/lay.1\"" 2>>$SUITE_ASIDE || exit
+    grep -q "layout: complete" "$d/full/run.out" && ! grep -q "missing or short after the layout" "$d/full/run.out" &&
+    grep -q -- "--client=.*011-own-readbw" "$d/full/stub.log" ||
+        { { echo "full: rc $(cat "$d/full/rc")"; cat "$d/full/run.out" "$d/full/stub.log"; } >&2; exit 1; }'
+t_assert "layout: a set's own layout job with no section the sweep can size is not checked after it runs" bash -c '
+    d=$(mktemp -d)
+    ownlay_run "$d" unsized ":" 2>>$SUITE_ASIDE || exit
+    grep -q "layout: complete" "$d/run.out" && ! grep -q "missing or short after the layout\|left files short" "$d/run.out" &&
+    grep -q -- "--client=.*011-own-readbw" "$d/stub.log" ||
+        { { echo "rc $(cat "$d/rc")"; cat "$d/run.out" "$d/stub.log"; } >&2; exit 1; }'
 t_assert "run_jobs: a staged layout with nothing to write runs no fio and says so" bash -c '
     d=$(mktemp -d); : > "$d/oplog"
     out=$( (source ./wekatester
