@@ -5601,6 +5601,63 @@ t_assert "host ranges: each row of names expands to its hosts, or stops the run 
         esac || { echo "[$args] want [$want], rc $rc: $(printf "%s" "$out" | head -3)" >&2; bad=$((bad + 1)); }
     done <<<"$RANGE_ROWS"
     [ "$bad" -eq 0 ]'
+# The three sources at the built tool's command line, -n -r: ssh, scp and
+# getent stubbed (nothing leaves this box), no terminal. Per row: id, the
+# WT_CLIENTS environment value (- unset, EMPTY set empty, \t a tab), the
+# arguments (<F> the host file), the host-file rows after the header (-
+# none, \n between), the status, then fragments joined by ^ (! = absent).
+read -r -d '' RANGE_CLI <<'EOF' || true
+C01|n[3-1]|--version|-|0|!host range
+C02|n[3-1]|-h|-|0|usage: wekatester^!host range
+C15|n[3-1]|-s /no/such/bundle.json|-|1|!host range
+C03|n[3-1]|-n -r|-|1|ERROR: environment WT_CLIENTS: host range 'n[3-1]': [3-1] runs backwards
+C04|-|-n -r -t <F>|WT_CLIENTS=n[3-1]|1|ERROR: <F>:2: WT_CLIENTS: host range 'n[3-1]': [3-1] runs backwards
+C05|-|-n -r -t <F>|h1,,,,\nn[3-1],,,,|1|ERROR: <F>:3: host range 'n[3-1]': [3-1] runs backwards
+R7|-|-n -r -- n[3-1]|-|1|ERROR: command line: host range 'n[3-1]': [3-1] runs backwards
+R7b|-|-n -r n[3-1]|-|1|ERROR: command line: host range 'n[3-1]': [3-1] runs backwards
+R1|-|-n -r -- my-gpu-0[01-03]|-|1|: 3 worker(s), master my-gpu-001,
+R1b|-|-n -r my-gpu-0{01..03}|-|1|: 3 worker(s), master my-gpu-001,
+C07|h1  h2\th3|-n -r|-|1|3 host(s) from WT_CLIENTS (the environment), 0 more from the command line^: 3 worker(s), master h1,
+R8|h[1-2] 192.0.2.[5-6]|-n -r|-|1|4 host(s) from WT_CLIENTS (the environment), 0 more from the command line^: 4 worker(s), master h1,
+C08|h[1-2]|-n -r -v -- h3|-|1|DEBUG: environment WT_CLIENTS: host range 'h[1-2]' gives 2 host(s)^2 host(s) from WT_CLIENTS (the environment), 1 more from the command line^: 3 worker(s), master h1,
+R9|-|-n -r -t <F>|WT_CLIENTS=h[1-2]|1|(no host lines; 2 host(s) from WT_CLIENTS, 0 more from the command line)^: 2 worker(s), master h1,
+R10|x[1-2]|-n -r -t <F>|WT_CLIENTS=h[1-2]|1|<F>:2: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole^: 2 worker(s), master x1,
+C17|-|-n -r -t <F>|"WT_CLIENTS=h{1,2}"|1|(no host lines; 2 host(s) from WT_CLIENTS, 0 more from the command line)
+C16|-|-n -r -t <F>|WT_CLIENTS=h1,h2|1|<F>:2: a settings line is one WT_NAME=value cell; quote a value that holds a comma
+C18|-|-n -r -t <F>|WT_CLIENTS=h{1,2}|1|<F>:2: a settings line is one WT_NAME=value cell; quote a value that holds a comma
+C21|-|-n -r -t <F>|WT_CLIENTS=h[1-2]\nWT_CLIENTS=x1|1|<F>:3: WT_CLIENTS is set twice (first at line 2)
+C22|EMPTY|-n -r -- h9|-|1|: 1 worker(s), master h9,^!WT_CLIENTS
+C10|h2|-n -r -t <F>|h[1-2],,,,|1|(2 host(s) from the file, 0 more from the command line)^: 2 worker(s), master h1,
+R14|h1|-n -r -t <F>|h1,,,,|1|(1 host(s) from the file, 0 more from the command line)^!named
+C13a|h1 h1|-n -r|-|1|h1 is named twice in WT_CLIENTS
+C13b|-|-n -r -- h1 h1|-|1|h1 is named twice on the command line
+C13c|h1|-n -r -- h1|-|1|h1 is named by WT_CLIENTS and the command line
+C13d|-|-n -r -- h[1-2] h2|-|1|h2 is named twice on the command line
+C13e|h[1-2]|-n -r -- h[2-3]|-|1|h2 is named by WT_CLIENTS and the command line
+F6|-|-n -r -t <F>|h{1,2},u,,,/mnt/q|1|ERROR: <F>:2: ^quote^!worker(s)
+EOF
+export RANGE_CLI
+t_assert "host ranges: WT_CLIENTS, the host file and the command line each expand, are counted, and stop the run naming where" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"; bad=0
+    printf "#!/bin/sh\nexit 255\n" > "$d/bin/ssh"; cp "$d/bin/ssh" "$d/bin/scp"
+    printf "#!/bin/sh\nexit 2\n" > "$d/bin/getent"; chmod +x "$d/bin/ssh" "$d/bin/scp" "$d/bin/getent"
+    while IFS="|" read -r id env args rows want frags; do
+        f=$d/$id.csv; read -ra a <<<"${args//<F>/$f}"
+        [ "$rows" = - ] || printf "host,user_login,ioengine,allowed_cpus,destination_folder\n%b\n" "$rows" > "$f"
+        out=$(unset $(compgen -v WT_)
+              case $env in (-) ;; (EMPTY) export WT_CLIENTS= ;; (*) export WT_CLIENTS="$(printf "%b" "$env")" ;; esac
+              PATH=$d/bin:$PATH WEKATESTER_PROMPT_TTY=$d/no-tty bash ./wekatester "${a[@]}" 2>&1); rc=$?
+        miss=""; [ "$rc" = "$want" ] || miss="rc $rc"
+        IFS="^" read -ra fr <<<"${frags//<F>/$f}"
+        for x in "${fr[@]}"; do
+            case $x in
+                "!"*) [[ $out != *"${x#!}"* ]] || miss+=" [$x]" ;;
+                *) [[ $out == *"$x"* ]] || miss+=" [$x]" ;;
+            esac
+        done
+        [ -z "$miss" ] || { echo "$id: want rc $want, missed:$miss; out: $(printf "%s" "$out" | head -4)" >&2; bad=$((bad + 1)); }
+    done <<<"$RANGE_CLI"
+    [ "$bad" -eq 0 ]'
 
 # --- engine proving, pinning enforcement, priv lifecycle ---
 t_assert "engines: candidates are proven with a real job; auto probe list is rewritten" bash -c '
