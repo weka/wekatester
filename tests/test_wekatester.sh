@@ -5669,6 +5669,44 @@ t_assert "host ranges: WT_CLIENTS, the host file and the command line each expan
         [ -z "$miss" ] || { echo "$id: want rc $want, missed:$miss; out: $(printf "%s" "$out" | head -4)" >&2; bad=$((bad + 1)); }
     done <<<"$RANGE_CLI"
     [ "$bad" -eq 0 ]'
+# A host cell with no * or ? whose brackets are ranges is a range row: each
+# host it gives gets the row's settings as its own host line would.
+t_assert "host ranges: a range row gives each of its hosts the row's settings, ranks as a host line, and a glob row stays a pattern" bash -c '
+    f=$(mktemp)
+    printf "%s\n" "h[1-3],u,libaio,,/mnt/r" "\"node[1-2,5]\",u,,,/mnt/s" "\"q{a,b}\",v,,,/mnt/q" \
+        "h*,,,,/mnt/p" "\"{a,b}*\",,,,/mnt/x" "n[1-2]*,,,,/mnt/g" "*,,,,/mnt/all" > "$f"
+    hosts=$(rt hosts "$f" - - -) || { echo "hosts: $hosts" >&2; exit 1; }
+    want="#$f:1: host range '\''h[1-3]'\'' gives 3 host(s)
+#$f:2: host range '\''node[1-2,5]'\'' gives 3 host(s)
+#$f:3: host range '\''q{a,b}'\'' gives 2 host(s)
+h1
+h2
+h3
+node1
+node2
+node5
+qa
+qb"
+    [ "$hosts" = "$want" ] || { echo "hosts: [$hosts]" >&2; exit 1; }
+    out=$(rt phase1 "$f" - - - h2 node5 qb hx ax "{a,b}x" n1x n3x) || { echo "$out" >&2; exit 1; }
+    got=$(printf "%s\n" "$out" | cut -f1,2,3,5 | tr "\t\n" ": ")
+    [ "$got" = "h2:u:libaio:/mnt/r node5:u:-:/mnt/s qb:v:-:/mnt/q hx:-:-:/mnt/p ax:-:-:/mnt/all {a,b}x:-:-:/mnt/x n1x:-:-:/mnt/g n3x:-:-:/mnt/all " ] || { echo "phase1: [$got]" >&2; exit 1; }'
+t_assert "host ranges: a host two rows give, by a range or by name, stops naming both rows; a list the CSV cut says to quote it" bash -c '
+    f=$(mktemp); bad=0
+    for c in "h[1-2],,,,|h2,,,,/mnt/x|duplicate definition for host '\''h2'\'' (first at line 1); '\''h[1-2]'\'' and '\''h2'\'' both resolve to '\''h2'\''" \
+             "h[1-2],,,,|h[2-3],,,,|duplicate definition for host '\''h2'\'' (first at line 1); '\''h[1-2]'\'' and '\''h[2-3]'\'' both resolve to '\''h2'\''" \
+             "h1,,,,|node[1-2,5],u,,,/mnt/s|$f:2: host range '\''node[1-2'\''" \
+             "h1,,,,|h{1,2},u,,,/mnt/q|$f:2: host range '\''h{1'\''"; do
+        IFS="|" read -r a b w <<<"$c"; printf "%s\n%s\n" "$a" "$b" > "$f"
+        err=$( (rt phase1 "$f" - - - h1) 2>&1 ); rc=$?
+        [ "$rc" -ne 0 ] && [[ $err == *"$w"* ]] || { echo "[$a / $b] rc $rc: $err" >&2; bad=$((bad + 1)); continue; }
+        case $b in (*"{"*|*,5*) [[ $err == *quote* ]] || { echo "[$b] no quote advice: $err" >&2; bad=$((bad + 1)); } ;; esac
+    done
+    [ "$bad" -eq 0 ]'
+t_assert "host ranges: H1 from a range row and h1 on its own line, resolving apart, need a terminal to fold or keep" bash -c '
+    d=$(mktemp -d)
+    h02_run "$d" notty "H[1-2],,,,\nh1,,,,/mnt/y\n"
+    [ "$(cat "$d/rc")" = 1 ] && grep -q "H1 and h1 look like one host but resolve differently: choosing to fold or keep them needs a terminal" "$d/out" || { h02_show "$d"; exit 1; }'
 
 # --- engine proving, pinning enforcement, priv lifecycle ---
 t_assert "engines: candidates are proven with a real job; auto probe list is rewritten" bash -c '
