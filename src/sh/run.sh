@@ -401,7 +401,7 @@ snapshot_jobfiles() {
 # gzip at the same level on every core.
 finalize_run_dir() {
     [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    local zip=-z _o out_lost="" err_lost=""
+    local zip=-z _o out_lost="" err_lost="" f fd t
     if _o=$(command -v pigz); then zip=--use-compress-program=pigz; fi
     if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
         # Restore the console and let the relays drain: their pipes EOF when
@@ -409,6 +409,15 @@ finalize_run_dir() {
         # A relay exiting 1 lost its console: the closing line below goes to
         # a stream still read, or nowhere.
         exec 1>&5 2>&6 5>&- 6>&-
+        # A signal trap's exit leaves a call-redirect's saved copy of stdout
+        # (fd 10 up) open on a log pipe, and no relay sees EOF while it lives.
+        if [ -d "/proc/$$/fd" ]; then
+            for f in "/proc/$$/fd/"*; do
+                fd=${f##*/}
+                [ "$fd" -gt 9 ] && t=$(readlink "$f") || continue
+                case $t in ("$WORK_DIR/log/out"*|"$WORK_DIR/log/err"*) exec {fd}>&- ;; esac
+            done
+        fi
         wait "${RELAY_PIDS[0]}"; [ $? -ne 1 ] || out_lost=1
         wait "${RELAY_PIDS[1]}"; [ $? -ne 1 ] || err_lost=1
         RELAY_PIDS=()
