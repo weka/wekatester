@@ -86,11 +86,12 @@ start_fio_servers() {
 # The master must reach every worker on $FIO_PORT (fio would silently benchmark
 # the survivors). One remote shell probes all at once; each probe is one
 # statement (bash survives a failed exec redirection) printing "FAIL <host>",
-# and DONE proves the snippet finished.
+# and DONE proves the snippet finished. A master without timeout(1) probes
+# bare: a dead host then costs the TCP connect timeout, not a FAIL for all.
 port_probe_cmd() {   # port_probe_cmd <host>... -> remote snippet
-    local h cmd="${COORD_NPROC:+ulimit -Su $COORD_NPROC; }pids=''; for h in"
+    local h cmd="${COORD_NPROC:+ulimit -Su $COORD_NPROC; }pids=''; t=''; if _o=\$(command -v timeout); then t='timeout 3'; fi; for h in"
     for h in "$@"; do cmd="$cmd '$h'"; done
-    cmd="$cmd; do ( timeout 3 bash -c \": </dev/tcp/\$h/$FIO_PORT\" || echo \"FAIL \$h\" ) & pids=\"\$pids \$!\"; done; wait \$pids; echo DONE"
+    cmd="$cmd; do ( \$t bash -c \": </dev/tcp/\$h/$FIO_PORT\" || echo \"FAIL \$h\" ) & pids=\"\$pids \$!\"; done; wait \$pids; echo DONE"
     printf '%s' "$cmd"
 }
 
