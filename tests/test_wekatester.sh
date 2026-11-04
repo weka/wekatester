@@ -416,7 +416,7 @@ t_assert "settings: the template quotes each flag setting's -h block, gives -d/-
          fi
          [[ $t == *"$want"* ]] || { echo "$name: its help and default are not in the template" >&2; exit 1; }
      done <<<"$SETTINGS_TABLE"
-     [ "$n" -eq 15 ] && [ "$o" -eq 6 ] || { echo "$n flag and $o own-help settings checked, want 15 and 6" >&2; exit 1; }
+     [ "$n" -eq 15 ] && [ "$o" -eq 7 ] || { echo "$n flag and $o own-help settings checked, want 15 and 7" >&2; exit 1; }
      case $t in *"#   --cal-clients n|all"*"WT_CAL_CLIENTS=1"*) ;; *) echo "no --cal-clients line in the template" >&2; exit 1;; esac
      case $t in *"--directory dir"*|*"--engine eng"*) echo "the -d or -e block is still in the template" >&2; exit 1;; esac
      for nm in WT_DIRECTORY WT_ENGINE; do [ -n "$(own_setting_help "$nm")" ] || { echo "$nm has no help" >&2; exit 1; }; done
