@@ -93,6 +93,7 @@ function range_values(t, V,    b, a, z, k, w, AL, ia, iz, n, sep, ok) {
     if (sep == ".." && !index(b, "..")) {   # a list
         n = split(b, V, ",")
         if (n < 1) { RANGE_ERR = t " is empty"; return -1 }
+        for (k = 1; k <= n; k++) if (V[k] == "") { RANGE_ERR = t " has an empty element"; return -1 }
         return n
     }
     if (sep == "-") ok = b ~ /^([0-9]+-[0-9]+|[a-z]-[a-z]|[A-Z]-[A-Z])$/

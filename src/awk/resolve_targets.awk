@@ -66,7 +66,11 @@ BEGIN {
             # the row's settings
             if (C[2] != "") { EK[ne, ++nk] = "login"; EV[ne, nk] = C[2] }
             pat = C[1]; sub(/\/.*/, "", pat); pat = strip(pat)
-            if ((nx = expand_ranges(pat, X)) < 0) awk_fail(path ":" r ": host range \047" pat "\047: " RANGE_ERR)
+            if ((nx = expand_ranges(pat, X)) < 0) {
+                # an unquoted {a,b} is cut at its comma by the CSV
+                if (RANGE_ERR == "\047{\047 is never closed") RANGE_ERR = RANGE_ERR " (quote a cell whose value holds a comma)"
+                awk_fail(path ":" r ": host range \047" pat "\047: " RANGE_ERR)
+            }
             if (phase == "hosts") print "#" path ":" r ": host range \047" pat "\047 gives " nx " host(s)"
             for (x = 1; x <= nx; x++) host_line(host_addr(X[x], ALIAS), C[1], r, ne)
             ELOGIN[ne] = ""; EENG[ne] = ""; ENSEL[ne] = 5
