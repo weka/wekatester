@@ -1281,6 +1281,90 @@ export -f consolelost_run
 t_assert "signal: a console lost with no signal (its reader gone mid-calibration) keeps the run going to exit 0, the lock released and the bundle's log holding what came after the loss, with one notice per lost stream" bash -c '
     source ./tests/helpers.sh; signal_trappable PIPE || exit 1
     out=$(consolelost_run 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+# A beta tester's report (2026-11-04, reproduced on 17b36a0): a local run
+# stopped during the layout fio printed "tearing down" and then hung in
+# finalize's wait on the log relay, no bundle, in 5 of 6 shapes. stophang_run
+# <INT|TERM> <pid|group> <want rc> [intignored]: the built tool itself, local
+# mode, -w smoke -r --any-fs, over a stub fio (a server listening on the fio
+# port; a --client run sleeping 30 s), signalled 2 s into the layout. Within
+# 15 s it must exit <want rc>, the console ending "run bundle: <tgz>", the tgz
+# kept, nothing left in its process group. Needs localhost to resolve and
+# the fio port free: local mode's port check probes localhost:8765.
+stophang_run() {
+    local sig=$1 to=$2 want=$3 ign=${4:-} d pid i rc took n0 n1 last _o
+    getent hosts localhost >>$SUITE_ASIDE || { echo "precondition: localhost does not resolve here, so local mode stops at its port check" >&2; return 1; }
+    if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "precondition: something already listens on 8765 (a real fio server?)" >&2; return 1; fi
+    d=$(mktemp -d); mkdir -p "$d/bin" "$d/data" "$d/out"
+    cat > "$d/bin/fio" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_LOG"
+case $1 in
+    (--version) echo fio-3.28; exit 0 ;;
+    (--server) # named as the tool's server, so its teardown finds it
+        (exec -a "$0 $*" python3 -c 'import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 8765)); s.listen(64)
+while True:
+    c, _ = s.accept(); c.close()' >> "$STUB_LOG.srv" 2>&1 < "$STUB_LOG.srv" &
+         echo $! > "${2#--daemonize=}")
+        exit 0 ;;
+esac
+for a; do case $a in (--client=*) exec sleep 30 ;; esac; done
+exit 0
+EOF
+    chmod +x "$d/bin/fio"; : > "$d/stub.log.srv"
+    set -m
+    STUB_LOG=$d/stub.log WT_FIO_BIN=$d/bin/fio WT_SETTLE=1 WT_STAGE_BASE=mktemp TMPDIR=$d \
+        WEKATESTER_SUITE_TARGET_DIR=$d/target WEKATESTER_SUITE_LOCK_DIR=$d/lock \
+        bash -c '[ -z "$1" ] || trap "" INT; shift; exec ./wekatester "$@"' x "$ign" -w smoke -r --any-fs -d "$d/data" -o "$d/out" > "$d/run.out" 2>&1 &
+    pid=$!
+    set +m
+    # the precondition: the layout fio in flight
+    i=0
+    until grep -q "laying out files" "$d/run.out" && [ -e "$d/stub.log" ] && grep -q -- "--client=" "$d/stub.log"; do
+        if [ "$i" -ge 300 ] || ! sigcal_alive "$pid"; then
+            echo "no layout in flight after $((i / 10)) s:" >&2; cat "$d/run.out" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1
+        fi
+        sleep 0.1; i=$((i + 1))
+    done
+    sleep 2
+    # the control: the tool and the layout fio are in its group
+    n0=$(pgrep -g "$pid" | grep -c .)
+    [ "$n0" -ge 2 ] || { echo "control: $n0 processes in group $pid before the signal, want >= 2" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+    case $to in (pid) kill -"$sig" "$pid" ;; (group) kill -"$sig" -- "-$pid" ;; esac
+    i=0
+    while sigcal_alive "$pid" && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+    if sigcal_alive "$pid"; then
+        echo "TIMEOUT after 15 s: $sig to the $to, the tool (pid $pid) still alive; its group:" >&2
+        ps -o pid=,stat=,wchan:20=,args= -g "$pid" | cut -c1-140 >&2; echo "--- console, last lines:" >&2; tail -n 3 "$d/run.out" >&2
+        kill -9 -- "-$pid" 2>&1 || :; return 1
+    fi
+    took=$((i / 10))
+    wait "$pid"; rc=$?
+    [ "$rc" -eq "$want" ] || { echo "exit $rc after $took s, want $want:" >&2; tail -n 5 "$d/run.out" >&2; return 1; }
+    last=$(tail -n 1 "$d/run.out")
+    case $last in (*" run bundle: $d/out/"*.tgz) ;; (*) echo "console ends with: $last" >&2; return 1 ;; esac
+    [ -s "${last##* run bundle: }" ] || { echo "no bundle at ${last##* run bundle: }: $(ls "$d/out" 2>&1 | tr "\n" " ")" >&2; return 1; }
+    sleep 0.2
+    n1=$(pgrep -g "$pid" | grep -c .)
+    [ "$n1" -eq 0 ] || { echo "$n1 processes left in group $pid (before the signal: $n0):" >&2; ps -o pid=,args= -g "$pid" >&2; kill -9 -- "-$pid" 2>&1 || :; return 1; }
+}
+export -f stophang_run
+t_assert "signal: a local run stopped mid-layout by INT to the tool alone exits 130 within 15 s with its bundle and nothing left" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    out=$(stophang_run INT pid 130 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: a local run stopped mid-layout by INT to its group (Ctrl-C) exits 130 within 15 s with its bundle and nothing left" bash -c '
+    source ./tests/helpers.sh; signal_trappable INT || exit 1
+    out=$(stophang_run INT group 130 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: a local run stopped mid-layout by TERM to the tool alone exits 143 within 15 s with its bundle and nothing left" bash -c '
+    source ./tests/helpers.sh; signal_trappable TERM || exit 1
+    out=$(stophang_run TERM pid 143 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: a local run stopped mid-layout by TERM to its group exits 143 within 15 s with its bundle and nothing left" bash -c '
+    source ./tests/helpers.sh; signal_trappable TERM || exit 1
+    out=$(stophang_run TERM group 143 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
+t_assert "signal: a local run started with INT ignored and stopped mid-layout by TERM to the tool exits 143 within 15 s with its bundle and nothing left" bash -c '
+    source ./tests/helpers.sh; signal_trappable TERM || exit 1
+    out=$(stophang_run TERM pid 143 intignored 2>&1) || { printf "%s\n" "$out" >>$SUITE_ASIDE; false; }'
 # PR #47 review, finding 1: a log() that traps SIGPIPE in the writer keeps
 # a producer alive after its reader is gone (`f | head -1` ran f to its end,
 # its output into the run log). The plain log() dies with its reader, 141.
