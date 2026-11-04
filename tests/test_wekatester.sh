@@ -5534,7 +5534,8 @@ t_assert "auth rounds: the host file pins a host's login when the credential has
 # --- host ranges (Frank, 2026-11-04) ---
 # One row per line: the names given to one source, then the names they
 # give, "#count first last", or "ERR fragment" (the run stops naming the
-# source and the name). Lists keep their order; [a,b] is a list (20:57Z).
+# source and the name). Lists keep their order; [..] holds a list of
+# numbers, letters and ranges, Slurm's way (21:11Z); {..} lists words.
 RANGE_ROWS='h[0-0]|h0
 h[a-a]|ha
 h{a..c}|ha hb hc
@@ -5553,6 +5554,12 @@ my-gpu-0[01-03]|my-gpu-001 my-gpu-002 my-gpu-003
 h{c,a,b}|hc ha hb
 h[1,2]|h1 h2
 h[c,a]|hc ha
+node[1-3,5]|node1 node2 node3 node5
+node[01-03,10]|node01 node02 node03 node10
+h[a-b,x]|ha hb hx
+h[5]|h5
+h{1-3,5}|h1-3 h5
+h{foo,bar}|hfoo hbar
 h[1-2]{a,b}|h1a h1b h2a h2b
 [1-2]h|1h 2h
 h{a,b}.{1..2}|ha.1 ha.2 hb.1 hb.2
@@ -5571,6 +5578,10 @@ h{a,,b}|ERR empty
 h{a,}|ERR empty
 h{,a}|ERR empty
 h[a,,b]|ERR empty
+h[1,,3]|ERR empty
+h[1,]|ERR empty
+h[3-1,5]|ERR runs backwards
+h[foo,bar]|ERR is not a range
 h{a,{b,c}}|ERR nest
 h{a,[1-2]}|ERR nest
 h[1-3|ERR never closed
@@ -5578,13 +5589,13 @@ h{a,b|ERR never closed
 h1-3]|ERR closes no range
 h}a{|ERR closes no range
 h[a-C]|ERR
-h[1-c]|ERR
+h[1-c]|ERR is not a range
 h[-1-3]|ERR
 h{-1..2}|ERR
 h{1..5..2}|ERR
 h[]|ERR
 h{}|ERR
-h[ab]|ERR
+h[ab]|ERR is not a range
 h[!a]|ERR'
 export RANGE_ROWS
 t_assert "host ranges: each row of names expands to its hosts, or stops the run naming the source and the name" bash -c '
