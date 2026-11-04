@@ -88,32 +88,50 @@ function expand_ranges(s, X,    n, i, j, k, q, c, cl, lit, nv, V, m, Y) {
     return n
 }
 # One [..] or {..} as its values, in order -> the count, the values in V.
-function range_values(t, V,    b, a, z, k, w, AL, ia, iz, n, sep, ok) {
-    split("", V); b = substr(t, 2, length(t) - 2)
+# [..] is Slurm's: comma-separated numbers, letters, N-M and a-c ranges;
+# {..} is one N..M or a..c range, or a list taken as written.
+function range_values(t, V,    b, k, n, ne, E, x) {
+    split("", V); b = substr(t, 2, length(t) - 2); n = 0
     if (index(b, "[") || index(b, "]") || index(b, "{") || index(b, "}")) {
         RANGE_ERR = t " holds a bracket or brace: ranges do not nest"; return -1 }
-    sep = substr(t, 1, 1) == "[" ? "-" : ".."
-    if (sep == ".." ? !index(b, "..") : index(b, ",") > 0) {   # a list
+    if (substr(t, 1, 1) == "[") {
+        if ((ne = split(b, E, ",")) < 1) { RANGE_ERR = t " is empty"; return -1 }
+        for (k = 1; k <= ne; k++) if (E[k] == "") { RANGE_ERR = t " has an empty element"; return -1 }
+        for (k = 1; k <= ne; k++) {
+            x = E[k]
+            if (x ~ /^([0-9]+|[a-zA-Z])$/) { V[++n] = x; continue }
+            if (x !~ /^([0-9]+-[0-9]+|[a-z]-[a-z]|[A-Z]-[A-Z])$/) {
+                RANGE_ERR = t " is not a range: [N-M], [a-z] or a list of them, [1-3,5]"; return -1 }
+            if ((n = span(substr(x, 1, index(x, "-") - 1), substr(x, index(x, "-") + 1), V, n)) < 0) {
+                RANGE_ERR = t " runs backwards"; return -1 }
+        }
+        return n
+    }
+    if (!index(b, "..")) {   # a list
         n = split(b, V, ",")
         if (n < 1) { RANGE_ERR = t " is empty"; return -1 }
         for (k = 1; k <= n; k++) if (V[k] == "") { RANGE_ERR = t " has an empty element"; return -1 }
         return n
     }
-    if (sep == "-") ok = b ~ /^([0-9]+-[0-9]+|[a-z]-[a-z]|[A-Z]-[A-Z])$/
-    else ok = b ~ /^([0-9]+[.][.][0-9]+|[a-z][.][.][a-z]|[A-Z][.][.][A-Z])$/
-    if (!ok) {
-        RANGE_ERR = t " is not a range: " (sep == "-" ? "[N-M], [a-z] or [a,b,c]" : "{N..M}, {a..z} or {a,b,c}"); return -1 }
-    k = index(b, sep); a = substr(b, 1, k - 1); z = substr(b, k + length(sep))
+    if (b !~ /^([0-9]+[.][.][0-9]+|[a-z][.][.][a-z]|[A-Z][.][.][A-Z])$/) {
+        RANGE_ERR = t " is not a range: {N..M}, {a..z} or {a,b,c}"; return -1 }
+    k = index(b, "..")
+    if ((n = span(substr(b, 1, k - 1), substr(b, k + 2), V, 0)) < 0) { RANGE_ERR = t " runs backwards"; return -1 }
+    return n
+}
+# a..z appended to V after its first n: numbers zero-padded to a's width,
+# or single letters -> the new count, -1 when it runs backwards
+function span(a, z, V, n,    w, AL, ia, iz) {
     if (a ~ /^[0-9]/) {
         w = length(a); a = dnorm(a); z = dnorm(z)
-        if (length(a) > length(z) || length(a) == length(z) && a > z) { RANGE_ERR = t " runs backwards"; return -1 }
-        for (n = 0; ; a = dinc(a)) { V[++n] = a; while (length(V[n]) < w) V[n] = "0" V[n]; if (a == z) break }
+        if (length(a) > length(z) || length(a) == length(z) && a > z) return -1
+        for (; ; a = dinc(a)) { V[++n] = a; while (length(V[n]) < w) V[n] = "0" V[n]; if (a == z) break }
         return n
     }
     AL = a ~ /[a-z]/ ? "abcdefghijklmnopqrstuvwxyz" : "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     ia = index(AL, a); iz = index(AL, z)
-    if (ia > iz) { RANGE_ERR = t " runs backwards"; return -1 }
-    for (n = 0; ia <= iz; ia++) V[++n] = substr(AL, ia, 1)
+    if (ia > iz) return -1
+    for (; ia <= iz; ia++) V[++n] = substr(AL, ia, 1)
     return n
 }
 # decimal strings, so no awk's number formatting limits a range
