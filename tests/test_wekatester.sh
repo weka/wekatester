@@ -2119,6 +2119,21 @@ s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(5); print(s.getsockname()
     kill "$(cat "$d/pid")"
     [ "$rc" -eq 0 ] &&
     case "$out" in *FAIL*) echo "open port: $out" >&2; false;; *DONE) true;; *) echo "open port: $out" >&2; false;; esac'
+# A master without timeout(1) probes bare (Bugbot 4473649158): the same snippet,
+# on a PATH holding only bash, still FAILs a closed port and passes an open one.
+t_assert "port check: a master without timeout probes bare -- closed port FAILs, open port passes, DONE either way" bash -c '
+    d=$(mktemp -d); mkdir "$d/bin"; b=$(command -v bash); ln -s "$b" "$d/bin/bash"
+    if env PATH="$d/bin" "$b" -c "command -v timeout"; then echo "timeout found on $d/bin" >&2; exit 1; fi
+    out=$( (source ./wekatester; FIO_PORT=1; env PATH="$d/bin" "$b" -c "$(port_probe_cmd 127.0.0.1)" 2>&1) )
+    case "$out" in *"FAIL 127.0.0.1"*DONE) true;; *) echo "closed port: $out" >&2; exit 1;; esac
+    { python3 -c "import socket,time
+s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(5); print(s.getsockname()[1], flush=True); time.sleep(20)" > "$d/port" & echo $! > "$d/pid"; } &&
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$d/port" ] && break; sleep 0.25; done &&
+    [ -s "$d/port" ] &&
+    out=$( (source ./wekatester; FIO_PORT=$(cat "$d/port"); env PATH="$d/bin" "$b" -c "$(port_probe_cmd 127.0.0.1 127.0.0.1)" 2>&1) ); rc=$?
+    kill "$(cat "$d/pid")"
+    [ "$rc" -eq 0 ] &&
+    case "$out" in *FAIL*) echo "open port: $out" >&2; false;; *DONE) true;; *) echo "open port: $out" >&2; false;; esac'
 t_assert "port check: a FAIL line for one worker leaves the others reachable" bash -c '
     err=$( (source ./wekatester
             LOCAL_MODE=0; HOSTS=(vega-1 vega-2 vega-3); MASTER=vega-1
