@@ -442,9 +442,10 @@ finalize_run_dir() {
 # fio --client exits 0 when worker jobs fail, so read success from the results:
 # a nonzero job error, or a measured job whose last entry per host moved
 # nothing. Layout jobs skip the second test; a silent layout failure trips the
-# next job.
-check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
-    local path=$1 mode=$2
+# next job. Given the tool's own layout plan, a layout that wrote fewer bytes
+# fails: a signal can end fio early with error 0 on every client.
+check_fio_errors() {   # check_fio_errors <results-file> <layout|measured> [planned write bytes]
+    local path=$1 mode=$2 plan=${3:-}
     # always a fresh parse: the file was just written; the reader after
     # this check takes the same lines (json_use)
     json_load "$path"
@@ -458,13 +459,16 @@ check_fio_errors() {   # check_fio_errors <results-file> <layout|measured>
         #@awk check_fio_errors')
     [ "$bad" != NONE ] || { echo "$path: fio returned no per-job stats -- the jobs did not run" >&2; return 1; }
     [ -n "$bad" ] || return 0
-    local line kind h job e desc
+    local line kind h job e desc fail=""
     while IFS=$'\t' read -r kind h job e; do
         case "$kind" in
-            E) errno_text_v "$e"; desc=$ERRNO_TEXT; echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2 ;;
-            Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2 ;;
+            E) errno_text_v "$e"; desc=$ERRNO_TEXT; echo "ERROR: $h: job '$job' error $e${desc:+ ($desc)}" >&2; fail=1 ;;
+            Z) echo "ERROR: $h: measured job moved no data (zero bytes, zero ios)" >&2; fail=1 ;;
+            W) [ "$mode" = layout ] && [ "$LAYOUT_OWN" -eq 0 ] && [ -n "$plan" ] && [ "$h" -lt "$plan" ] || continue
+               echo "ERROR: layout cut short: fio wrote $h of $plan bytes (a signal or a dropped worker ended it early)" >&2; fail=1 ;;
         esac
     done <<<"$bad"
+    [ -n "$fail" ] || return 0
     # fio log text before the first "{" names the cause; matched ignoring case
     LC_ALL=C awk '
         #@awk check_fio_errors.cause' "$path" >&2
@@ -678,7 +682,7 @@ run_jobs() {
             t0=$SECONDS
             run_host "$MASTER" "$cmd" > "$outfile" \
                 || die "layout failed for $job (partial output in $outfile)"
-            if ! check_fio_errors "$outfile" layout; then
+            if ! check_fio_errors "$outfile" layout "$LAYOUT_WRITE_BYTES"; then
                 postmortem_hosts layout "$job" "$WORK_DIR/jobs" "$TARGET_DIR" \
                     "$RUN_DIR/parse.${job%.job}" "${lclients[@]}"
                 die "layout $job failed -- the files were not created (raw output in $outfile)"

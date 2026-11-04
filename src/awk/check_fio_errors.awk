@@ -9,7 +9,10 @@ index($1, "client_stats.") != 1 { next }
     else if (f == "hostname") host[i] = $2
     else if (f == "error") err[i] = $2
     # anything a direction moved -- ios, bytes, or (older fio) only a rate
-    else if (f ~ /^(read|write|trim)\.(total_ios|io_bytes|bw_bytes)$/) moved[i] += $2
+    else if (f ~ /^(read|write|trim)\.(total_ios|io_bytes|bw_bytes)$/) {
+        moved[i] += $2
+        if (f == "write.io_bytes") { wrote[i] = $2; seenw = 1 }
+    }
 }
 END {
     for (k = 1; k <= n; k++) {
@@ -19,8 +22,12 @@ END {
         e = err[i] + 0
         if (e) { h = (i in host) ? host[i] : job[i]; printf "E\t%s\t%s\t%d\n", h, job[i], e; anybad = 1 }
         h = (i in host) ? host[i] : job[i]; last[h] = i; hosts[h] = 1
+        wsum += wrote[i]
     }
     if (!stats) { print "NONE"; exit }
     if (mode == "measured" && !anybad)
         for (h in hosts) if (moved[last[h]] + 0 == 0) printf "Z\t%s\n", h | "LC_ALL=C sort"
+    # the fleet's write bytes, for the caller to hold against the layout's
+    # plan (fio names each client by its own hostname, not the host file's)
+    if (mode == "layout" && seenw) printf "W\t%.0f\n", wsum
 }
