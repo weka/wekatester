@@ -5448,10 +5448,14 @@ EOF
 # h02_show <dir>: what a failing check prints
 h02_show() { { echo "rc $(cat "$1/rc"); hosts: $(tr "\n" " " < "$1/hosts" 2>&1)"; cat "$1/out" "$1/calls"; } >&2; }
 export -f h02_dns h02_run h02_show
-t_assert "hosts from file: spellings: names with no shared first label look nothing up; a pair is looked up, 2 ssh -G and 2 getent" bash -c '
+t_assert "hosts from file: spellings: names with no shared first label, or IPv4 addresses, look nothing up; a pair is looked up, 2 ssh -G and 2 getent" bash -c '
     d=$(mktemp -d)
     H02_LOUD=1 h02_run "$d/a" enter "node1,ubuntu,,,\nnode2,ubuntu,,,\n"
     [ "$(cat "$d/a/rc")" = 0 ] && [ "$(grep -c "" "$d/a/calls")" -eq 0 ] && [ "$(tr "\n" " " < "$d/a/hosts")" = "node1 node2 " ] || { h02_show "$d/a"; exit 1; }
+    # an address is its own label: two never meet, and nothing asks (no terminal)
+    H02_LOUD=1 h02_run "$d/ip" notty "192.0.2.11,ubuntu,,,\n192.0.2.12,ubuntu,,,\n"
+    [ "$(cat "$d/ip/rc")" = 0 ] && [ "$(grep -c "" "$d/ip/calls")" -eq 0 ] && ! grep -q "look like one host" "$d/ip/out" &&
+    [ "$(tr "\n" " " < "$d/ip/hosts")" = "192.0.2.11 192.0.2.12 " ] || { h02_show "$d/ip"; exit 1; }
     # the control: a pair calls each stub once per name
     h02_dns "$d/b" node1 192.0.2.1; h02_dns "$d/b" node1.lab 192.0.2.1
     h02_run "$d/b" enter "node1,ubuntu,,,\nNode1.lab,ubuntu,,,\n"
