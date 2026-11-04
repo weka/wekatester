@@ -1290,15 +1290,17 @@ t_assert "signal: a console lost with no signal (its reader gone mid-calibration
 # A beta tester's report (2026-11-04, reproduced on 17b36a0): a local run
 # stopped during the layout fio printed "tearing down" and then hung in
 # finalize's wait on the log relay, no bundle, in 5 of 6 shapes. stophang_run
-# <INT|TERM> <pid|group> <want rc> [intignored]: the built tool itself, local
-# mode, -w smoke -r --any-fs, over a stub fio (a server listening on the fio
-# port; a --client run sleeping 30 s), signalled 2 s into the layout. Within
-# 15 s it must exit <want rc>, the console ending "run bundle: <tgz>", the tgz
-# kept, nothing left in its process group. Local mode's port check probes
+# <INT|TERM> <pid|group> <want rc> <bound s> [intignored]: the built tool
+# itself, local mode, -w smoke -r --any-fs, over a stub fio (a server
+# listening on the fio port; a --client run sleeping 8 s), signalled 2 s into
+# the layout. Within the bound it must exit <want rc>, the console ending "run
+# bundle: <tgz>", the tgz kept, nothing left in its process group. A signal to
+# the pid alone waits for the layout fio (bash runs a trap once its foreground
+# child exits), so those rows allow the layout's 8 s. Local mode's port check probes
 # localhost:8765: where localhost does not resolve each row is a SKIP (rc
 # 77), and a listener already on 8765 is a FAIL (a host left unclean).
 stophang_run() {
-    local sig=$1 to=$2 want=$3 ign=${4:-} d pid i rc took n0 n1 last _o
+    local sig=$1 to=$2 want=$3 bound=$4 ign=${5:-} d pid i rc took n0 n1 last _o
     _o=$(getent hosts localhost) || { echo "precondition: localhost does not resolve here, so local mode stops at its port check" >&2; return 77; }
     if _o=$( (: </dev/tcp/127.0.0.1/8765) 2>&1); then echo "host not clean: something already listens on 8765 (a fio server left behind?)" >&2; return 1; fi
     d=$(mktemp -d); mkdir -p "$d/bin" "$d/data" "$d/out"
@@ -1316,7 +1318,7 @@ while True:
          echo $! > "${2#--daemonize=}"; echo $! > "$STUB_LOG.pid")
         exit 0 ;;
 esac
-for a; do case $a in (--client=*) exec sleep 30 ;; esac; done
+for a; do case $a in (--client=*) exec sleep 8 ;; esac; done
 exit 0
 EOF
     chmod +x "$d/bin/fio"; : > "$d/stub.log.srv"
@@ -1340,9 +1342,9 @@ EOF
     [ "$n0" -ge 2 ] || { echo "control: $n0 processes in group $pid before the signal, want >= 2" >&2; stophang_kill "$pid" "$d"; return 1; }
     case $to in (pid) kill -"$sig" "$pid" ;; (group) kill -"$sig" -- "-$pid" ;; esac
     i=0
-    while sigcal_alive "$pid" && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+    while sigcal_alive "$pid" && [ "$i" -lt $((bound * 10)) ]; do sleep 0.1; i=$((i + 1)); done
     if sigcal_alive "$pid"; then
-        echo "TIMEOUT after 15 s: $sig to the $to, the tool (pid $pid) still alive; its group:" >&2
+        echo "TIMEOUT after $bound s: $sig to the $to, the tool (pid $pid) still alive; its group:" >&2
         ps -o pid=,stat=,wchan:20=,args= -p "$(pgrep -g "$pid" | paste -sd, -)" | cut -c1-140 >&2; echo "--- console, last lines:" >&2; tail -n 3 "$d/run.out" >&2
         stophang_kill "$pid" "$d"; return 1
     fi
@@ -1374,21 +1376,21 @@ stophang_row() {
     return "$rc"
 }
 export -f stophang_row
-t_assert "signal: a local run stopped mid-layout by INT to the tool alone exits 130 within 15 s with its bundle and nothing left" bash -c '
+t_assert "signal: a local run stopped mid-layout by INT to the tool alone exits 130 within the layout's 8 s plus 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
-    stophang_row INT pid 130'
+    stophang_row INT pid 130 23'
 t_assert "signal: a local run stopped mid-layout by INT to its group (Ctrl-C) exits 130 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable INT || exit 1
-    stophang_row INT group 130'
-t_assert "signal: a local run stopped mid-layout by TERM to the tool alone exits 143 within 15 s with its bundle and nothing left" bash -c '
+    stophang_row INT group 130 15'
+t_assert "signal: a local run stopped mid-layout by TERM to the tool alone exits 143 within the layout's 8 s plus 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    stophang_row TERM pid 143'
+    stophang_row TERM pid 143 23'
 t_assert "signal: a local run stopped mid-layout by TERM to its group exits 143 within 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    stophang_row TERM group 143'
-t_assert "signal: a local run started with INT ignored and stopped mid-layout by TERM to the tool exits 143 within 15 s with its bundle and nothing left" bash -c '
+    stophang_row TERM group 143 15'
+t_assert "signal: a local run started with INT ignored and stopped mid-layout by TERM to the tool exits 143 within the layout's 8 s plus 15 s with its bundle and nothing left" bash -c '
     source ./tests/helpers.sh; signal_trappable TERM || exit 1
-    stophang_row TERM pid 143 intignored'
+    stophang_row TERM pid 143 23 intignored'
 # PR #47 review, finding 1: a log() that traps SIGPIPE in the writer keeps
 # a producer alive after its reader is gone (`f | head -1` ran f to its end,
 # its output into the run log). The plain log() dies with its reader, 141.
