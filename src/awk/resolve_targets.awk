@@ -33,6 +33,9 @@ BEGIN {
         for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
         if (C[5] != "" && substr(C[5], 1, 1) != "/")
             awk_fail(path ":" r ": destination dir \047" C[5] "\047 is not an absolute path -- quote cpu lists, e.g. \"0-3,8\"")
+        # it goes single-quoted into remote commands, as -d does (check_args)
+        if (index(C[5], "\047") || index(C[5], "\n"))
+            awk_fail(path ":" r ": the destination directory may not contain an apostrophe or a newline: " C[5])
         ne++; nk = 0
         if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
         if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }

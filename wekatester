@@ -2116,6 +2116,13 @@ check_args() {
         # host.
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
+    else
+        # both go single-quoted into remote commands (the lock, the sweep,
+        # cleanup), and the sweep lists by line: refused here, never escaped
+        case $DIRECTORY in (*"'"*|*$'\n'*) setting_where WT_DIRECTORY; usage >&2
+            die "${SETTING_WHERE:--d: }the destination directory may not contain an apostrophe or a newline: $DIRECTORY" ;; esac
+        case $FIO_BIN in (*"'"*|*$'\n'*) setting_where WT_FIO_BIN; usage >&2
+            die "${SETTING_WHERE:--f: }the fio path may not contain an apostrophe or a newline: $FIO_BIN" ;; esac
     fi
     # only a calibration's bandwidth search has a target to set; a
     # WT_LINE_RATE setting is named where it was set
@@ -4660,6 +4667,10 @@ preflight() {
             failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
         elif [ "$rc" -eq 77 ]; then
             failed+=("$host: cannot create the run lock $LOCK_DIR")
+        elif [ -z "${FIO_VERSIONS[$i]+set}" ]; then
+            # the session's first command prints the version line, so its
+            # shell ran none of it: a command it could not parse
+            failed+=("$host: its shell ran none of preflight's command (exit $rc, no fio --version line${line:+, first line: $line}); its own error is above")
         else
             failed+=("$host: $FIO_BIN not found, or not an executable file")
         fi
@@ -7239,6 +7250,9 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                 for (k = 1; k <= ncols; k++) C[k] = k <= CN[r] ? strip(CV[r, k]) : ""
                 if (C[5] != "" && substr(C[5], 1, 1) != "/")
                     awk_fail(path ":" r ": destination dir \047" C[5] "\047 is not an absolute path -- quote cpu lists, e.g. \"0-3,8\"")
+                # it goes single-quoted into remote commands, as -d does (check_args)
+                if (index(C[5], "\047") || index(C[5], "\n"))
+                    awk_fail(path ":" r ": the destination directory may not contain an apostrophe or a newline: " C[5])
                 ne++; nk = 0
                 if (C[3] != "") { EK[ne, ++nk] = "engine"; EV[ne, nk] = C[3] }
                 if (C[4] != "") { EK[ne, ++nk] = "cpus"; EV[ne, nk] = C[4] }

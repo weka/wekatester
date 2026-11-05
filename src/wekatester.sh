@@ -559,6 +559,13 @@ check_args() {
         # host.
         [ "$FAST_TRACK" -eq 0 ] || { usage >&2
             die "-r cannot be combined with -s; -s now always prints the full summary (the '-r items' filter was removed)"; }
+    else
+        # both go single-quoted into remote commands (the lock, the sweep,
+        # cleanup), and the sweep lists by line: refused here, never escaped
+        case $DIRECTORY in (*"'"*|*$'\n'*) setting_where WT_DIRECTORY; usage >&2
+            die "${SETTING_WHERE:--d: }the destination directory may not contain an apostrophe or a newline: $DIRECTORY" ;; esac
+        case $FIO_BIN in (*"'"*|*$'\n'*) setting_where WT_FIO_BIN; usage >&2
+            die "${SETTING_WHERE:--f: }the fio path may not contain an apostrophe or a newline: $FIO_BIN" ;; esac
     fi
     # only a calibration's bandwidth search has a target to set; a
     # WT_LINE_RATE setting is named where it was set

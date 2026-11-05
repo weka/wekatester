@@ -105,6 +105,10 @@ preflight() {
             failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
         elif [ "$rc" -eq 77 ]; then
             failed+=("$host: cannot create the run lock $LOCK_DIR")
+        elif [ -z "${FIO_VERSIONS[$i]+set}" ]; then
+            # the session's first command prints the version line, so its
+            # shell ran none of it: a command it could not parse
+            failed+=("$host: its shell ran none of preflight's command (exit $rc, no fio --version line${line:+, first line: $line}); its own error is above")
         else
             failed+=("$host: $FIO_BIN not found, or not an executable file")
         fi
