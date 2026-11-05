@@ -133,10 +133,12 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
 # A host may lack procps: remote commands walk /proc (_wt_proc, else /proc),
 # not ps, pgrep or pkill. _wt_args <pid> sets _wt_a to its args, <defunct>
 # for a zombie, or returns 1; _wt_comm <name>... prints the pids so named;
-# _wt_pfx <name> <prefix> sets _wt_l to those whose args start with prefix.
+# _wt_pfx <name> <prefix> sets _wt_l to those whose args start with prefix;
+# _wt_kbin prints the kill binary on PATH (command -v names the builtin).
 PROC_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < \"\${_wt_proc:-/proc}/\$1/cmdline\") || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat \"\${_wt_proc:-/proc}/\$1/stat\" 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }; \
 _wt_comm() { awk -v w=\"\$*\" 'BEGIN { n = split(w, N, \" \"); for (i = 1; i <= n; i++) W[N[i]]; for (i = 1; i < ARGC; i++) { f = ARGV[i] \"/comm\"; if (((getline c < f) > 0) && (c in W)) { p = ARGV[i]; sub(/.*\\//, \"\", p); print p }; close(f) } }' \"\${_wt_proc:-/proc}\"/[0-9]*; }; \
-_wt_pfx() { _wt_l=; for _wt_q in \$(_wt_comm \"\$1\"); do _wt_args \$_wt_q || continue; case \$_wt_a in \"\$2\"*) _wt_l=\"\$_wt_l \$_wt_q\" ;; esac; done; [ -n \"\$_wt_l\" ]; }"
+_wt_pfx() { _wt_l=; for _wt_q in \$(_wt_comm \"\$1\"); do _wt_args \$_wt_q || continue; case \$_wt_a in \"\$2\"*) _wt_l=\"\$_wt_l \$_wt_q\" ;; esac; done; [ -n \"\$_wt_l\" ]; }; \
+_wt_kbin() { (IFS=:; for _wt_d in \$PATH:/usr/bin:/bin; do if [ -n \"\$_wt_d\" ] && [ -f \"\$_wt_d/kill\" ] && [ -x \"\$_wt_d/kill\" ]; then echo \"\$_wt_d/kill\"; exit 0; fi; done; exit 1); }"
 
 # Every passwordless escalator a sweep tries, in this order (site tools
 # before sudo, each with its no-prompt flag), and how long each try may

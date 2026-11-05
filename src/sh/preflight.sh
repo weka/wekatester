@@ -30,15 +30,16 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
-        # probe's order; its sh's own kill, as the kill binary comes with
-        # procps): a root fio needs one. still() keeps the pids alive
+        # probe's order; the kill binary, else, with no procps, its sh's
+        # own kill): a root fio needs one. still() keeps the pids alive
         # and still ours: a zombie is gone, and a reused pid is not ours.
         escalator_words_v "'"
         LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
-        LOCK_CMD+="; if [ -n \"\$left\" ]; then for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue; _o=\$(timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left 2>&1) && break; done; sleep 1; still; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _wt_k=\$(_wt_kbin) || _wt_k=; for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue"
+        LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
         # every earlier run's group file in this host's destination (dd,

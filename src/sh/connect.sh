@@ -23,15 +23,16 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # this shell carries that command in its own cmdline (an unanchored
     # pkill -9 once killed the teardown). taskset execs fio, so argv starts
     # with the binary.
-    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" fc=${FIO_BIN##*/} kl=kill
+    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" fc=${FIO_BIN##*/} ek="_wt_ek() { kill \"\$@\"; }"
     fc=${fc:0:15}   # a process name (comm) holds 15 bytes
-    # escalated, the shell's own kill: the kill binary comes with procps
-    [ -z "$priv" ] || kl="${priv}sh -c 'kill \"\$@\"' sh"
+    # escalated: the kill binary (a sudoers rule may allow only it), else,
+    # with no procps, the shell's own kill under the escalator
+    [ -z "$priv" ] || ek="_wt_k=\$(_wt_kbin) || _wt_k=; _wt_ek() { if [ -n \"\$_wt_k\" ]; then ${priv}\"\$_wt_k\" \"\$@\"; else ${priv}sh -c 'kill \"\$@\"' sh \"\$@\"; fi; }"
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="$PROC_FN; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$($kl \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    KILL_FIO_CMD="$PROC_FN; $ek; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(_wt_ek \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while _wt_pfx '$fc' '$srv' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && _wt_pfx '$fc' '$srv'; then $kl -9 \$_wt_l || true; fi"
+        if [ \"\$i\" -ge 15 ] && _wt_pfx '$fc' '$srv'; then _wt_ek -9 \$_wt_l || true; fi"
 }
 
 start_fio_servers() {
