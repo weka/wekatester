@@ -3921,6 +3921,8 @@ cal_dispatch() {   # cal_dispatch engines|searches
 # procps needed): the state is the field after the last ") ", the ppid next.
 cal_proc_runs() {   # cal_proc_runs <pid>
     local k
+    # an empty pid would read /proc/stat
+    case $1 in (""|*[!0-9]*) return 1 ;; esac
     k=$(cat "/proc/$1/stat" 2>&1) || return 1
     k=${k##*') '}
     case $k in (Z*|"") return 1 ;; esac
@@ -3929,6 +3931,7 @@ cal_proc_runs() {   # cal_proc_runs <pid>
 # Whether this shell is the parent of a process (and so the one to wait it).
 cal_my_child() {   # cal_my_child <pid> <my-pid>
     local k
+    case $1 in (""|*[!0-9]*) return 1 ;; esac
     k=$(cat "/proc/$1/stat" 2>&1) || return 1
     k=${k##*') '}; k=${k#* }
     [ "${k%% *}" = "$2" ]
