@@ -1327,8 +1327,10 @@ esac
 for a; do case $a in (--client=*) c=1 ;; esac; done
 [ -n "${c:-}" ] || exit 0
 [ -n "${STUB_LAYOUT:-}" ] || exec sleep 8
-# lay <jobnum> <size>: the staged job's file for that job, written to that size
-lay() { local f; f=$(sed -n 's/^filename_format=//p' "$job" | head -n 1); head -c "$2" /dev/zero > "$STUB_DATA/${f//\$jobnum/$1}"; }
+# lay <jobnum> <size> [sparse]: the staged job's file for that job, written
+# to that size (sparse: truncated to it, a hole, as a cut fio leaves it)
+lay() { local f; f=$(sed -n 's/^filename_format=//p' "$job" | head -n 1); f=$STUB_DATA/${f//\$jobnum/$1}
+    if [ "${3:-}" = sparse ]; then truncate -s "$2" "$f"; else head -c "$2" /dev/zero > "$f"; fi; }
 job=${@: -1}
 case $job in (*/000-wekatester-layout.job) eval "$STUB_LAYOUT" ;; esac
 printf '{ "client_stats": [ { "jobname": "j", "hostname": "localhost", "error": 0, "read": { "total_ios": 1, "io_bytes": 4096, "bw_bytes": 4096 }, "write": { "total_ios": 0, "io_bytes": %s, "bw_bytes": 0 } } ] }\n' "${STUB_WBYTES:-0}"
@@ -5047,12 +5049,13 @@ numjobs=2"
 # fio truncates a file to full size before it writes it, so a cut own layout
 # leaves it full size with a hole (Frank 00:05Z, the blocks check): after the
 # layout, a file with under 95% of its size allocated counts as cut; before
-# it, size alone decides. Rows: dir|listing ("" none)|after ("ok" or "<files>
-# <bytes>"), or "pre" (the pre-layout pass, by size only).
+# it, size alone decides. Rows: dir|filesize|listing|after ("ok" or "<files>
+# <bytes>", the bytes counted against the job's filesize), or "pre" (the
+# pre-layout pass, by size only: flips if that pass learns blocks too).
 t_assert "check_own_layout: a full-size file with under 95% of it allocated counts as cut and stops the run with its bytes; before the layout, size alone is credited" bash -c '
-    while IFS="|" read -r dir sz want; do
+    while IFS="|" read -r dir fs sz want; do
         d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/set" "$d/probe"
-        printf "[global]\ndirectory=%s\n[lay]\ncreate_only=1\nfilename_format=h1.\$jobnum\nfilesize=64K\n" "$dir" > "$d/set/000-wekatester-layout.job"
+        printf "[global]\ndirectory=%s\n[lay]\ncreate_only=1\nfilename_format=h1.\$jobnum\nfilesize=%s\n" "$dir" "$fs" > "$d/set/000-wekatester-layout.job"
         cp "$d/set/000-wekatester-layout.job" "$d/jobs/h1/"
         printf "%s\n" "$sz" > "$d/probe/h1.sizes"
         if [ "$want" = pre ]; then
@@ -5072,13 +5075,15 @@ t_assert "check_own_layout: a full-size file with under 95% of it allocated coun
         else [ "$rc" -ne 0 ] && [[ $out == *"ERROR: h1: ${want% *} layout file(s) missing, short or sparse after the layout (${want#* } bytes)"*"ERROR: layout 000-wekatester-layout.job left files short"* ]]; fi ||
             { echo "[$dir|$sz] want $want, rc $rc: $out" >&2; exit 1; }
     done <<"ROWS"
-/w|65536 128 /w/h1.0|ok
-/w|65536 0 /w/h1.0|1 65536
-/w|65536 122 /w/h1.0|ok
-/w|65536 121 /w/h1.0|1 3584
-/w x|65536 128 /w x/h1.0|ok
-/w x|65536 0 /w x/h1.0|1 65536
-/w|65536 0 /w/h1.0|pre
+/w|64K|65536 128 /w/h1.0|ok
+/w|64K|65536 0 /w/h1.0|1 65536
+/w|64K|65536 122 /w/h1.0|ok
+/w|64K|65536 121 /w/h1.0|1 3584
+/w|40K|40960 76 /w/h1.0|ok
+/w|64K|131072 64 /w/h1.0|1 32768
+/w x|64K|65536 128 /w x/h1.0|ok
+/w x|64K|65536 0 /w x/h1.0|1 65536
+/w|64K|65536 0 /w/h1.0|pre
 ROWS'
 # A set's own layout job (create_only, no write bytes to count) is swept
 # again once it ends (Frank, 2026-11-04): a sized file still missing or short
@@ -5130,12 +5135,13 @@ t_assert "layout: the tool's own layout that wrote fewer bytes than its plan sto
     grep -q "layout: complete" "$d/full/run.out" && ! grep -q "layout cut short" "$d/full/run.out" &&
     grep -q -- "--client=.*011-" "$d/full/stub.log" ||
         { { echo "full: rc $(cat "$d/full/rc")"; cat "$d/full/run.out" "$d/full/stub.log"; } >&2; exit 1; }'
-t_assert "layout: a set's own layout job that leaves a file short stops the run naming the host and the job, before any measured job; full files go on" bash -c '
+t_assert "layout: a set's own layout job that leaves a file short or sparse stops the run naming the host and the job, before any measured job; full files go on" bash -c '
     d=$(mktemp -d)
-    ownlay_run "$d/short" sized "lay 0 64K; lay 1 1000" 2>>$SUITE_ASIDE || exit
+    # one file full size with a hole (as fio truncates before writing), one short
+    ownlay_run "$d/short" sized "lay 0 64K sparse; lay 1 1000" 2>>$SUITE_ASIDE || exit
     o=$(cat "$d/short/run.out")
     [ "$(cat "$d/short/rc")" -ne 0 ] &&
-    case "$o" in *"ERROR: localhost: 1 layout file(s) missing, short or sparse after the layout ("*"ERROR: layout 000-wekatester-layout.job left files short -- the set'"'"'s own layout job did not finish (a signal or a dropped worker)"*) true;; *) false;; esac &&
+    case "$o" in *"ERROR: localhost: 2 layout file(s) missing, short or sparse after the layout ("*"ERROR: layout 000-wekatester-layout.job left files short -- the set'"'"'s own layout job did not finish (a signal or a dropped worker)"*) true;; *) false;; esac &&
     ! grep -q -- "--client=.*011-own-readbw" "$d/short/stub.log" ||
         { { echo "short: rc $(cat "$d/short/rc")"; cat "$d/short/run.out" "$d/short/stub.log"; } >&2; exit 1; }
     # the control: both files full, the layout completes and the measured job runs
