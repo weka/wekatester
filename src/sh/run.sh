@@ -516,7 +516,8 @@ layout_grid_spec() {
 # Evidence, not markers (README, Workloads): per host, the size of every file
 # in its layout grid, into probe/<host>.sizes ("<bytes> <blocks> <path>",
 # blocks of 512 bytes allocated); nothing is
-# deleted, so a short file is extended, not rewritten (stage_layout_writes).
+# deleted: a short file is extended, a sparse one rewritten from 0 or, for a
+# set's own layout, emptied first (stage_layout_writes).
 # A dry run lists too, which changes nothing, so it can say what would be written.
 sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were said
     local lay=${JOBFILES[0]} again=${1:-}
@@ -576,10 +577,12 @@ layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
 # layout becomes the run's own, a dense sequential write of exactly what is
 # missing (layout_writes); its grid is kept under grid/ for the directory
 # pass and the capacity check. A set's own layout job is staged as written:
-# only its credit is counted. LAYOUT_WRITE_BYTES: the fleet total.
+# only its credit is counted, and its sparse files are emptied
+# (empty_sparse_files). LAYOUT_WRITE_BYTES: the fleet total.
 LAYOUT_WRITE_BYTES=""
 stage_layout_writes() {
     local lay=${JOBFILES[0]} host dirs=() out h nf by re kept tf=0 tb=0 nh=0 what
+    local sp pids=() hs=() ns=() i
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     for host in "${HOSTS[@]}"; do dirs+=("$WORK_DIR/grid/$host"); done
     mkdir -p "${dirs[@]}" || die "cannot create the layout grid dirs under $WORK_DIR/grid"
@@ -589,18 +592,48 @@ stage_layout_writes() {
         [ -n "$h" ] || continue
         if [ "$nf" -gt 0 ]; then
             nh=$((nh + 1)); tf=$((tf + nf)); tb=$((tb + by))
-            log "layout: $h: $nf file(s) missing or short, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
+            log "layout: $h: $nf file(s) missing, short or sparse, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
         elif [ "$re" -gt 0 ]; then
             log "layout: $h: nothing to write ($re file(s) reused)"
         fi
         [ "$LAYOUT_OWN" -eq 1 ] || [ "$kept" -eq 0 ] || log "WARNING: $h: $kept layout section(s) the sweep cannot size stay create_only (a size off 4KiB, no filesize, or a format variable wekatester cannot expand): an interrupted layout there can leave full-size files with holes" >&2
     done <<<"$out"
-    [ "$LAYOUT_OWN" -eq 0 ] || return 0
+    if [ "$LAYOUT_OWN" -eq 1 ]; then
+        for host in "${HOSTS[@]}"; do
+            mapfile -t sp < "$WORK_DIR/probe/$host.sparse" || die "cannot read the sparse layout files of $host"
+            [ "${#sp[@]}" -gt 0 ] || continue
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "layout: $host: ${#sp[@]} sparse file(s) (full size, under 95% allocated) would be emptied so the layout writes them again (dry run: nothing emptied)"
+                continue
+            fi
+            empty_sparse_files "$host" "${sp[@]}" &
+            pids+=($!); hs+=("$host"); ns+=("${#sp[@]}")
+        done
+        for i in "${!pids[@]}"; do
+            wait "${pids[$i]}" || die "cannot empty the sparse layout files on ${hs[$i]}"
+            log "layout: ${hs[$i]}: ${ns[$i]} sparse file(s) (full size, under 95% allocated) emptied so the layout writes them again"
+        done
+        return 0
+    fi
     LAYOUT_WRITE_BYTES=$tb
     if [ "$tf" -eq 0 ]; then what="nothing to write (files reused)"
     else what="$tf file(s), $tb bytes to write on $nh host(s)"; fi
     [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] || printf 'layout\t%s\n' "$what" >> "$RUN_DIR/settings" \
         || log "WARNING: could not record the layout in $RUN_DIR/settings" >&2
+}
+
+# fio's create_only skips a full-size file, so a set's own layout cannot fill
+# a sparse one: each is emptied, never removed, 400 paths a command to stay
+# under the ssh packet limit (as ensure_layout_dirs)
+empty_sparse_files() {   # empty_sparse_files <host> <path>...
+    local host=$1 p cmd="" n=0 q="'\\''"
+    shift
+    for p in "$@"; do
+        cmd="$cmd${cmd:+ && }: > '${p//\'/$q}'"
+        n=$((n + 1))
+        [ $((n % 400)) -ne 0 ] || { run_host "$host" "$cmd" || return 1; cmd=""; }
+    done
+    [ -z "$cmd" ] || run_host "$host" "$cmd"
 }
 
 # A set's own layout job reports no write bytes (create_only), so the sweep

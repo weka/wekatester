@@ -2,17 +2,18 @@
 # the sweep listed. Writes grid/<host>/<layout> (the grid, for the directory
 # pass and the capacity check), probe/<host>.laidout (the bytes present) and,
 # when converting, the run's layout: a dense sequential write of each file
-# missing or short of its size. Prints per host "<host> <files> <bytes>
-# <reused> <kept-sections>", tab-separated. Mode "check" (after a set's own
-# layout) prints the same lines, counting a file with under 95% of its size
-# allocated as short too, and writes nothing.
+# missing, short or sparse (full size, under 95% allocated: fio truncates
+# before writing, so a cut layout). Sparse paths go to probe/<host>.sparse.
+# Prints per host "<host> <files> <bytes> <reused> <kept-sections>",
+# tab-separated. Mode "check" (after a set's own layout) prints the same
+# lines and writes nothing.
 function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
     b = 1048576
     while (b > 1 && v % b) b /= 2
     return b
 }
 function esc_colon(s) { gsub(/:/, "\\:", s); return s }
-function do_host(h, convert,    L, n, SZ, AL, q, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
+function do_host(h, convert,    L, n, SZ, AL, q, sp, spf, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
     if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
     if (!check) writelines(work "/grid/" h "/" lay, L, n)
     if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
@@ -57,33 +58,34 @@ function do_host(h, convert,    L, n, SZ, AL, q, m, S, S0, i, p, P, SN, KV, ns, 
     }
     credit = 0; nwrite = 0; bytes = 0; reused = 0; ng = 0
     split("", GC)
+    spf = work "/probe/" h ".sparse"
+    if (!check) printf "" > spf
     for (i = 1; i <= nw; i++) {
         path = ORD[i]; F = W[path]; S0 = (path in SZ) ? SZ[path] : 0
-        credit += S0 < F ? S0 : F
-        if (S0 >= F) {
-            # check only: fio truncates to full size before writing, so a cut
-            # layout leaves the file sparse (compression would false-fail)
-            if (check && AL[path] < F * 0.95) { nwrite++; bytes += F - AL[path]; continue }
-            reused++; continue
-        }
+        # credited by its allocated bytes (compression would false-fail)
+        sp = S0 >= F && AL[path] < F * 0.95
+        credit += sp ? AL[path] : (S0 < F ? S0 : F)
+        if (S0 >= F && !sp) { reused++; continue }
+        if (sp && check) { nwrite++; bytes += F - AL[path]; continue }
+        if (sp) print path > spf
         # appended from its end when that end sits on the block size, else
-        # rewritten from 0 in place: never a hole either way
-        b = lowbit(F); app = S0 % b == 0
+        # (or sparse) rewritten from 0 in place: never a hole either way
+        b = lowbit(F); app = !sp && S0 % b == 0
         nwrite++; bytes += app ? F - S0 : F
         g = sprintf("%012d %015.0f %d", WJ[path], F, app)
         if (!(g in GC)) { GK[++ng] = g; GC[g] = 0 }
         GN[g, ++GC[g]] = esc_colon(WN[path])
     }
-    if (!check) { printf "%.0f\n", credit > (work "/probe/" h ".laidout"); close(work "/probe/" h ".laidout") }
+    if (!check) { close(spf); printf "%.0f\n", credit > (work "/probe/" h ".laidout"); close(work "/probe/" h ".laidout") }
     kept = 0
     for (s = 1; s <= ns; s++) if (WHY[s]) kept++
     printf "%s\t%d\t%.0f\t%d\t%d\n", h, nwrite, bytes, reused, kept
     if (!convert) return
     no = 0; split("", O)
     O[++no] = layout_write_marker()
-    O[++no] = "# Staged per run from the layout grid, after the sweep: every file missing"
-    O[++no] = "# or short of its size is written sequentially from its end, so a stopped"
-    O[++no] = "# layout leaves a short file, never a full-size one with a hole (README)."
+    O[++no] = "# Staged per run from the layout grid, after the sweep: every file missing,"
+    O[++no] = "# short or sparse is written sequentially (a short one from its end), so a"
+    O[++no] = "# stopped layout leaves a short or sparse file the next sweep finds (README)."
     # the grid's [global], as staged
     inglob = 0; nh = 0
     for (i = 1; i <= n; i++) {
