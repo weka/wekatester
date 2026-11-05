@@ -825,18 +825,21 @@ cal_dispatch() {   # cal_dispatch engines|searches
 }
 
 # Whether a process still runs: one that has exited is a zombie until its
-# parent waits, and a zombie answers kill -0 (ps, procps).
+# parent waits, and a zombie answers kill -0. /proc/<pid>/stat, not ps (no
+# procps needed): the state is the field after the last ") ", the ppid next.
 cal_proc_runs() {   # cal_proc_runs <pid>
     local k
-    k=$(ps -o stat= -p "$1" 2>&1) || return 1
-    case ${k//[[:space:]]/} in (Z*|"") return 1 ;; esac
+    k=$(cat "/proc/$1/stat" 2>&1) || return 1
+    k=${k##*') '}
+    case $k in (Z*|"") return 1 ;; esac
 }
 
 # Whether this shell is the parent of a process (and so the one to wait it).
 cal_my_child() {   # cal_my_child <pid> <my-pid>
     local k
-    k=$(ps -o ppid= -p "$1" 2>&1) || return 1
-    [ "${k//[[:space:]]/}" = "$2" ]
+    k=$(cat "/proc/$1/stat" 2>&1) || return 1
+    k=${k##*') '}; k=${k#* }
+    [ "${k%% *}" = "$2" ]
 }
 
 # Stop process groups: each pid given leads one (a shape or a cell, forked
@@ -1239,8 +1242,8 @@ calibrate() {
     cal_capacity_check "$shapes" "$ladders"
     # every shape at once, each in a subshell of its own; a failed shape
     # stops the others, whole trees (a foreground seed included), then the
-    # run. The TERM handler only sets a flag (see cal_pause). Polled by ps,
-    # not waited in order: the first failure stops the rest.
+    # run. The TERM handler only sets a flag (see cal_pause). Polled by
+    # /proc, not waited in order: the first failure stops the rest.
     pids=(); hs=(); local failed="" live rc
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
         # set -m for the fork alone: the shape is a process group of its own

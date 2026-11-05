@@ -130,6 +130,12 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
     fi
 }
 
+# A worker may lack procps: remote commands read /proc, not ps. _wt_args
+# <pid> sets _wt_a to the args ("<defunct>" for a zombie), or returns 1 for
+# no such process. The stat line's state follows the last ") " (comm may
+# hold spaces).
+PROC_ARGS_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < /proc/\$1/cmdline) || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat /proc/\$1/stat 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }"
+
 # pgrep and pkill take a regex: a path goes in with every ERE metacharacter
 # backslashed, or a binary named fio-3.38+git never matches itself.
 ere_quote_v() {   # ere_quote_v <string> -> ERE_QUOTED

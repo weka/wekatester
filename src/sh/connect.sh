@@ -26,7 +26,7 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     ere_quote_v "$srv"; pat="^$ERE_QUOTED"
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); case \"\$(ps -o args= -p \"\$_p\" 2>&1)\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    KILL_FIO_CMD="$PROC_ARGS_FN; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
         if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
 }
@@ -108,9 +108,11 @@ limit_short() {   # limit_short <limit|unlimited> <need>: the limit is a number 
 # subshell and an ssh client per host: three per host (302 for 100 measured).
 check_controller_procs() {
     [ "$LOCAL_MODE" -eq 0 ] || return 0
-    local n=${#HOSTS[@]} soft hard cur need
+    local n=${#HOSTS[@]} soft hard cur need d
     soft=$(ulimit -Su); hard=$(ulimit -Hu)
-    cur=$(ps -u "$(id -u)" -o pid= | wc -l)
+    # this user's processes, from /proc: the controller may lack procps
+    cur=0
+    for d in /proc/[0-9]*; do [ ! -O "$d" ] || cur=$((cur + 1)); done
     need=$(( 3 * n + cur + 64 ))
     limit_short "$soft" "$need" || return 0
     if limit_short "$hard" "$need"; then

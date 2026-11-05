@@ -23,18 +23,18 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     # wekatester's fio, by its args: its server, the runs that read its
     # staging, its engine tests
     mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
-    LOCK_CMD="_o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="$PROC_ARGS_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     LOCK_CMD+="; for p in \$($pg); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
-    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
+    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
     LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order): a root fio needs one. still() keeps the pids alive
         # and still ours: a zombie is gone, and a reused pid is not ours.
         escalator_words_v "'"
-        LOCK_CMD+="; still() { l2=; for p in \$left; do a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
+        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"

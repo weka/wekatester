@@ -224,6 +224,12 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
     fi
 }
 
+# A worker may lack procps: remote commands read /proc, not ps. _wt_args
+# <pid> sets _wt_a to the args ("<defunct>" for a zombie), or returns 1 for
+# no such process. The stat line's state follows the last ") " (comm may
+# hold spaces).
+PROC_ARGS_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < /proc/\$1/cmdline) || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat /proc/\$1/stat 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }"
+
 # pgrep and pkill take a regex: a path goes in with every ERE metacharacter
 # backslashed, or a binary named fio-3.38+git never matches itself.
 ere_quote_v() {   # ere_quote_v <string> -> ERE_QUOTED
@@ -3920,18 +3926,21 @@ cal_dispatch() {   # cal_dispatch engines|searches
 }
 
 # Whether a process still runs: one that has exited is a zombie until its
-# parent waits, and a zombie answers kill -0 (ps, procps).
+# parent waits, and a zombie answers kill -0. /proc/<pid>/stat, not ps (no
+# procps needed): the state is the field after the last ") ", the ppid next.
 cal_proc_runs() {   # cal_proc_runs <pid>
     local k
-    k=$(ps -o stat= -p "$1" 2>&1) || return 1
-    case ${k//[[:space:]]/} in (Z*|"") return 1 ;; esac
+    k=$(cat "/proc/$1/stat" 2>&1) || return 1
+    k=${k##*') '}
+    case $k in (Z*|"") return 1 ;; esac
 }
 
 # Whether this shell is the parent of a process (and so the one to wait it).
 cal_my_child() {   # cal_my_child <pid> <my-pid>
     local k
-    k=$(ps -o ppid= -p "$1" 2>&1) || return 1
-    [ "${k//[[:space:]]/}" = "$2" ]
+    k=$(cat "/proc/$1/stat" 2>&1) || return 1
+    k=${k##*') '}; k=${k#* }
+    [ "${k%% *}" = "$2" ]
 }
 
 # Stop process groups: each pid given leads one (a shape or a cell, forked
@@ -4478,8 +4487,8 @@ calibrate() {
     cal_capacity_check "$shapes" "$ladders"
     # every shape at once, each in a subshell of its own; a failed shape
     # stops the others, whole trees (a foreground seed included), then the
-    # run. The TERM handler only sets a flag (see cal_pause). Polled by ps,
-    # not waited in order: the first failure stops the rest.
+    # run. The TERM handler only sets a flag (see cal_pause). Polled by
+    # /proc, not waited in order: the first failure stops the rest.
     pids=(); hs=(); local failed="" live rc
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members <&3; do
         # set -m for the fork alone: the shape is a process group of its own
@@ -4585,18 +4594,18 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     # wekatester's fio, by its args: its server, the runs that read its
     # staging, its engine tests
     mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
-    LOCK_CMD="_o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="$PROC_ARGS_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     LOCK_CMD+="; for p in \$($pg); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
-    LOCK_CMD+="; a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
+    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
     LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order): a root fio needs one. still() keeps the pids alive
         # and still ours: a zombie is gone, and a reused pid is not ours.
         escalator_words_v "'"
-        LOCK_CMD+="; still() { l2=; for p in \$left; do a=\$(ps -o args= -p \$p) || continue; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
+        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
         LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
@@ -5204,7 +5213,7 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     ere_quote_v "$srv"; pat="^$ERE_QUOTED"
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); case \"\$(ps -o args= -p \"\$_p\" 2>&1)\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+    KILL_FIO_CMD="$PROC_ARGS_FN; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
         i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
         if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
 }
@@ -5286,9 +5295,11 @@ limit_short() {   # limit_short <limit|unlimited> <need>: the limit is a number 
 # subshell and an ssh client per host: three per host (302 for 100 measured).
 check_controller_procs() {
     [ "$LOCAL_MODE" -eq 0 ] || return 0
-    local n=${#HOSTS[@]} soft hard cur need
+    local n=${#HOSTS[@]} soft hard cur need d
     soft=$(ulimit -Su); hard=$(ulimit -Hu)
-    cur=$(ps -u "$(id -u)" -o pid= | wc -l)
+    # this user's processes, from /proc: the controller may lack procps
+    cur=0
+    for d in /proc/[0-9]*; do [ ! -O "$d" ] || cur=$((cur + 1)); done
     need=$(( 3 * n + cur + 64 ))
     limit_short "$soft" "$need" || return 0
     if limit_short "$hard" "$need"; then
