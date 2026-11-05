@@ -8519,9 +8519,10 @@ stage_jobfiles() {
             has_layout=1; own=1
         fi
         cp "$JOBFILE_SRC/$job" "$SET_DIR/$job" || die "cannot copy jobfile $job into the staged set"
-        # fallocate other than none makes full-size files at once: a cut
-        # layout would pass the post-layout sweep (check_own_layout). The
-        # staged copy only; the source stays as written.
+        # fallocate other than none allocates a file's blocks at once; none
+        # leaves them unallocated until written, so the post-layout sweep's
+        # block count tells a cut layout from a finished one
+        # (check_own_layout). The staged copy only; the source stays as written.
         [ "$own" -eq 1 ] || continue
         fa=$(awkrun '# A set'\''s own layout job, staged: every fallocate line set to none in place,
         # and, when no line set none and [global] sets no fallocate, fallocate=none
@@ -8555,7 +8556,7 @@ stage_jobfiles() {
             print (add ? "added" : "") (add && set ? " and " : "") (set ? "set in " set " line(s)" : "")
         }' "$SET_DIR/$job") \
             || die "cannot stage fallocate=none into the set's own layout job $job"
-        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so an interrupted layout leaves short files the sweep catches, never full-size hollow ones"
+        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins
@@ -9269,7 +9270,8 @@ layout_grid_spec() {
 }
 
 # Evidence, not markers (README, Workloads): per host, the size of every file
-# in its layout grid, into probe/<host>.sizes ("<bytes> <path>"); nothing is
+# in its layout grid, into probe/<host>.sizes ("<bytes> <blocks> <path>",
+# blocks of 512 bytes allocated); nothing is
 # deleted, so a short file is extended, not rewritten (stage_layout_writes).
 # A dry run lists too, which changes nothing, so it can say what would be written.
 sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were said
@@ -9307,7 +9309,7 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
                      cmd="${cmd}if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
                 *)   lit=""; cmd="${cmd}find \"$hd\"" ;;
             esac
-            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -printf '%s %p\\n'"
+            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -printf '%s %b %p\\n'"
             [ -z "$lit" ] || cmd="$cmd; fi"
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
@@ -9329,20 +9331,27 @@ layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
     # when converting, the run'\''s layout: a dense sequential write of each file
     # missing or short of its size. Prints per host "<host> <files> <bytes>
     # <reused> <kept-sections>", tab-separated. Mode "check" (after a set'\''s own
-    # layout) prints the same lines and writes nothing.
+    # layout) prints the same lines, counting a file with under 95% of its size
+    # allocated as short too, and writes nothing.
     function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
         b = 1048576
         while (b > 1 && v % b) b /= 2
         return b
     }
     function esc_colon(s) { gsub(/:/, "\\:", s); return s }
-    function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
+    function do_host(h, convert,    L, n, SZ, AL, q, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
         if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
         if (!check) writelines(work "/grid/" h "/" lay, L, n)
         if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
-        split("", SZ)
-        for (i = 1; i <= m; i++)
-            if ((p = index(S[i], " ")) > 1) SZ[substr(S[i], p + 1)] = substr(S[i], 1, p - 1) + 0
+        split("", SZ); split("", AL)
+        # "<bytes> <blocks> <path>": the path is the rest, spaces and all
+        for (i = 1; i <= m; i++) {
+            if ((p = index(S[i], " ")) < 2) continue
+            x = substr(S[i], p + 1)
+            if ((q = index(x, " ")) < 2) continue
+            path = substr(x, q + 1)
+            SZ[path] = substr(S[i], 1, p - 1) + 0; AL[path] = substr(x, 1, q - 1) * 512
+        }
         ns = ini_parse(L, n, SN, KV)
         # A section the sweep cannot state (no format or filesize, a variable
         # other than $jobname/$jobnum/$filenum, a size off 4KiB) keeps its
@@ -9378,7 +9387,12 @@ layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
         for (i = 1; i <= nw; i++) {
             path = ORD[i]; F = W[path]; S0 = (path in SZ) ? SZ[path] : 0
             credit += S0 < F ? S0 : F
-            if (S0 >= F) { reused++; continue }
+            if (S0 >= F) {
+                # check only: fio truncates to full size before writing, so a cut
+                # layout leaves the file sparse (compression would false-fail)
+                if (check && AL[path] < F * 0.95) { nwrite++; bytes += F - AL[path]; continue }
+                reused++; continue
+            }
             # appended from its end when that end sits on the block size, else
             # rewritten from 0 in place: never a hole either way
             b = lowbit(F); app = S0 % b == 0
@@ -9474,8 +9488,9 @@ stage_layout_writes() {
 }
 
 # A set's own layout job reports no write bytes (create_only), so the sweep
-# runs again once it ends: a file it sized still missing or short means the
-# layout was cut. One more find per host, LAYOUT_OWN=1 only.
+# runs again once it ends: a file it sized still missing, short or sparse
+# (fio truncates to full size before writing) means the layout was cut. One
+# more find per host, LAYOUT_OWN=1 only.
 check_own_layout() {   # check_own_layout <layout job>
     local out h nf by re kept short=0
     sweep_layout_grid again
@@ -9483,7 +9498,7 @@ check_own_layout() {   # check_own_layout <layout job>
         || die "cannot check the layout against the sweep"
     while IFS=$'\t' read -r h nf by re kept; do
         [ -n "$h" ] && [ "$nf" -gt 0 ] || continue
-        log "ERROR: $h: $nf layout file(s) missing or short after the layout ($by bytes)" >&2
+        log "ERROR: $h: $nf layout file(s) missing, short or sparse after the layout ($by bytes)" >&2
         short=1
     done <<<"$out"
     [ "$short" -eq 0 ] || die "layout $1 left files short -- the set's own layout job did not finish (a signal or a dropped worker)"

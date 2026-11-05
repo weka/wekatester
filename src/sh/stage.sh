@@ -298,13 +298,14 @@ stage_jobfiles() {
             has_layout=1; own=1
         fi
         cp "$JOBFILE_SRC/$job" "$SET_DIR/$job" || die "cannot copy jobfile $job into the staged set"
-        # fallocate other than none makes full-size files at once: a cut
-        # layout would pass the post-layout sweep (check_own_layout). The
-        # staged copy only; the source stays as written.
+        # fallocate other than none allocates a file's blocks at once; none
+        # leaves them unallocated until written, so the post-layout sweep's
+        # block count tells a cut layout from a finished one
+        # (check_own_layout). The staged copy only; the source stays as written.
         [ "$own" -eq 1 ] || continue
         fa=$(awkrun '#@awk layout_fallocate_none' "$SET_DIR/$job") \
             || die "cannot stage fallocate=none into the set's own layout job $job"
-        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so an interrupted layout leaves short files the sweep catches, never full-size hollow ones"
+        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins

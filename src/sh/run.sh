@@ -514,7 +514,8 @@ layout_grid_spec() {
 }
 
 # Evidence, not markers (README, Workloads): per host, the size of every file
-# in its layout grid, into probe/<host>.sizes ("<bytes> <path>"); nothing is
+# in its layout grid, into probe/<host>.sizes ("<bytes> <blocks> <path>",
+# blocks of 512 bytes allocated); nothing is
 # deleted, so a short file is extended, not rewritten (stage_layout_writes).
 # A dry run lists too, which changes nothing, so it can say what would be written.
 sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were said
@@ -552,7 +553,7 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
                      cmd="${cmd}if [ -d \"$hd/$lit\" ]; then find \"$hd/$lit\"" ;;
                 *)   lit=""; cmd="${cmd}find \"$hd\"" ;;
             esac
-            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -printf '%s %p\\n'"
+            cmd="$cmd -maxdepth $dep -type f -path \"$hd/$glob\" ! -path \"$hd/$CAL_SCRATCH/*\" -printf '%s %b %p\\n'"
             [ -z "$lit" ] || cmd="$cmd; fi"
         done < "$WORK_DIR/probe/$host.gridspec"
         [ -n "$cmd" ] || continue
@@ -603,8 +604,9 @@ stage_layout_writes() {
 }
 
 # A set's own layout job reports no write bytes (create_only), so the sweep
-# runs again once it ends: a file it sized still missing or short means the
-# layout was cut. One more find per host, LAYOUT_OWN=1 only.
+# runs again once it ends: a file it sized still missing, short or sparse
+# (fio truncates to full size before writing) means the layout was cut. One
+# more find per host, LAYOUT_OWN=1 only.
 check_own_layout() {   # check_own_layout <layout job>
     local out h nf by re kept short=0
     sweep_layout_grid again
@@ -612,7 +614,7 @@ check_own_layout() {   # check_own_layout <layout job>
         || die "cannot check the layout against the sweep"
     while IFS=$'\t' read -r h nf by re kept; do
         [ -n "$h" ] && [ "$nf" -gt 0 ] || continue
-        log "ERROR: $h: $nf layout file(s) missing or short after the layout ($by bytes)" >&2
+        log "ERROR: $h: $nf layout file(s) missing, short or sparse after the layout ($by bytes)" >&2
         short=1
     done <<<"$out"
     [ "$short" -eq 0 ] || die "layout $1 left files short -- the set's own layout job did not finish (a signal or a dropped worker)"

@@ -4,20 +4,27 @@
 # when converting, the run's layout: a dense sequential write of each file
 # missing or short of its size. Prints per host "<host> <files> <bytes>
 # <reused> <kept-sections>", tab-separated. Mode "check" (after a set's own
-# layout) prints the same lines and writes nothing.
+# layout) prints the same lines, counting a file with under 95% of its size
+# allocated as short too, and writes nothing.
 function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
     b = 1048576
     while (b > 1 && v % b) b /= 2
     return b
 }
 function esc_colon(s) { gsub(/:/, "\\:", s); return s }
-function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
+function do_host(h, convert,    L, n, SZ, AL, q, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
     if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
     if (!check) writelines(work "/grid/" h "/" lay, L, n)
     if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
-    split("", SZ)
-    for (i = 1; i <= m; i++)
-        if ((p = index(S[i], " ")) > 1) SZ[substr(S[i], p + 1)] = substr(S[i], 1, p - 1) + 0
+    split("", SZ); split("", AL)
+    # "<bytes> <blocks> <path>": the path is the rest, spaces and all
+    for (i = 1; i <= m; i++) {
+        if ((p = index(S[i], " ")) < 2) continue
+        x = substr(S[i], p + 1)
+        if ((q = index(x, " ")) < 2) continue
+        path = substr(x, q + 1)
+        SZ[path] = substr(S[i], 1, p - 1) + 0; AL[path] = substr(x, 1, q - 1) * 512
+    }
     ns = ini_parse(L, n, SN, KV)
     # A section the sweep cannot state (no format or filesize, a variable
     # other than $jobname/$jobnum/$filenum, a size off 4KiB) keeps its
@@ -53,7 +60,12 @@ function do_host(h, convert,    L, n, SZ, m, S, S0, i, p, P, SN, KV, ns, s, fmt,
     for (i = 1; i <= nw; i++) {
         path = ORD[i]; F = W[path]; S0 = (path in SZ) ? SZ[path] : 0
         credit += S0 < F ? S0 : F
-        if (S0 >= F) { reused++; continue }
+        if (S0 >= F) {
+            # check only: fio truncates to full size before writing, so a cut
+            # layout leaves the file sparse (compression would false-fail)
+            if (check && AL[path] < F * 0.95) { nwrite++; bytes += F - AL[path]; continue }
+            reused++; continue
+        }
         # appended from its end when that end sits on the block size, else
         # rewritten from 0 in place: never a hole either way
         b = lowbit(F); app = S0 % b == 0
