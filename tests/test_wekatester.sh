@@ -10836,9 +10836,17 @@ t_assert "build: a marker it cannot place exactly stops it, target untouched" ba
 # that opens a single-quoted program on an awk, gawk, mawk or awkrun command
 # (backslash continuations joined, a marker's own quotes set aside) and does
 # not close it must hand it to a marker on the next line. Programs in double
-# quotes, in variables or behind -f are not seen.
+# quotes, in variables or behind -f are not seen; an apostrophe inside a
+# double-quoted string (a die message joined by a continuation) opens nothing.
 t_assert "build: no multi-line awk program is left inline in src/" bash -c '
     prog=$(cat <<"EOF"
+function sq(s,    i, c, st, n) {   # single quotes outside double-quoted strings
+    for (i = 1; i <= length(s); i++) { c = substr(s, i, 1)
+        if (st == 2) { if (c == "\\") i++; else if (c == "\"") st = 0 }
+        else if (st == 1) { if (c == "\047") { n++; st = 0 } }
+        else if (c == "\047") { n++; st = 1 } else if (c == "\"") st = 2 }
+    return n
+}
 FNR == 1 { open = 0; cont = "" }
 { line = cont $0; cont = "" }
 line ~ /\\$/ { cont = substr(line, 1, length(line) - 1) " "; next }
@@ -10848,10 +10856,17 @@ open {
 }
 line ~ /^[ \t]*#/ { next }
 { gsub(/\047#@awk [A-Za-z0-9_.]+\047/, "", line); t = " " line " " }
-t ~ /[^A-Za-z_][gm]?awk(run)? / { if (gsub(/\047/, "", t) % 2) { if (line ~ /\047$/) open = 1; else print FILENAME ":" FNR } }
+t ~ /[^A-Za-z_][gm]?awk(run)? / { if (sq(t) % 2) { if (line ~ /\047$/) open = 1; else print FILENAME ":" FNR } }
 EOF
 )
-    bad=$(find src -name "*.sh" | sort | xargs awk "$prog") && [ -z "$bad" ] || { echo "inline at: $bad" >&2; false; }'
+    bad=$(find src -name "*.sh" | sort | xargs awk "$prog") && [ -z "$bad" ] || { echo "inline at: $bad" >&2; exit 1; }
+    # the control: an inline program is caught; a marker call continued onto a
+    # die message with an apostrophe is not
+    d=$(mktemp -d); q=$(printf "\047")
+    printf "f() {\n    x=\$(awk %s\nBEGIN { print 1 }%s)\n}\n" "$q" "$q" > "$d/in.sh"
+    printf "f() {\n    fa=\$(awkrun %s#@awk x%s \"\$a\") \\\\\n        || die \"cannot stage the set%ss own job\"\n}\n" "$q" "$q" "$q" > "$d/ok.sh"
+    [ "$(awk "$prog" "$d/in.sh")" = "$d/in.sh:2" ] && [ -z "$(awk "$prog" "$d/ok.sh")" ] ||
+        { echo "control: in [$(awk "$prog" "$d/in.sh")] ok [$(awk "$prog" "$d/ok.sh")]" >&2; cat "$d/in.sh" "$d/ok.sh" >&2; false; }'
 
 rm -f -- "${SUITE_ASIDE:?}"
 if [ -z "${SUITE_ONLY:-}" ]; then
