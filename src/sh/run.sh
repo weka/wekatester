@@ -184,6 +184,7 @@ remote_helpers_cmd() {
 sysinfo_nic_cmd() {
     # mlnx_qos may need root: a non-root failure is retried once under the
     # escalator.
+    printf '%s\n' "$PROC_FN"
     remote_helpers_cmd
     printf '%s' '_nlist
     echo "=== WEKATESTER_SYSINFO sysctl ==="
@@ -199,9 +200,9 @@ sysinfo_nic_cmd() {
         cat "$_sr"/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>&1 | sort | uniq -c
     else echo "not available: /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor not readable"; fi
     echo "=== WEKATESTER_SYSINFO irqbalance ==="
-    if ! _o=$(command -v pgrep); then echo "not available: pgrep not installed"
-    elif _o=$(pgrep -x irqbalance); then echo running
-    else _rc=$?; if [ $_rc -eq 1 ]; then echo "not running"; else echo "not available: pgrep exited $_rc"; fi; fi
+    if ! _o=$(_wt_comm irqbalance); then echo "not available: cannot list /proc"
+    elif [ -n "$_o" ]; then echo running
+    else echo "not running"; fi
     echo "=== WEKATESTER_SYSINFO nics ==="; _nlsay
     for _n in $_nl; do
         _v=/sys/class/net/$_n/device

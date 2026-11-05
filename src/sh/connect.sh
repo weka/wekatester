@@ -18,17 +18,18 @@ kill_fio_cmd() {   # kill_fio_cmd [priv]
 # that ended before its 15th poll saw no server, so only a timed-out one
 # looks again before the -9.
 kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
-    # An escalated server is root-owned: the kill needs the same escalator. The
-    # ^ anchor is load-bearing: this shell carries the pattern in its own
-    # cmdline (an unanchored pkill -9 once killed the teardown). taskset execs
-    # fio, so argv starts with the binary.
-    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" pat
-    ere_quote_v "$srv"; pat="^$ERE_QUOTED"
+    # An escalated server is root-owned: the kill needs the same escalator.
+    # The match is fio's name and args STARTING with the server's command:
+    # this shell carries that command in its own cmdline (an unanchored
+    # pkill -9 once killed the teardown). taskset execs fio, so argv starts
+    # with the binary.
+    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" fc=${FIO_BIN##*/}
+    fc=${fc:0:15}   # a process name (comm) holds 15 bytes
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="$PROC_ARGS_FN; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
-        i=0; while _o=\$(pgrep -f '$pat') && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && _o=\$(pgrep -f '$pat'); then ${priv}pkill -9 -f '$pat' || true; fi"
+    KILL_FIO_CMD="$PROC_FN; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(${priv}kill \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+        i=0; while _wt_pfx '$fc' '$srv' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if [ \"\$i\" -ge 15 ] && _wt_pfx '$fc' '$srv'; then ${priv}kill -9 \$_wt_l || true; fi"
 }
 
 start_fio_servers() {

@@ -14,10 +14,10 @@ probe_remote_cmd() {
     # under taskset -c. bindable_priv: what the escalator's cgroup adds, "-"
     # if unknown.
     escalator_words_v "'"
-    printf '%s' "_sr=\${WEKATESTER_SYSROOT:-}; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
+    printf '%s' "$PROC_FN; _sr=\${WEKATESTER_SYSROOT:-}; _wt_proc=\$_sr/proc; echo \"ncpus \$(getconf _NPROCESSORS_ONLN)\"; \
         echo \"limits \$(ulimit -Sn) \$(ulimit -Hn) \$(ulimit -Su) \$(ulimit -Hu)\"; \
-        echo \"wekanode \$(pgrep -xc wekanode || true)\"; \
-        for p in \$(pgrep -x wekanode || true); do cat /proc/\$p/status; done \
+        _wn=\$(_wt_comm wekanode); _wc=0; for p in \$_wn; do _wc=\$((_wc + 1)); done; echo \"wekanode \$_wc\"; \
+        for p in \$_wn; do cat \"\$_wt_proc/\$p/status\"; done \
         | awk '/^Cpus_allowed_list/ {print \"weka_allowed\", \$2}' | sort -u; \
         echo \"engines \$('$FIO_BIN' --enghelp | tr \"\\n\" \" \")\"; \
         _ts=; _te=; if _tso=\$(taskset -cp \$\$ 2>&1); then _ts=\$(printf '%s\\n' \"\$_tso\" | awk -F': ' '{print \$2}'); [ -n \"\$_ts\" ] || _te='gave no affinity list'; else _te=failed; fi; echo \"taskset \$_ts\"; \
