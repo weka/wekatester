@@ -4886,9 +4886,9 @@ numjobs=2"
     grep -qxF "12288 24 $t/h1.wt.0.0" "$d/probe/h1.sizes" ||
         { echo "credited $(cat "$d/probe/h1.laidout"); left: $left; sizes: $(cat "$d/probe/h1.sizes"); $out" >&2; exit 1; }
     want="# wekatester-layout: generated as a dense write
-# Staged per run from the layout grid, after the sweep: every file missing
-# or short of its size is written sequentially from its end, so a stopped
-# layout leaves a short file, never a full-size one with a hole (README).
+# Staged per run from the layout grid, after the sweep: every file missing,
+# short or sparse is written sequentially (a short one from its end), so a
+# stopped layout leaves a short or sparse file the next sweep finds (README).
 [global]
 directory=$t
 fallocate=none
@@ -4944,7 +4944,7 @@ filename=h1.wt.2.0"
     # the grid is kept for the directory pass and the capacity check
     grep -qx "filename_format=h1.\$filenum/\$jobnum" "$d/grid/h1/000-wekatester-layout.job" &&
     grep -qx "layout	4 file(s), 36864 bytes to write on 1 host(s)" "$d/run/settings" &&
-    case "$out" in *"layout: h1: 4 file(s) missing or short, 0.0 GiB to write (3 reused)"*) true;;
+    case "$out" in *"layout: h1: 4 file(s) missing, short or sparse, 0.0 GiB to write (3 reused)"*) true;;
         *) echo "$out" >&2; false;; esac'
 # Overlapping grids were chained with wait_for so no file was laid out twice
 # at once; each file now sits in exactly one section, at its largest size.
@@ -4985,7 +4985,7 @@ filesize=4K"
     grep -A9 -x "\[lay-0-16384-a4\]" "$l" | grep -qx "filesize=16384" &&
     grep -A9 -x "\[lay-0-8192-a2\]" "$l" | grep -qx "nrfiles=16" &&
     ! grep -q "^wait_for=\|^create_only" "$l" &&
-    case "$out" in *"layout: h1: 22 file(s) missing or short, 0.0 GiB to write (0 reused)"*) true;;
+    case "$out" in *"layout: h1: 22 file(s) missing, short or sparse, 0.0 GiB to write (0 reused)"*) true;;
         *) echo "$out" >&2; false;; esac'
 t_assert "stage_layout_writes: a namespace the sweep cannot size keeps its create_only sections, wait_for chain and all, earns no credit, and says so" bash -c '
     d=$(mktemp -d)
@@ -5048,24 +5048,15 @@ numjobs=2"
     [ ! -s "$d/run/settings" ] || { echo "$out" >&2; cat "$d/jobs/h1/000-wekatester-layout.job" >&2; false; }'
 # fio truncates a file to full size before it writes it, so a cut own layout
 # leaves it full size with a hole (Frank 00:05Z, the blocks check): after the
-# layout, a file with under 95% of its size allocated counts as cut; before
-# it, size alone decides. Rows: dir|filesize|listing|after ("ok" or "<files>
-# <bytes>", the bytes counted against the job's filesize), or "pre" (the
-# pre-layout pass, by size only: flips if that pass learns blocks too).
-t_assert "check_own_layout: a full-size file with under 95% of it allocated counts as cut and stops the run with its bytes; before the layout, size alone is credited" bash -c '
+# layout, a file with under 95% of its size allocated counts as cut. Rows:
+# dir|filesize|listing|"ok" or "<files> <bytes>" (the bytes counted against
+# the job's filesize).
+t_assert "check_own_layout: a full-size file with under 95% of it allocated counts as cut and stops the run with its bytes" bash -c '
     while IFS="|" read -r dir fs sz want; do
         d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/set" "$d/probe"
         printf "[global]\ndirectory=%s\n[lay]\ncreate_only=1\nfilename_format=h1.\$jobnum\nfilesize=%s\n" "$dir" "$fs" > "$d/set/000-wekatester-layout.job"
         cp "$d/set/000-wekatester-layout.job" "$d/jobs/h1/"
         printf "%s\n" "$sz" > "$d/probe/h1.sizes"
-        if [ "$want" = pre ]; then
-            out=$( (source ./wekatester
-             WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1; LAYOUT_OWN=1; RUN_DIR=""
-             JOBFILES=(000-wekatester-layout.job)
-             stage_layout_writes) 2>&1 ) && [ "$(cat "$d/probe/h1.laidout")" = 65536 ] ||
-                { echo "[$sz] pre: credited $(cat "$d/probe/h1.laidout"): $out" >&2; exit 1; }
-            continue
-        fi
         out=$( (source ./wekatester
          WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); LAYOUT_OWN=1
          JOBFILES=(000-wekatester-layout.job)
@@ -5083,8 +5074,60 @@ t_assert "check_own_layout: a full-size file with under 95% of it allocated coun
 /w|64K|131072 64 /w/h1.0|1 32768
 /w x|64K|65536 128 /w x/h1.0|ok
 /w x|64K|65536 0 /w x/h1.0|1 65536
-/w|64K|65536 0 /w/h1.0|pre
 ROWS'
+# Before the layout too, every sweep (Frank 00:30Z "Yes, widen it"): a sparse
+# file is never reused, so no benchmark reads holes. A generated layout
+# rewrites it from 0; a set's own layout has it emptied first, never removed
+# (create_only skips a full-size file); a dry run empties nothing. Real files
+# in a directory with a space and a quote, real find, run_host runs locally.
+t_assert "layout: a sparse file before the layout is not reused: a generated layout rewrites it from 0, a set's own layout empties it first (401 in two commands), a dry run empties nothing" bash -c '
+    run() {   # run <dir> <own|gen> <dry 0|1> <files> [fail]: sweep and stage over <dir>/t; fail: emptying fails
+        local d=$1 t own=0 g="" fe=${5:-}
+        t="$1/it'"'"'s here"
+        [ "$2" = own ] && own=1 || g="# wekatester-layout: generated sha256=abc\n"
+        (source ./wekatester
+         parse_args -d "$t" h1
+         WORK_DIR=$d; SET_DIR=$d/set; DRY_RUN=$3; RUN_DIR=$d/run; LAYOUT_OWN=$own
+         mkdir -p "$RUN_DIR" "$d/jobs/h1" "$SET_DIR"
+         printf "${g}[global]\ndirectory=%s\nfallocate=none\nioengine=psync\nunique_filename=0\n[lay]\ncreate_only=1\nfilename_format=f.\$jobnum\nfilesize=64K\nnumjobs=%s\n" "$t" "$4" > "$SET_DIR/000-wekatester-layout.job"
+         cp "$SET_DIR/000-wekatester-layout.job" "$d/jobs/h1/"
+         JOBFILES=(000-wekatester-layout.job)
+         run_host() { printf "%s\n" "$2" >> "$d/cmds"; [ -n "$fe" ] && [[ $2 == ": > "* ]] && return 1; bash -c "$2"; }
+         sweep_layout_grid && stage_layout_writes) > "$d/out" 2>&1
+        echo $? > "$d/rc"
+    }
+    plant() {   # plant <dir>: f.0 sparse at 64K, f.1 written 64K, f.2 written 1000 bytes
+        local t="$1/it'"'"'s here"
+        mkdir -p "$t" && truncate -s 64K "$t/f.0" && head -c 65536 /dev/zero > "$t/f.1" && head -c 1000 /dev/zero > "$t/f.2"
+    }
+    sz() { stat -c %s "$1/it'"'"'s here/f.$2"; }
+    fail() { { echo "$1: rc $(cat "$2/rc")"; cat "$2/out"; cat "$2/cmds" 2>&1; } >&2; exit 1; }
+    b=$(mktemp -d)
+    # own layout: f.0 emptied (credit 0), f.1 and f.2 untouched (credit 65536 + 1000)
+    d=$b/own; plant "$d"; run "$d" own 0 3
+    [ "$(cat "$d/rc")" -eq 0 ] && [ "$(sz "$d" 0)" -eq 0 ] && [ "$(sz "$d" 1)" -eq 65536 ] && [ "$(sz "$d" 2)" -eq 1000 ] &&
+    [ "$(cat "$d/probe/h1.laidout")" = 66536 ] && grep -q "^: > " "$d/cmds" &&
+    grep -qF "layout: h1: 1 sparse file(s) (full size, under 95% allocated) emptied so the layout writes them again" "$d/out" || fail own "$d"
+    # the dry run reports it and empties nothing
+    d=$b/dry; plant "$d"; run "$d" own 1 3
+    [ "$(cat "$d/rc")" -eq 0 ] && [ "$(sz "$d" 0)" -eq 65536 ] && ! grep -q "^: > " "$d/cmds" &&
+    grep -qF "dry run: nothing emptied" "$d/out" || fail dry "$d"
+    # a generated layout: f.0 and f.2 rewritten from 0 (64K each), f.1 reused, nothing emptied
+    d=$b/gen; plant "$d"; run "$d" gen 0 3
+    [ "$(cat "$d/rc")" -eq 0 ] && [ "$(sz "$d" 0)" -eq 65536 ] && ! grep -q "^: > " "$d/cmds" &&
+    grep -qF "layout: h1: 2 file(s) missing, short or sparse, 0.0 GiB to write (1 reused)" "$d/out" &&
+    grep -qxF "layout	2 file(s), 131072 bytes to write on 1 host(s)" "$d/run/settings" &&
+    awk "/^\[/ { s = \$0 } /^filename=f\.0\$/ { f = s } /^file_append=0\$/ { a[s] = 1 } END { exit !(f != \"\" && (f in a)) }" "$d/jobs/h1/000-wekatester-layout.job" ||
+        { cat "$d/jobs/h1/000-wekatester-layout.job" >&2; fail gen "$d"; }
+    # 401 sparse files: all emptied, in two commands
+    d=$b/many; t="$d/it'"'"'s here"; mkdir -p "$t" && (cd "$t" && truncate -s 64K $(seq -f "f.%g" 0 400)) || exit 1
+    run "$d" own 0 401
+    n=$(find "$t" -type f -size 0 | wc -l)
+    [ "$(cat "$d/rc")" -eq 0 ] && [ "$n" -eq 401 ] && [ "$(grep -c "^: > " "$d/cmds")" -eq 2 ] || { echo "emptied $n of 401" >&2; fail many "$d"; }
+    # an emptying that fails stops the run naming the host
+    d=$b/err; plant "$d"; run "$d" own 0 3 fail
+    [ "$(cat "$d/rc")" -ne 0 ] && grep -q "ERROR: .*sparse.* h1" "$d/out" || fail err "$d"
+    rm -rf -- "${b:?}"'
 # A set's own layout job (create_only, no write bytes to count) is swept
 # again once it ends (Frank, 2026-11-04): a sized file still missing or short
 # stops the run before any measured job. ownlay_run <dir> <sized|unsized>
@@ -5277,7 +5320,7 @@ numjobs=2"
     cat "$d/oplog" >>$SUITE_ASIDE
     [ "$(wc -l < "$d/oplog")" -eq 1 ] && grep -q "^RUN: find .*-printf" "$d/oplog" && ! grep -q -- "-delete\|rm " "$d/oplog" &&
     grep -qx "filename=h1.1" "$d/jobs/h1/000-wekatester-layout.job" &&
-    case "$out" in *"layout: h1: 1 file(s) missing or short, 0.0 GiB to write (1 reused)"*"layout: would write 0.0 GiB across the hosts"*"filename=h1.1"*) true;;
+    case "$out" in *"layout: h1: 1 file(s) missing, short or sparse, 0.0 GiB to write (1 reused)"*"layout: would write 0.0 GiB across the hosts"*"filename=h1.1"*) true;;
         *) echo "$out" >&2; false;; esac'
 t_assert "capacity: swept bytes are credited against the requirement" bash -c '
     source ./tests/helpers.sh; tuner_fixture
