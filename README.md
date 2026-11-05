@@ -689,7 +689,7 @@ On a bundle, `-s` opens with a synopsis of the run, read only from what the bund
 
 ```
 run      2026-10-23 14:10:02 (bundle 20261023-141002.tgz)
-version  wekatester 2026-10-11, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
+version  wekatester 2026-11-05, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
 command  ./wekatester -a cal -w default h1 h2 h3
 clients  3 (master h1), 2 shapes, 1 filesystem group
 workload default; -a cal (30 s cells); dest /mnt/weka/wt (wekafs)
