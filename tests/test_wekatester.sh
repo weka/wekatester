@@ -5104,8 +5104,10 @@ t_assert "layout: a sparse file before the layout is not reused: a generated lay
     fail() { { echo "$1: rc $(cat "$2/rc")"; cat "$2/out"; cat "$2/cmds" 2>&1; } >&2; exit 1; }
     b=$(mktemp -d)
     # own layout: f.0 emptied (credit 0), f.1 and f.2 untouched (credit 65536 + 1000)
-    d=$b/own; plant "$d"; run "$d" own 0 3
+    # (the same inode: emptied, not removed and made again)
+    d=$b/own; plant "$d"; ino=$(stat -c %i "$d/it'"'"'s here/f.0"); run "$d" own 0 3
     [ "$(cat "$d/rc")" -eq 0 ] && [ "$(sz "$d" 0)" -eq 0 ] && [ "$(sz "$d" 1)" -eq 65536 ] && [ "$(sz "$d" 2)" -eq 1000 ] &&
+    [ "$(stat -c %i "$d/it'"'"'s here/f.0")" = "$ino" ] &&
     [ "$(cat "$d/probe/h1.laidout")" = 66536 ] && grep -q "^: > " "$d/cmds" &&
     grep -qF "layout: h1: 1 sparse file(s) (full size, under 95% allocated) emptied so the layout writes them again" "$d/out" || fail own "$d"
     # the dry run reports it and empties nothing
@@ -5128,6 +5130,29 @@ t_assert "layout: a sparse file before the layout is not reused: a generated lay
     d=$b/err; plant "$d"; run "$d" own 0 3 fail
     [ "$(cat "$d/rc")" -ne 0 ] && grep -q "ERROR: .*sparse.* h1" "$d/out" || fail err "$d"
     rm -rf -- "${b:?}"'
+# The generated layout's edge (e857c23): under 95% allocated is written
+# in full, credited by what is allocated; 95% and up is reused. Rows:
+# filesize|listing blocks|"<files> <bytes> <credit>".
+t_assert "stage_layout_writes: a generated layout writes a full-size file under 95% allocated in full, credited by its allocated bytes; 95% and up is reused" bash -c '
+    while IFS="|" read -r fs sz want; do
+        d=$(mktemp -d); mkdir -p "$d/jobs/h1" "$d/set" "$d/probe" "$d/run"
+        printf "# wekatester-layout: generated sha256=abc\n[global]\ndirectory=/w\n[lay]\ncreate_only=1\nfilename_format=h1.\$jobnum\nfilesize=%s\n" "$fs" > "$d/set/000-wekatester-layout.job"
+        cp "$d/set/000-wekatester-layout.job" "$d/jobs/h1/"
+        printf "%s /w/h1.0\n" "$sz" > "$d/probe/h1.sizes"
+        out=$( (source ./wekatester
+         WORK_DIR=$d; SET_DIR=$d/set; HOSTS=(h1); DRY_RUN=1; LAYOUT_OWN=0; RUN_DIR=$d/run
+         JOBFILES=(000-wekatester-layout.job)
+         stage_layout_writes) 2>&1 ) || { echo "[$sz]: $out" >&2; exit 1; }
+        read -r nf by cr <<<"$want"
+        if [ "$nf" -eq 0 ]; then w="nothing to write (files reused)"; else w="$nf file(s), $by bytes to write on 1 host(s)"; fi
+        grep -qxF "layout	$w" "$d/run/settings" && [ "$(cat "$d/probe/h1.laidout")" = "$cr" ] ||
+            { echo "[$fs|$sz] want $want: settings $(cat "$d/run/settings"), credited $(cat "$d/probe/h1.laidout"): $out" >&2; exit 1; }
+    done <<"ROWS"
+64K|65536 0|1 65536 0
+64K|65536 121|1 65536 61952
+64K|65536 122|0 0 65536
+40K|40960 76|0 0 40960
+ROWS'
 # A set's own layout job (create_only, no write bytes to count) is swept
 # again once it ends (Frank, 2026-11-04): a sized file still missing or short
 # stops the run before any measured job. ownlay_run <dir> <sized|unsized>
