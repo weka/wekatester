@@ -14,7 +14,9 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
     exit 2
 }
 
-VERSION="2026-11-05"
+# The release version; the patch number moves with every change that
+# reaches the wekatester-v3 release.
+VERSION="3.0.1"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
