@@ -366,19 +366,20 @@ prompt_password_creds() {
 
 # One connection attempt. external: is a user-owned master alive (ssh -O
 # check, our ControlPath absent)? default/key: a master in our socket dir
-# with BatchMode. pw: the same, through askpass.
+# with BatchMode. pw: the same, through askpass. ssh's stderr goes to the
+# err file (external: stdout too), read after the round's wait.
 SETSID_BIN=""
-attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
+attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index> <err-file>
     local u=() fifo rc
     [ -z "$3" ] || u=(-o "User=$3")
     case "$1" in
         external)
-            ssh -O check $SSH_OPTS "$2" > "$AUTH_DIR/$2.extcheck" 2>&1 ;;
+            ssh -O check $SSH_OPTS "$2" > "$5" 2>&1 ;;
         default)
-            ssh -n "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+            ssh -n "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true 2> "$5" ;;
         key)
             ssh -n "${u[@]}" -o "IdentityFile=$4" -o IdentitiesOnly=yes \
-                $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+                $SSH_OPTS $CONTROL_OPTS "$2" true 2> "$5" ;;
         pw)
             fifo="$AUTH_DIR/$2.fifo"
             mkfifo -m 600 "$fifo" || return 1
@@ -391,7 +392,7 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
             WEKATESTER_PW_FIFO="$fifo" SSH_ASKPASS="$AUTH_DIR/askpass.sh" \
                 SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-wekatester}" \
                 $SETSID_BIN ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 \
-                "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true </dev/null
+                "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true </dev/null 2> "$5"
             rc=$?
             exec 4>&-
             rm -f "$fifo" "$fifo.used"
@@ -399,12 +400,28 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
     esac
 }
 
+# ssh's last non-empty stderr line (a banner or a warning can come first),
+# "" when it printed nothing.
+auth_reason_v() {   # auth_reason_v <err-file> -> AUTH_REASON
+    local l
+    AUTH_REASON=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l%$'\r'}
+        [ -z "$l" ] || AUTH_REASON=$l
+    done < "$1"
+}
+
 # One round: this credential against every still-unconnected client, in
-# parallel. Winners record their per-host transport delta and leave the pool.
+# parallel. Winners record their per-host transport delta and leave the pool;
+# a loser's label and ssh's reason are kept for the closing WARNING.
 REMAINING=()
+AUTH_ROUND=0
+declare -gA AUTH_LAST_LABEL=() AUTH_LAST_REASON=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() effs=() left=() i n=0 eff logins=()
+    local host pids=() effs=() left=() i n=0 eff logins=() ef
+    AUTH_ROUND=$((AUTH_ROUND + 1))
     # a credential's own login wins; else the host file pins this host's
     # (one awk for the round, not one per host)
     if [ -z "$3" ] && [ -f "$WORK_DIR/targets.phase1" ]; then
@@ -416,7 +433,9 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
         eff=$3
         [ -n "$eff" ] || eff=${logins[$i]:-}
         effs+=("${eff:-.}")
-        attempt_host "$2" "$host" "$eff" "$4" &
+        # the external check's output keeps its own name
+        ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+        attempt_host "$2" "$host" "$eff" "$4" "$ef" &
         pids+=($!)
     done
     for i in "${!REMAINING[@]}"; do
@@ -429,11 +448,16 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
             debug "$host: connected via $1"
         else
             left+=("$host")
+            ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+            auth_reason_v "$ef"
+            AUTH_LAST_LABEL[$host]=$1; AUTH_LAST_REASON[$host]=$AUTH_REASON
+            if [ -n "$AUTH_REASON" ]; then debug2 "$host: $1 failed: $AUTH_REASON"
+            else debug2 "$host: $1 failed (ssh printed nothing)"; fi
         fi
     done
     REMAINING=()
     [ ${#left[@]} -eq 0 ] || REMAINING=("${left[@]}")
-    [ "$n" -eq 0 ] || log "auth: $n host(s) connected via $1"
+    [ "$n" -eq 0 ] || debug "auth: $n host(s) connected via $1"
 }
 
 # The password goes back ONCE per attempt; a second question gets a failure,
@@ -479,6 +503,13 @@ establish_connections() {
             pw "${PW_LOGINS[$i]}" "$i"
     done
     PW_SECRETS=()
+    # one WARNING per unreached host, with ssh's reason from its last attempt,
+    # then stop: without a winning round its ssh would fall back to the
+    # default login
+    local h
+    for h in "${REMAINING[@]}"; do
+        log "WARNING: $h: no working ssh credentials (last tried ${AUTH_LAST_LABEL[$h]:-nothing}: ${AUTH_LAST_REASON[$h]:-ssh printed nothing})" >&2
+    done
     [ ${#REMAINING[@]} -eq 0 ] \
-        || log "WARNING: no working ssh credentials for: ${REMAINING[*]}" >&2
+        || die "no working ssh credentials for ${#REMAINING[@]} of ${#HOSTS[@]} host(s): ${REMAINING[*]}"
 }

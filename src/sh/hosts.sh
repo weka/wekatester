@@ -331,8 +331,13 @@ targets_path() {
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
     else
-        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
-        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        workload_path_v
+        if [ -n "$WORKLOAD_PATH" ]; then
+            candidate="$WORKLOAD_PATH/hostlist.csv"
+        else
+            candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+            [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        fi
         [ -f "$candidate" ] || candidate="./hostlist.csv"
     fi
     TARGETS_FILE=$candidate

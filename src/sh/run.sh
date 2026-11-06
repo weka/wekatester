@@ -64,12 +64,23 @@ record_run() {
     printf 'version\t%s\nworkload\t%s\nauto\t%s\ncal-seconds\t%s\nmaster\t%s\nhosts\t%s\n' \
         "$VERSION" "$WORKLOAD" "${AUTO_LEVEL:--}" "$q" "$MASTER" "${HOSTS[*]}" > "$RUN_DIR/settings" \
         || log "WARNING: could not record the run settings in $RUN_DIR/settings" >&2
-    # the override, only when given: what the version check found
+    # the overrides, only when given: what their checks found
     [ "$ALLOW_FIO_MISMATCH" -eq 0 ] \
         || printf 'allow-fio-mismatch\t%s\n' "${FIO_VERSION_NOTE:-not checked}" >> "$RUN_DIR/settings" \
         || log "WARNING: could not record --allow-fio-mismatch in $RUN_DIR/settings" >&2
+    [ "$ALLOW_CACHED_MOUNT" -eq 0 ] \
+        || printf 'allow-cached-mount\t%s\n' "${CACHED_MOUNT_NOTE:-not checked}" >> "$RUN_DIR/settings" \
+        || log "WARNING: could not record --allow-cached-mount in $RUN_DIR/settings" >&2
     settings_provenance >> "$RUN_DIR/settings" \
         || log "WARNING: could not record where the settings came from in $RUN_DIR/settings" >&2
+    # each connection attempt's ssh output (connect.sh); none in local mode
+    local f auth=()
+    if [ -n "$AUTH_DIR" ]; then
+        for f in "$AUTH_DIR"/*.err "$AUTH_DIR"/*.extcheck; do [ ! -f "$f" ] || auth+=("$f"); done
+    fi
+    [ ${#auth[@]} -eq 0 ] \
+        || { mkdir -p "$RUN_DIR/auth" && cp -- "${auth[@]}" "$RUN_DIR/auth/"; } \
+        || log "WARNING: could not copy the ssh attempts' output into $RUN_DIR/auth" >&2
 }
 
 # Per-host system context, one file per item under sysinfo/<host>/ (README,

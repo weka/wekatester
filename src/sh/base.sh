@@ -1,6 +1,10 @@
 # --- logging -----------------------------------------------------------------
 log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
+# README, -v: -v per-host outcomes and notes, -vv every connection attempt,
+# -vvv nothing more yet
+debug2() { [ "$VERBOSITY" -ge 2 ] && log "DEBUG: $*"; return 0; }
+debug3() { [ "$VERBOSITY" -ge 3 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
 # Warnings raised before the run log opens, replayed once into the log FILE
@@ -228,12 +232,16 @@ require_interactive() {   # require_interactive <what-needs-it> [advice]
 # Best effort, for prompts that have a default on unattended runs (-r/-n).
 try_interactive() {
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
-    # exec with only redirections fails without killing the shell; its stderr
-    # names the device.
-    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
+    # Probe the open in a subshell first: without a terminal, bash's own
+    # diagnostic (a line of the built tool, a device the user never typed)
+    # lands in err, shown only under -v, never raw on stderr.
+    local err
+    if err=$(exec 2>&1; exec 3<>"$PROMPT_TTY" && [ -t 3 ]) && exec 3<>"$PROMPT_TTY"; then
         PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
         return 0
     fi
+    err=${err#*line [0-9]*: }
+    debug "no terminal: ${err:-$PROMPT_TTY is not a terminal}"
     return 1
 }
 

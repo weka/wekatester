@@ -18,7 +18,7 @@ VERSION="2026-11-05"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
-WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
+WORKLOAD="default"              # workload set: a subdir of fio-jobfiles, or a path
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
 DIRECTORY_EXPLICIT=0            # -d was given (CLI beats a host file's dir)
@@ -90,6 +90,7 @@ IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
+ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
 
 #@include sh/base.sh
 
@@ -98,7 +99,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
-                  [--allow-fio-mismatch]
+                  [--allow-fio-mismatch] [--allow-cached-mount]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -124,8 +125,8 @@ EOF
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
 USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
-    break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
-    duration unlink summarize verbose version help dashdash"
+    break_lock any_fs allow_fio_mismatch allow_cached_mount identity password targets bulk
+    fast dry regen duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
     case $1 in
     (directory) cat <<EOF
@@ -136,8 +137,8 @@ opt_help() {   # opt_help <key>
 EOF
     ;;
     (workload) cat <<EOF
-  -w, --workload set      workload definition directory, a subdir of
-                          fio-jobfiles (default: $WORKLOAD)
+  -w, --workload set      workload set: a subdirectory of fio-jobfiles, or a
+                          path to a directory of jobfiles (default: $WORKLOAD)
 EOF
     ;;
     (fio_bin) cat <<EOF
@@ -221,6 +222,12 @@ EOF
                           host whose fio --version fails still stops the run)
 EOF
     ;;
+    (allow_cached_mount) cat <<EOF
+  --allow-cached-mount    run on when a wekafs destination is not mounted
+                          forcedirect (a warning instead of a stop; the
+                          numbers include the client cache)
+EOF
+    ;;
     (identity) cat <<EOF
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
@@ -290,7 +297,8 @@ EOF
 EOF
     ;;
     (verbose) cat <<EOF
-  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+  -v             increase output verbosity: -v per-host outcomes and
+                 notes, -vv every connection attempt
 EOF
     ;;
     (version) cat <<EOF
@@ -492,6 +500,7 @@ parse_args() {
             --break-lock) BREAK_LOCK=1; shift ;;
             --any-fs) ANY_FS=1; shift ;;
             --allow-fio-mismatch) ALLOW_FIO_MISMATCH=1; shift ;;
+            --allow-cached-mount) ALLOW_CACHED_MOUNT=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;

@@ -262,10 +262,29 @@ check_aio_room() {
     esac
 }
 
-# The -w set's directory: the one beside wekatester, else under the current
-# directory.
+# A -w value holding / is a directory path (absolute or relative to the
+# current directory), trailing slashes dropped as -d's are; / stays /.
+# -> WORKLOAD_PATH, empty for a set name
+workload_path_v() {
+    WORKLOAD_PATH=""
+    case $WORKLOAD in (*/*) ;; (*) return 0 ;; esac
+    WORKLOAD_PATH=$WORKLOAD
+    while [ "$WORKLOAD_PATH" != / ] && [ "${WORKLOAD_PATH%/}" != "$WORKLOAD_PATH" ]; do
+        WORKLOAD_PATH=${WORKLOAD_PATH%/}
+    done
+}
+
+# The -w set's directory: a path as given, nowhere else; a set name is the
+# one beside wekatester, else under the current directory.
 workload_src_dir() {
-    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    local d
+    workload_path_v
+    if [ -n "$WORKLOAD_PATH" ]; then
+        [ -d "$WORKLOAD_PATH" ] || die "cannot locate workload directory $WORKLOAD"
+        printf '%s' "$WORKLOAD_PATH"
+        return 0
+    fi
+    d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
     [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
     [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
     printf '%s' "$d"

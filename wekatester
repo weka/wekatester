@@ -19,7 +19,7 @@ VERSION="2026-11-05"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
-WORKLOAD="default"              # workload definition dir, a subdir of fio-jobfiles
+WORKLOAD="default"              # workload set: a subdir of fio-jobfiles, or a path
 FIO_BIN="/usr/bin/fio"          # fio binary on the workers
 OUTPUT_DIR="results"            # local directory for the run bundles
 DIRECTORY_EXPLICIT=0            # -d was given (CLI beats a host file's dir)
@@ -91,10 +91,15 @@ IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
 BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
+ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
 
 # --- logging -----------------------------------------------------------------
 log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
 debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
+# README, -v: -v per-host outcomes and notes, -vv every connection attempt,
+# -vvv nothing more yet
+debug2() { [ "$VERBOSITY" -ge 2 ] && log "DEBUG: $*"; return 0; }
+debug3() { [ "$VERBOSITY" -ge 3 ] && log "DEBUG: $*"; return 0; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
 # Warnings raised before the run log opens, replayed once into the log FILE
@@ -322,12 +327,16 @@ require_interactive() {   # require_interactive <what-needs-it> [advice]
 # Best effort, for prompts that have a default on unattended runs (-r/-n).
 try_interactive() {
     if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
-    # exec with only redirections fails without killing the shell; its stderr
-    # names the device.
-    if exec 3<>"$PROMPT_TTY" && [ -t 3 ]; then
+    # Probe the open in a subshell first: without a terminal, bash's own
+    # diagnostic (a line of the built tool, a device the user never typed)
+    # lands in err, shown only under -v, never raw on stderr.
+    local err
+    if err=$(exec 2>&1; exec 3<>"$PROMPT_TTY" && [ -t 3 ]) && exec 3<>"$PROMPT_TTY"; then
         PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
         return 0
     fi
+    err=${err#*line [0-9]*: }
+    debug "no terminal: ${err:-$PROMPT_TTY is not a terminal}"
     return 1
 }
 
@@ -408,7 +417,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
-                  [--allow-fio-mismatch]
+                  [--allow-fio-mismatch] [--allow-cached-mount]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -434,8 +443,8 @@ EOF
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
 USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
-    break_lock any_fs allow_fio_mismatch identity password targets bulk fast dry regen
-    duration unlink summarize verbose version help dashdash"
+    break_lock any_fs allow_fio_mismatch allow_cached_mount identity password targets bulk
+    fast dry regen duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
     case $1 in
     (directory) cat <<EOF
@@ -446,8 +455,8 @@ opt_help() {   # opt_help <key>
 EOF
     ;;
     (workload) cat <<EOF
-  -w, --workload set      workload definition directory, a subdir of
-                          fio-jobfiles (default: $WORKLOAD)
+  -w, --workload set      workload set: a subdirectory of fio-jobfiles, or a
+                          path to a directory of jobfiles (default: $WORKLOAD)
 EOF
     ;;
     (fio_bin) cat <<EOF
@@ -531,6 +540,12 @@ EOF
                           host whose fio --version fails still stops the run)
 EOF
     ;;
+    (allow_cached_mount) cat <<EOF
+  --allow-cached-mount    run on when a wekafs destination is not mounted
+                          forcedirect (a warning instead of a stop; the
+                          numbers include the client cache)
+EOF
+    ;;
     (identity) cat <<EOF
   -i, --identity [login:]keyfile[,...]
                           ssh key(s) to try, each optionally bound to a login;
@@ -600,7 +615,8 @@ EOF
 EOF
     ;;
     (verbose) cat <<EOF
-  -v             increase output verbosity (repeatable: -v, -vv, -vvv)
+  -v             increase output verbosity: -v per-host outcomes and
+                 notes, -vv every connection attempt
 EOF
     ;;
     (version) cat <<EOF
@@ -2049,6 +2065,7 @@ parse_args() {
             --break-lock) BREAK_LOCK=1; shift ;;
             --any-fs) ANY_FS=1; shift ;;
             --allow-fio-mismatch) ALLOW_FIO_MISMATCH=1; shift ;;
+            --allow-cached-mount) ALLOW_CACHED_MOUNT=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
@@ -4749,8 +4766,10 @@ check_fio_versions() {
 
 # --- phase 1b: mount mode verification ----------------------------------------
 # -d must be wekafs, mounted forcedirect (direct=1 alone leaves the client
-# cache in the path); any other type, an unmounted weka's root-disk mount
-# point included, is refused unless --any-fs turns the type check off.
+# cache in the path; -r or --allow-cached-mount warn instead); other types,
+# an unmounted weka's root-disk mount point included, are refused unless
+# --any-fs. CACHED_MOUNT_NOTE: what the forcedirect check found.
+CACHED_MOUNT_NOTE=""
 
 # ok, "fail <mode>", or "other <type>", left in MOUNT_VERDICT, from a
 # /proc/mounts line: its 3rd field is the type, its 4th the options.
@@ -4979,7 +4998,7 @@ verify_mount_mode() {
     [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
     local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
     local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
-    local cached_hosts=() cached_modes=() mode who n anyfs_hosts=() anyfs_types=() off
+    local cached_hosts=() cached_modes=() mode who n sw anyfs_hosts=() anyfs_types=() off
     local -A said=()
     # Three fan-outs: every host gets the same commands in the same order and
     # the messages come back in host order, as a serial walk produced them;
@@ -5021,7 +5040,7 @@ verify_mount_mode() {
     done
     # classification is local, of the line the record keeps and fio sees (a
     # stacked mount's visible one); probe[i] marks the hosts that get the
-    # write probe: destination present, mode ok (or -r's warning)
+    # write probe: destination present, mode ok (or the cached-mount warning)
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
@@ -5047,7 +5066,7 @@ verify_mount_mode() {
                       fi
                       continue
                   fi ;;
-            fail*) if [ "$FAST_TRACK" -eq 1 ]; then
+            fail*) if [ "$FAST_TRACK" -eq 1 ] || [ "$ALLOW_CACHED_MOUNT" -eq 1 ]; then
                        # said once per MODE after the loop: 111 identical
                        # lines is noise, not information (field fleet D, 2026-09-09)
                        cached_hosts+=("$host"); cached_modes+=("${verdict#fail }"); ft=wekafs
@@ -5057,7 +5076,7 @@ verify_mount_mode() {
                        continue
                    fi ;;
         esac
-        # said once per type after the loop, like -r's warning
+        # said once per type after the loop, like the cached-mount warning
         [ "$ANY_FS" -eq 0 ] || { anyfs_hosts+=("$host"); anyfs_types+=("$ft"); }
         if [ -n "$anc" ]; then
             missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc"); missing_types+=("$ft")
@@ -5081,21 +5100,26 @@ verify_mount_mode() {
         [ -z "${msgs[$i]:-}" ] || failed+=("${msgs[$i]}")
     done
     rm -rf "${td:?}"
-    # The -r warning, one line per distinct cached mode: the host alone when
-    # it is one host, "all N" when it is every host, the list otherwise.
+    # The cached-mount warning, one line per distinct cached mode, naming the
+    # switch that continued: the host alone when it is one host, "all N" when
+    # it is every host, the list otherwise.
+    CACHED_MOUNT_NOTE="no wekafs destination without forcedirect"
     if [ ${#cached_hosts[@]} -gt 0 ]; then
+        CACHED_MOUNT_NOTE=""; sw=--allow-cached-mount
+        [ "$FAST_TRACK" -eq 0 ] || sw=-r
         for mode in $(printf '%s\n' "${cached_modes[@]}" | sort -u); do
             who=""; n=0
             for i in "${!cached_hosts[@]}"; do
                 [ "${cached_modes[$i]}" = "$mode" ] || continue
                 who="$who${who:+ }${cached_hosts[$i]}"; n=$((n + 1))
             done
+            CACHED_MOUNT_NOTE+="${CACHED_MOUNT_NOTE:+; }$mode on $n host(s): $who"
             if [ "$n" -eq 1 ]; then
-                warn_prerun "$who: wekafs mounted $mode (need forcedirect); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "$who: wekafs mounted $mode (need forcedirect); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             elif [ "$n" -eq ${#HOSTS[@]} ]; then
-                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             else
-                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             fi
         done
     fi
@@ -5165,7 +5189,7 @@ verify_mount_mode() {
         # Advise a remount only when a mount mode was the problem: when findmnt
         # failed everywhere, -d most likely does not exist.
         [ "$mode_fail" -eq 0 ] || \
-            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run, or run with --allow-cached-mount (the numbers then include the client cache)"
         [ "$type_fail" -eq 0 ] || \
             die "a destination is not on wekafs; wekatester checks for wekafs only, and --any-fs turns that check off -- nothing was written"
         [ "$gone_fail" -eq 0 ] || \
@@ -5551,19 +5575,20 @@ prompt_password_creds() {
 
 # One connection attempt. external: is a user-owned master alive (ssh -O
 # check, our ControlPath absent)? default/key: a master in our socket dir
-# with BatchMode. pw: the same, through askpass.
+# with BatchMode. pw: the same, through askpass. ssh's stderr goes to the
+# err file (external: stdout too), read after the round's wait.
 SETSID_BIN=""
-attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
+attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index> <err-file>
     local u=() fifo rc
     [ -z "$3" ] || u=(-o "User=$3")
     case "$1" in
         external)
-            ssh -O check $SSH_OPTS "$2" > "$AUTH_DIR/$2.extcheck" 2>&1 ;;
+            ssh -O check $SSH_OPTS "$2" > "$5" 2>&1 ;;
         default)
-            ssh -n "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+            ssh -n "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true 2> "$5" ;;
         key)
             ssh -n "${u[@]}" -o "IdentityFile=$4" -o IdentitiesOnly=yes \
-                $SSH_OPTS $CONTROL_OPTS "$2" true ;;
+                $SSH_OPTS $CONTROL_OPTS "$2" true 2> "$5" ;;
         pw)
             fifo="$AUTH_DIR/$2.fifo"
             mkfifo -m 600 "$fifo" || return 1
@@ -5576,7 +5601,7 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
             WEKATESTER_PW_FIFO="$fifo" SSH_ASKPASS="$AUTH_DIR/askpass.sh" \
                 SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-wekatester}" \
                 $SETSID_BIN ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 \
-                "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true </dev/null
+                "${u[@]}" $SSH_OPTS $CONTROL_OPTS "$2" true </dev/null 2> "$5"
             rc=$?
             exec 4>&-
             rm -f "$fifo" "$fifo.used"
@@ -5584,12 +5609,28 @@ attempt_host() {   # attempt_host <mode> <host> <login> <key-or-pw-index>
     esac
 }
 
+# ssh's last non-empty stderr line (a banner or a warning can come first),
+# "" when it printed nothing.
+auth_reason_v() {   # auth_reason_v <err-file> -> AUTH_REASON
+    local l
+    AUTH_REASON=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l%$'\r'}
+        [ -z "$l" ] || AUTH_REASON=$l
+    done < "$1"
+}
+
 # One round: this credential against every still-unconnected client, in
-# parallel. Winners record their per-host transport delta and leave the pool.
+# parallel. Winners record their per-host transport delta and leave the pool;
+# a loser's label and ssh's reason are kept for the closing WARNING.
 REMAINING=()
+AUTH_ROUND=0
+declare -gA AUTH_LAST_LABEL=() AUTH_LAST_REASON=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() effs=() left=() i n=0 eff logins=()
+    local host pids=() effs=() left=() i n=0 eff logins=() ef
+    AUTH_ROUND=$((AUTH_ROUND + 1))
     # a credential's own login wins; else the host file pins this host's
     # (one awk for the round, not one per host)
     if [ -z "$3" ] && [ -f "$WORK_DIR/targets.phase1" ]; then
@@ -5601,7 +5642,9 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
         eff=$3
         [ -n "$eff" ] || eff=${logins[$i]:-}
         effs+=("${eff:-.}")
-        attempt_host "$2" "$host" "$eff" "$4" &
+        # the external check's output keeps its own name
+        ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+        attempt_host "$2" "$host" "$eff" "$4" "$ef" &
         pids+=($!)
     done
     for i in "${!REMAINING[@]}"; do
@@ -5614,11 +5657,16 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
             debug "$host: connected via $1"
         else
             left+=("$host")
+            ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+            auth_reason_v "$ef"
+            AUTH_LAST_LABEL[$host]=$1; AUTH_LAST_REASON[$host]=$AUTH_REASON
+            if [ -n "$AUTH_REASON" ]; then debug2 "$host: $1 failed: $AUTH_REASON"
+            else debug2 "$host: $1 failed (ssh printed nothing)"; fi
         fi
     done
     REMAINING=()
     [ ${#left[@]} -eq 0 ] || REMAINING=("${left[@]}")
-    [ "$n" -eq 0 ] || log "auth: $n host(s) connected via $1"
+    [ "$n" -eq 0 ] || debug "auth: $n host(s) connected via $1"
 }
 
 # The password goes back ONCE per attempt; a second question gets a failure,
@@ -5664,8 +5712,15 @@ establish_connections() {
             pw "${PW_LOGINS[$i]}" "$i"
     done
     PW_SECRETS=()
+    # one WARNING per unreached host, with ssh's reason from its last attempt,
+    # then stop: without a winning round its ssh would fall back to the
+    # default login
+    local h
+    for h in "${REMAINING[@]}"; do
+        log "WARNING: $h: no working ssh credentials (last tried ${AUTH_LAST_LABEL[$h]:-nothing}: ${AUTH_LAST_REASON[$h]:-ssh printed nothing})" >&2
+    done
     [ ${#REMAINING[@]} -eq 0 ] \
-        || log "WARNING: no working ssh credentials for: ${REMAINING[*]}" >&2
+        || die "no working ssh credentials for ${#REMAINING[@]} of ${#HOSTS[@]} host(s): ${REMAINING[*]}"
 }
 
 # --- phase 2b: probe workers for auto-mode system info -----------------------
@@ -6869,8 +6924,13 @@ targets_path() {
     if [ -n "$TARGETS_PATH" ]; then
         candidate=$TARGETS_PATH
     else
-        candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
-        [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        workload_path_v
+        if [ -n "$WORKLOAD_PATH" ]; then
+            candidate="$WORKLOAD_PATH/hostlist.csv"
+        else
+            candidate="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD/hostlist.csv"
+            [ -f "$candidate" ] || candidate="./fio-jobfiles/$WORKLOAD/hostlist.csv"
+        fi
         [ -f "$candidate" ] || candidate="./hostlist.csv"
     fi
     TARGETS_FILE=$candidate
@@ -7408,6 +7468,7 @@ WT_CAL_CLIENTS flag --cal-clients cal_clients
 WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
 WT_ANY_FS switch --any-fs any_fs
 WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
+WT_ALLOW_CACHED_MOUNT switch --allow-cached-mount allow_cached_mount
 WT_IDENTITY flag --identity identity
 WT_PASSWORD count --password password
 WT_BULK switch --bulk bulk
@@ -7422,7 +7483,8 @@ WT_CLIENTS env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
-    [WT_ALLOW_FIO_MISMATCH]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0 [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_ALLOW_CACHED_MOUNT]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0
+    [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
     [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
 declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
 DEFAULT_ENGINE=""            # WT_ENGINE from the environment or the host file
@@ -7465,6 +7527,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (--ignore-capacity) CLI_SET[WT_IGNORE_CAPACITY]=1 ;;
             (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
             (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
+            (--allow-cached-mount) CLI_SET[WT_ALLOW_CACHED_MOUNT]=1 ;;
             (-i*|--identity|--identity=*) CLI_SET[WT_IDENTITY]=1 ;;
             (-p*|--password|--password=*) CLI_SET[WT_PASSWORD]=1 ;;
             (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
@@ -7645,6 +7708,7 @@ setting_value() {   # setting_value <name>
         (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
         (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
         (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;
+        (WT_ALLOW_CACHED_MOUNT) printf '%s' "$ALLOW_CACHED_MOUNT" ;;
         (WT_IDENTITY) printf '%s' "${IDENT_RAW[*]}" ;;
         (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;
         (WT_BULK) printf '%s' "$BULK" ;;
@@ -8510,10 +8574,29 @@ check_aio_room() {
     esac
 }
 
-# The -w set's directory: the one beside wekatester, else under the current
-# directory.
+# A -w value holding / is a directory path (absolute or relative to the
+# current directory), trailing slashes dropped as -d's are; / stays /.
+# -> WORKLOAD_PATH, empty for a set name
+workload_path_v() {
+    WORKLOAD_PATH=""
+    case $WORKLOAD in (*/*) ;; (*) return 0 ;; esac
+    WORKLOAD_PATH=$WORKLOAD
+    while [ "$WORKLOAD_PATH" != / ] && [ "${WORKLOAD_PATH%/}" != "$WORKLOAD_PATH" ]; do
+        WORKLOAD_PATH=${WORKLOAD_PATH%/}
+    done
+}
+
+# The -w set's directory: a path as given, nowhere else; a set name is the
+# one beside wekatester, else under the current directory.
 workload_src_dir() {
-    local d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
+    local d
+    workload_path_v
+    if [ -n "$WORKLOAD_PATH" ]; then
+        [ -d "$WORKLOAD_PATH" ] || die "cannot locate workload directory $WORKLOAD"
+        printf '%s' "$WORKLOAD_PATH"
+        return 0
+    fi
+    d="$SCRIPT_DIR/fio-jobfiles/$WORKLOAD"
     [ -d "$d" ] || d="./fio-jobfiles/$WORKLOAD"
     [ -d "$d" ] || die "cannot locate fio-jobfiles/$WORKLOAD"
     printf '%s' "$d"
@@ -8719,12 +8802,23 @@ record_run() {
     printf 'version\t%s\nworkload\t%s\nauto\t%s\ncal-seconds\t%s\nmaster\t%s\nhosts\t%s\n' \
         "$VERSION" "$WORKLOAD" "${AUTO_LEVEL:--}" "$q" "$MASTER" "${HOSTS[*]}" > "$RUN_DIR/settings" \
         || log "WARNING: could not record the run settings in $RUN_DIR/settings" >&2
-    # the override, only when given: what the version check found
+    # the overrides, only when given: what their checks found
     [ "$ALLOW_FIO_MISMATCH" -eq 0 ] \
         || printf 'allow-fio-mismatch\t%s\n' "${FIO_VERSION_NOTE:-not checked}" >> "$RUN_DIR/settings" \
         || log "WARNING: could not record --allow-fio-mismatch in $RUN_DIR/settings" >&2
+    [ "$ALLOW_CACHED_MOUNT" -eq 0 ] \
+        || printf 'allow-cached-mount\t%s\n' "${CACHED_MOUNT_NOTE:-not checked}" >> "$RUN_DIR/settings" \
+        || log "WARNING: could not record --allow-cached-mount in $RUN_DIR/settings" >&2
     settings_provenance >> "$RUN_DIR/settings" \
         || log "WARNING: could not record where the settings came from in $RUN_DIR/settings" >&2
+    # each connection attempt's ssh output (connect.sh); none in local mode
+    local f auth=()
+    if [ -n "$AUTH_DIR" ]; then
+        for f in "$AUTH_DIR"/*.err "$AUTH_DIR"/*.extcheck; do [ ! -f "$f" ] || auth+=("$f"); done
+    fi
+    [ ${#auth[@]} -eq 0 ] \
+        || { mkdir -p "$RUN_DIR/auth" && cp -- "${auth[@]}" "$RUN_DIR/auth/"; } \
+        || log "WARNING: could not copy the ssh attempts' output into $RUN_DIR/auth" >&2
 }
 
 # Per-host system context, one file per item under sysinfo/<host>/ (README,

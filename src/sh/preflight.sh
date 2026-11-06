@@ -181,8 +181,10 @@ check_fio_versions() {
 
 # --- phase 1b: mount mode verification ----------------------------------------
 # -d must be wekafs, mounted forcedirect (direct=1 alone leaves the client
-# cache in the path); any other type, an unmounted weka's root-disk mount
-# point included, is refused unless --any-fs turns the type check off.
+# cache in the path; -r or --allow-cached-mount warn instead); other types,
+# an unmounted weka's root-disk mount point included, are refused unless
+# --any-fs. CACHED_MOUNT_NOTE: what the forcedirect check found.
+CACHED_MOUNT_NOTE=""
 
 # ok, "fail <mode>", or "other <type>", left in MOUNT_VERDICT, from a
 # /proc/mounts line: its 3rd field is the type, its 4th the options.
@@ -403,7 +405,7 @@ verify_mount_mode() {
     [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
     local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
     local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
-    local cached_hosts=() cached_modes=() mode who n anyfs_hosts=() anyfs_types=() off
+    local cached_hosts=() cached_modes=() mode who n sw anyfs_hosts=() anyfs_types=() off
     local -A said=()
     # Three fan-outs: every host gets the same commands in the same order and
     # the messages come back in host order, as a serial walk produced them;
@@ -445,7 +447,7 @@ verify_mount_mode() {
     done
     # classification is local, of the line the record keeps and fio sees (a
     # stacked mount's visible one); probe[i] marks the hosts that get the
-    # write probe: destination present, mode ok (or -r's warning)
+    # write probe: destination present, mode ok (or the cached-mount warning)
     for i in "${!HOSTS[@]}"; do
         [ -z "${msgs[$i]:-}" ] || continue
         host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
@@ -471,7 +473,7 @@ verify_mount_mode() {
                       fi
                       continue
                   fi ;;
-            fail*) if [ "$FAST_TRACK" -eq 1 ]; then
+            fail*) if [ "$FAST_TRACK" -eq 1 ] || [ "$ALLOW_CACHED_MOUNT" -eq 1 ]; then
                        # said once per MODE after the loop: 111 identical
                        # lines is noise, not information (field fleet D, 2026-09-09)
                        cached_hosts+=("$host"); cached_modes+=("${verdict#fail }"); ft=wekafs
@@ -481,7 +483,7 @@ verify_mount_mode() {
                        continue
                    fi ;;
         esac
-        # said once per type after the loop, like -r's warning
+        # said once per type after the loop, like the cached-mount warning
         [ "$ANY_FS" -eq 0 ] || { anyfs_hosts+=("$host"); anyfs_types+=("$ft"); }
         if [ -n "$anc" ]; then
             missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc"); missing_types+=("$ft")
@@ -505,21 +507,26 @@ verify_mount_mode() {
         [ -z "${msgs[$i]:-}" ] || failed+=("${msgs[$i]}")
     done
     rm -rf "${td:?}"
-    # The -r warning, one line per distinct cached mode: the host alone when
-    # it is one host, "all N" when it is every host, the list otherwise.
+    # The cached-mount warning, one line per distinct cached mode, naming the
+    # switch that continued: the host alone when it is one host, "all N" when
+    # it is every host, the list otherwise.
+    CACHED_MOUNT_NOTE="no wekafs destination without forcedirect"
     if [ ${#cached_hosts[@]} -gt 0 ]; then
+        CACHED_MOUNT_NOTE=""; sw=--allow-cached-mount
+        [ "$FAST_TRACK" -eq 0 ] || sw=-r
         for mode in $(printf '%s\n' "${cached_modes[@]}" | sort -u); do
             who=""; n=0
             for i in "${!cached_hosts[@]}"; do
                 [ "${cached_modes[$i]}" = "$mode" ] || continue
                 who="$who${who:+ }${cached_hosts[$i]}"; n=$((n + 1))
             done
+            CACHED_MOUNT_NOTE+="${CACHED_MOUNT_NOTE:+; }$mode on $n host(s): $who"
             if [ "$n" -eq 1 ]; then
-                warn_prerun "$who: wekafs mounted $mode (need forcedirect); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "$who: wekafs mounted $mode (need forcedirect); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             elif [ "$n" -eq ${#HOSTS[@]} ]; then
-                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             else
-                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); -r continues anyway -- the client cache is in the IO path and the numbers include it"
+                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
             fi
         done
     fi
@@ -589,7 +596,7 @@ verify_mount_mode() {
         # Advise a remount only when a mount mode was the problem: when findmnt
         # failed everywhere, -d most likely does not exist.
         [ "$mode_fail" -eq 0 ] || \
-            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run"
+            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run, or run with --allow-cached-mount (the numbers then include the client cache)"
         [ "$type_fail" -eq 0 ] || \
             die "a destination is not on wekafs; wekatester checks for wekafs only, and --any-fs turns that check off -- nothing was written"
         [ "$gone_fail" -eq 0 ] || \
