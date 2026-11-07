@@ -317,6 +317,36 @@ cleanup() {
         RUN_LOCKS=()
         teardown_wait "the lock release was cut off after $TEARDOWN_LOCK_S s; the next run there needs --break-lock" "${ph[@]}"
     fi
+    # -n's stand-ins for a missing -d (verify_mount_mode): each recorded path
+    # from its own host, then one line per -d and parent
+    if [ ${#DRYRUN_DIR[@]} -gt 0 ]; then
+        local -A gone=() cnt=()
+        ph=()
+        for host in "${!DRYRUN_DIR[@]}"; do
+            f=${DRYRUN_DIR[$host]}
+            case $f in (*/"$DRYRUN_NAME") ;; (*) continue ;; esac
+            set -m
+            # judged by the path, not rm: hosts sharing it remove it at once
+            RUN_HOST_TIMEOUT=$TEARDOWN_LOCK_S run_host "$host" "_o=\$(rm -rf -- '${f:?}' 2>&1); [ ! -e '$f' ] || { printf '%s\\n' \"\$_o\" >&2; exit 1; }" &
+            set +m
+            ph+=($! "$host")
+        done
+        set -- ${ph[@]+"${ph[@]}"}
+        while [ $# -ge 2 ]; do
+            wait_through "$1"
+            if [ "$WAIT_RC" -eq 0 ]; then gone[$2]=1
+            else log "WARNING: $2: could not remove the dry run's temporary directory ${DRYRUN_DIR[$2]} (exit $WAIT_RC)" >&2; fi
+            shift 2
+        done
+        for f in "${DRYRUN_SAY[@]}"; do
+            [ -n "${gone[${f%%$'\t'*}]+set}" ] && [ -n "${DRYRUN_MADE[${f%%$'\t'*}]+set}" ] || continue
+            f=${f#*$'\t'}; cnt[$f]=$(( ${cnt[$f]:-0} + 1 ))
+        done
+        for f in "${!cnt[@]}"; do
+            log "${cnt[$f]} host(s): ${f%%$'\t'*} does not exist; the dry run used a temporary directory in ${f#*$'\t'} and removed it"
+        done
+        DRYRUN_DIR=(); DRYRUN_MADE=()
+    fi
     # a run that ends before its log opens: the pre-log relays stop while
     # their pipes still exist
     stop_prelog

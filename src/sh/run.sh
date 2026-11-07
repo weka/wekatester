@@ -456,6 +456,9 @@ dry_run_report() {
     log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
     log "fio version: ${FIO_VERSION_NOTE:-not checked}"
     [ "$ANY_FS" -eq 0 ] || log "destination: the filesystem-type check was off (--any-fs); the WARNING above names what -d is on"
+    # -n's stand-in for a missing -d (preflight.sh DRYRUN_DIR); the staged
+    # jobs below name -d, as the real run would
+    [ ${#DRYRUN_DIR[@]} -eq 0 ] || log "destination: -d is missing on ${#DRYRUN_DIR[@]} host(s); this dry run used <its parent>/$DRYRUN_NAME in its place (removed at exit); a real run creates -d (asking first, unless -r)"
     if [ "$LAYOUT_WRITE_BYTES" = 0 ]; then
         log "layout: nothing to write (files reused)"
     elif [ -n "$LAYOUT_WRITE_BYTES" ]; then

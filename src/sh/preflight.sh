@@ -3,6 +3,13 @@
 # line names this run, taken in preflight's own session before anything is
 # written, and released by cleanup.
 declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
+# -n with a missing -d (verify_mount_mode): host -> its stand-in,
+# <nearest parent>/<DRYRUN_NAME>, one name per run so hosts on one
+# filesystem share it; the host's directory for the rest of the dry run
+# (hosts.sh), removed by cleanup. DRYRUN_MADE: hosts that created it.
+# DRYRUN_SAY: "host<tab>-d<tab>parent".
+declare -gA DRYRUN_DIR=() DRYRUN_MADE=()
+DRYRUN_NAME=""; DRYRUN_SAY=()
 LOCK_TOKEN=""
 lock_token() {   # lock_token -> LOCK_TOKEN
     # the stamp carries its UTC offset: another machine reads it in its own zone
@@ -397,8 +404,9 @@ write_fix_hint() {   # write_fix_hint <dir> -> how to fix a directory the login 
     printf '%s' "fix the root's owner/mode (a one-time 'sudo chmod 1777 $1' on any host persists in the filesystem) or run as a user that can write"
 }
 
-# Asked once for every host that lacks the destination. -r/-n: 5s, default
+# Asked once for every host that lacks the destination. -r: 5s, default
 # create, and created outright without a terminal; otherwise only a y creates.
+# -n never asks: verify_mount_mode gives it a stand-in (DRYRUN_DIR).
 confirm_create_dirs() {   # confirm_create_dirs <count>
     local msg="create the missing destination directory on $1 host(s)?"
     if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
@@ -583,7 +591,18 @@ verify_mount_mode() {
                 if [ "$ft" = wekafs ]; then ft="a wekafs mount"; else ft="on $ft (--any-fs)"; fi
                 log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is $ft"
             done
-            confirm_create_dirs "${#missing[@]}"
+            # -n creates no -d: the stand-in (DRYRUN_DIR) takes its place,
+            # recorded before it is made so cleanup removes it on any exit
+            if [ "$DRY_RUN" -eq 1 ]; then
+                [ -n "$DRYRUN_NAME" ] || printf -v DRYRUN_NAME 'wt-dryrun.%(%s)T.%s.%s%s' -1 "$$" "$RANDOM" "$RANDOM"
+                for i in "${!missing[@]}"; do
+                    DRYRUN_DIR[${missing[$i]}]=${missing_parents[$i]%/}/$DRYRUN_NAME
+                    DRYRUN_SAY+=("${missing[$i]}"$'\t'"${missing_dirs[$i]}"$'\t'"${missing_parents[$i]}")
+                    missing_dirs[$i]=${DRYRUN_DIR[${missing[$i]}]}
+                done
+            else
+                confirm_create_dirs "${#missing[@]}"
+            fi
             # one fan-out, each host its mkdir and then its write probe
             local rc
             pids=()
@@ -607,6 +626,7 @@ verify_mount_mode() {
                     continue
                 fi
                 debug "$host: created $hd"
+                [ -z "${DRYRUN_DIR[$host]+set}" ] || DRYRUN_MADE[$host]=1
                 [ "$rc" -eq 0 ] \
                     || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                          write_fail=1; }

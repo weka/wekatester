@@ -634,7 +634,11 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         die "calibration $what errored on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
     if [ "$type" = lat ] || [ "$type" = lat1m ]; then
-        vals=$(cal_lat_values "$json" "$dirn") || die "cannot read the latency of ${json##*/}"
+        if ! vals=$(cal_lat_values "$json" "$dirn"); then
+            # a cell with no mean latency failed: its evidence, as above
+            cal_evidence "$what" "$json" "$base.job" quiet "$rep"
+            die "cannot read the latency of ${json##*/} (it and the cell jobfile are in the run bundle under cal/)"
+        fi
         read -r h v a <<<"$vals"
         CAL_READING="$v $a"
     else

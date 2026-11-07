@@ -414,9 +414,12 @@ writeback_targets() {
 }
 
 # The host's destination dir: the finished resolution when it exists, the
-# pre-auth phase otherwise, the global -d as the fallback.
+# pre-auth phase otherwise, the global -d as the fallback. A dry run's
+# stand-in for a missing -d (preflight.sh DRYRUN_DIR) comes first, in all
+# three resolvers.
 host_dir() {   # host_dir <host>
     local d=""
+    if [ -n "${DRYRUN_DIR[$1]+set}" ]; then printf '%s' "${DRYRUN_DIR[$1]}"; return 0; fi
     if [ -f "$WORK_DIR/targets.final" ]; then
         d=$(targets_field "$1" 5 "$WORK_DIR/targets.final")
     elif [ -f "$WORK_DIR/targets.phase1" ]; then
@@ -441,7 +444,7 @@ load_host_dirs() {
     fi
     HOST_DIRS=(); HOST_DIR_OF=(); HOST_DIRS_KEY=$f
     if [ -z "$f" ]; then
-        for d in "${HOSTS[@]}"; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
+        for d in "${HOSTS[@]}"; do HOST_DIRS[i]=${DRYRUN_DIR[$d]:-$DIRECTORY}; i=$((i + 1)); done
         return 0
     fi
     while IFS= read -r d; do
@@ -450,13 +453,18 @@ load_host_dirs() {
     # a host the awk never answered for still gets -d, as host_dir gives it
     while [ "$i" -lt ${#HOSTS[@]} ]; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
     for i in "${!HOSTS[@]}"; do
+        [ -z "${DRYRUN_DIR[${HOSTS[$i]}]+set}" ] || HOST_DIRS[i]=${DRYRUN_DIR[${HOSTS[$i]}]}
+    done
+    for i in "${!HOSTS[@]}"; do
         [ -n "${HOST_DIR_OF[${HOSTS[$i]}]+set}" ] || HOST_DIR_OF[${HOSTS[$i]}]=${HOST_DIRS[$i]}
     done
 }
 # host_dir without its subshells and awk: from the last load of targets.final
 # (its writers clear HOST_DIRS_KEY), -d when no file resolves dirs
 host_dir_v() {   # host_dir_v <host> -> HOST_DIR
-    if [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
+    if [ -n "${DRYRUN_DIR[$1]+set}" ]; then
+        HOST_DIR=${DRYRUN_DIR[$1]}
+    elif [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
         HOST_DIR=${HOST_DIR_OF[$1]}
     elif [ ! -f "$WORK_DIR/targets.final" ] && [ ! -f "$WORK_DIR/targets.phase1" ]; then
         HOST_DIR=$DIRECTORY

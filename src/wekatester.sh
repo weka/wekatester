@@ -270,9 +270,10 @@ EOF
     ;;
     (dry) cat <<EOF
   -n             dry run: create/generate, print the files and the run details;
-                 no measured job runs, but a missing -d is created and the
-                 ioengines are proven with small fio jobs (with -a/-t/-e,
-                 or when a jobfile names none)
+                 no measured job runs, but the ioengines are proven with
+                 small fio jobs (with -a/-t/-e, or when a jobfile names
+                 none); a missing -d is not created: a temporary directory
+                 in its parent stands in, removed at exit
 EOF
     ;;
     (regen) cat <<EOF

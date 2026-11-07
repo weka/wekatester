@@ -640,9 +640,10 @@ EOF
     ;;
     (dry) cat <<EOF
   -n             dry run: create/generate, print the files and the run details;
-                 no measured job runs, but a missing -d is created and the
-                 ioengines are proven with small fio jobs (with -a/-t/-e,
-                 or when a jobfile names none)
+                 no measured job runs, but the ioengines are proven with
+                 small fio jobs (with -a/-t/-e, or when a jobfile names
+                 none); a missing -d is not created: a temporary directory
+                 in its parent stands in, removed at exit
 EOF
     ;;
     (regen) cat <<EOF
@@ -2635,6 +2636,8 @@ cal_lat_values() {   # cal_lat_values <json> <read|write>
                 i = order[k]
                 if (substr(job[i], 1, 4) != "cal-") continue
                 h = (i in host) ? host[i] : "?"
+                # no mean is a failed cell, not 0 us (it would win every comparison)
+                if (!(i in lat)) { printf "ERROR: cal_lat_values: %s: %s: no %s mean latency\n", path, h, d > "/dev/stderr"; exit 1 }
                 us = lat[i] / 1000.0; io = ios[i] + 0; ip = iops[i] + 0
                 if (!(h in seen)) { seen[h] = 1; nh++; L[h] = us; I[h] = ip; N[h] = io; continue }
                 t = N[h] + io
@@ -3818,7 +3821,11 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         die "calibration $what errored on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
     if [ "$type" = lat ] || [ "$type" = lat1m ]; then
-        vals=$(cal_lat_values "$json" "$dirn") || die "cannot read the latency of ${json##*/}"
+        if ! vals=$(cal_lat_values "$json" "$dirn"); then
+            # a cell with no mean latency failed: its evidence, as above
+            cal_evidence "$what" "$json" "$base.job" quiet "$rep"
+            die "cannot read the latency of ${json##*/} (it and the cell jobfile are in the run bundle under cal/)"
+        fi
         read -r h v a <<<"$vals"
         CAL_READING="$v $a"
     else
@@ -4662,6 +4669,13 @@ calibrate() {
 # line names this run, taken in preflight's own session before anything is
 # written, and released by cleanup.
 declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
+# -n with a missing -d (verify_mount_mode): host -> its stand-in,
+# <nearest parent>/<DRYRUN_NAME>, one name per run so hosts on one
+# filesystem share it; the host's directory for the rest of the dry run
+# (hosts.sh), removed by cleanup. DRYRUN_MADE: hosts that created it.
+# DRYRUN_SAY: "host<tab>-d<tab>parent".
+declare -gA DRYRUN_DIR=() DRYRUN_MADE=()
+DRYRUN_NAME=""; DRYRUN_SAY=()
 LOCK_TOKEN=""
 lock_token() {   # lock_token -> LOCK_TOKEN
     # the stamp carries its UTC offset: another machine reads it in its own zone
@@ -5064,8 +5078,9 @@ write_fix_hint() {   # write_fix_hint <dir> -> how to fix a directory the login 
     printf '%s' "fix the root's owner/mode (a one-time 'sudo chmod 1777 $1' on any host persists in the filesystem) or run as a user that can write"
 }
 
-# Asked once for every host that lacks the destination. -r/-n: 5s, default
+# Asked once for every host that lacks the destination. -r: 5s, default
 # create, and created outright without a terminal; otherwise only a y creates.
+# -n never asks: verify_mount_mode gives it a stand-in (DRYRUN_DIR).
 confirm_create_dirs() {   # confirm_create_dirs <count>
     local msg="create the missing destination directory on $1 host(s)?"
     if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
@@ -5250,7 +5265,18 @@ verify_mount_mode() {
                 if [ "$ft" = wekafs ]; then ft="a wekafs mount"; else ft="on $ft (--any-fs)"; fi
                 log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is $ft"
             done
-            confirm_create_dirs "${#missing[@]}"
+            # -n creates no -d: the stand-in (DRYRUN_DIR) takes its place,
+            # recorded before it is made so cleanup removes it on any exit
+            if [ "$DRY_RUN" -eq 1 ]; then
+                [ -n "$DRYRUN_NAME" ] || printf -v DRYRUN_NAME 'wt-dryrun.%(%s)T.%s.%s%s' -1 "$$" "$RANDOM" "$RANDOM"
+                for i in "${!missing[@]}"; do
+                    DRYRUN_DIR[${missing[$i]}]=${missing_parents[$i]%/}/$DRYRUN_NAME
+                    DRYRUN_SAY+=("${missing[$i]}"$'\t'"${missing_dirs[$i]}"$'\t'"${missing_parents[$i]}")
+                    missing_dirs[$i]=${DRYRUN_DIR[${missing[$i]}]}
+                done
+            else
+                confirm_create_dirs "${#missing[@]}"
+            fi
             # one fan-out, each host its mkdir and then its write probe
             local rc
             pids=()
@@ -5274,6 +5300,7 @@ verify_mount_mode() {
                     continue
                 fi
                 debug "$host: created $hd"
+                [ -z "${DRYRUN_DIR[$host]+set}" ] || DRYRUN_MADE[$host]=1
                 [ "$rc" -eq 0 ] \
                     || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                          write_fail=1; }
@@ -5621,6 +5648,36 @@ cleanup() {
         done
         RUN_LOCKS=()
         teardown_wait "the lock release was cut off after $TEARDOWN_LOCK_S s; the next run there needs --break-lock" "${ph[@]}"
+    fi
+    # -n's stand-ins for a missing -d (verify_mount_mode): each recorded path
+    # from its own host, then one line per -d and parent
+    if [ ${#DRYRUN_DIR[@]} -gt 0 ]; then
+        local -A gone=() cnt=()
+        ph=()
+        for host in "${!DRYRUN_DIR[@]}"; do
+            f=${DRYRUN_DIR[$host]}
+            case $f in (*/"$DRYRUN_NAME") ;; (*) continue ;; esac
+            set -m
+            # judged by the path, not rm: hosts sharing it remove it at once
+            RUN_HOST_TIMEOUT=$TEARDOWN_LOCK_S run_host "$host" "_o=\$(rm -rf -- '${f:?}' 2>&1); [ ! -e '$f' ] || { printf '%s\\n' \"\$_o\" >&2; exit 1; }" &
+            set +m
+            ph+=($! "$host")
+        done
+        set -- ${ph[@]+"${ph[@]}"}
+        while [ $# -ge 2 ]; do
+            wait_through "$1"
+            if [ "$WAIT_RC" -eq 0 ]; then gone[$2]=1
+            else log "WARNING: $2: could not remove the dry run's temporary directory ${DRYRUN_DIR[$2]} (exit $WAIT_RC)" >&2; fi
+            shift 2
+        done
+        for f in "${DRYRUN_SAY[@]}"; do
+            [ -n "${gone[${f%%$'\t'*}]+set}" ] && [ -n "${DRYRUN_MADE[${f%%$'\t'*}]+set}" ] || continue
+            f=${f#*$'\t'}; cnt[$f]=$(( ${cnt[$f]:-0} + 1 ))
+        done
+        for f in "${!cnt[@]}"; do
+            log "${cnt[$f]} host(s): ${f%%$'\t'*} does not exist; the dry run used a temporary directory in ${f#*$'\t'} and removed it"
+        done
+        DRYRUN_DIR=(); DRYRUN_MADE=()
     fi
     # a run that ends before its log opens: the pre-log relays stop while
     # their pipes still exist
@@ -7390,9 +7447,12 @@ writeback_targets() {
 }
 
 # The host's destination dir: the finished resolution when it exists, the
-# pre-auth phase otherwise, the global -d as the fallback.
+# pre-auth phase otherwise, the global -d as the fallback. A dry run's
+# stand-in for a missing -d (preflight.sh DRYRUN_DIR) comes first, in all
+# three resolvers.
 host_dir() {   # host_dir <host>
     local d=""
+    if [ -n "${DRYRUN_DIR[$1]+set}" ]; then printf '%s' "${DRYRUN_DIR[$1]}"; return 0; fi
     if [ -f "$WORK_DIR/targets.final" ]; then
         d=$(targets_field "$1" 5 "$WORK_DIR/targets.final")
     elif [ -f "$WORK_DIR/targets.phase1" ]; then
@@ -7427,7 +7487,7 @@ load_host_dirs() {
     fi
     HOST_DIRS=(); HOST_DIR_OF=(); HOST_DIRS_KEY=$f
     if [ -z "$f" ]; then
-        for d in "${HOSTS[@]}"; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
+        for d in "${HOSTS[@]}"; do HOST_DIRS[i]=${DRYRUN_DIR[$d]:-$DIRECTORY}; i=$((i + 1)); done
         return 0
     fi
     while IFS= read -r d; do
@@ -7436,13 +7496,18 @@ load_host_dirs() {
     # a host the awk never answered for still gets -d, as host_dir gives it
     while [ "$i" -lt ${#HOSTS[@]} ]; do HOST_DIRS[i]=$DIRECTORY; i=$((i + 1)); done
     for i in "${!HOSTS[@]}"; do
+        [ -z "${DRYRUN_DIR[${HOSTS[$i]}]+set}" ] || HOST_DIRS[i]=${DRYRUN_DIR[${HOSTS[$i]}]}
+    done
+    for i in "${!HOSTS[@]}"; do
         [ -n "${HOST_DIR_OF[${HOSTS[$i]}]+set}" ] || HOST_DIR_OF[${HOSTS[$i]}]=${HOST_DIRS[$i]}
     done
 }
 # host_dir without its subshells and awk: from the last load of targets.final
 # (its writers clear HOST_DIRS_KEY), -d when no file resolves dirs
 host_dir_v() {   # host_dir_v <host> -> HOST_DIR
-    if [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
+    if [ -n "${DRYRUN_DIR[$1]+set}" ]; then
+        HOST_DIR=${DRYRUN_DIR[$1]}
+    elif [ "$HOST_DIRS_KEY" = "$WORK_DIR/targets.final" ] && [ -n "${HOST_DIR_OF[$1]+set}" ]; then
         HOST_DIR=${HOST_DIR_OF[$1]}
     elif [ ! -f "$WORK_DIR/targets.final" ] && [ ! -f "$WORK_DIR/targets.phase1" ]; then
         HOST_DIR=$DIRECTORY
@@ -9378,6 +9443,9 @@ dry_run_report() {
     log "hosts (${#HOSTS[@]}): ${HOSTS[*]} (master: $MASTER)"
     log "fio version: ${FIO_VERSION_NOTE:-not checked}"
     [ "$ANY_FS" -eq 0 ] || log "destination: the filesystem-type check was off (--any-fs); the WARNING above names what -d is on"
+    # -n's stand-in for a missing -d (preflight.sh DRYRUN_DIR); the staged
+    # jobs below name -d, as the real run would
+    [ ${#DRYRUN_DIR[@]} -eq 0 ] || log "destination: -d is missing on ${#DRYRUN_DIR[@]} host(s); this dry run used <its parent>/$DRYRUN_NAME in its place (removed at exit); a real run creates -d (asking first, unless -r)"
     if [ "$LAYOUT_WRITE_BYTES" = 0 ]; then
         log "layout: nothing to write (files reused)"
     elif [ -n "$LAYOUT_WRITE_BYTES" ]; then

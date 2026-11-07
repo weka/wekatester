@@ -11,6 +11,8 @@ END {
         i = order[k]
         if (substr(job[i], 1, 4) != "cal-") continue
         h = (i in host) ? host[i] : "?"
+        # no mean is a failed cell, not 0 us (it would win every comparison)
+        if (!(i in lat)) { printf "ERROR: cal_lat_values: %s: %s: no %s mean latency\n", path, h, d > "/dev/stderr"; exit 1 }
         us = lat[i] / 1000.0; io = ios[i] + 0; ip = iops[i] + 0
         if (!(h in seen)) { seen[h] = 1; nh++; L[h] = us; I[h] = ip; N[h] = io; continue }
         t = N[h] + io
