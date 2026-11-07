@@ -112,7 +112,7 @@ function filenum_fmt(j, nr, L, n,    i, v) {
         L[i] = "filename_format=" v ".$filenum"
         if (!(j in FNOTED)) {
             FNOTED[j] = 1
-            print "note: " NM[j] ": filename_format=" v " has no $filenum, so nrfiles above 1 would open one file repeatedly; staged as " v ".$filenum" > "/dev/stderr"
+            gated(1, "note: " NM[j] ": filename_format=" v " has no $filenum, so nrfiles above 1 would open one file repeatedly; staged as " v ".$filenum", "/dev/stderr")
         }
     }
 }
@@ -185,7 +185,7 @@ function auto_facts(    x, h, np, P, i, F, m, c, S, nodes, WK, ISO, R, PHYS, ALL
         if (ISOL[h] != "" && parse_cpulist(ISOL[h], IS) && set_any(IS)) {
             parse_cpulist(CAL[h], ALL); c = 0; y = 0
             for (v in ALL) if (v in IS) c = 1; else y = 1
-            if (c && y) print "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" > "/dev/stderr"
+            if (c && y) gated(1, "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu", "/dev/stderr")
         }
     }
     for (x = 1; x <= nh; x++) { v = work "/usable/" H[x]; print CAL[H[x]] > v; close(v) }
@@ -228,7 +228,7 @@ function auto_job(j, h, ROW, L, n,    D, kind, floor, slot, q, v, cap, nn, fs, n
                 if (v + 0 > 4 * nn)
                     warn_once(h ": host-file " slot "_nj=" v " exceeds 4N (" 4 * nn "; N=" nn " usable physical cores) -- split affinity will run " ceil_div(v + 0, cap) " jobs on some cpus")
                 else if (v + 0 > cap)
-                    print "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)" > "/dev/stderr"
+                    gated(1, "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)", "/dev/stderr")
             }
             n = override_lines(L, n, KNOB[q], v)
             if (q == 3) nrset = v

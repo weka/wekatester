@@ -324,13 +324,13 @@ stage_jobfiles() {
         [ "$own" -eq 1 ] || continue
         fa=$(awkrun '#@awk layout_fallocate_none' "$SET_DIR/$job") \
             || die "cannot stage fallocate=none into the set's own layout job $job"
-        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
+        [ -z "$fa" ] || debug "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins
         twins=$(stage_bulk_twins "$SET_DIR") || die "cannot stage the -b 1MiB latency tests"
         if [ -n "$twins" ]; then
-            log "-b: staged the 1MiB latency test(s) $twins beside their 4k originals"
+            debug "-b: staged the 1MiB latency test(s) $twins beside their 4k originals"
         else
             log "WARNING: -b: this set has no 4k latency test to run at 1MiB" >&2
         fi
@@ -338,7 +338,7 @@ stage_jobfiles() {
     if cal_mode; then
         local floors
         floors=$(stage_floor_twins "$SET_DIR") || die "cannot stage the one-job latency tests"
-        [ -z "$floors" ] || log "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
+        [ -z "$floors" ] || debug "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
     fi
     LAYOUT_OWN=$has_layout
     if [ "$has_layout" -eq 0 ]; then
@@ -357,7 +357,7 @@ stage_jobfiles() {
         fi
     done
     if [ -n "$lay" ] && [ "$lay" != "${JOBFILES[0]}" ]; then
-        log "layout job $lay moved to run first (a layout job is only a barrier at position one)"
+        debug "layout job $lay moved to run first (a layout job is only a barrier at position one)"
         JOBFILES=("$lay")
         [ ${#reordered[@]} -eq 0 ] || JOBFILES=("$lay" "${reordered[@]}")
     fi

@@ -215,14 +215,14 @@ fold_spellings() {
             kb=${HOST_ADDRS_OF[$b]:-${HOST_ADDRS_WHY_OF[$b]}}
             if [ -n "${HOST_ADDRS_OF[$a]}" ] && [ "${HOST_ADDRS_OF[$a]}" = "${HOST_ADDRS_OF[$b]}" ]; then
                 fold_rows_check "$a" "$b" "$fb" "$fa"
-                log "host $b is $a (same address): folded"
+                debug "host $b is $a (same address): folded"
                 k=$a; break
             fi
             require_interactive "$a and $b look like one host but resolve differently: choosing to fold or keep them" \
                 "drop one of the two rows, or spell the names apart"
             if confirm_explicit "$a and $b look like one host but resolve differently ($a: $ka; $b: $kb): fold them?"; then
                 fold_rows_check "$a" "$b" "$fb" "$fa"
-                log "host $b is $a (the operator's answer): folded"
+                debug "host $b is $a (the operator's answer): folded"
                 k=$a; break
             fi
         done
@@ -271,14 +271,14 @@ clients_setting() {
     check_hosts_once
     # under -t the host file's count line carries them
     [ "$TARGETS" -eq 1 ] \
-        || log "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
+        || debug "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
 }
 
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
     targets_path
     [ -f "$TARGETS_FILE" ] || create_targets_file
-    log "host file: $TARGETS_FILE"
+    debug "host file: $TARGETS_FILE"
 }
 
 # With -t the file's host lines are the run's hosts, in file order; a CLI
@@ -302,7 +302,7 @@ hosts_from_file() {
     # a file created this run (the template) names no host: local mode
     # was settled before it was written
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        log "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
+        debug "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
     fi
     fold_spellings "$nf" "${merged[@]}"
     nf=0; nc=0
@@ -317,11 +317,11 @@ hosts_from_file() {
     # the WT_CLIENTS clause only when it added a host
     if [ "$nf" -gt 0 ]; then
         [ "$nw" -eq 0 ] || w="$nw from WT_CLIENTS, "
-        log "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
+        debug "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
     elif [ "$nw" -gt 0 ]; then
-        log "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
+        debug "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
     else
-        log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
+        debug "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
     fi
 }
 

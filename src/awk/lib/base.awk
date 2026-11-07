@@ -1,4 +1,15 @@
 function awk_fail(msg) { print "ERROR: " msg > "/dev/stderr"; exit 1 }
+# A gated line, as the shell's debug_at: while the run log's relays run it
+# goes out marked with \037 and its level for them; otherwise it prints only
+# at its level (gate_mode, from awkrun). Level 0 always prints. out: "" for
+# stdout, else a file.
+function gated(level, line, out,    g) {
+    g = gate_mode()
+    if (level > 0 && g == "relay") line = "\037" level line
+    else if (level > 0 && g + 0 < level) return
+    if (out == "") print line
+    else print line > out
+}
 
 # ASCII whitespace strip and split; the common cases skip the regex, since
 # they run on every probe line.

@@ -13,45 +13,58 @@ lock_token() {   # lock_token -> LOCK_TOKEN
 
 # preflight's remote command: no executable fio exits 1. Another run's traces
 # (its lock, staging, or any fio of wekatester's) print "held ..." and exit 75;
-# fio wekatester did not start prints "alien ..." and exits 76, and is never
-# touched. --break-lock clears the traces first and prints "healed ...".
+# fio wekatester did not start prints "alien ..." and exits 76. --break-lock
+# kills every fio (a "killed <pid> <user> <start> <command>" row per foreign
+# one), clears the traces and prints "healed ...".
 lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     local fb=${FIO_BIN##*/} names=fio mine
     fb=${fb:0:15}   # a process name (comm) holds 15 bytes
     [ "$fb" = fio ] || names="fio '$fb'"
-    # wekatester's fio, by its args: its server, the runs that read its
-    # staging, its engine tests
+    # wekatester's fio, by its args: its server (also _wt_srv below), the
+    # runs that read its staging, its engine tests
     mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
-    LOCK_CMD="$PROC_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="$PROC_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; alp=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     LOCK_CMD+="; for p in \$(_wt_comm $names); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
-    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
-    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
+    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then ours=\"\$ours \$p\"; else al=\"\$al \$p:\${a%% *}\"; alp=\"\$alp \$p\"; fi ;; esac; done"
+    # a server of ours under any name (a -f wrapper's real binary, an
+    # earlier version's leak) is this tool's trace, not foreign fio
+    LOCK_CMD+="; ! _wt_srvs '$FIO_PIDFILE' || for p in \$_wt_l; do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \"; ours=\"\$ours \$p\"; done"
+    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\""
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order; the kill binary, else, with no procps, its sh's
-        # own kill): a root fio needs one. still() keeps the pids alive
-        # and still ours: a zombie is gone, and a reused pid is not ours.
+        # own kill): a root fio needs one. still() keeps the pids alive and
+        # still ours, or foreign and still named fio: a zombie is gone.
         escalator_words_v "'"
-        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
-        LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
+        LOCK_CMD+="; fcn() { case \"\$1\" in fio|'$fb') return 0 ;; esac; return 1; }"
+        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then l2=\"\$l2 \$p\"; else case \" \$alp \" in *\" \$p \"*) _c=\$(cat \"\${_wt_proc:-/proc}/\$p/comm\" 2>&1) && fcn \"\$_c\" && l2=\"\$l2 \$p\" ;; esac; fi ;; esac; done; left=\$l2; }"
+        # a row per foreign fio, read before the kill: user and start from
+        # ps when it gives them, else the /proc Uid and -; printed after
+        # the kill for each pid that is gone (kout)
+        LOCK_CMD+="; nl=\$(printf '\\n_'); nl=\${nl%_}; kr=; for p in \$alp; do _wt_args \$p || continue; c=\$_wt_a; u=-; s=-"
+        LOCK_CMD+="; if _q=\$(ps -o user=,lstart= -p \$p 2>&1) && [ -n \"\$_q\" ]; then set -- \$_q; u=\$1; shift; s=\"\$*\"; elif [ -r \"\${_wt_proc:-/proc}/\$p/status\" ]; then while read -r k v r; do [ \"\$k\" != Uid: ] || { u=\$v; break; }; done < \"\${_wt_proc:-/proc}/\$p/status\"; fi"
+        LOCK_CMD+="; kr=\"\$kr\$p \$u \$s \$c\$nl\"; done"
+        LOCK_CMD+="; kout() { printf '%s' \"\$kr\" | while IFS= read -r r; do case \" \$left \" in *\" \${r%% *} \"*) ;; *) printf 'killed %s\\n' \"\$r\" ;; esac; done; }"
+        LOCK_CMD+="; if [ -n \"\$ev\" ] || [ -n \"\$alp\" ]; then left=\"\$ours\$alp\"; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _wt_k=\$(_wt_kbin) || _wt_k=; for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue"
         LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
-        LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
-        LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
+        LOCK_CMD+="; kout; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
+        LOCK_CMD+="; [ -z \"\$ev\" ] || { _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; }; fi"
         # every earlier run's group file in this host's destination (dd,
         # set per host by preflight), evidence or not: cleanup released the
         # lock of a run that died before collect_fs_groups
         LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*.lst; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
     else
-        LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
+        LOCK_CMD+="; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
     # mkdir is the atomic take; one machine under two names (parse_args refuses
-    # one name twice) finds this run's own lock
-    LOCK_CMD+="; if ! mkdir \"\$lk\"; then [ -d \"\$lk\" ] || { echo nolock; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
+    # one name twice) finds this run's own lock. mkdir's message is captured:
+    # it says why for nolock, and is noise otherwise
+    LOCK_CMD+="; if ! _mk=\$(mkdir \"\$lk\" 2>&1); then [ -d \"\$lk\" ] || { echo \"nolock \$_mk\"; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
     LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
 }
 # cleanup's half: the lock goes only when it is still this run's
@@ -66,11 +79,11 @@ lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
 FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        log "checking $FIO_BIN on the local host..."
+        debug "checking $FIO_BIN on the local host..."
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc held=0 line l got fv=""
+    local pids=() failed=() host i rc held=0 line l got fv="" nolock lc=() kd
     [ -n "$LOCK_TOKEN" ] || lock_token
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
@@ -80,32 +93,39 @@ preflight() {
     for i in "${!HOSTS[@]}"; do
         run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
+        lc+=("${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD")
     done
+    debug3_cmds "lock command" ${lc[@]+"${lc[@]}"}
     for i in "${!HOSTS[@]}"; do
         host=${HOSTS[$i]}
         wait "${pids[$i]}"
         rc=$?
         # the lock's line is the first one that is not the version's
-        line=""; got=0
+        line=""; got=0; nolock=""; kd=""
         while IFS= read -r l || [ -n "$l" ]; do
             case $l in
                 ("fio-version "*) [ -n "${FIO_VERSIONS[$i]+set}" ] || FIO_VERSIONS[$i]=${l#fio-version } ;;
+                # mkdir's reason (after a --break-lock "healed" line, too)
+                ("nolock "*) nolock=${l#nolock } ;;
+                # --break-lock's foreign fio, one row each
+                ("killed "*) kd+="${kd:+; }${l#killed }" ;;
                 (*) [ "$got" -eq 1 ] || { line=$l; got=1; } ;;
             esac
         done < "$WORK_DIR/lock/$i"
+        [ -z "$kd" ] || log "WARNING: $host: --break-lock killed fio that wekatester did not start: $kd" >&2
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
             failed+=("$host: ssh failed")
         elif [ "$rc" -eq 0 ]; then
             RUN_LOCKS[$host]=1
-            [ "${line%% *}" != healed ] || log "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
+            [ "${line%% *}" != healed ] || debug "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
         elif [ "$rc" -eq 75 ]; then
             held=1; failed+=("$host: another wekatester run is here, or one that did not clean up:${line#held}")
         elif [ "$rc" -eq 76 ]; then
-            failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
+            held=1; failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it, or rerun with --break-lock to kill it")
         elif [ "$rc" -eq 77 ]; then
-            failed+=("$host: cannot create the run lock $LOCK_DIR")
+            failed+=("$host: cannot create the run lock $LOCK_DIR${nolock:+ ($nolock)}")
         elif [ -z "${FIO_VERSIONS[$i]+set}" ]; then
             # the session's first command prints the version line, so its
             # shell ran none of it: a command it could not parse
@@ -118,7 +138,7 @@ preflight() {
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
         done
-        [ "$held" -eq 0 ] || log "a run that is gone: rerun with --break-lock, which kills wekatester's own fio on those hosts and clears its lock and staging" >&2
+        [ "$held" -eq 0 ] || log "a run that is gone, or fio from elsewhere: rerun with --break-lock, which kills every fio on those hosts and clears wekatester's lock and staging" >&2
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
     debug "preflight passed on all hosts"
@@ -155,7 +175,7 @@ check_fio_versions() {
     if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
         FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
         [ ${#HOSTS[@]} -gt 1 ] || FIO_VERSION_NOTE="${vers[0]} on the one host"
-        log "fio version: $FIO_VERSION_NOTE"
+        debug "fio version: $FIO_VERSION_NOTE"
         return 0
     fi
     why="fio differs across the hosts, ${#vers[@]} versions on ${#HOSTS[@]} hosts, and fio's client/server protocol is version-sensitive"
@@ -229,7 +249,7 @@ write_mount_lines() {   # write_mount_lines <dir> <line>...
 # must be the one verify_mount_mode recorded. A change, or a line that cannot
 # be read, stops the run, -r included.
 check_mounts_unchanged() {
-    log "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
+    debug "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
     [ -s "$WORK_DIR/mount/sums" ] || die "no mount record from the mount check in $WORK_DIR/mount"
     local td i line was pids=() rcs=() now=() old=() new=() changed=()
     td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
@@ -243,6 +263,7 @@ check_mounts_unchanged() {
         wait "${pids[$i]}"; rcs[$i]=$?
         line=""; IFS= read -r line < "$td/$i.out" || :
         now[$i]=$line
+        [ -z "$line" ] || debug3 "${HOSTS[$i]}: mount: $line"
     done
     write_mount_lines "$td/now" "${now[@]}"
     mapfile -t old < "$WORK_DIR/mount/sums"
@@ -348,7 +369,7 @@ collect_fs_groups() {
     log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
     while IFS=$'\t' read -r i line; do
         h=${line%% *}
-        log "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
+        debug "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
     done <<<"${summary#*$'\n'}"
 }
 
@@ -457,6 +478,7 @@ verify_mount_mode() {
             proc_fail=1
             continue
         fi
+        debug3 "$host: mount: ${procs[$i]}"
         classify_mount_line_v "${procs[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ft=wekafs ;;
@@ -584,7 +606,7 @@ verify_mount_mode() {
                     write_fail=1
                     continue
                 fi
-                log "$host: created $hd"
+                debug "$host: created $hd"
                 [ "$rc" -eq 0 ] \
                     || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                          write_fail=1; }

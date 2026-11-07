@@ -17,7 +17,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.1"
+VERSION="3.0.2"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -90,40 +90,83 @@ LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
-BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
+BREAK_LOCK=0        # 1: kill every fio and clear a dead run's lock before taking ours
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
 ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
 
 # --- logging -----------------------------------------------------------------
-log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
-debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
-# README, -v: -v per-host outcomes and notes, -vv every connection attempt,
-# -vvv nothing more yet
-debug2() { [ "$VERBOSITY" -ge 2 ] && log "DEBUG: $*"; return 0; }
-debug3() { [ "$VERBOSITY" -ge 3 ] && log "DEBUG: $*"; return 0; }
+# Until the pre-log relays start (start_prelog), the main shell's lines are
+# also kept here; they open the run log. While the relays are paused for a
+# prompt (run.sh relay_pause), LOG_DIRECT names the log file and each line is
+# appended to it here, in program order.
+LOG_BUFFERING=1; LOG_BUFFER=()
+LOG_DIRECT=""
+log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts $*"); [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts $*" >> "$LOG_DIRECT"; echo "$ts $*"; }
+log_blank() { [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=(""); [ -z "$LOG_DIRECT" ] || echo >> "$LOG_DIRECT"; echo; }
+# A gated line. While a relay runs, every level reaches the file: the line
+# goes out marked with \037 and its level, and the relay shows it on the
+# console only at that verbosity (each line of a multi-line text is marked).
+# Otherwise it is buffered or written direct (above) and printed at its level.
+debug_at() {   # debug_at <level> <text>
+    local ts
+    printf -v ts '%(%H:%M:%S)T' -1
+    if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
+        printf '\037%s%s DEBUG: %s\n' "$1" "$ts" "${2//$'\n'/$'\n\037'$1}"
+    else
+        [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts DEBUG: $2")
+        [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts DEBUG: $2" >> "$LOG_DIRECT"
+        [ "$VERBOSITY" -lt "$1" ] || echo "$ts DEBUG: $2"
+    fi
+    return 0
+}
+# README, -v: the console's level (the run log gets every line): -v per-host
+# outcomes and notes, -vv every connection attempt, -vvv the commands run on
+# the hosts and each phase's seconds
+debug()  { debug_at 1 "$*"; }
+debug2() { debug_at 2 "$*"; }
+debug3() { debug_at 3 "$*"; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
-# Warnings raised before the run log opens, replayed once into the log FILE
-# (not stderr: the console saw them live).
-PRERUN_WARNINGS=()
-warn_prerun() {
-    local w
-    log "WARNING: $*" >&2
-    for w in "${PRERUN_WARNINGS[@]}"; do
-        [ "$w" != "$*" ] || return 0
-    done
-    PRERUN_WARNINGS+=("$*")
+# -vvv helpers, which do nothing when the line would go nowhere (no relay or
+# direct file, and a console below -vvv)
+debug3_on() { [ ${#RELAY_PIDS[@]} -gt 0 ] || [ -n "$LOG_DIRECT" ] || [ "$VERBOSITY" -ge 3 ]; }
+debug3_rows() {   # debug3_rows <prefix> <file>: each line of the file
+    debug3_on && [ -f "$2" ] || return 0
+    local l
+    while IFS= read -r l || [ -n "$l" ]; do debug3 "$1$l"; done < "$2"
+    return 0
 }
-replay_prerun_warnings() {
-    local w f="$RUN_DIR/wekatester.log"
-    # Gated on the run directory, not the file: the background relays may not
-    # have created it yet.
-    [ ${#PRERUN_WARNINGS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    for w in "${PRERUN_WARNINGS[@]}"; do
-        log "WARNING (before the run log opened): $w" >> "$f"
+# Each distinct command once, naming its hosts (eight, then +N more): every
+# run's log holds the -vvv lines, so per-host copies would bloat it.
+debug3_cmds() {   # debug3_cmds <what> <host> <command> [<host> <command>]...
+    debug3_on || return 0
+    local what=$1 c n s names cmds=()
+    local -A who=() cnt=()
+    shift
+    while [ $# -ge 2 ]; do
+        if [ -z "${who[$2]+set}" ]; then
+            cmds+=("$2"); who[$2]=$1; cnt[$2]=1
+        else
+            n=${cnt[$2]}; cnt[$2]=$((n + 1))
+            [ "$n" -ge 8 ] || who[$2]+=", $1"
+        fi
+        shift 2
+    done
+    for c in ${cmds[@]+"${cmds[@]}"}; do
+        n=${cnt[$c]}; names=${who[$c]}; s=s
+        [ "$n" -le 8 ] || names+=", +$((n - 8)) more"
+        [ "$n" -ne 1 ] || s=""
+        debug3 "$what ($n host$s: $names): $c"
     done
 }
+# -vvv: a phase's seconds, from the end of the one before (PHASE_T0, main)
+PHASE_T0=0
+phase_done() { debug3 "$1: $((SECONDS - PHASE_T0))s"; PHASE_T0=$SECONDS; }
+
+# A warning raised before the run log opens: the pre-log relays carry it into
+# the file like any other line.
+warn_prerun() { log "WARNING: $*" >&2; }
 
 # --- transport ----------------------------------------------------------------
 # The only two places that know whether a host is remote. A command string
@@ -234,12 +277,15 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
 # A host may lack procps: remote commands walk /proc (_wt_proc, else /proc),
 # not ps, pgrep or pkill. _wt_args <pid> sets _wt_a to its args, <defunct>
 # for a zombie, or returns 1; _wt_comm <name>... prints the pids so named;
-# _wt_pfx <name> <prefix> sets _wt_l to those whose args start with prefix;
+# _wt_srv <pidfile>: _wt_a is wekatester's fio server, argv[1] --server and
+# argv[2] --daemonize=<pidfile> exactly, whatever argv[0] (a shell's argv[1]
+# is -c); _wt_srvs <pidfile> sets _wt_l to every such pid, any name;
 # _wt_kbin prints the kill binary on PATH (command -v names the builtin;
 # only an expansion splits on IFS, so the fallback dirs join a variable).
 PROC_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < \"\${_wt_proc:-/proc}/\$1/cmdline\") || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat \"\${_wt_proc:-/proc}/\$1/stat\" 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }; \
 _wt_comm() { awk -v w=\"\$*\" 'BEGIN { n = split(w, N, \" \"); for (i = 1; i <= n; i++) W[N[i]]; for (i = 1; i < ARGC; i++) { f = ARGV[i] \"/comm\"; if (((getline c < f) > 0) && (c in W)) { p = ARGV[i]; sub(/.*\\//, \"\", p); print p }; close(f) } }' \"\${_wt_proc:-/proc}\"/[0-9]*; }; \
-_wt_pfx() { _wt_l=; for _wt_q in \$(_wt_comm \"\$1\"); do _wt_args \$_wt_q || continue; case \$_wt_a in \"\$2\"*) _wt_l=\"\$_wt_l \$_wt_q\" ;; esac; done; [ -n \"\$_wt_l\" ]; }; \
+_wt_srv() { case \${_wt_a#* } in \"--server --daemonize=\$1\"|\"--server --daemonize=\$1 \"*) return 0 ;; esac; return 1; }; \
+_wt_srvs() { _wt_l=; for _wt_f in \$(grep -l -s -F -e \"--daemonize=\$1\" \"\${_wt_proc:-/proc}\"/[0-9]*/cmdline); do _wt_q=\${_wt_f%/cmdline}; _wt_q=\${_wt_q##*/}; _wt_args \$_wt_q || continue; ! _wt_srv \"\$1\" || _wt_l=\"\$_wt_l \$_wt_q\"; done; [ -n \"\$_wt_l\" ]; }; \
 _wt_kbin() { (_wt_p=\$PATH:/usr/bin:/bin; IFS=:; for _wt_d in \$_wt_p; do if [ -n \"\$_wt_d\" ] && [ -f \"\$_wt_d/kill\" ] && [ -x \"\$_wt_d/kill\" ]; then echo \"\$_wt_d/kill\"; exit 0; fi; done; exit 1); }"
 
 # Every passwordless escalator a sweep tries, in this order (site tools
@@ -266,7 +312,7 @@ resolve_local_mode() {
     HOSTS=(localhost)
     MASTER=localhost
     LOCAL_NAME=$(local_short_hostname)
-    log "no servers given: running on the local host (no ssh required)"
+    debug "no servers given: running on the local host (no ssh required)"
     debug "local mode: data files are prefixed ${LOCAL_NAME:-localhost}. (host_name)"
 }
 
@@ -387,9 +433,12 @@ prompt_key() {   # prompt_key <timeout-seconds|0>
 }
 
 # Enter/y/space yes, Esc/n no; any other key or none takes the default, so
-# there is no re-prompt loop. Returns 0 for yes.
+# there is no re-prompt loop. Returns 0 for yes. The log relays pause from
+# the question to the answer's log line (run.sh): nothing earlier is still
+# queued when the question shows, and the answer precedes the caller's die.
 confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
     local secs=$1 default=$2 msg=$3 answer
+    relay_pause
     prompt_say "$msg [Enter/y = yes, Esc/n = no] (${secs}s -> $default) "
     prompt_key "$secs"
     case "$PROMPT_KEY" in
@@ -399,18 +448,21 @@ confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
     esac
     prompt_line "$answer"
     log "$msg $answer"
+    relay_resume
     [ "$answer" = yes ]
 }
 
 # Untimed: only y means yes; Enter takes the no the prompt shows.
 confirm_explicit() {   # confirm_explicit <message>
     local answer=no
+    relay_pause
     prompt_say "$1 [y/N] "
     if prompt_key 0; then
         case "$PROMPT_KEY" in (y|Y) answer=yes ;; esac
     fi
     prompt_line "$answer"
     log "$1 $answer"
+    relay_resume
     [ "$answer" = yes ]
 }
 
@@ -523,9 +575,9 @@ EOF
     ;;
     (break_lock) cat <<EOF
   --break-lock            a run that died left its lock, staging or fio on a
-                          host: kill wekatester's own fio there, clear its
-                          files and take the lock (fio it did not start still
-                          stops the run)
+                          host, or another fio is running there: kill every
+                          fio there, clear wekatester's files and take the
+                          lock
 EOF
     ;;
     (any_fs) cat <<EOF
@@ -617,8 +669,10 @@ EOF
 EOF
     ;;
     (verbose) cat <<EOF
-  -v             increase output verbosity: -v per-host outcomes and
-                 notes, -vv every connection attempt
+  -v             more on the console (the run log in the bundle gets
+                 every line): -v per-host outcomes and notes, -vv every
+                 connection attempt, -vvv the commands run on the hosts
+                 and each phase's seconds
 EOF
     ;;
     (version) cat <<EOF
@@ -692,6 +746,17 @@ LINE_RATE_SLOTS="bw_r bw_w"
 
 IFS= read -r -d '' WEKA_AWK <<'AWKLIB' || :
 function awk_fail(msg) { print "ERROR: " msg > "/dev/stderr"; exit 1 }
+# A gated line, as the shell's debug_at: while the run log's relays run it
+# goes out marked with \037 and its level for them; otherwise it prints only
+# at its level (gate_mode, from awkrun). Level 0 always prints. out: "" for
+# stdout, else a file.
+function gated(level, line, out,    g) {
+    g = gate_mode()
+    if (level > 0 && g == "relay") line = "\037" level line
+    else if (level > 0 && g + 0 < level) return
+    if (out == "") print line
+    else print line > out
+}
 
 # ASCII whitespace strip and split; the common cases skip the regex, since
 # they run on every probe line.
@@ -1819,7 +1884,12 @@ function json_feed(tok, isstr) {
 AWKLIB
 
 awkrun() {   # awkrun <program> <arg>... -- WEKA_AWK prepended, LC_ALL=C
+    # gate_mode, for base.awk's gated: relay while the run log's relays run,
+    # else the verbosity
+    local gate=$VERBOSITY
+    [ ${#RELAY_PIDS[@]} -eq 0 ] || gate=relay
     LC_ALL=C awk "$WEKA_AWK
+function gate_mode() { return \"$gate\" }
 function geom_slots() { return \"$GEOM_SLOTS\" }
 function geom_names() { return \"$GEOM_NAMES\" }
 function layout_job() { return \"$LAYOUT_JOB\" }
@@ -2283,7 +2353,7 @@ cal_scratch_dirs() {   # cal_scratch_dirs <host> <sep> <fmt> <nj> <maxfilenum>
 fio_parse_postmortem() {   # fio_parse_postmortem <what> <host> <remote-jobfile> <outfile>
     local what=$1 host=$2 jf=$3 outf=$4 l
     if run_host "$host" "'$FIO_BIN' --parse-only '$jf'" > "$outf" 2>&1; then
-        log "note: $host: the $what jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
+        debug "note: $host: the $what jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
     else
         log "ERROR: $host: the host's own fio rejects the $what jobfile (full text: ${outf##*/} in the run bundle):" >&2
         head -5 "$outf" | while IFS= read -r l; do
@@ -2626,6 +2696,7 @@ apply_cal_results() {
     }' "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" "${LINE_RATE_GBPS:--}" \
         || die "cannot apply the calibration results"
     HOST_DIRS_KEY=""   # a host_dir_v map of the old targets.final is stale
+    debug3_rows "host file, after calibration: " "$WORK_DIR/targets.final"
 }
 
 # Only this cell file goes to the master, one copy per push, from a staging
@@ -2865,7 +2936,7 @@ SUBDIREOF
     fi
     set -- $active
     [ "$#" -le 1 ] || by=" across $# client(s) of its filesystem group"
-    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "$availmib" "$hd")"
+    debug "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "$availmib" "$hd")"
     if [ "${nmib:-0}" -gt 0 ]; then
         if [ -z "$availmib" ]; then
             log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2
@@ -2953,7 +3024,7 @@ cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
         set -- $members; n=$#
         take=$n; [ "$CAL_CLIENTS" = all ] || take=$CAL_CLIENTS
         if [ "$take" -gt "$n" ]; then
-            log "cal: shape $sid: $CAL_CLIENTS client(s) asked and the shape has $n: calibrating on $n"
+            debug "cal: shape $sid: $CAL_CLIENTS client(s) asked and the shape has $n: calibrating on $n"
             take=$n
         fi
         list=""
@@ -3758,7 +3829,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     # the file is the hand-off (a background cell has no other); CAL_READING
     # spares the serial callers a cat per cell
     printf '%s\n' "$CAL_READING" > "$rf" || die "cannot write the reading of ${json##*/} to $rf"
-    debug "cal: shape $CAL_SID $what ${rt}s on $rep: $CAL_READING"
+    debug2 "cal: shape $CAL_SID $what ${rt}s on $rep: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
 
@@ -3809,6 +3880,7 @@ cal_search_ask() {   # cal_search_ask <search-index>
     # shellcheck disable=SC2086 -- the knobs are one k=v word each
     act=$(cal_plan batch "$type" "$dirn" "$1" "$2" "$3" "$4" "${S_HIST[$i]}" ${S_KNOBS[$i]}) \
         || die "the calibration planner failed for $type $dirn (history: cal/s$CAL_SID/${S_HIST[$i]##*/} in the run bundle)"
+    debug3 "cal: shape $CAL_SID $type $dirn: planner: $act"
     S_ASK[i]=0
     case "$act" in
         ("cell "*) S_Q[i]=$act ;;
@@ -4054,7 +4126,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
             # the host file pins these knobs: they are the only values this
             # search tries, and every other knob is searched around them
             printf '%s\n' "$c" | tr '/' ' ' > "$sdir/pins-$type-$dirn"
-            log "cal: shape $sid: $type $dirn is pinned by $rep's host-file row (qd/nr/fs/nj $c): only those values are tested (-g searches everything)"
+            debug "cal: shape $sid: $type $dirn is pinned by $rep's host-file row (qd/nr/fs/nj $c): only those values are tested (-g searches everything)"
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
@@ -4095,10 +4167,10 @@ BUDEOF
     [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
     if [ "$pinned" != "-" ]; then
         eng=$pinned
-        log "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
+        debug "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
     elif [ "$ncand" -le 1 ]; then
         eng=${engines%%,*}
-        log "cal: shape $sid: ioengine $eng (the only candidate that passed its test)"
+        debug "cal: shape $sid: ioengine $eng (the only candidate that passed its test)"
     else
         : > "$sdir/engines"
         for etype in bw iops lat; do
@@ -4135,7 +4207,7 @@ BUDEOF
             for e in ${engines//,/ }; do
                 # libaio past the aio room dies with EAGAIN: rank the others
                 if [ "$e" = libaio ] && [ "$aio" != - ] && [ $((enj * eqd)) -gt "$aio" ]; then
-                    log "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
+                    debug "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
                     continue
                 fi
                 E_CELL+=("$etype $ctype $edirn $e $enj $eqd $enr ${pinfs:--}")
@@ -4152,7 +4224,7 @@ BUDEOF
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
         read -r eng rest <<<"$pick"
-        log "cal: shape $sid: ioengine $eng -- $rest"
+        debug "cal: shape $sid: ioengine $eng -- $rest"
     fi
     printf '%s\n' "$eng" > "$sdir/engine"
     CAL_TODO=$todo
@@ -4456,7 +4528,7 @@ calibrate() {
     esac
     log "calibrating ($AUTO_LEVEL) $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g') per client shape, the shapes at once, each $on"
     if brutal_mode; then
-        log "cal: -a brutal: the same search with every early stop disabled -- every rung of every ladder is measured"
+        debug "cal: -a brutal: the same search with every early stop disabled -- every rung of every ladder is measured"
     fi
     # NOT local: the seed, every cell and the staged jobs share one namespace.
     # CAL_NS_DIR is the subdirectory under each destination ("" = itself);
@@ -4474,10 +4546,10 @@ calibrate() {
                 || die "the host name 'shared' is reserved for the fleet-shared read dataset ($host)"
         done
         CAL_NS_DIR=""; CAL_SEP="."
-        log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
+        debug "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
     else
         CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
-        log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
+        debug "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
     fi
     mkdir -p "$WORK_DIR/cal"
     local shapes="$WORK_DIR/cal/shapes" line host i pids hs
@@ -4575,11 +4647,11 @@ calibrate() {
     # run keeps it for the rerun.
     if [ "$UNLINK" -eq 1 ]; then
         CAL_UNLINK_PENDING=1
-        log "cal: -u: the calibration dataset is removed after the last measured job"
+        debug "cal: -u: the calibration dataset is removed after the last measured job"
     elif [ -z "$CAL_NS_DIR" ]; then
-        log "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
+        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
     else
-        log "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
+        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
@@ -4600,45 +4672,58 @@ lock_token() {   # lock_token -> LOCK_TOKEN
 
 # preflight's remote command: no executable fio exits 1. Another run's traces
 # (its lock, staging, or any fio of wekatester's) print "held ..." and exit 75;
-# fio wekatester did not start prints "alien ..." and exits 76, and is never
-# touched. --break-lock clears the traces first and prints "healed ...".
+# fio wekatester did not start prints "alien ..." and exits 76. --break-lock
+# kills every fio (a "killed <pid> <user> <start> <command>" row per foreign
+# one), clears the traces and prints "healed ...".
 lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
     local fb=${FIO_BIN##*/} names=fio mine
     fb=${fb:0:15}   # a process name (comm) holds 15 bytes
     [ "$fb" = fio ] || names="fio '$fb'"
-    # wekatester's fio, by its args: its server, the runs that read its
-    # staging, its engine tests
+    # wekatester's fio, by its args: its server (also _wt_srv below), the
+    # runs that read its staging, its engine tests
     mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
-    LOCK_CMD="$PROC_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; ours=; seen=' '"
+    LOCK_CMD="$PROC_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; alp=; ours=; seen=' '"
     LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
     LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
     LOCK_CMD+="; for p in \$(_wt_comm $names); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
-    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) al=\"\$al \$p:\${a%% *}\" ;; esac; done"
-    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\"; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }"
+    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then ours=\"\$ours \$p\"; else al=\"\$al \$p:\${a%% *}\"; alp=\"\$alp \$p\"; fi ;; esac; done"
+    # a server of ours under any name (a -f wrapper's real binary, an
+    # earlier version's leak) is this tool's trace, not foreign fio
+    LOCK_CMD+="; ! _wt_srvs '$FIO_PIDFILE' || for p in \$_wt_l; do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \"; ours=\"\$ours \$p\"; done"
+    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\""
     if [ "$BREAK_LOCK" -eq 1 ]; then
         # TERM, then -9, then -9 under the first escalator that works (the
         # probe's order; the kill binary, else, with no procps, its sh's
-        # own kill): a root fio needs one. still() keeps the pids alive
-        # and still ours: a zombie is gone, and a reused pid is not ours.
+        # own kill): a root fio needs one. still() keeps the pids alive and
+        # still ours, or foreign and still named fio: a zombie is gone.
         escalator_words_v "'"
-        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; esac; done; left=\$l2; }"
-        LOCK_CMD+="; if [ -n \"\$ev\" ]; then left=\$ours; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
+        LOCK_CMD+="; fcn() { case \"\$1\" in fio|'$fb') return 0 ;; esac; return 1; }"
+        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then l2=\"\$l2 \$p\"; else case \" \$alp \" in *\" \$p \"*) _c=\$(cat \"\${_wt_proc:-/proc}/\$p/comm\" 2>&1) && fcn \"\$_c\" && l2=\"\$l2 \$p\" ;; esac; fi ;; esac; done; left=\$l2; }"
+        # a row per foreign fio, read before the kill: user and start from
+        # ps when it gives them, else the /proc Uid and -; printed after
+        # the kill for each pid that is gone (kout)
+        LOCK_CMD+="; nl=\$(printf '\\n_'); nl=\${nl%_}; kr=; for p in \$alp; do _wt_args \$p || continue; c=\$_wt_a; u=-; s=-"
+        LOCK_CMD+="; if _q=\$(ps -o user=,lstart= -p \$p 2>&1) && [ -n \"\$_q\" ]; then set -- \$_q; u=\$1; shift; s=\"\$*\"; elif [ -r \"\${_wt_proc:-/proc}/\$p/status\" ]; then while read -r k v r; do [ \"\$k\" != Uid: ] || { u=\$v; break; }; done < \"\${_wt_proc:-/proc}/\$p/status\"; fi"
+        LOCK_CMD+="; kr=\"\$kr\$p \$u \$s \$c\$nl\"; done"
+        LOCK_CMD+="; kout() { printf '%s' \"\$kr\" | while IFS= read -r r; do case \" \$left \" in *\" \${r%% *} \"*) ;; *) printf 'killed %s\\n' \"\$r\" ;; esac; done; }"
+        LOCK_CMD+="; if [ -n \"\$ev\" ] || [ -n \"\$alp\" ]; then left=\"\$ours\$alp\"; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
         LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
         LOCK_CMD+="; if [ -n \"\$left\" ]; then _wt_k=\$(_wt_kbin) || _wt_k=; for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue"
         LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
-        LOCK_CMD+="; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
-        LOCK_CMD+="; _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; fi"
+        LOCK_CMD+="; kout; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
+        LOCK_CMD+="; [ -z \"\$ev\" ] || { _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; }; fi"
         # every earlier run's group file in this host's destination (dd,
         # set per host by preflight), evidence or not: cleanup released the
         # lock of a run that died before collect_fs_groups
         LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*.lst; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
     else
-        LOCK_CMD+="; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
+        LOCK_CMD+="; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
     # mkdir is the atomic take; one machine under two names (parse_args refuses
-    # one name twice) finds this run's own lock
-    LOCK_CMD+="; if ! mkdir \"\$lk\"; then [ -d \"\$lk\" ] || { echo nolock; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
+    # one name twice) finds this run's own lock. mkdir's message is captured:
+    # it says why for nolock, and is noise otherwise
+    LOCK_CMD+="; if ! _mk=\$(mkdir \"\$lk\" 2>&1); then [ -d \"\$lk\" ] || { echo \"nolock \$_mk\"; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
     LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
 }
 # cleanup's half: the lock goes only when it is still this run's
@@ -4653,11 +4738,11 @@ lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
 FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
 preflight() {
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        log "checking $FIO_BIN on the local host..."
+        debug "checking $FIO_BIN on the local host..."
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc held=0 line l got fv=""
+    local pids=() failed=() host i rc held=0 line l got fv="" nolock lc=() kd
     [ -n "$LOCK_TOKEN" ] || lock_token
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
@@ -4667,32 +4752,39 @@ preflight() {
     for i in "${!HOSTS[@]}"; do
         run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
         pids+=($!)
+        lc+=("${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD")
     done
+    debug3_cmds "lock command" ${lc[@]+"${lc[@]}"}
     for i in "${!HOSTS[@]}"; do
         host=${HOSTS[$i]}
         wait "${pids[$i]}"
         rc=$?
         # the lock's line is the first one that is not the version's
-        line=""; got=0
+        line=""; got=0; nolock=""; kd=""
         while IFS= read -r l || [ -n "$l" ]; do
             case $l in
                 ("fio-version "*) [ -n "${FIO_VERSIONS[$i]+set}" ] || FIO_VERSIONS[$i]=${l#fio-version } ;;
+                # mkdir's reason (after a --break-lock "healed" line, too)
+                ("nolock "*) nolock=${l#nolock } ;;
+                # --break-lock's foreign fio, one row each
+                ("killed "*) kd+="${kd:+; }${l#killed }" ;;
                 (*) [ "$got" -eq 1 ] || { line=$l; got=1; } ;;
             esac
         done < "$WORK_DIR/lock/$i"
+        [ -z "$kd" ] || log "WARNING: $host: --break-lock killed fio that wekatester did not start: $kd" >&2
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
             failed+=("$host: ssh failed")
         elif [ "$rc" -eq 0 ]; then
             RUN_LOCKS[$host]=1
-            [ "${line%% *}" != healed ] || log "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
+            [ "${line%% *}" != healed ] || debug "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
         elif [ "$rc" -eq 75 ]; then
             held=1; failed+=("$host: another wekatester run is here, or one that did not clean up:${line#held}")
         elif [ "$rc" -eq 76 ]; then
-            failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it first -- wekatester never kills fio it did not start")
+            held=1; failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it, or rerun with --break-lock to kill it")
         elif [ "$rc" -eq 77 ]; then
-            failed+=("$host: cannot create the run lock $LOCK_DIR")
+            failed+=("$host: cannot create the run lock $LOCK_DIR${nolock:+ ($nolock)}")
         elif [ -z "${FIO_VERSIONS[$i]+set}" ]; then
             # the session's first command prints the version line, so its
             # shell ran none of it: a command it could not parse
@@ -4705,7 +4797,7 @@ preflight() {
         for host in "${failed[@]}"; do
             log "ERROR: $host" >&2
         done
-        [ "$held" -eq 0 ] || log "a run that is gone: rerun with --break-lock, which kills wekatester's own fio on those hosts and clears its lock and staging" >&2
+        [ "$held" -eq 0 ] || log "a run that is gone, or fio from elsewhere: rerun with --break-lock, which kills every fio on those hosts and clears wekatester's lock and staging" >&2
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
     fi
     debug "preflight passed on all hosts"
@@ -4742,7 +4834,7 @@ check_fio_versions() {
     if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
         FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
         [ ${#HOSTS[@]} -gt 1 ] || FIO_VERSION_NOTE="${vers[0]} on the one host"
-        log "fio version: $FIO_VERSION_NOTE"
+        debug "fio version: $FIO_VERSION_NOTE"
         return 0
     fi
     why="fio differs across the hosts, ${#vers[@]} versions on ${#HOSTS[@]} hosts, and fio's client/server protocol is version-sensitive"
@@ -4824,7 +4916,7 @@ write_mount_lines() {   # write_mount_lines <dir> <line>...
 # must be the one verify_mount_mode recorded. A change, or a line that cannot
 # be read, stops the run, -r included.
 check_mounts_unchanged() {
-    log "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
+    debug "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
     [ -s "$WORK_DIR/mount/sums" ] || die "no mount record from the mount check in $WORK_DIR/mount"
     local td i line was pids=() rcs=() now=() old=() new=() changed=()
     td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
@@ -4838,6 +4930,7 @@ check_mounts_unchanged() {
         wait "${pids[$i]}"; rcs[$i]=$?
         line=""; IFS= read -r line < "$td/$i.out" || :
         now[$i]=$line
+        [ -z "$line" ] || debug3 "${HOSTS[$i]}: mount: $line"
     done
     write_mount_lines "$td/now" "${now[@]}"
     mapfile -t old < "$WORK_DIR/mount/sums"
@@ -4943,7 +5036,7 @@ collect_fs_groups() {
     log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
     while IFS=$'\t' read -r i line; do
         h=${line%% *}
-        log "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
+        debug "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
     done <<<"${summary#*$'\n'}"
 }
 
@@ -5052,6 +5145,7 @@ verify_mount_mode() {
             proc_fail=1
             continue
         fi
+        debug3 "$host: mount: ${procs[$i]}"
         classify_mount_line_v "${procs[$i]}"; verdict=$MOUNT_VERDICT
         case "$verdict" in
             ok)   ft=wekafs ;;
@@ -5179,7 +5273,7 @@ verify_mount_mode() {
                     write_fail=1
                     continue
                 fi
-                log "$host: created $hd"
+                debug "$host: created $hd"
                 [ "$rc" -eq 0 ] \
                     || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
                          write_fail=1; }
@@ -5219,8 +5313,8 @@ RUN_RC=0
 
 # Kill the pidfile daemon and wait until every process of ours is gone (TERM
 # up to 3s, then KILL). fio --server forks a child per connection, so the
-# drain matches the full command line, anchored to the fio binary and
-# carrying the pidfile path.
+# drain matches every process whose argv[1] and argv[2] are the server's
+# --server --daemonize=<pidfile> (base.sh _wt_srv).
 kill_fio_cmd() {   # kill_fio_cmd [priv]
     kill_fio_cmd_v "$1"
     printf '%s' "$KILL_FIO_CMD"
@@ -5230,26 +5324,25 @@ kill_fio_cmd() {   # kill_fio_cmd [priv]
 # looks again before the -9.
 kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # An escalated server is root-owned: the kill needs the same escalator.
-    # The match is fio's name and args STARTING with the server's command:
-    # this shell carries that command in its own cmdline (an unanchored
-    # pkill -9 once killed the teardown). taskset execs fio, so argv starts
-    # with the binary.
-    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" fc=${FIO_BIN##*/} ek="_wt_ek() { kill \"\$@\"; }"
-    fc=${fc:0:15}   # a process name (comm) holds 15 bytes
+    # The match is argv[1] and argv[2] exactly (_wt_srv), whatever runs as
+    # argv[0]: a -f wrapper that execs fio shows the real binary. This
+    # shell carries the server's command in its own cmdline, and an
+    # unanchored pkill -9 once killed the teardown.
+    local priv=${1:+$1 } ek="_wt_ek() { kill \"\$@\"; }"
     # escalated: the kill binary (a sudoers rule may allow only it), else,
     # with no procps, the shell's own kill under the escalator
     [ -z "$priv" ] || ek="_wt_k=\$(_wt_kbin) || _wt_k=; _wt_ek() { if [ -n \"\$_wt_k\" ]; then ${priv}\"\$_wt_k\" \"\$@\"; else ${priv}sh -c 'kill \"\$@\"' sh \"\$@\"; fi; }"
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="$PROC_FN; $ek; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(_wt_ek \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
-        i=0; while _wt_pfx '$fc' '$srv' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && _wt_pfx '$fc' '$srv'; then _wt_ek -9 \$_wt_l || true; fi"
+    KILL_FIO_CMD="$PROC_FN; $ek; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; if _wt_srv '$FIO_PIDFILE'; then _o=\$(_wt_ek \"\$_p\" 2>&1) || true; fi; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+        i=0; while _wt_srvs '$FIO_PIDFILE' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if [ \"\$i\" -ge 15 ] && _wt_srvs '$FIO_PIDFILE'; then _wt_ek -9 \$_wt_l || true; fi"
 }
 
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch base line
+    local pids=() failed=() host i priv cpus launch base line kc=()
     for host in "${HOSTS[@]}"; do
         priv=""; cpus=""
         [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
@@ -5269,7 +5362,9 @@ start_fio_servers() {
         kill_fio_cmd_v "$priv"
         run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
         pids+=($!)
+        kc+=("$host" "$KILL_FIO_CMD")
     done
+    debug3_cmds "kill command" ${kc[@]+"${kc[@]}"}
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
@@ -5334,7 +5429,7 @@ check_controller_procs() {
         die "this controller allows $(id -un) $hard processes (ulimit -Hu), and $n hosts need about $need at once: an ssh master per host, plus a subshell and an ssh client per host while a phase talks to every host ($cur already running) -- raise nproc for $(id -un) (/etc/security/limits.conf), or run from a controller that allows more"
     fi
     ulimit -Su "$need" || die "cannot raise this run's process limit to $need (ulimit -Su)"
-    log "note: raised this run's process limit (ulimit -u) from $soft to $need for $n hosts (the hard limit is $hard)"
+    debug "note: raised this run's process limit (ulimit -u) from $soft to $need for $n hosts (the hard limit is $hard)"
 }
 
 # The coordinator: fio --client holds one connection per client and raises no
@@ -5353,14 +5448,14 @@ check_coordinator_limits() {
         limit_short "$hn" "$need" \
             && die "$MASTER: fio's coordinator keeps one connection open per client, so $n clients need about $need open files, and $MASTER allows $hn (ulimit -Hn) -- raise nofile for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
         COORD_NOFILE=$need
-        log "note: $MASTER: fio's coordinator runs with its open-file limit raised from $sn to $need for $n clients (the hard limit is $hn)"
+        debug "note: $MASTER: fio's coordinator runs with its open-file limit raised from $sn to $need for $n clients (the hard limit is $hn)"
     fi
     need=$(( 3 * n + 64 ))
     if limit_short "$su" "$need"; then
         limit_short "$hu" "$need" \
             && die "$MASTER: the fio port check probes every client at once from one shell, so $n clients need about $need processes there, and $MASTER allows $hu (ulimit -Hu) -- raise nproc for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
         COORD_NPROC=$need
-        log "note: $MASTER: the port check runs with its process limit raised from $su to $need for $n clients (the hard limit is $hu)"
+        debug "note: $MASTER: the port check runs with its process limit raised from $su to $need for $n clients (the hard limit is $hu)"
     fi
 }
 
@@ -5368,7 +5463,7 @@ check_coordinator_limits() {
 # worker fanned N sessions into one multiplexed connection, past MaxSessions
 # (10) and MaxStartups, and 39 of 111 probes read as firewalls.
 verify_fio_ports() {
-    log "verifying fio port $FIO_PORT reachability from $MASTER..."
+    debug "verifying fio port $FIO_PORT reachability from $MASTER..."
     local out rc failed=() host line
     out=$(run_host "$MASTER" "$(port_probe_cmd "${HOSTS[@]}")"); rc=$?
     case "$out" in
@@ -5463,7 +5558,7 @@ teardown_wait() {   # teardown_wait <what happened> <pid> <host> [<pid> <host>].
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=()
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=() kc=()
     local -A grm=()
     # first: calibration's shape subshells, while the work dir they poll
     # still exists (a signal reached main alone; they would spin forever)
@@ -5484,7 +5579,9 @@ cleanup() {
             RUN_HOST_TIMEOUT=$TEARDOWN_STOP_S run_host "$host" "$kcmd" &
             set +m
             ph+=($! "$host")
+            kc+=("$host" "$KILL_FIO_CMD")
         done
+        debug3_cmds "kill command" "${kc[@]}"
         # These pids only: a bare wait also waits on the run-log relays, which
         # exit only after cleanup returns. That is a deadlock.
         teardown_wait "the fio stop was cut off after $TEARDOWN_STOP_S s; its server may still run" "${ph[@]}"
@@ -5500,7 +5597,7 @@ cleanup() {
         elif [ "$fio_ran" -eq 1 ]; then CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end fio-log
         else
             [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] \
-                || log "note: no fio server log to read: the run stopped before the fio servers started"
+                || debug "note: no fio server log to read: the run stopped before the fio servers started"
             CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end
         fi
         port_fail_report
@@ -5525,6 +5622,9 @@ cleanup() {
         RUN_LOCKS=()
         teardown_wait "the lock release was cut off after $TEARDOWN_LOCK_S s; the next run there needs --break-lock" "${ph[@]}"
     fi
+    # a run that ends before its log opens: the pre-log relays stop while
+    # their pipes still exist
+    stop_prelog
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         # Close every ControlMaster at once (one at a time was seconds at a few
         # hundred hosts), then drop the work dir. -q silences the banner; a
@@ -5560,6 +5660,8 @@ prompt_password_creds() {
     # a WT_PASSWORD setting is named where it was set
     setting_where WT_PASSWORD
     require_interactive "${SETTING_WHERE}-p" "use key-based auth (-i) for unattended runs"
+    # the log relays pause for the prompts (run.sh): a die here writes direct
+    relay_pause
     for ((j = 1; j <= PW_COUNT; j++)); do
         printf 'ssh login %d of %d (empty for %s): ' "$j" "$PW_COUNT" "$(id -un)" >&"$PROMPT_OUT_FD"
         IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"
@@ -5573,6 +5675,7 @@ prompt_password_creds() {
         PW_LOGINS+=("$login")
         PW_SECRETS+=("$pw")
     done
+    relay_resume
 }
 
 # One connection attempt. external: is a user-owned master alive (ssh -O
@@ -5631,7 +5734,7 @@ AUTH_ROUND=0
 declare -gA AUTH_LAST_LABEL=() AUTH_LAST_REASON=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() effs=() left=() i n=0 eff logins=() ef
+    local host pids=() effs=() left=() i n=0 eff logins=() ef won j l last rows=()
     AUTH_ROUND=$((AUTH_ROUND + 1))
     # a credential's own login wins; else the host file pins this host's
     # (one awk for the round, not one per host)
@@ -5651,19 +5754,40 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     done
     for i in "${!REMAINING[@]}"; do
         host=${REMAINING[$i]}
+        ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+        won=0
         if wait "${pids[$i]}"; then
-            n=$((n + 1))
+            won=1; n=$((n + 1))
             eff=${effs[$i]}; [ "$eff" = "." ] && eff=""
             [ "$2" != external ] || : > "$AUTH_DIR/$host.external"
             [ -z "$eff" ] || printf '%s\n' "$eff" > "$AUTH_DIR/$host.user"
             debug "$host: connected via $1"
         else
             left+=("$host")
-            ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
             auth_reason_v "$ef"
             AUTH_LAST_LABEL[$host]=$1; AUTH_LAST_REASON[$host]=$AUTH_REASON
-            if [ -n "$AUTH_REASON" ]; then debug2 "$host: $1 failed: $AUTH_REASON"
-            else debug2 "$host: $1 failed (ssh printed nothing)"; fi
+            # ssh -O check without a ControlPath: the operator runs no
+            # multiplexing session of their own, the usual case
+            case $2:$AUTH_REASON in
+                (external:*"No ControlPath specified"*) debug2 "$host: no ssh session of the operator's own" ;;
+                (*:) debug2 "$host: $1 failed (ssh printed nothing)" ;;
+                (*) debug2 "$host: $1 failed: $AUTH_REASON" ;;
+            esac
+        fi
+        # -vvv: the rest of what ssh printed on this attempt. A lost one's
+        # last non-empty line is the -vv line's already (auth_reason_v), the
+        # usual no-ControlPath answer included.
+        if debug3_on && [ -f "$ef" ]; then
+            mapfile -t rows < "$ef"
+            last=-1
+            if [ "$won" -eq 0 ]; then
+                for j in "${!rows[@]}"; do [ -z "${rows[$j]%$'\r'}" ] || last=$j; done
+            fi
+            for j in "${!rows[@]}"; do
+                l=${rows[$j]%$'\r'}
+                [ -n "$l" ] && [ "$j" -ne "$last" ] || continue
+                debug3 "$host: $1: $l"
+            done
         fi
     done
     REMAINING=()
@@ -5700,7 +5824,7 @@ establish_connections() {
     # setsid detaches the tty for OpenSSH older than 8.4, which lacks
     # SSH_ASKPASS_REQUIRE.
     SETSID_BIN=$(command -v setsid || true)
-    log "connecting to ${#HOSTS[@]} host(s)..."
+    debug "connecting to ${#HOSTS[@]} host(s)..."
     REMAINING=("${HOSTS[@]}")
     auth_round "an existing ssh session" external "" ""
     auth_round "default ssh auth" default "" ""
@@ -5941,6 +6065,7 @@ finalize_targets() {
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
     HOST_DIRS_KEY=""   # a host_dir_v map of an earlier targets.final is stale
+    debug3_rows "host file, final: " "$WORK_DIR/targets.final"
     # one awk for the fleet: the first host, in host order, whose host-file
     # engine did not pass its test there
     local bad
@@ -6014,7 +6139,7 @@ discover_engines() {
         for c in $ENGINE_ORDER; do [ -z "${known[$host $c]:-}" ] || { pick=$c; break; }; done
         if [ -z "$pick" ]; then none+=("$host"); continue; fi
         echo "$host $pick" >> "$WORK_DIR/engine.discovered"
-        log "$host: ioengine $pick discovered, the first of $ENGINE_ORDER to pass its test job: no ioengine in the host file or the jobfiles"
+        debug "$host: ioengine $pick discovered, the first of $ENGINE_ORDER to pass its test job: no ioengine in the host file or the jobfiles"
     done
     [ ${#none[@]} -gt 0 ] || return 0
     # the workdir dies with the process: quote the evidence now
@@ -6208,35 +6333,35 @@ check_cpu_pinning() {
         case "$vflags" in
             (*nolist*) ;;
             (*unbindable*)
-                log "note: $host: requested cpus ($req) include $unbindable, which this host refuses to bind -- offline, or held by another cgroup's cpuset partition; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) include $unbindable, which this host refuses to bind -- offline, or held by another cgroup's cpuset partition; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*) ;;
             (*catchall*)
                 # one note says it all: the phantom, core-0 and weka-overlap
                 # notes below would each describe a list that counts as none
-                log "note: $host: requested cpus ($req) cover every cpu fio could use, which counts as no list: the OS reserve applies as if the host file gave none; executing on $effective -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) cover every cpu fio could use, which counts as no list: the OS reserve applies as if the host file gave none; executing on $effective -- the host file keeps the list as written" ;;
             (*phantom*)
-                log "note: $host: requested cpus ($req) name cpus this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1))); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) name cpus this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1))); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*) ;;
             (*mixed*)
                 # safe with cpus_allowed_policy=split beside every list: each
                 # job holds one cpu, and single-cpu affinity cannot collapse
-                log "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
+                debug "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
         esac
         case "$vflags" in
             (*nolist*|*catchall*) ;;
             (*core0*)
-                log "note: $host: requested cpus ($req) include core 0's pair ($os0), which stays with the OS; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) include core 0's pair ($os0), which stays with the OS; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*|*catchall*) ;;
             (*overlap*)
                 # the host file keeps the operator's list AS WRITTEN;
                 # execution simply never touches weka's own cores
-                log "note: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*outside*)
@@ -6261,7 +6386,7 @@ check_cpu_pinning() {
         debug "$host: fio server will run ${under}taskset -c $effective"
     done < "$WORK_DIR/pin.verdicts"
     if [ ${#nolist_hosts[@]} -gt 0 ]; then
-        log "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
+        debug "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
     fi
 }
 
@@ -6458,7 +6583,8 @@ check_capacity() {   # check_capacity [preview]
                 # (same-named filesystems of two clusters)
                 if (n >= 3 && strip(L[3]) == "wekafs") { fs = F[1]; sub(/.*\//, "", fs); key = fs SUBSEP F[2] }
             }
-            print "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
+            # a host with nothing left to write shows at -v (bytes, not the GiB shown)
+            gated(req > 0 ? 0 : 1, "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available", "")
             # avail "" = no df line, unchecked; 0 is a full filesystem
             if (avail != "" && req > avail) {
                 over = 1
@@ -6567,7 +6693,7 @@ generate_layout() {   # generate_layout <setdir> <outdir>
     case "$2" in (*/) path="$2$LAYOUT_JOB" ;; (*) path="$2/$LAYOUT_JOB" ;; esac
     { [ -d "$2" ] || mkdir -p "$2"; } && printf '%s sha256=%s\n%s\n' "$LAYOUT_MARKER" "$sha" "$body" > "$path" \
         || return 1
-    printf 'layout: generated %s (%s namespace(s))\n' "$path" "$n"
+    debug "layout: generated $path ($n namespace(s))"
 }
 
 # --- host files (-t) --------------------------------------------------------------
@@ -6795,14 +6921,14 @@ fold_spellings() {
             kb=${HOST_ADDRS_OF[$b]:-${HOST_ADDRS_WHY_OF[$b]}}
             if [ -n "${HOST_ADDRS_OF[$a]}" ] && [ "${HOST_ADDRS_OF[$a]}" = "${HOST_ADDRS_OF[$b]}" ]; then
                 fold_rows_check "$a" "$b" "$fb" "$fa"
-                log "host $b is $a (same address): folded"
+                debug "host $b is $a (same address): folded"
                 k=$a; break
             fi
             require_interactive "$a and $b look like one host but resolve differently: choosing to fold or keep them" \
                 "drop one of the two rows, or spell the names apart"
             if confirm_explicit "$a and $b look like one host but resolve differently ($a: $ka; $b: $kb): fold them?"; then
                 fold_rows_check "$a" "$b" "$fb" "$fa"
-                log "host $b is $a (the operator's answer): folded"
+                debug "host $b is $a (the operator's answer): folded"
                 k=$a; break
             fi
         done
@@ -6866,14 +6992,14 @@ clients_setting() {
     check_hosts_once
     # under -t the host file's count line carries them
     [ "$TARGETS" -eq 1 ] \
-        || log "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
+        || debug "${#CLIENT_HOSTS[@]} host(s) from WT_CLIENTS$from, $(( ${#HOSTS[@]} - ${#CLIENT_HOSTS[@]} )) more from the command line"
 }
 
 resolve_targets_file() {
     [ "$TARGETS" -eq 1 ] || return 0
     targets_path
     [ -f "$TARGETS_FILE" ] || create_targets_file
-    log "host file: $TARGETS_FILE"
+    debug "host file: $TARGETS_FILE"
 }
 
 # With -t the file's host lines are the run's hosts, in file order; a CLI
@@ -6897,7 +7023,7 @@ hosts_from_file() {
     # a file created this run (the template) names no host: local mode
     # was settled before it was written
     if [ "$LOCAL_MODE" -eq 1 ]; then
-        log "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
+        debug "host file: $TARGETS_FILE (no host lines; running on the local host)"; return 0
     fi
     fold_spellings "$nf" "${merged[@]}"
     nf=0; nc=0
@@ -6912,11 +7038,11 @@ hosts_from_file() {
     # the WT_CLIENTS clause only when it added a host
     if [ "$nf" -gt 0 ]; then
         [ "$nw" -eq 0 ] || w="$nw from WT_CLIENTS, "
-        log "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
+        debug "host file: $TARGETS_FILE ($nf host(s) from the file, $w$nc more from the command line)"
     elif [ "$nw" -gt 0 ]; then
-        log "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
+        debug "host file: $TARGETS_FILE (no host lines; $nw host(s) from WT_CLIENTS, $nc more from the command line)"
     else
-        log "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
+        debug "host file: $TARGETS_FILE (no host lines; $nc host(s) from the command line)"
     fi
 }
 
@@ -7634,7 +7760,7 @@ settings_from_file() {
         [ -n "$name" ] || continue
         if [ -n "${CLI_SET[$name]:-}" ] || [ -n "${SETTING_SRC[$name]:-}" ]; then
             [ "$name" != WT_CLIENTS ] \
-                || log "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
+                || debug "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
             continue
         fi
         SETTING_SRC[$name]="$TARGETS_FILE:$line"
@@ -7993,7 +8119,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
             L[i] = "filename_format=" v ".$filenum"
             if (!(j in FNOTED)) {
                 FNOTED[j] = 1
-                print "note: " NM[j] ": filename_format=" v " has no $filenum, so nrfiles above 1 would open one file repeatedly; staged as " v ".$filenum" > "/dev/stderr"
+                gated(1, "note: " NM[j] ": filename_format=" v " has no $filenum, so nrfiles above 1 would open one file repeatedly; staged as " v ".$filenum", "/dev/stderr")
             }
         }
     }
@@ -8066,7 +8192,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
             if (ISOL[h] != "" && parse_cpulist(ISOL[h], IS) && set_any(IS)) {
                 parse_cpulist(CAL[h], ALL); c = 0; y = 0
                 for (v in ALL) if (v in IS) c = 1; else y = 1
-                if (c && y) print "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" > "/dev/stderr"
+                if (c && y) gated(1, "note: " h ": fio cpus " CAL[h] " span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu", "/dev/stderr")
             }
         }
         for (x = 1; x <= nh; x++) { v = work "/usable/" H[x]; print CAL[H[x]] > v; close(v) }
@@ -8109,7 +8235,7 @@ stage_hosts() {   # stage_hosts <plain|auto> <src> <directory> <label|-> <target
                     if (v + 0 > 4 * nn)
                         warn_once(h ": host-file " slot "_nj=" v " exceeds 4N (" 4 * nn "; N=" nn " usable physical cores) -- split affinity will run " ceil_div(v + 0, cap) " jobs on some cpus")
                     else if (v + 0 > cap)
-                        print "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)" > "/dev/stderr"
+                        gated(1, "note: " h ": " slot "_nj=" v " runs up to " ceil_div(v + 0, cap) " jobs per cpu (" cap " usable threads)", "/dev/stderr")
                 }
                 n = override_lines(L, n, KNOB[q], v)
                 if (q == 3) nrset = v
@@ -8393,7 +8519,7 @@ stamp_unique_names() {
             awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ") -- list cpus within it, or drop the line and staging fills it in")
         if (set_size(RUN) == set_size(REQ)) return w == v ? "" : "cpus_allowed=" w
         run = fmt_cpulist(RUN)
-        print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")" > "/dev/stderr"
+        gated(1, "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")", "/dev/stderr")
         return "cpus_allowed=" run
     }
     function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, v, hasfmt, hascpus, haspol, INS, ni, g) {
@@ -8668,13 +8794,13 @@ stage_jobfiles() {
             print (add ? "added" : "") (add && set ? " and " : "") (set ? "set in " set " line(s)" : "")
         }' "$SET_DIR/$job") \
             || die "cannot stage fallocate=none into the set's own layout job $job"
-        [ -z "$fa" ] || log "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
+        [ -z "$fa" ] || debug "NOTE: $job: fallocate=none $fa in the set's own layout job, so the sweep's block count after the layout tells a cut layout from a finished one"
     done
     if [ "$BULK" -eq 1 ]; then
         local twins
         twins=$(stage_bulk_twins "$SET_DIR") || die "cannot stage the -b 1MiB latency tests"
         if [ -n "$twins" ]; then
-            log "-b: staged the 1MiB latency test(s) $twins beside their 4k originals"
+            debug "-b: staged the 1MiB latency test(s) $twins beside their 4k originals"
         else
             log "WARNING: -b: this set has no 4k latency test to run at 1MiB" >&2
         fi
@@ -8682,7 +8808,7 @@ stage_jobfiles() {
     if cal_mode; then
         local floors
         floors=$(stage_floor_twins "$SET_DIR") || die "cannot stage the one-job latency tests"
-        [ -z "$floors" ] || log "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
+        [ -z "$floors" ] || debug "cal: staged the one-job latency test(s) $floors: one stream per client at numjobs=iodepth=nrfiles=1, beside each calibrated latency test"
     fi
     LAYOUT_OWN=$has_layout
     if [ "$has_layout" -eq 0 ]; then
@@ -8701,7 +8827,7 @@ stage_jobfiles() {
         fi
     done
     if [ -n "$lay" ] && [ "$lay" != "${JOBFILES[0]}" ]; then
-        log "layout job $lay moved to run first (a layout job is only a barrier at position one)"
+        debug "layout job $lay moved to run first (a layout job is only a barrier at position one)"
         JOBFILES=("$lay")
         [ ${#reordered[@]} -eq 0 ] || JOBFILES=("$lay" "${reordered[@]}")
     fi
@@ -8753,34 +8879,105 @@ report_items() {   # report_items <jobfile>
 # Everything printed is also written to $RUN_DIR/wekatester.log. Two fifos
 # and two relays (below), not process substitution: bash before 5.1 cannot
 # wait on a substituted process, and finalize must drain the log before
-# archiving.
+# archiving. RELAY_DIR holds the fifos of the relays up now (pre-log or run
+# log), RELAY_FILE their file, RELAY_END the stop line nothing else prints.
 RELAY_PIDS=()
-start_run_log() {
-    local p="$WORK_DIR/log"
+RELAY_DIR=""; RELAY_FILE=""; RELAY_END=""
+
+# Both relays on RELAY_DIR's fifos, forked before the exec so each inherits
+# the console it writes; then the main shell's streams go into the fifos.
+relay_start() {
+    [ -n "$RELAY_END" ] || printf -v RELAY_END 'wekatester log relay end %s %s%s' "$$" "$RANDOM" "$RANDOM"
+    run_log_relay "$RELAY_DIR/out" 1 stdout "$RELAY_FILE" "$RELAY_END" &
+    RELAY_PIDS+=($!)
+    run_log_relay "$RELAY_DIR/err" 2 stderr "$RELAY_FILE" "$RELAY_END" &
+    RELAY_PIDS+=($!)
+    exec >"$RELAY_DIR/out" 2>"$RELAY_DIR/err"
+}
+
+# Before a prompt: the stop line down each pipe by path (a signal may strike
+# inside a call's redirect; read-write, so the open never blocks), the console
+# back, then these relays' pids alone: every earlier line is on the console
+# and in the file. Until relay_resume, log writes the file direct (base.sh).
+relay_pause() {
+    local i
+    [ ${#RELAY_PIDS[@]} -gt 0 ] || return 0
+    printf '%s\n' "$RELAY_END" 1<>"$RELAY_DIR/out"
+    printf '%s\n' "$RELAY_END" 1<>"$RELAY_DIR/err"
+    exec 1>&5 2>&6
+    for i in "${RELAY_PIDS[@]}"; do wait_through "$i"; done
+    RELAY_PIDS=()
+    LOG_DIRECT=$RELAY_FILE
+}
+
+# After the answer: the same fifos and file, the relays forked anew. No-op
+# unless paused.
+relay_resume() {
+    [ -n "$RELAY_DIR" ] && [ ${#RELAY_PIDS[@]} -eq 0 ] || return 0
+    LOG_DIRECT=""
+    relay_start
+}
+
+# Before the run log opens, from the work dir's creation: the same relays copy
+# both streams to $WORK_DIR/prelog, after the lines log buffered until now.
+# start_run_log puts it at the top of wekatester.log; a run that ends first
+# drops it with the work dir (cleanup).
+PRELOG_DIR=""
+start_prelog() {
+    local p="$WORK_DIR/prelog.d"
     mkdir "$p" || die "cannot create log pipe dir $p"
     mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
-    # Forked before the exec, so each relay inherits the console it writes.
-    run_log_relay "$p/out" 1 stdout &
-    RELAY_PIDS+=($!)
-    run_log_relay "$p/err" 2 stderr &
-    RELAY_PIDS+=($!)
+    if [ ${#LOG_BUFFER[@]} -gt 0 ]; then
+        printf '%s\n' "${LOG_BUFFER[@]}" > "$WORK_DIR/prelog" || die "cannot write $WORK_DIR/prelog"
+    fi
+    LOG_BUFFERING=0; LOG_BUFFER=()
+    exec 5>&1 6>&2
+    # set before the relays: after a failed exec there, cleanup still stops them
+    RELAY_DIR=$p; RELAY_FILE=$WORK_DIR/prelog; PRELOG_DIR=$p
+    relay_start
+}
+
+# The pre-log relays' end: paused, then retired, the console fds closed.
+# Called by start_run_log and by cleanup; a second call (the EXIT trap's after
+# an interrupted one) finishes the wait and returns.
+stop_prelog() {
+    [ -n "$PRELOG_DIR" ] || return 0
+    relay_pause
+    PRELOG_DIR=""; RELAY_DIR=""; RELAY_FILE=""; LOG_DIRECT=""
+    exec 5>&- 6>&-
+}
+
+start_run_log() {
+    local p="$WORK_DIR/log"
+    stop_prelog
+    # the lines before this open the file; the relays append after them
+    [ ! -f "$WORK_DIR/prelog" ] || cp -- "$WORK_DIR/prelog" "$RUN_DIR/wekatester.log" \
+        || log "WARNING: could not copy the lines printed before the run log into $RUN_DIR/wekatester.log" >&2
+    mkdir "$p" || die "cannot create log pipe dir $p"
+    mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
     # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
     # already closed by the time the run phase starts).
-    exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
+    exec 5>&1 6>&2
+    RELAY_DIR=$p; RELAY_FILE=$RUN_DIR/wekatester.log
+    relay_start
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
 # Each fifo line goes to the log file and to a live console. A failed console
 # write retires it with a notice; the relay exits 1. Group signals ignored,
-# EOF ends it (a group INT was seen to end an async subshell). Builtins
-# only: no child inherits that.
-run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
-    local l ts con=1
+# EOF or the stop line ends it (a group INT was seen to end an async
+# subshell). Builtins only: no child inherits that.
+run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name> <file> <stop line or "">
+    local l ts con=1 lv
     trap '' INT TERM HUP QUIT PIPE
-    exec 7>>"$RUN_DIR/wekatester.log"
+    exec 7>>"$4"
     while IFS= read -r l || [ -n "$l" ]; do
+        [ -z "$5" ] || [ "$l" != "$5" ] || break
+        # a gated line (debug_at): the file always, the console at its level
+        lv=0
+        case $l in ($'\037'[1-3]*) lv=${l:1:1}; l=${l:2} ;; esac
         printf '%s\n' "$l" >&7
-        [ -z "$con" ] || printf '%s\n' "$l" >&"$2" 2>&7 || {
+        [ -z "$con" ] || [ "$VERBOSITY" -lt "$lv" ] || printf '%s\n' "$l" >&"$2" 2>&7 || {
             con=""; printf -v ts '%(%H:%M:%S)T' -1
             printf '%s console lost (%s): the rest of this log is in the file alone\n' "$ts" "$3" >&7
         }
@@ -8860,12 +9057,13 @@ $(sysinfo_nic_cmd)"
 # cut off keeps its partial capture, which says where it stopped and which
 # bound, plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc f pids=() hs=() k=${CAPTURE_BOUND:-WT_SYSINFO_TIMEOUT} t
+    local host i rc f pids=() hs=() sc=() k=${CAPTURE_BOUND:-WT_SYSINFO_TIMEOUT} t
     t=${!k:-300}
     for host in "${HOSTS[@]}"; do
         ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
-        pids+=($!); hs+=("$host")
+        pids+=($!); hs+=("$host"); sc+=("$host" "$3")
     done
+    debug3_cmds "sysinfo command ($1)" "${sc[@]}"
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" && continue
         rc=$?
@@ -9176,6 +9374,9 @@ finalize_run_dir() {
         wait "${RELAY_PIDS[1]}"; [ $? -ne 1 ] || err_lost=1
         RELAY_PIDS=()
     fi
+    # retired (or still paused for a prompt the run ended at): the file is
+    # archived next, so nothing resumes or writes it direct from here
+    RELAY_DIR=""; RELAY_FILE=""; LOG_DIRECT=""
     if [ "${TEARDOWN_ABORT:-0}" -eq 1 ]; then
         # a second INT or TERM during the teardown: no archive, the dir stays
         if [ -z "$out_lost" ]; then log "run bundle skipped (Ctrl-C during the teardown): the run directory is left uncompressed at $RUN_DIR"
@@ -9602,9 +9803,9 @@ stage_layout_writes() {
         [ -n "$h" ] || continue
         if [ "$nf" -gt 0 ]; then
             nh=$((nh + 1)); tf=$((tf + nf)); tb=$((tb + by))
-            log "layout: $h: $nf file(s) missing, short or sparse, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
+            debug "layout: $h: $nf file(s) missing, short or sparse, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
         elif [ "$re" -gt 0 ]; then
-            log "layout: $h: nothing to write ($re file(s) reused)"
+            debug "layout: $h: nothing to write ($re file(s) reused)"
         fi
         [ "$LAYOUT_OWN" -eq 1 ] || [ "$kept" -eq 0 ] || log "WARNING: $h: $kept layout section(s) the sweep cannot size stay create_only (a size off 4KiB, no filesize, or a format variable wekatester cannot expand): an interrupted layout there can leave full-size files with holes" >&2
     done <<<"$out"
@@ -9753,7 +9954,7 @@ run_jobs() {
                 continue
             fi
             [ ${#lclients[@]} -eq ${#HOSTS[@]} ] \
-                || log "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
+                || debug "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
             cmd=$(fio_client_cmd "$job" "${lclients[@]}")
             log "laying out files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
@@ -9800,7 +10001,8 @@ run_jobs() {
         fi
         report=$(report_items "$SET_DIR/$job") || die "cannot read the report directive of $job"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
-        debug "running on $MASTER: $cmd"
+        PHASE_T0=$SECONDS   # -vvv times the measured job alone
+        debug2 "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
             || die "fio run failed for $job (partial output in $outfile)"
         check_fio_errors "$outfile" measured \
@@ -9810,9 +10012,8 @@ run_jobs() {
         # tar probe (GNU tar reads the whole file looking for a header).
         summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
             || summ_job_failed "$job"
+        phase_done "job $job"
     done
-    log "raw fio results: $RUN_DIR/"
-    echo
 }
 
 # $1 a results .json, or a bundle .tgz (every results file in job order,
@@ -10529,18 +10730,25 @@ main() {
     validate_credentials
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
-    echo
+    log_blank
 
     # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
     # trap alone runs cleanup (shapes first: INT reaches main alone) and
     # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
     # fio still stops, no bundle. PIPE caught, not ignored: children keep
     # the default. Set before the work dir exists, so no stop leaks it.
-    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
+    # A signal inside "IFS= read" (a prompt's key) runs the traps with that
+    # empty IFS: the teardown's unquoted $SSH_OPTS reached ssh as one word,
+    # leaving the lock and fio. The EXIT trap restores the default first.
+    DEFAULT_IFS=$' \t\n'
+    trap 'rc=$?; IFS=$DEFAULT_IFS; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; PHASE_T0=$SECONDS; teardown_notice "$rc"; cleanup; phase_done teardown; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap ':' PIPE
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
+    # from here every line printed reaches the run log (run.sh)
+    start_prelog
+    PHASE_T0=$SECONDS
     make_ctrl_dir
     mkdir -p "$WORK_DIR/jobs"
     # One connection per host, multiplexed, for the WHOLE run (cleanup -O exit
@@ -10558,11 +10766,14 @@ main() {
         resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
             - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
             || die "host file resolution failed ($TARGETS_FILE)"
+        debug3_rows "host file, phase 1: " "$WORK_DIR/targets.phase1"
     fi
     check_controller_procs
-    [ "$LOCAL_MODE" -eq 1 ] || establish_connections
+    if [ "$LOCAL_MODE" -eq 0 ]; then establish_connections; phase_done connect; fi
     preflight
+    phase_done preflight
     verify_mount_mode
+    phase_done mount
     # -p, a -t host file created on the way, and a destination created by the
     # mount pass open the prompt fd: it closes before the run so no child
     # inherits the terminal.
@@ -10606,35 +10817,42 @@ main() {
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     record_run
     start_run_log
-    replay_prerun_warnings
     snapshot_sysinfo
     snapshot_pressure start
+    phase_done sysinfo
     # every run probes and pins: only the probe knows where weka's pinned
     # cores are, and fio never lands on them (Frank, 2026-09-29)
     probe_workers
     check_coordinator_limits
+    phase_done probe
     if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
         test_engines
         finalize_targets
     fi
     discover_engines
+    phase_done engines
     check_cpu_pinning
     # every check but capacity has passed: who shares a destination
     collect_fs_groups
     cal_preflight
     start_fio_servers
     verify_fio_ports
+    phase_done "fio servers"
     calibrate
+    phase_done calibration
     stage_jobfiles
+    phase_done stage
     # the layout job's content is the sweep's answer: staged after it, pushed
     # once it is final
     sweep_layout_grid
     stage_layout_writes
     check_capacity
+    phase_done "layout plan"
     push_jobfiles
     writeback_targets
     snapshot_jobfiles
     check_mounts_unchanged
+    phase_done push
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
     # every job ran; a summary that failed (summ_job_failed) makes the

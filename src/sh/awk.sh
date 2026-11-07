@@ -26,7 +26,12 @@ IFS= read -r -d '' WEKA_AWK <<'AWKLIB' || :
 AWKLIB
 
 awkrun() {   # awkrun <program> <arg>... -- WEKA_AWK prepended, LC_ALL=C
+    # gate_mode, for base.awk's gated: relay while the run log's relays run,
+    # else the verbosity
+    local gate=$VERBOSITY
+    [ ${#RELAY_PIDS[@]} -eq 0 ] || gate=relay
     LC_ALL=C awk "$WEKA_AWK
+function gate_mode() { return \"$gate\" }
 function geom_slots() { return \"$GEOM_SLOTS\" }
 function geom_names() { return \"$GEOM_NAMES\" }
 function layout_job() { return \"$LAYOUT_JOB\" }

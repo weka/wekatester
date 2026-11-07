@@ -199,6 +199,7 @@ finalize_targets() {
         "$WORK_DIR/engine.results" "${HOSTS[@]}" > "$WORK_DIR/targets.final" \
         || die "host file resolution failed ($TARGETS_FILE)"
     HOST_DIRS_KEY=""   # a host_dir_v map of an earlier targets.final is stale
+    debug3_rows "host file, final: " "$WORK_DIR/targets.final"
     # one awk for the fleet: the first host, in host order, whose host-file
     # engine did not pass its test there
     local bad
@@ -258,7 +259,7 @@ discover_engines() {
         for c in $ENGINE_ORDER; do [ -z "${known[$host $c]:-}" ] || { pick=$c; break; }; done
         if [ -z "$pick" ]; then none+=("$host"); continue; fi
         echo "$host $pick" >> "$WORK_DIR/engine.discovered"
-        log "$host: ioengine $pick discovered, the first of $ENGINE_ORDER to pass its test job: no ioengine in the host file or the jobfiles"
+        debug "$host: ioengine $pick discovered, the first of $ENGINE_ORDER to pass its test job: no ioengine in the host file or the jobfiles"
     done
     [ ${#none[@]} -gt 0 ] || return 0
     # the workdir dies with the process: quote the evidence now
@@ -324,35 +325,35 @@ check_cpu_pinning() {
         case "$vflags" in
             (*nolist*) ;;
             (*unbindable*)
-                log "note: $host: requested cpus ($req) include $unbindable, which this host refuses to bind -- offline, or held by another cgroup's cpuset partition; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) include $unbindable, which this host refuses to bind -- offline, or held by another cgroup's cpuset partition; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*) ;;
             (*catchall*)
                 # one note says it all: the phantom, core-0 and weka-overlap
                 # notes below would each describe a list that counts as none
-                log "note: $host: requested cpus ($req) cover every cpu fio could use, which counts as no list: the OS reserve applies as if the host file gave none; executing on $effective -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) cover every cpu fio could use, which counts as no list: the OS reserve applies as if the host file gave none; executing on $effective -- the host file keeps the list as written" ;;
             (*phantom*)
-                log "note: $host: requested cpus ($req) name cpus this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1))); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) name cpus this host does not have ($phantom; the host has $ncpus cpus: 0-$((ncpus - 1))); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*) ;;
             (*mixed*)
                 # safe with cpus_allowed_policy=split beside every list: each
                 # job holds one cpu, and single-cpu affinity cannot collapse
-                log "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
+                debug "note: $host: requested cpus ($req) span isolated and housekeeping cpus; per-job split affinity keeps each job on its own cpu" ;;
         esac
         case "$vflags" in
             (*nolist*|*catchall*) ;;
             (*core0*)
-                log "note: $host: requested cpus ($req) include core 0's pair ($os0), which stays with the OS; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) include core 0's pair ($os0), which stays with the OS; executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*nolist*|*catchall*) ;;
             (*overlap*)
                 # the host file keeps the operator's list AS WRITTEN;
                 # execution simply never touches weka's own cores
-                log "note: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
+                debug "note: $host: requested cpus ($req) overlap weka's dedicated cores ($dedicated); executing on the remainder ($effective) -- the host file keeps the list as written" ;;
         esac
         case "$vflags" in
             (*outside*)
@@ -377,7 +378,7 @@ check_cpu_pinning() {
         debug "$host: fio server will run ${under}taskset -c $effective"
     done < "$WORK_DIR/pin.verdicts"
     if [ ${#nolist_hosts[@]} -gt 0 ]; then
-        log "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
+        debug "note: fio stays off weka's pinned cores and core 0's pair on the ${#nolist_hosts[@]} host(s) the host file gives no cpu list (${nolist_hosts[0]}: ${nolist_eff[0]}$([ ${#nolist_hosts[@]} -eq 1 ] || printf ', ...'))"
     fi
 }
 

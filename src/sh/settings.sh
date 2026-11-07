@@ -161,7 +161,7 @@ settings_from_file() {
         [ -n "$name" ] || continue
         if [ -n "${CLI_SET[$name]:-}" ] || [ -n "${SETTING_SRC[$name]:-}" ]; then
             [ "$name" != WT_CLIENTS ] \
-                || log "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
+                || debug "$TARGETS_FILE:$line: WT_CLIENTS is not read: the environment's WT_CLIENTS replaces it whole"
             continue
         fi
         SETTING_SRC[$name]="$TARGETS_FILE:$line"

@@ -16,7 +16,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.1"
+VERSION="3.0.2"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -89,7 +89,7 @@ LOCAL_NAME=""      # local mode: the short hostname data files are prefixed with
 # Auto mode: derive system-specific fio options
 AUTO_LEVEL=""    # "", "safe", "max", "cal", or "brutal"
 IGNORE_CAPACITY=0   # 1: run even when the workload does not fit at $DIRECTORY
-BREAK_LOCK=0        # 1: clear a dead run's lock and fio before taking ours
+BREAK_LOCK=0        # 1: kill every fio and clear a dead run's lock before taking ours
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
 ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
@@ -205,9 +205,9 @@ EOF
     ;;
     (break_lock) cat <<EOF
   --break-lock            a run that died left its lock, staging or fio on a
-                          host: kill wekatester's own fio there, clear its
-                          files and take the lock (fio it did not start still
-                          stops the run)
+                          host, or another fio is running there: kill every
+                          fio there, clear wekatester's files and take the
+                          lock
 EOF
     ;;
     (any_fs) cat <<EOF
@@ -299,8 +299,10 @@ EOF
 EOF
     ;;
     (verbose) cat <<EOF
-  -v             increase output verbosity: -v per-host outcomes and
-                 notes, -vv every connection attempt
+  -v             more on the console (the run log in the bundle gets
+                 every line): -v per-host outcomes and notes, -vv every
+                 connection attempt, -vvv the commands run on the hosts
+                 and each phase's seconds
 EOF
     ;;
     (version) cat <<EOF
@@ -678,18 +680,25 @@ main() {
     validate_credentials
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
-    echo
+    log_blank
 
     # Signals exit: a bare INT/TERM trap would RESUME after cleanup. The EXIT
     # trap alone runs cleanup (shapes first: INT reaches main alone) and
     # finalizes the bundle; there a second INT or TERM sets TEARDOWN_ABORT:
     # fio still stops, no bundle. PIPE caught, not ignored: children keep
     # the default. Set before the work dir exists, so no stop leaks it.
-    trap 'rc=$?; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; teardown_notice "$rc"; cleanup; finalize_run_dir; exit $rc' EXIT
+    # A signal inside "IFS= read" (a prompt's key) runs the traps with that
+    # empty IFS: the teardown's unquoted $SSH_OPTS reached ssh as one word,
+    # leaving the lock and fio. The EXIT trap restores the default first.
+    DEFAULT_IFS=$' \t\n'
+    trap 'rc=$?; IFS=$DEFAULT_IFS; RUN_RC=$rc; trap "TEARDOWN_ABORT=1" INT TERM; PHASE_T0=$SECONDS; teardown_notice "$rc"; cleanup; phase_done teardown; finalize_run_dir; exit $rc' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap ':' PIPE
     WORK_DIR=$(mktemp -d "$STAGE_BASE/wt.XXXXXX") || die "cannot create staging dir in $STAGE_BASE"
+    # from here every line printed reaches the run log (run.sh)
+    start_prelog
+    PHASE_T0=$SECONDS
     make_ctrl_dir
     mkdir -p "$WORK_DIR/jobs"
     # One connection per host, multiplexed, for the WHOLE run (cleanup -O exit
@@ -707,11 +716,14 @@ main() {
         resolve_targets phase1 "$TARGETS_FILE" "${ENGINE:--}" "$CLI_DIR" \
             - "${HOSTS[@]}" > "$WORK_DIR/targets.phase1" \
             || die "host file resolution failed ($TARGETS_FILE)"
+        debug3_rows "host file, phase 1: " "$WORK_DIR/targets.phase1"
     fi
     check_controller_procs
-    [ "$LOCAL_MODE" -eq 1 ] || establish_connections
+    if [ "$LOCAL_MODE" -eq 0 ]; then establish_connections; phase_done connect; fi
     preflight
+    phase_done preflight
     verify_mount_mode
+    phase_done mount
     # -p, a -t host file created on the way, and a destination created by the
     # mount pass open the prompt fd: it closes before the run so no child
     # inherits the terminal.
@@ -755,35 +767,42 @@ main() {
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     record_run
     start_run_log
-    replay_prerun_warnings
     snapshot_sysinfo
     snapshot_pressure start
+    phase_done sysinfo
     # every run probes and pins: only the probe knows where weka's pinned
     # cores are, and fio never lands on them (Frank, 2026-09-29)
     probe_workers
     check_coordinator_limits
+    phase_done probe
     if [ -n "$AUTO_LEVEL" ] || [ "$TARGETS" -eq 1 ] || [ -n "$ENGINE" ]; then
         test_engines
         finalize_targets
     fi
     discover_engines
+    phase_done engines
     check_cpu_pinning
     # every check but capacity has passed: who shares a destination
     collect_fs_groups
     cal_preflight
     start_fio_servers
     verify_fio_ports
+    phase_done "fio servers"
     calibrate
+    phase_done calibration
     stage_jobfiles
+    phase_done stage
     # the layout job's content is the sweep's answer: staged after it, pushed
     # once it is final
     sweep_layout_grid
     stage_layout_writes
     check_capacity
+    phase_done "layout plan"
     push_jobfiles
     writeback_targets
     snapshot_jobfiles
     check_mounts_unchanged
+    phase_done push
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
     # every job ran; a summary that failed (summ_job_failed) makes the

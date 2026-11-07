@@ -105,7 +105,8 @@ BEGIN {
             # (same-named filesystems of two clusters)
             if (n >= 3 && strip(L[3]) == "wekafs") { fs = F[1]; sub(/.*\//, "", fs); key = fs SUBSEP F[2] }
         }
-        print "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available"
+        # a host with nothing left to write shows at -v (bytes, not the GiB shown)
+        gated(req > 0 ? 0 : 1, "capacity" before ": " h " needs ~" gib(req) "GiB" (credit ? " (~" gib(credit) "GiB already laid out)" : "") ", has " gib(avail) "GiB available", "")
         # avail "" = no df line, unchecked; 0 is a full filesystem
         if (avail != "" && req > avail) {
             over = 1

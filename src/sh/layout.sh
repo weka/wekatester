@@ -75,5 +75,5 @@ generate_layout() {   # generate_layout <setdir> <outdir>
     case "$2" in (*/) path="$2$LAYOUT_JOB" ;; (*) path="$2/$LAYOUT_JOB" ;; esac
     { [ -d "$2" ] || mkdir -p "$2"; } && printf '%s sha256=%s\n%s\n' "$LAYOUT_MARKER" "$sha" "$body" > "$path" \
         || return 1
-    printf 'layout: generated %s (%s namespace(s))\n' "$path" "$n"
+    debug "layout: generated $path ($n namespace(s))"
 }

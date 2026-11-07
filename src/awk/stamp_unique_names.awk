@@ -14,7 +14,7 @@ function trim_cpus(host, path, s, cpus,    v, w, job, REQ, EFF, RUN, c, run) {
         awk_fail(host ": jobfile " job ": cpus_allowed (" v ") names no cpu fio may use on this host (" cpus ") -- list cpus within it, or drop the line and staging fills it in")
     if (set_size(RUN) == set_size(REQ)) return w == v ? "" : "cpus_allowed=" w
     run = fmt_cpulist(RUN)
-    print "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")" > "/dev/stderr"
+    gated(1, "note: " host ": jobfile " job ": cpus_allowed (" v ") includes cpus outside this host\047s fio cpus (" cpus "); executing on the remainder (" run ")", "/dev/stderr")
     return "cpus_allowed=" run
 }
 function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, v, hasfmt, hascpus, haspol, INS, ni, g) {

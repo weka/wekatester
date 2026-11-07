@@ -105,8 +105,10 @@ WT_DURATION=
 #                  so the next calibration can reuse them
 WT_UNLINK=0
 #
-#   -v             increase output verbosity: -v per-host outcomes and
-#                  notes, -vv every connection attempt
+#   -v             more on the console (the run log in the bundle gets
+#                  every line): -v per-host outcomes and notes, -vv every
+#                  connection attempt, -vvv the commands run on the hosts
+#                  and each phase's seconds
 WT_VERBOSE=0
 #
 # WT_ENGINE_TEST_TIMEOUT: seconds an ioengine's test job may run before it is killed and counts as a failure (default 15)

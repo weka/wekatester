@@ -1,32 +1,75 @@
 # --- logging -----------------------------------------------------------------
-log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; echo "$ts $*"; }
-debug() { [ "$VERBOSITY" -ge 1 ] && log "DEBUG: $*"; return 0; }
-# README, -v: -v per-host outcomes and notes, -vv every connection attempt,
-# -vvv nothing more yet
-debug2() { [ "$VERBOSITY" -ge 2 ] && log "DEBUG: $*"; return 0; }
-debug3() { [ "$VERBOSITY" -ge 3 ] && log "DEBUG: $*"; return 0; }
+# Until the pre-log relays start (start_prelog), the main shell's lines are
+# also kept here; they open the run log. While the relays are paused for a
+# prompt (run.sh relay_pause), LOG_DIRECT names the log file and each line is
+# appended to it here, in program order.
+LOG_BUFFERING=1; LOG_BUFFER=()
+LOG_DIRECT=""
+log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts $*"); [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts $*" >> "$LOG_DIRECT"; echo "$ts $*"; }
+log_blank() { [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=(""); [ -z "$LOG_DIRECT" ] || echo >> "$LOG_DIRECT"; echo; }
+# A gated line. While a relay runs, every level reaches the file: the line
+# goes out marked with \037 and its level, and the relay shows it on the
+# console only at that verbosity (each line of a multi-line text is marked).
+# Otherwise it is buffered or written direct (above) and printed at its level.
+debug_at() {   # debug_at <level> <text>
+    local ts
+    printf -v ts '%(%H:%M:%S)T' -1
+    if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
+        printf '\037%s%s DEBUG: %s\n' "$1" "$ts" "${2//$'\n'/$'\n\037'$1}"
+    else
+        [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts DEBUG: $2")
+        [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts DEBUG: $2" >> "$LOG_DIRECT"
+        [ "$VERBOSITY" -lt "$1" ] || echo "$ts DEBUG: $2"
+    fi
+    return 0
+}
+# README, -v: the console's level (the run log gets every line): -v per-host
+# outcomes and notes, -vv every connection attempt, -vvv the commands run on
+# the hosts and each phase's seconds
+debug()  { debug_at 1 "$*"; }
+debug2() { debug_at 2 "$*"; }
+debug3() { debug_at 3 "$*"; }
 die()   { log "ERROR: $*" >&2; exit 1; }
 
-# Warnings raised before the run log opens, replayed once into the log FILE
-# (not stderr: the console saw them live).
-PRERUN_WARNINGS=()
-warn_prerun() {
-    local w
-    log "WARNING: $*" >&2
-    for w in "${PRERUN_WARNINGS[@]}"; do
-        [ "$w" != "$*" ] || return 0
-    done
-    PRERUN_WARNINGS+=("$*")
+# -vvv helpers, which do nothing when the line would go nowhere (no relay or
+# direct file, and a console below -vvv)
+debug3_on() { [ ${#RELAY_PIDS[@]} -gt 0 ] || [ -n "$LOG_DIRECT" ] || [ "$VERBOSITY" -ge 3 ]; }
+debug3_rows() {   # debug3_rows <prefix> <file>: each line of the file
+    debug3_on && [ -f "$2" ] || return 0
+    local l
+    while IFS= read -r l || [ -n "$l" ]; do debug3 "$1$l"; done < "$2"
+    return 0
 }
-replay_prerun_warnings() {
-    local w f="$RUN_DIR/wekatester.log"
-    # Gated on the run directory, not the file: the background relays may not
-    # have created it yet.
-    [ ${#PRERUN_WARNINGS[@]} -gt 0 ] && [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] || return 0
-    for w in "${PRERUN_WARNINGS[@]}"; do
-        log "WARNING (before the run log opened): $w" >> "$f"
+# Each distinct command once, naming its hosts (eight, then +N more): every
+# run's log holds the -vvv lines, so per-host copies would bloat it.
+debug3_cmds() {   # debug3_cmds <what> <host> <command> [<host> <command>]...
+    debug3_on || return 0
+    local what=$1 c n s names cmds=()
+    local -A who=() cnt=()
+    shift
+    while [ $# -ge 2 ]; do
+        if [ -z "${who[$2]+set}" ]; then
+            cmds+=("$2"); who[$2]=$1; cnt[$2]=1
+        else
+            n=${cnt[$2]}; cnt[$2]=$((n + 1))
+            [ "$n" -ge 8 ] || who[$2]+=", $1"
+        fi
+        shift 2
+    done
+    for c in ${cmds[@]+"${cmds[@]}"}; do
+        n=${cnt[$c]}; names=${who[$c]}; s=s
+        [ "$n" -le 8 ] || names+=", +$((n - 8)) more"
+        [ "$n" -ne 1 ] || s=""
+        debug3 "$what ($n host$s: $names): $c"
     done
 }
+# -vvv: a phase's seconds, from the end of the one before (PHASE_T0, main)
+PHASE_T0=0
+phase_done() { debug3 "$1: $((SECONDS - PHASE_T0))s"; PHASE_T0=$SECONDS; }
+
+# A warning raised before the run log opens: the pre-log relays carry it into
+# the file like any other line.
+warn_prerun() { log "WARNING: $*" >&2; }
 
 # --- transport ----------------------------------------------------------------
 # The only two places that know whether a host is remote. A command string
@@ -137,12 +180,15 @@ copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
 # A host may lack procps: remote commands walk /proc (_wt_proc, else /proc),
 # not ps, pgrep or pkill. _wt_args <pid> sets _wt_a to its args, <defunct>
 # for a zombie, or returns 1; _wt_comm <name>... prints the pids so named;
-# _wt_pfx <name> <prefix> sets _wt_l to those whose args start with prefix;
+# _wt_srv <pidfile>: _wt_a is wekatester's fio server, argv[1] --server and
+# argv[2] --daemonize=<pidfile> exactly, whatever argv[0] (a shell's argv[1]
+# is -c); _wt_srvs <pidfile> sets _wt_l to every such pid, any name;
 # _wt_kbin prints the kill binary on PATH (command -v names the builtin;
 # only an expansion splits on IFS, so the fallback dirs join a variable).
 PROC_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < \"\${_wt_proc:-/proc}/\$1/cmdline\") || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat \"\${_wt_proc:-/proc}/\$1/stat\" 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }; \
 _wt_comm() { awk -v w=\"\$*\" 'BEGIN { n = split(w, N, \" \"); for (i = 1; i <= n; i++) W[N[i]]; for (i = 1; i < ARGC; i++) { f = ARGV[i] \"/comm\"; if (((getline c < f) > 0) && (c in W)) { p = ARGV[i]; sub(/.*\\//, \"\", p); print p }; close(f) } }' \"\${_wt_proc:-/proc}\"/[0-9]*; }; \
-_wt_pfx() { _wt_l=; for _wt_q in \$(_wt_comm \"\$1\"); do _wt_args \$_wt_q || continue; case \$_wt_a in \"\$2\"*) _wt_l=\"\$_wt_l \$_wt_q\" ;; esac; done; [ -n \"\$_wt_l\" ]; }; \
+_wt_srv() { case \${_wt_a#* } in \"--server --daemonize=\$1\"|\"--server --daemonize=\$1 \"*) return 0 ;; esac; return 1; }; \
+_wt_srvs() { _wt_l=; for _wt_f in \$(grep -l -s -F -e \"--daemonize=\$1\" \"\${_wt_proc:-/proc}\"/[0-9]*/cmdline); do _wt_q=\${_wt_f%/cmdline}; _wt_q=\${_wt_q##*/}; _wt_args \$_wt_q || continue; ! _wt_srv \"\$1\" || _wt_l=\"\$_wt_l \$_wt_q\"; done; [ -n \"\$_wt_l\" ]; }; \
 _wt_kbin() { (_wt_p=\$PATH:/usr/bin:/bin; IFS=:; for _wt_d in \$_wt_p; do if [ -n \"\$_wt_d\" ] && [ -f \"\$_wt_d/kill\" ] && [ -x \"\$_wt_d/kill\" ]; then echo \"\$_wt_d/kill\"; exit 0; fi; done; exit 1); }"
 
 # Every passwordless escalator a sweep tries, in this order (site tools
@@ -169,7 +215,7 @@ resolve_local_mode() {
     HOSTS=(localhost)
     MASTER=localhost
     LOCAL_NAME=$(local_short_hostname)
-    log "no servers given: running on the local host (no ssh required)"
+    debug "no servers given: running on the local host (no ssh required)"
     debug "local mode: data files are prefixed ${LOCAL_NAME:-localhost}. (host_name)"
 }
 
@@ -290,9 +336,12 @@ prompt_key() {   # prompt_key <timeout-seconds|0>
 }
 
 # Enter/y/space yes, Esc/n no; any other key or none takes the default, so
-# there is no re-prompt loop. Returns 0 for yes.
+# there is no re-prompt loop. Returns 0 for yes. The log relays pause from
+# the question to the answer's log line (run.sh): nothing earlier is still
+# queued when the question shows, and the answer precedes the caller's die.
 confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
     local secs=$1 default=$2 msg=$3 answer
+    relay_pause
     prompt_say "$msg [Enter/y = yes, Esc/n = no] (${secs}s -> $default) "
     prompt_key "$secs"
     case "$PROMPT_KEY" in
@@ -302,17 +351,20 @@ confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
     esac
     prompt_line "$answer"
     log "$msg $answer"
+    relay_resume
     [ "$answer" = yes ]
 }
 
 # Untimed: only y means yes; Enter takes the no the prompt shows.
 confirm_explicit() {   # confirm_explicit <message>
     local answer=no
+    relay_pause
     prompt_say "$1 [y/N] "
     if prompt_key 0; then
         case "$PROMPT_KEY" in (y|Y) answer=yes ;; esac
     fi
     prompt_line "$answer"
     log "$1 $answer"
+    relay_resume
     [ "$answer" = yes ]
 }

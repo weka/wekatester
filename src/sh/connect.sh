@@ -8,8 +8,8 @@ RUN_RC=0
 
 # Kill the pidfile daemon and wait until every process of ours is gone (TERM
 # up to 3s, then KILL). fio --server forks a child per connection, so the
-# drain matches the full command line, anchored to the fio binary and
-# carrying the pidfile path.
+# drain matches every process whose argv[1] and argv[2] are the server's
+# --server --daemonize=<pidfile> (base.sh _wt_srv).
 kill_fio_cmd() {   # kill_fio_cmd [priv]
     kill_fio_cmd_v "$1"
     printf '%s' "$KILL_FIO_CMD"
@@ -19,26 +19,25 @@ kill_fio_cmd() {   # kill_fio_cmd [priv]
 # looks again before the -9.
 kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
     # An escalated server is root-owned: the kill needs the same escalator.
-    # The match is fio's name and args STARTING with the server's command:
-    # this shell carries that command in its own cmdline (an unanchored
-    # pkill -9 once killed the teardown). taskset execs fio, so argv starts
-    # with the binary.
-    local priv=${1:+$1 } srv="$FIO_BIN --server --daemonize=$FIO_PIDFILE" fc=${FIO_BIN##*/} ek="_wt_ek() { kill \"\$@\"; }"
-    fc=${fc:0:15}   # a process name (comm) holds 15 bytes
+    # The match is argv[1] and argv[2] exactly (_wt_srv), whatever runs as
+    # argv[0]: a -f wrapper that execs fio shows the real binary. This
+    # shell carries the server's command in its own cmdline, and an
+    # unanchored pkill -9 once killed the teardown.
+    local priv=${1:+$1 } ek="_wt_ek() { kill \"\$@\"; }"
     # escalated: the kill binary (a sudoers rule may allow only it), else,
     # with no procps, the shell's own kill under the escalator
     [ -z "$priv" ] || ek="_wt_k=\$(_wt_kbin) || _wt_k=; _wt_ek() { if [ -n \"\$_wt_k\" ]; then ${priv}\"\$_wt_k\" \"\$@\"; else ${priv}sh -c 'kill \"\$@\"' sh \"\$@\"; fi; }"
     # The pidfile's pid gets the TERM only while its args still read as our
     # server: one that died uncleanly leaves a pid the kernel may reuse.
-    KILL_FIO_CMD="$PROC_FN; $ek; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; case \"\$_wt_a\" in '$srv'*) _o=\$(_wt_ek \"\$_p\" 2>&1) || true ;; esac; ${priv}rm -f '$FIO_PIDFILE'; fi; \
-        i=0; while _wt_pfx '$fc' '$srv' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
-        if [ \"\$i\" -ge 15 ] && _wt_pfx '$fc' '$srv'; then _wt_ek -9 \$_wt_l || true; fi"
+    KILL_FIO_CMD="$PROC_FN; $ek; if [ -f '$FIO_PIDFILE' ]; then _p=\$(cat '$FIO_PIDFILE'); _wt_args \"\$_p\" || :; if _wt_srv '$FIO_PIDFILE'; then _o=\$(_wt_ek \"\$_p\" 2>&1) || true; fi; ${priv}rm -f '$FIO_PIDFILE'; fi; \
+        i=0; while _wt_srvs '$FIO_PIDFILE' && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; \
+        if [ \"\$i\" -ge 15 ] && _wt_srvs '$FIO_PIDFILE'; then _wt_ek -9 \$_wt_l || true; fi"
 }
 
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch base line
+    local pids=() failed=() host i priv cpus launch base line kc=()
     for host in "${HOSTS[@]}"; do
         priv=""; cpus=""
         [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
@@ -58,7 +57,9 @@ start_fio_servers() {
         kill_fio_cmd_v "$priv"
         run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
         pids+=($!)
+        kc+=("$host" "$KILL_FIO_CMD")
     done
+    debug3_cmds "kill command" ${kc[@]+"${kc[@]}"}
     FIO_STARTED=1   # set before checking: partial starts must still be torn down
     for i in "${!HOSTS[@]}"; do
         wait "${pids[$i]}" || failed+=("${HOSTS[$i]}")
@@ -123,7 +124,7 @@ check_controller_procs() {
         die "this controller allows $(id -un) $hard processes (ulimit -Hu), and $n hosts need about $need at once: an ssh master per host, plus a subshell and an ssh client per host while a phase talks to every host ($cur already running) -- raise nproc for $(id -un) (/etc/security/limits.conf), or run from a controller that allows more"
     fi
     ulimit -Su "$need" || die "cannot raise this run's process limit to $need (ulimit -Su)"
-    log "note: raised this run's process limit (ulimit -u) from $soft to $need for $n hosts (the hard limit is $hard)"
+    debug "note: raised this run's process limit (ulimit -u) from $soft to $need for $n hosts (the hard limit is $hard)"
 }
 
 # The coordinator: fio --client holds one connection per client and raises no
@@ -142,14 +143,14 @@ check_coordinator_limits() {
         limit_short "$hn" "$need" \
             && die "$MASTER: fio's coordinator keeps one connection open per client, so $n clients need about $need open files, and $MASTER allows $hn (ulimit -Hn) -- raise nofile for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
         COORD_NOFILE=$need
-        log "note: $MASTER: fio's coordinator runs with its open-file limit raised from $sn to $need for $n clients (the hard limit is $hn)"
+        debug "note: $MASTER: fio's coordinator runs with its open-file limit raised from $sn to $need for $n clients (the hard limit is $hn)"
     fi
     need=$(( 3 * n + 64 ))
     if limit_short "$su" "$need"; then
         limit_short "$hu" "$need" \
             && die "$MASTER: the fio port check probes every client at once from one shell, so $n clients need about $need processes there, and $MASTER allows $hu (ulimit -Hu) -- raise nproc for the login user on $MASTER (/etc/security/limits.conf), or name a host that allows more first"
         COORD_NPROC=$need
-        log "note: $MASTER: the port check runs with its process limit raised from $su to $need for $n clients (the hard limit is $hu)"
+        debug "note: $MASTER: the port check runs with its process limit raised from $su to $need for $n clients (the hard limit is $hu)"
     fi
 }
 
@@ -157,7 +158,7 @@ check_coordinator_limits() {
 # worker fanned N sessions into one multiplexed connection, past MaxSessions
 # (10) and MaxStartups, and 39 of 111 probes read as firewalls.
 verify_fio_ports() {
-    log "verifying fio port $FIO_PORT reachability from $MASTER..."
+    debug "verifying fio port $FIO_PORT reachability from $MASTER..."
     local out rc failed=() host line
     out=$(run_host "$MASTER" "$(port_probe_cmd "${HOSTS[@]}")"); rc=$?
     case "$out" in
@@ -252,7 +253,7 @@ teardown_wait() {   # teardown_wait <what happened> <pid> <host> [<pid> <host>].
 }
 
 cleanup() {
-    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=()
+    local host f priv pids=() kcmd i fio_ran=$FIO_STARTED ph=() kc=()
     local -A grm=()
     # first: calibration's shape subshells, while the work dir they poll
     # still exists (a signal reached main alone; they would spin forever)
@@ -273,7 +274,9 @@ cleanup() {
             RUN_HOST_TIMEOUT=$TEARDOWN_STOP_S run_host "$host" "$kcmd" &
             set +m
             ph+=($! "$host")
+            kc+=("$host" "$KILL_FIO_CMD")
         done
+        debug3_cmds "kill command" "${kc[@]}"
         # These pids only: a bare wait also waits on the run-log relays, which
         # exit only after cleanup returns. That is a deadlock.
         teardown_wait "the fio stop was cut off after $TEARDOWN_STOP_S s; its server may still run" "${ph[@]}"
@@ -289,7 +292,7 @@ cleanup() {
         elif [ "$fio_ran" -eq 1 ]; then CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end fio-log
         else
             [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ] \
-                || log "note: no fio server log to read: the run stopped before the fio servers started"
+                || debug "note: no fio server log to read: the run stopped before the fio servers started"
             CAPTURE_BOUND=TEARDOWN_CAPTURE_S snapshot_pressure end
         fi
         port_fail_report
@@ -314,6 +317,9 @@ cleanup() {
         RUN_LOCKS=()
         teardown_wait "the lock release was cut off after $TEARDOWN_LOCK_S s; the next run there needs --break-lock" "${ph[@]}"
     fi
+    # a run that ends before its log opens: the pre-log relays stop while
+    # their pipes still exist
+    stop_prelog
     if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
         # Close every ControlMaster at once (one at a time was seconds at a few
         # hundred hosts), then drop the work dir. -q silences the banner; a
@@ -349,6 +355,8 @@ prompt_password_creds() {
     # a WT_PASSWORD setting is named where it was set
     setting_where WT_PASSWORD
     require_interactive "${SETTING_WHERE}-p" "use key-based auth (-i) for unattended runs"
+    # the log relays pause for the prompts (run.sh): a die here writes direct
+    relay_pause
     for ((j = 1; j <= PW_COUNT; j++)); do
         printf 'ssh login %d of %d (empty for %s): ' "$j" "$PW_COUNT" "$(id -un)" >&"$PROMPT_OUT_FD"
         IFS= read -r login <&"$PROMPT_IN_FD" || die "no login read"
@@ -362,6 +370,7 @@ prompt_password_creds() {
         PW_LOGINS+=("$login")
         PW_SECRETS+=("$pw")
     done
+    relay_resume
 }
 
 # One connection attempt. external: is a user-owned master alive (ssh -O
@@ -420,7 +429,7 @@ AUTH_ROUND=0
 declare -gA AUTH_LAST_LABEL=() AUTH_LAST_REASON=()
 auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     [ ${#REMAINING[@]} -gt 0 ] || return 0
-    local host pids=() effs=() left=() i n=0 eff logins=() ef
+    local host pids=() effs=() left=() i n=0 eff logins=() ef won j l last rows=()
     AUTH_ROUND=$((AUTH_ROUND + 1))
     # a credential's own login wins; else the host file pins this host's
     # (one awk for the round, not one per host)
@@ -440,19 +449,40 @@ auth_round() {   # auth_round <label> <mode> <login> <key-or-pw-index>
     done
     for i in "${!REMAINING[@]}"; do
         host=${REMAINING[$i]}
+        ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
+        won=0
         if wait "${pids[$i]}"; then
-            n=$((n + 1))
+            won=1; n=$((n + 1))
             eff=${effs[$i]}; [ "$eff" = "." ] && eff=""
             [ "$2" != external ] || : > "$AUTH_DIR/$host.external"
             [ -z "$eff" ] || printf '%s\n' "$eff" > "$AUTH_DIR/$host.user"
             debug "$host: connected via $1"
         else
             left+=("$host")
-            ef=$AUTH_DIR/$host.$AUTH_ROUND.err; [ "$2" != external ] || ef=$AUTH_DIR/$host.extcheck
             auth_reason_v "$ef"
             AUTH_LAST_LABEL[$host]=$1; AUTH_LAST_REASON[$host]=$AUTH_REASON
-            if [ -n "$AUTH_REASON" ]; then debug2 "$host: $1 failed: $AUTH_REASON"
-            else debug2 "$host: $1 failed (ssh printed nothing)"; fi
+            # ssh -O check without a ControlPath: the operator runs no
+            # multiplexing session of their own, the usual case
+            case $2:$AUTH_REASON in
+                (external:*"No ControlPath specified"*) debug2 "$host: no ssh session of the operator's own" ;;
+                (*:) debug2 "$host: $1 failed (ssh printed nothing)" ;;
+                (*) debug2 "$host: $1 failed: $AUTH_REASON" ;;
+            esac
+        fi
+        # -vvv: the rest of what ssh printed on this attempt. A lost one's
+        # last non-empty line is the -vv line's already (auth_reason_v), the
+        # usual no-ControlPath answer included.
+        if debug3_on && [ -f "$ef" ]; then
+            mapfile -t rows < "$ef"
+            last=-1
+            if [ "$won" -eq 0 ]; then
+                for j in "${!rows[@]}"; do [ -z "${rows[$j]%$'\r'}" ] || last=$j; done
+            fi
+            for j in "${!rows[@]}"; do
+                l=${rows[$j]%$'\r'}
+                [ -n "$l" ] && [ "$j" -ne "$last" ] || continue
+                debug3 "$host: $1: $l"
+            done
         fi
     done
     REMAINING=()
@@ -489,7 +519,7 @@ establish_connections() {
     # setsid detaches the tty for OpenSSH older than 8.4, which lacks
     # SSH_ASKPASS_REQUIRE.
     SETSID_BIN=$(command -v setsid || true)
-    log "connecting to ${#HOSTS[@]} host(s)..."
+    debug "connecting to ${#HOSTS[@]} host(s)..."
     REMAINING=("${HOSTS[@]}")
     auth_round "an existing ssh session" external "" ""
     auth_round "default ssh auth" default "" ""

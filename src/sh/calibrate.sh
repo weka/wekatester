@@ -47,7 +47,7 @@ cal_scratch_dirs() {   # cal_scratch_dirs <host> <sep> <fmt> <nj> <maxfilenum>
 fio_parse_postmortem() {   # fio_parse_postmortem <what> <host> <remote-jobfile> <outfile>
     local what=$1 host=$2 jf=$3 outf=$4 l
     if run_host "$host" "'$FIO_BIN' --parse-only '$jf'" > "$outf" 2>&1; then
-        log "note: $host: the $what jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
+        debug "note: $host: the $what jobfile parses cleanly on its host -- the jobs died at setup, not at option parsing" >&2
     else
         log "ERROR: $host: the host's own fio rejects the $what jobfile (full text: ${outf##*/} in the run bundle):" >&2
         head -5 "$outf" | while IFS= read -r l; do
@@ -301,6 +301,7 @@ apply_cal_results() {
     awkrun '#@awk apply_cal_results' "$WORK_DIR/cal.results" "$WORK_DIR/targets.final" "$REGEN_LAYOUT" "${LINE_RATE_GBPS:--}" \
         || die "cannot apply the calibration results"
     HOST_DIRS_KEY=""   # a host_dir_v map of the old targets.final is stale
+    debug3_rows "host file, after calibration: " "$WORK_DIR/targets.final"
 }
 
 # Only this cell file goes to the master, one copy per push, from a staging
@@ -419,7 +420,7 @@ SUBDIREOF
     fi
     set -- $active
     [ "$#" -le 1 ] || by=" across $# client(s) of its filesystem group"
-    log "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "$availmib" "$hd")"
+    debug "cal: seed estimate: $host ($side, ${rnj:-0}x${rnr:-0} read + ${wnj:-0}x${wnr:-0} write jobs x files$by): $(seed_estimate_line "${nfiles:-0}" "${nmib:-0}" "$availmib" "$hd")"
     if [ "${nmib:-0}" -gt 0 ]; then
         if [ -z "$availmib" ]; then
             log "WARNING: $host: cannot read free space on $hd; seeding anyway" >&2
@@ -507,7 +508,7 @@ cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
         set -- $members; n=$#
         take=$n; [ "$CAL_CLIENTS" = all ] || take=$CAL_CLIENTS
         if [ "$take" -gt "$n" ]; then
-            log "cal: shape $sid: $CAL_CLIENTS client(s) asked and the shape has $n: calibrating on $n"
+            debug "cal: shape $sid: $CAL_CLIENTS client(s) asked and the shape has $n: calibrating on $n"
             take=$n
         fi
         list=""
@@ -644,7 +645,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     # the file is the hand-off (a background cell has no other); CAL_READING
     # spares the serial callers a cat per cell
     printf '%s\n' "$CAL_READING" > "$rf" || die "cannot write the reading of ${json##*/} to $rf"
-    debug "cal: shape $CAL_SID $what ${rt}s on $rep: $CAL_READING"
+    debug2 "cal: shape $CAL_SID $what ${rt}s on $rep: $CAL_READING"
     [ "$dirn" != write ] || sleep "$CAL_SETTLE"
 }
 
@@ -695,6 +696,7 @@ cal_search_ask() {   # cal_search_ask <search-index>
     # shellcheck disable=SC2086 -- the knobs are one k=v word each
     act=$(cal_plan batch "$type" "$dirn" "$1" "$2" "$3" "$4" "${S_HIST[$i]}" ${S_KNOBS[$i]}) \
         || die "the calibration planner failed for $type $dirn (history: cal/s$CAL_SID/${S_HIST[$i]##*/} in the run bundle)"
+    debug3 "cal: shape $CAL_SID $type $dirn: planner: $act"
     S_ASK[i]=0
     case "$act" in
         ("cell "*) S_Q[i]=$act ;;
@@ -940,7 +942,7 @@ cal_shape_run() {   # cal_shape_run <id> <rep> <N> <phys-cpus> <all-cpus> <liner
             # the host file pins these knobs: they are the only values this
             # search tries, and every other knob is searched around them
             printf '%s\n' "$c" | tr '/' ' ' > "$sdir/pins-$type-$dirn"
-            log "cal: shape $sid: $type $dirn is pinned by $rep's host-file row (qd/nr/fs/nj $c): only those values are tested (-g searches everything)"
+            debug "cal: shape $sid: $type $dirn is pinned by $rep's host-file row (qd/nr/fs/nj $c): only those values are tested (-g searches everything)"
         fi
         todo="$todo$type $dirn"$'\n'
         if [ "$dirn" = read ]; then any_read=1; else any_write=1; fi
@@ -981,10 +983,10 @@ BUDEOF
     [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
     if [ "$pinned" != "-" ]; then
         eng=$pinned
-        log "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
+        debug "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
     elif [ "$ncand" -le 1 ]; then
         eng=${engines%%,*}
-        log "cal: shape $sid: ioengine $eng (the only candidate that passed its test)"
+        debug "cal: shape $sid: ioengine $eng (the only candidate that passed its test)"
     else
         : > "$sdir/engines"
         for etype in bw iops lat; do
@@ -1021,7 +1023,7 @@ BUDEOF
             for e in ${engines//,/ }; do
                 # libaio past the aio room dies with EAGAIN: rank the others
                 if [ "$e" = libaio ] && [ "$aio" != - ] && [ $((enj * eqd)) -gt "$aio" ]; then
-                    log "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
+                    debug "cal: shape $sid: no $etype engine cell for libaio: numjobs=$enj iodepth=$eqd would set up $((enj * eqd)) aio events and the kernel has room for $aio (fs.aio-max-nr less fs.aio-nr, as probed)"
                     continue
                 fi
                 E_CELL+=("$etype $ctype $edirn $e $enj $eqd $enr ${pinfs:--}")
@@ -1038,7 +1040,7 @@ BUDEOF
         done
         pick=$(cal_engine_pick "$sdir/engines") || die "cannot choose shape $sid's ioengine"
         read -r eng rest <<<"$pick"
-        log "cal: shape $sid: ioengine $eng -- $rest"
+        debug "cal: shape $sid: ioengine $eng -- $rest"
     fi
     printf '%s\n' "$eng" > "$sdir/engine"
     CAL_TODO=$todo
@@ -1198,7 +1200,7 @@ calibrate() {
     esac
     log "calibrating ($AUTO_LEVEL) $(printf '%s' "$ladders" | tr '\n' ',' | sed 's/,$//;s/,/, /g') per client shape, the shapes at once, each $on"
     if brutal_mode; then
-        log "cal: -a brutal: the same search with every early stop disabled -- every rung of every ladder is measured"
+        debug "cal: -a brutal: the same search with every early stop disabled -- every rung of every ladder is measured"
     fi
     # NOT local: the seed, every cell and the staged jobs share one namespace.
     # CAL_NS_DIR is the subdirectory under each destination ("" = itself);
@@ -1216,10 +1218,10 @@ calibrate() {
                 || die "the host name 'shared' is reserved for the fleet-shared read dataset ($host)"
         done
         CAL_NS_DIR=""; CAL_SEP="."
-        log "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
+        debug "cal: measuring on the workload's own files (filename_format=$CAL_FMT at the destination) -- reads on the shared dataset, writes on each client's own"
     else
         CAL_NS_DIR=/$CAL_SCRATCH; CAL_SEP=".cal."
-        log "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
+        debug "cal: this set's filename_format cannot express the grid; measuring in the private scratch ($CAL_SCRATCH)"
     fi
     mkdir -p "$WORK_DIR/cal"
     local shapes="$WORK_DIR/cal/shapes" line host i pids hs
@@ -1317,11 +1319,11 @@ calibrate() {
     # run keeps it for the rerun.
     if [ "$UNLINK" -eq 1 ]; then
         CAL_UNLINK_PENDING=1
-        log "cal: -u: the calibration dataset is removed after the last measured job"
+        debug "cal: -u: the calibration dataset is removed after the last measured job"
     elif [ -z "$CAL_NS_DIR" ]; then
-        log "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
+        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
     else
-        log "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
+        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2

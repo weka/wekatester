@@ -13,34 +13,105 @@ report_items() {   # report_items <jobfile>
 # Everything printed is also written to $RUN_DIR/wekatester.log. Two fifos
 # and two relays (below), not process substitution: bash before 5.1 cannot
 # wait on a substituted process, and finalize must drain the log before
-# archiving.
+# archiving. RELAY_DIR holds the fifos of the relays up now (pre-log or run
+# log), RELAY_FILE their file, RELAY_END the stop line nothing else prints.
 RELAY_PIDS=()
-start_run_log() {
-    local p="$WORK_DIR/log"
+RELAY_DIR=""; RELAY_FILE=""; RELAY_END=""
+
+# Both relays on RELAY_DIR's fifos, forked before the exec so each inherits
+# the console it writes; then the main shell's streams go into the fifos.
+relay_start() {
+    [ -n "$RELAY_END" ] || printf -v RELAY_END 'wekatester log relay end %s %s%s' "$$" "$RANDOM" "$RANDOM"
+    run_log_relay "$RELAY_DIR/out" 1 stdout "$RELAY_FILE" "$RELAY_END" &
+    RELAY_PIDS+=($!)
+    run_log_relay "$RELAY_DIR/err" 2 stderr "$RELAY_FILE" "$RELAY_END" &
+    RELAY_PIDS+=($!)
+    exec >"$RELAY_DIR/out" 2>"$RELAY_DIR/err"
+}
+
+# Before a prompt: the stop line down each pipe by path (a signal may strike
+# inside a call's redirect; read-write, so the open never blocks), the console
+# back, then these relays' pids alone: every earlier line is on the console
+# and in the file. Until relay_resume, log writes the file direct (base.sh).
+relay_pause() {
+    local i
+    [ ${#RELAY_PIDS[@]} -gt 0 ] || return 0
+    printf '%s\n' "$RELAY_END" 1<>"$RELAY_DIR/out"
+    printf '%s\n' "$RELAY_END" 1<>"$RELAY_DIR/err"
+    exec 1>&5 2>&6
+    for i in "${RELAY_PIDS[@]}"; do wait_through "$i"; done
+    RELAY_PIDS=()
+    LOG_DIRECT=$RELAY_FILE
+}
+
+# After the answer: the same fifos and file, the relays forked anew. No-op
+# unless paused.
+relay_resume() {
+    [ -n "$RELAY_DIR" ] && [ ${#RELAY_PIDS[@]} -eq 0 ] || return 0
+    LOG_DIRECT=""
+    relay_start
+}
+
+# Before the run log opens, from the work dir's creation: the same relays copy
+# both streams to $WORK_DIR/prelog, after the lines log buffered until now.
+# start_run_log puts it at the top of wekatester.log; a run that ends first
+# drops it with the work dir (cleanup).
+PRELOG_DIR=""
+start_prelog() {
+    local p="$WORK_DIR/prelog.d"
     mkdir "$p" || die "cannot create log pipe dir $p"
     mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
-    # Forked before the exec, so each relay inherits the console it writes.
-    run_log_relay "$p/out" 1 stdout &
-    RELAY_PIDS+=($!)
-    run_log_relay "$p/err" 2 stderr &
-    RELAY_PIDS+=($!)
+    if [ ${#LOG_BUFFER[@]} -gt 0 ]; then
+        printf '%s\n' "${LOG_BUFFER[@]}" > "$WORK_DIR/prelog" || die "cannot write $WORK_DIR/prelog"
+    fi
+    LOG_BUFFERING=0; LOG_BUFFER=()
+    exec 5>&1 6>&2
+    # set before the relays: after a failed exec there, cleanup still stops them
+    RELAY_DIR=$p; RELAY_FILE=$WORK_DIR/prelog; PRELOG_DIR=$p
+    relay_start
+}
+
+# The pre-log relays' end: paused, then retired, the console fds closed.
+# Called by start_run_log and by cleanup; a second call (the EXIT trap's after
+# an interrupted one) finishes the wait and returns.
+stop_prelog() {
+    [ -n "$PRELOG_DIR" ] || return 0
+    relay_pause
+    PRELOG_DIR=""; RELAY_DIR=""; RELAY_FILE=""; LOG_DIRECT=""
+    exec 5>&- 6>&-
+}
+
+start_run_log() {
+    local p="$WORK_DIR/log"
+    stop_prelog
+    # the lines before this open the file; the relays append after them
+    [ ! -f "$WORK_DIR/prelog" ] || cp -- "$WORK_DIR/prelog" "$RUN_DIR/wekatester.log" \
+        || log "WARNING: could not copy the lines printed before the run log into $RUN_DIR/wekatester.log" >&2
+    mkdir "$p" || die "cannot create log pipe dir $p"
+    mkfifo "$p/out" "$p/err" || die "cannot create log pipes in $p"
     # 5/6 keep the real console for finalize to restore (3 is the prompt tty,
     # already closed by the time the run phase starts).
-    exec 5>&1 6>&2 >"$p/out" 2>"$p/err"
+    exec 5>&1 6>&2
+    RELAY_DIR=$p; RELAY_FILE=$RUN_DIR/wekatester.log
+    relay_start
     debug "logging to $RUN_DIR/wekatester.log"
 }
 
 # Each fifo line goes to the log file and to a live console. A failed console
 # write retires it with a notice; the relay exits 1. Group signals ignored,
-# EOF ends it (a group INT was seen to end an async subshell). Builtins
-# only: no child inherits that.
-run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name>
-    local l ts con=1
+# EOF or the stop line ends it (a group INT was seen to end an async
+# subshell). Builtins only: no child inherits that.
+run_log_relay() {   # run_log_relay <fifo> <console fd> <stream name> <file> <stop line or "">
+    local l ts con=1 lv
     trap '' INT TERM HUP QUIT PIPE
-    exec 7>>"$RUN_DIR/wekatester.log"
+    exec 7>>"$4"
     while IFS= read -r l || [ -n "$l" ]; do
+        [ -z "$5" ] || [ "$l" != "$5" ] || break
+        # a gated line (debug_at): the file always, the console at its level
+        lv=0
+        case $l in ($'\037'[1-3]*) lv=${l:1:1}; l=${l:2} ;; esac
         printf '%s\n' "$l" >&7
-        [ -z "$con" ] || printf '%s\n' "$l" >&"$2" 2>&7 || {
+        [ -z "$con" ] || [ "$VERBOSITY" -lt "$lv" ] || printf '%s\n' "$l" >&"$2" 2>&7 || {
             con=""; printf -v ts '%(%H:%M:%S)T' -1
             printf '%s console lost (%s): the rest of this log is in the file alone\n' "$ts" "$3" >&7
         }
@@ -120,12 +191,13 @@ $(sysinfo_nic_cmd)"
 # cut off keeps its partial capture, which says where it stopped and which
 # bound, plus a session-timeout item.
 capture_hosts() {   # capture_hosts <what> <capture-file-prefix> <command-string>
-    local host i rc f pids=() hs=() k=${CAPTURE_BOUND:-WT_SYSINFO_TIMEOUT} t
+    local host i rc f pids=() hs=() sc=() k=${CAPTURE_BOUND:-WT_SYSINFO_TIMEOUT} t
     t=${!k:-300}
     for host in "${HOSTS[@]}"; do
         ( RUN_HOST_TIMEOUT=$t run_host "$host" "$3" > "$2$host" ) &
-        pids+=($!); hs+=("$host")
+        pids+=($!); hs+=("$host"); sc+=("$host" "$3")
     done
+    debug3_cmds "sysinfo command ($1)" "${sc[@]}"
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" && continue
         rc=$?
@@ -434,6 +506,9 @@ finalize_run_dir() {
         wait "${RELAY_PIDS[1]}"; [ $? -ne 1 ] || err_lost=1
         RELAY_PIDS=()
     fi
+    # retired (or still paused for a prompt the run ended at): the file is
+    # archived next, so nothing resumes or writes it direct from here
+    RELAY_DIR=""; RELAY_FILE=""; LOG_DIRECT=""
     if [ "${TEARDOWN_ABORT:-0}" -eq 1 ]; then
         # a second INT or TERM during the teardown: no archive, the dir stays
         if [ -z "$out_lost" ]; then log "run bundle skipped (Ctrl-C during the teardown): the run directory is left uncompressed at $RUN_DIR"
@@ -604,9 +679,9 @@ stage_layout_writes() {
         [ -n "$h" ] || continue
         if [ "$nf" -gt 0 ]; then
             nh=$((nh + 1)); tf=$((tf + nf)); tb=$((tb + by))
-            log "layout: $h: $nf file(s) missing, short or sparse, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
+            debug "layout: $h: $nf file(s) missing, short or sparse, $(awk -v b="$by" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') to write ($re reused)"
         elif [ "$re" -gt 0 ]; then
-            log "layout: $h: nothing to write ($re file(s) reused)"
+            debug "layout: $h: nothing to write ($re file(s) reused)"
         fi
         [ "$LAYOUT_OWN" -eq 1 ] || [ "$kept" -eq 0 ] || log "WARNING: $h: $kept layout section(s) the sweep cannot size stay create_only (a size off 4KiB, no filesize, or a format variable wekatester cannot expand): an interrupted layout there can leave full-size files with holes" >&2
     done <<<"$out"
@@ -749,7 +824,7 @@ run_jobs() {
                 continue
             fi
             [ ${#lclients[@]} -eq ${#HOSTS[@]} ] \
-                || log "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
+                || debug "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
             cmd=$(fio_client_cmd "$job" "${lclients[@]}")
             log "laying out files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
@@ -796,7 +871,8 @@ run_jobs() {
         fi
         report=$(report_items "$SET_DIR/$job") || die "cannot read the report directive of $job"
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
-        debug "running on $MASTER: $cmd"
+        PHASE_T0=$SECONDS   # -vvv times the measured job alone
+        debug2 "running on $MASTER: $cmd"
         run_host "$MASTER" "$cmd" > "$outfile" \
             || die "fio run failed for $job (partial output in $outfile)"
         check_fio_errors "$outfile" measured \
@@ -806,9 +882,8 @@ run_jobs() {
         # tar probe (GNU tar reads the whole file looking for a header).
         summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
             || summ_job_failed "$job"
+        phase_done "job $job"
     done
-    log "raw fio results: $RUN_DIR/"
-    echo
 }
 
 # $1 a results .json, or a bundle .tgz (every results file in job order,

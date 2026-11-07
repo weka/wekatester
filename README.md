@@ -16,7 +16,7 @@ wekatester uses fio's native client/server mode:
 - ssh and scp are the system binaries, so agent forwarding, `~/.ssh/config`, `ProxyJump`, and ssh certificates work exactly as they do for interactive ssh. Connections run in `BatchMode` — wekatester never prompts; if ssh would have prompted, the run fails fast instead. `ControlMaster` multiplexing means one authentication per host for the entire run.
 - All transient staging lives in tmpfs (`/dev/shm` locally when available, and `/dev/shm` on the remote side). The only files written to disk are the run bundles in the output directory (`./results` by default, `-o` to choose another).
 - With no servers at all, wekatester runs the whole thing on the local host over loopback — no sshd required. Every phase and guard above still runs, unchanged; only the transport is swapped for direct execution, so the results are shaped exactly like a remote run's.
-- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio (and, with two hosts or more, reads its version: one fio version across the hosts, Caveats): a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start, which it never kills. A run that died without cleaning up leaves that evidence behind: `--break-lock` kills wekatester's own fio processes on those hosts (escalating for a root fio, and never a pid the kernel has since given to another process), removes its staging and its lock, and takes the lock. It also removes every filesystem-group file (`.wekatester-group.*.lst`, below) in each host's destination, whether or not that host held other evidence. A destination shared with another controller's live run can lose that run's group file this way.
+- **One run per host.** Before anything is written, every host is checked and locked in the same session that checks for fio (and, with two hosts or more, reads its version: one fio version across the hosts, Caveats): a `/dev/shm/wekatester.lock` directory whose owner line names the controller, user, pid and start time, released when the run exits (dry runs too). Another run on a host stops this one, naming the evidence: its lock, its staging directories, or a fio process wekatester started (its server, a run reading its staging, an engine test). So does any fio process wekatester did not start. A run that died without cleaning up leaves that evidence behind, and a fio from elsewhere may still be running: `--break-lock` kills every fio process on those hosts, wekatester's and any other (escalating for a root fio, and never a pid the kernel has since given to another process), removes wekatester's staging and its lock, and takes the lock. Each fio it killed that wekatester did not start is named in one `WARNING` per host (pid, user, start time, command), which the run log keeps. It also removes every filesystem-group file (`.wekatester-group.*.lst`, below) in each host's destination, whether or not that host held other evidence. A destination shared with another controller's live run can lose that run's group file this way.
 
 # Usage
 ```
@@ -83,9 +83,9 @@ attaching is the way to pass a value that starts with a dash.
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
   --break-lock            a run that died left its lock, staging or fio on a
-                          host: kill wekatester's own fio there, clear its
-                          files and take the lock (fio it did not start still
-                          stops the run)
+                          host, or another fio is running there: kill every
+                          fio there, clear wekatester's files and take the
+                          lock
   --any-fs                turn the filesystem-type check off: -d may be on
                           any filesystem, a local disk included, and a
                           missing -d is created anywhere; the run log says
@@ -135,8 +135,10 @@ attaching is the way to pass a value that starts with a dash.
                  bundle .tgz, straight from the archive, after a synopsis
                  of the run (README, Output) -- and exit; with -v, also
                  the counters that rose and each host's health flags
-  -v             increase output verbosity: -v per-host outcomes and
-                 notes, -vv every connection attempt
+  -v             more on the console (the run log in the bundle gets
+                 every line): -v per-host outcomes and notes, -vv every
+                 connection attempt, -vvv the commands run on the hosts
+                 and each phase's seconds
   --version      display version number and exit
   -h, --help     show this help and exit
   --             everything after this is a server name
@@ -176,12 +178,12 @@ With no server given, the test runs on the local host -- no ssh required.
 
 `-x/--duration secs` — run every measured job for this many seconds (`time_based`), whatever its jobfile says. A burn-in or soak is one such run with long jobs: `-x 86400` runs each test in the set for 24 hours, one after another. There is no repeat mode. The end capture keeps the last 2000 lines of each host's kernel log, so on a multi-day run the start of the window may be cut (the file says so).
 
-`-v` — more verbosity; repeatable (`-vv`, `-vvv`). Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`. Each level adds to the one below:
+`-v` — more on the console; repeatable (`-vv`, `-vvv`). It sets only what the console shows: `wekatester.log` in the run bundle gets every line at every level, `-vvv`'s included, whatever `-v` was. Option names are case-insensitive throughout, so `-V` is also verbosity; the version is printed by `--version`. Each level adds to the one below:
 
-- none: everything but the `DEBUG` lines; of the connection phase, only the hosts wekatester could not connect to;
-- `-v`: per-host outcomes and notes (the credential a host connected with, each connection round's count, and the rest of the `DEBUG` lines);
+- none: everything but the `DEBUG` lines, and the capacity line only for the hosts that still need space; of the connection phase, only the hosts wekatester could not connect to;
+- `-v`: per-host outcomes and notes (the credential a host connected with, each connection round's count, each host range's count, the capacity line for every host, four notes from job staging, and the rest of the `DEBUG` lines);
 - `-vv`: every connection attempt, the failed ones included with ssh's own reason;
-- `-vvv`: nothing beyond `-vv` yet.
+- `-vvv`: the commands wekatester runs on the hosts (the lock, the fio stop, the system captures; each distinct command once, with the hosts it went to), every line of each connection attempt's ssh output, the mount line each check read, the resolved host-file rows, the calibration planner's verdicts, and each phase's seconds.
 
 # Workloads
 A workload is a directory of standard fio jobfiles, usually under `fio-jobfiles/`, run in sorted filename order. Shipped sets:
@@ -657,7 +659,7 @@ Per worker, the first success wins and every later ssh/scp in the run rides that
 Each job prints a summary block as it completes, and every run leaves one self-contained bundle in the output directory (`./results` by default, `-o` to choose another). During the run the bundle is a `<date>-<time>/` directory holding:
 
 - `results_<jobname>.json` — the raw fio JSON, one file per job, written as each job completes;
-- `wekatester.log` — everything the run printed, stdout and stderr, including teardown;
+- `wekatester.log` — every line the run printed, stdout and stderr, from its first line through the teardown, plus every `DEBUG` line of every `-v` level whatever the console showed;
 - `cmdline` — the command line as typed, shell-quoted on one line, `./wekatester` first; `settings` — what it resolved to, one `<key><tab><value>` per line: `version`, `workload`, `auto` (the `-a` level, `-` without it), `cal-seconds` (the calibration cell length, `-` without `-a`), `master` and `hosts`, then, only under `--allow-fio-mismatch`, `allow-fio-mismatch` (what the fio version check found: the versions and their hosts when they differ), only under `--allow-cached-mount`, `allow-cached-mount` (what the `forcedirect` check found: each cache mode and its hosts, or `no wekafs destination without forcedirect`), and once the sweep has run, `layout` (what the generated layout writes: `<n> file(s), <bytes> bytes to write on <h> host(s)`, or `nothing to write (files reused)`, which `-s` repeats), then one `<WT_NAME><tab><value><tab><source>` line for each setting whose value is not its default, the source being `cli`, `environment` or `<file>:<line>` (`WT_PASSWORD` records its prompt count, never a password); `fs-groups` — `<host> <group>` per host, the filesystem groups (hosts sharing one destination directory);
 - `auth/` — each connection attempt's ssh output (Authentication): `<host>.extcheck` for the existing-session check, `<host>.<n>.err` for round `n` after it (2 is the plain defaults, then each `-i` key and `-p` pair in order); absent in local mode;
 - `fio-jobfiles/<host>/` — the staged per-host jobfile variants that actually ran (with auto mode these differ per host — this is the execution truth);
@@ -701,7 +703,7 @@ On a bundle, `-s` opens with a synopsis of the run, read only from what the bund
 
 ```
 run      2026-10-23 14:10:02 (bundle 20261023-141002.tgz)
-version  wekatester 3.0.1, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
+version  wekatester 3.0.2, fio 3.36, weka 4.4.2 (2 hosts), no weka CLI (1 host)
 command  ./wekatester -a cal -w default h1 h2 h3
 clients  3 (master h1), 2 shapes, 1 filesystem group
 workload default; -a cal (30 s cells); dest /mnt/weka/wt (wekafs)
