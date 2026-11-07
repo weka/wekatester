@@ -27,14 +27,56 @@ function footprint(path, L, n, KV, s,    nj, fs, sz, nr, b, job, fmt, oj, of) {
     }
     return 0
 }
+# fio's filename= list into N[1..]: ':' separates, "\:" is a colon, empty
+# names are skipped (get_next_str). Every clone opens these same files,
+# under the job's directory (staging sets it), so they are priced once.
+function fio_names(v, N,    n, i, c, cur) {
+    split("", N); n = 0; cur = ""
+    for (i = 1; i <= length(v); i++) {
+        c = substr(v, i, 1)
+        if (c == "\\" && substr(v, i + 1, 1) == ":") { cur = cur ":"; i++ }
+        else if (c == ":") { if (cur != "") N[++n] = cur; cur = "" }
+        else cur = cur c
+    }
+    if (cur != "") N[++n] = cur
+    return n
+}
+# a filename= section's per-file length: filesize, else size over its cnt
+# names; unreadable sizes as footprint() treats them
+function named_len(path, L, n, KV, s, cnt,    fs, sz, b, job) {
+    if ((fs = sec_value(L, n, KV, s, "filesize", "")) != "") {
+        if ((b = parse_size(fs)) == "") awk_fail("capacity: " path ": filesize=" fs " is not a byte count")
+        return b
+    }
+    if ((sz = sec_value(L, n, KV, s, "size", "")) != "") {
+        if ((b = parse_size(sz)) != "") return b / cnt
+        job = path; sub(/.*\//, "", job)
+        print "WARNING: " job ": size=" sz " is not a byte count; it contributes nothing to the capacity estimate" > "/dev/stderr"
+    }
+    return 0
+}
 # The layout job, each file priced once. Per section (create_only ones too,
 # [global] the fallback): its namespace, filename_format else fio's default
 # <section>.$jobnum.$filenum; a counter the format lacks names one file; the
 # length is filesize, else size / nrfiles. An unreadable size prices nothing.
-function layout_footprint(L, n,    LSN, LKV, ns, s, total, fmt, nj, nr, len, v, G, NC, NK, nk, c) {
+function layout_footprint(L, n,    LSN, LKV, ns, s, total, fmt, nj, nr, len, v, G, NC, NK, nk, c, NM, x) {
     ns = ini_parse(L, n, LSN, LKV); nk = 0; split("", G); split("", NC)
     for (s = 1; s <= ns; s++) {
         nj = need_int(sec_value(L, n, LKV, s, "numjobs", "1"), "the layout numjobs") + 0
+        if ((v = sec_value(L, n, LKV, s, "filename", "")) != "") {
+            # named files (fio_names): one 1 x 1 grid each, filesize else
+            # size over the names; an unreadable size prices nothing
+            if (!(nr = fio_names(v, NM))) continue
+            if ((v = sec_value(L, n, LKV, s, "filesize", "")) != "") { if ((len = parse_size(v)) == "") continue }
+            else if ((len = parse_size(sec_value(L, n, LKV, s, "size", ""))) == "") continue
+            else len /= nr
+            for (x = 1; x <= nr; x++) {
+                fmt = "file:" NM[x]
+                if (!(fmt in NC)) { NC[fmt] = 0; NK[++nk] = fmt }
+                c = ++NC[fmt]; G[fmt, c, "j"] = 1; G[fmt, c, "r"] = 1; G[fmt, c, "l"] = len + 0
+            }
+            continue
+        }
         # nrfiles is required beside filesize (as before); beside size an
         # unreadable one prices the job total as one file, as before
         if ((v = sec_value(L, n, LKV, s, "filesize", "")) != "") {
@@ -114,15 +156,31 @@ BEGIN {
                 continue
             }
             # Per job section: one filename_format is one set of files, costing
-            # its largest section; without one, fio names files after the
-            # section, a namespace of its own. Namespaces sum below.
+            # its largest section; without one, fio's default
+            # <section>.$jobnum.$filenum, so like-named sections of two
+            # jobfiles share theirs, as the layout lays them out. Namespaces
+            # sum below.
             nsec = job_sections(L, n, SN, KV, J)
             for (x = 1; x <= nsec; x++) {
                 s = J[x]
-                if ((ns = sec_value(L, n, KV, s, "filename_format", "")) == "") ns = "__default__:" job (s == "g" ? "" : SUBSEP SN[s])
-                else ns = replace_all(ns, "$jobname", sec_jobname(L, n, SN, s, job))   # its own files, as the layout names them
-                # a group fleet-shared dataset is priced once, on its first host
-                if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
+                if ((v = sec_value(L, n, KV, s, "filename", "")) != "") {
+                    # named files (fio_names), filename_format unused: each
+                    # its own namespace, at its largest per-file length
+                    if (!(nm = fio_names(v, NM))) continue
+                    b = named_len(p, L, n, KV, s, nm)
+                    for (w = 1; w <= nm; w++) {
+                        ns = "file:" NM[w]
+                        if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
+                        if (b > NSV[ns]) NSV[ns] = b
+                    }
+                    continue
+                }
+                if ((ns = sec_value(L, n, KV, s, "filename_format", "")) == "") ns = sec_jobname(L, n, SN, s, job) ".$jobnum.$filenum"
+                else {
+                    ns = replace_all(ns, "$jobname", sec_jobname(L, n, SN, s, job))   # its own files, as the layout names them
+                    # a group fleet-shared dataset is priced once, on its first host
+                    if (index(ns, "shared.") == 1 && h != FIRST[(h in GID) ? GID[h] : "1"]) continue
+                }
                 if (!(ns in NSV)) { NSV[ns] = 0; NSK[++nns] = ns }
                 if ((b = footprint(p, L, n, KV, s)) > NSV[ns]) NSV[ns] = b
             }

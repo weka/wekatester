@@ -196,7 +196,8 @@ override_staged() {   # override_staged <all|measured> <key> <value> [<key> <val
 }
 
 # Predictable paths (README, Workloads): unique_filename=0 and a "<name>."
-# prefix on filename_format; a $clientuid format keeps its own scheme. The same
+# prefix on filename_format; a $clientuid format keeps its own scheme; a
+# filename= line is dropped, with a WARNING per jobfile. The same
 # pass stamps cpus_allowed_policy=split on every cpu list, gives a pinned
 # host list to variants without cpus_allowed, and trims a jobfile's own list
 # to that host list, with a note (nothing left stops the run).

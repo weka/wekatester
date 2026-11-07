@@ -28,6 +28,14 @@ function stamp(path, name, cpus, host,    L, n, O, m, i, k, s, t, v, hasfmt, has
                 L[i] = "filename_format=" name "." v
         } else if (k == "unique_filename")
             continue   # replaced by the forced 0 below
+        else if (k == "filename") {
+            # dropped: the layout, the sweep and the capacity check name files
+            # by filename_format only, so a named file would be one nobody
+            # laid out. Said once per jobfile, at level 0.
+            t = path; sub(/.*\//, "", t)
+            if (!(t in DROPPED)) { DROPPED[t] = 1; print "WARNING: " t ": filename= is ignored; wekatester names the files (filename_format)" > "/dev/stderr" }
+            continue
+        }
         else if (k == "cpus_allowed") {
             # every one, in any section: fio never runs on weka's cores or
             # core 0's pair, whatever a cpu list says
