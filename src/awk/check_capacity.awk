@@ -4,33 +4,78 @@ function need_int(v, what) {   # int(), or a stop where python raised
     return v
 }
 # one job section s of a staged jobfile (job_sections): numjobs x filesize
-# x nrfiles, or numjobs x size= (fio: the job total across its files)
-function footprint(path, L, n, KV, s,    nj, fs, sz, nr, b, job) {
+# x nrfiles, or numjobs x size= (fio: the job total across its files). A
+# filename_format without $jobnum (or $filenum) names one file for every
+# job (or every file number), as layout_footprint counts them.
+function footprint(path, L, n, KV, s,    nj, fs, sz, nr, b, job, fmt, oj, of) {
     nj = need_int(sec_value(L, n, KV, s, "numjobs", "1"), path ": numjobs")
+    fmt = sec_value(L, n, KV, s, "filename_format", "")
+    oj = fmt != "" && !index(fmt, "$jobnum"); of = fmt != "" && !index(fmt, "$filenum")
+    if (oj) nj = 1
     if ((fs = sec_value(L, n, KV, s, "filesize", "")) != "") {
         if ((b = parse_size(fs)) == "") awk_fail("capacity: " path ": filesize=" fs " is not a byte count")
-        return nj * b * need_int(sec_value(L, n, KV, s, "nrfiles", "1"), path ": nrfiles")
+        return nj * b * (of ? 1 : need_int(sec_value(L, n, KV, s, "nrfiles", "1"), path ": nrfiles"))
     }
     if ((sz = sec_value(L, n, KV, s, "size", "")) != "") {
-        if ((b = parse_size(sz)) != "") return nj * b
+        if ((b = parse_size(sz)) != "") {
+            # one file of the job's size / nrfiles, when the format names one
+            if (of && (nr = py_int(sec_value(L, n, KV, s, "nrfiles", "1"))) != "" && nr + 0 > 0) b /= nr
+            return nj * b
+        }
         job = path; sub(/.*\//, "", job)
         print "WARNING: " job ": size=" sz " is not a byte count; it contributes nothing to the capacity estimate" > "/dev/stderr"
     }
     return 0
 }
-# the layout job: per job section (create_only ones too), [global] the
-# fallback, numjobs x nrfiles x filesize, or numjobs x size=; an
-# unreadable size prices nothing
-function layout_footprint(L, n,    LSN, LKV, ns, s, total, nj, v, b) {
-    ns = ini_parse(L, n, LSN, LKV); total = 0
+# The layout job, each file priced once. Per section (create_only ones too,
+# [global] the fallback): its namespace, filename_format else fio's default
+# <section>.$jobnum.$filenum; a counter the format lacks names one file; the
+# length is filesize, else size / nrfiles. An unreadable size prices nothing.
+function layout_footprint(L, n,    LSN, LKV, ns, s, total, fmt, nj, nr, len, v, G, NC, NK, nk, c) {
+    ns = ini_parse(L, n, LSN, LKV); nk = 0; split("", G); split("", NC)
     for (s = 1; s <= ns; s++) {
-        nj = need_int(sec_value(L, n, LKV, s, "numjobs", "1"), "the layout numjobs")
+        nj = need_int(sec_value(L, n, LKV, s, "numjobs", "1"), "the layout numjobs") + 0
+        # nrfiles is required beside filesize (as before); beside size an
+        # unreadable one prices the job total as one file, as before
         if ((v = sec_value(L, n, LKV, s, "filesize", "")) != "") {
-            if ((b = parse_size(v)) == "") continue
-            total += nj * b * need_int(sec_value(L, n, LKV, s, "nrfiles", "1"), "the layout nrfiles")
-        } else if ((b = parse_size(sec_value(L, n, LKV, s, "size", ""))) != "") total += nj * b
+            if ((len = parse_size(v)) == "") continue
+            nr = need_int(sec_value(L, n, LKV, s, "nrfiles", "1"), "the layout nrfiles") + 0
+        } else {
+            if ((len = parse_size(sec_value(L, n, LKV, s, "size", ""))) == "") continue
+            if ((nr = py_int(sec_value(L, n, LKV, s, "nrfiles", "1"))) == "" || nr + 0 <= 0) nr = 1
+            else { nr += 0; len /= nr }
+        }
+        if ((fmt = sec_value(L, n, LKV, s, "filename_format", "")) == "") fmt = LSN[s] ".$jobnum.$filenum"
+        else fmt = replace_all(fmt, "$jobname", LSN[s])
+        if (!index(fmt, "$jobnum")) nj = 1
+        if (!index(fmt, "$filenum")) nr = 1
+        if (!(fmt in NC)) { NC[fmt] = 0; NK[++nk] = fmt }
+        c = ++NC[fmt]; G[fmt, c, "j"] = nj; G[fmt, c, "r"] = nr; G[fmt, c, "l"] = len + 0
     }
+    total = 0
+    for (c = 1; c <= nk; c++) total += grid_union(G, NK[c], NC[NK[c]])
     return total
+}
+# A namespace's m grids (jobs 0..nj-1 x files 0..nr-1, all from 0) as their
+# union: over the distinct job and file edges, each block at the largest
+# length of the grids covering it. At most m^2 blocks of m checks; m is a
+# handful (lay_prune's survivors).
+function grid_union(G, k, m,    D, E, F, ne, nf, a, b, c, best, sum) {
+    split("", D); ne = 0; nf = 0
+    for (c = 1; c <= m; c++) {
+        if (!(("j", G[k, c, "j"]) in D)) { D["j", G[k, c, "j"]] = 1; E[++ne] = G[k, c, "j"] }
+        if (!(("r", G[k, c, "r"]) in D)) { D["r", G[k, c, "r"]] = 1; F[++nf] = G[k, c, "r"] }
+    }
+    sort_arr(E, ne, 1); sort_arr(F, nf, 1)
+    sum = 0
+    for (a = 1; a <= ne; a++)
+        for (b = 1; b <= nf; b++) {
+            best = 0
+            for (c = 1; c <= m; c++)
+                if (G[k, c, "j"] >= E[a] + 0 && G[k, c, "r"] >= F[b] + 0 && G[k, c, "l"] > best) best = G[k, c, "l"]
+            sum += (E[a] - (a > 1 ? E[a - 1] : 0)) * (F[b] - (b > 1 ? F[b - 1] : 0)) * best
+        }
+    return sum
 }
 BEGIN {
     work = ARGV[1]; preview = ARGV[3] == "preview"
