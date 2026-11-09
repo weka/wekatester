@@ -14,7 +14,10 @@ function lowbit(v,    b) {   # the largest power of two up to 1Mi dividing v
 }
 function esc_colon(s) { gsub(/:/, "\\:", s); return s }
 function do_host(h, convert,    L, n, SZ, AL, q, sp, spf, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
-    if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
+    # a check after the run reads the kept grid: the staged file may be the
+    # dense write by then (a rerun after a dropped host)
+    if (!check || (n = readlines(work "/grid/" h "/" lay, L)) < 0)
+        if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
     if (!check) writelines(work "/grid/" h "/" lay, L, n)
     if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
     split("", SZ); split("", AL)

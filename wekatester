@@ -9899,7 +9899,11 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
     pids=(); hs=()
     # one awk derives every host's grid (was one per host plus a grep,
     # serial, ahead of a fan-out whose floor is one round trip)
-    for host in "${HOSTS[@]}"; do args+=("$host" "$WORK_DIR/jobs/$host/$lay"); done
+    # the kept grid once staged (the staged file becomes the dense write)
+    for host in "${HOSTS[@]}"; do
+        spec=$WORK_DIR/grid/$host/$lay; [ -f "$spec" ] || spec=$WORK_DIR/jobs/$host/$lay
+        args+=("$host" "$spec")
+    done
     nofa=$(layout_grid_spec -o "$WORK_DIR/probe" "${args[@]}") \
         || die "cannot derive the layout grid"
     # a kept layout job without fallocate=none can leave full-size hollow files
@@ -9941,7 +9945,10 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
 }
 
 # One copy of the awk in the built tool for both callers
-layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
+layout_writes() {   # layout_writes <layout job> <0|1|check> [host...]: every host, or the ones named
+    local job=$1 mode=$2
+    shift 2
+    [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     awkrun '# Per host, after the sweep: its staged layout (the grid) against the sizes
     # the sweep listed. Writes grid/<host>/<layout> (the grid, for the directory
     # pass and the capacity check), probe/<host>.laidout (the bytes present) and,
@@ -9958,7 +9965,10 @@ layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
     }
     function esc_colon(s) { gsub(/:/, "\\:", s); return s }
     function do_host(h, convert,    L, n, SZ, AL, q, sp, spf, m, S, S0, i, p, P, SN, KV, ns, s, fmt, fs, F, nr, nj, dir, NSBAD, WHY, W, WJ, WN, ORD, nw, j, f, name, path, credit, nwrite, bytes, reused, b, app, g, GK, GC, GN, ng, O, no, x, c, y, line, sections, HDR, nh, k, kept, inglob) {
-        if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
+        # a check after the run reads the kept grid: the staged file may be the
+        # dense write by then (a rerun after a dropped host)
+        if (!check || (n = readlines(work "/grid/" h "/" lay, L)) < 0)
+            if ((n = readlines(work "/jobs/" h "/" lay, L)) < 0) awk_fail("cannot read the staged layout for " h)
         if (!check) writelines(work "/grid/" h "/" lay, L, n)
         if ((m = readlines(work "/probe/" h ".sizes", S)) < 0) awk_fail("cannot read the sweep listing for " h)
         split("", SZ); split("", AL)
@@ -10072,7 +10082,7 @@ layout_writes() {   # layout_writes <layout job> <0|1|check>: every host
     BEGIN {
         work = ARGV[1]; lay = ARGV[2]; convert = ARGV[3] == "1"; check = ARGV[3] == "check"
         for (a = 4; a < ARGC; a++) do_host(ARGV[a], convert)
-    }' "$WORK_DIR" "$1" "$2" "${HOSTS[@]}"
+    }' "$WORK_DIR" "$job" "$mode" "$@"
 }
 
 # After the sweep, before the capacity check and the push: each host's
@@ -10138,10 +10148,11 @@ empty_sparse_files() {   # empty_sparse_files <host> <path>...
     [ -z "$cmd" ] || run_host "$host" "$cmd"
 }
 
-# A set's own layout job reports no write bytes (create_only), so the sweep
-# runs again once it ends: a file it sized still missing, short or sparse
-# (fio truncates to full size before writing) means the layout was cut. One
-# more find per host, LAYOUT_OWN=1 only.
+# A set's own layout job reports no write bytes (create_only), and a layout
+# that ran in parts (a dropped host, run_aux_job) has no fleet byte count,
+# so the sweep runs again once it ends: a file it sized still missing,
+# short or sparse (fio truncates to full size before writing) means the
+# layout was cut. One more find per host.
 check_own_layout() {   # check_own_layout <layout job>
     local out h nf by re kept short=0
     sweep_layout_grid again
@@ -10152,7 +10163,114 @@ check_own_layout() {   # check_own_layout <layout job>
         log "ERROR: $h: $nf layout file(s) missing, short or sparse after the layout ($by bytes)" >&2
         short=1
     done <<<"$out"
-    [ "$short" -eq 0 ] || die "layout $1 left files short -- the set's own layout job did not finish (a signal or a dropped worker)"
+    [ "$short" -eq 0 ] || die "layout $1 left files short -- the layout did not finish on the host(s) above (a signal or a dropped worker)"
+}
+
+# The group's shared read set is laid out by the group's first host
+# (derive_layouts). When that host is excluded during the layout, the
+# group's next host in HOSTS takes it: its layout is re-derived without the
+# excluded hosts, swept, staged as a dense write and pushed, and it joins
+# the rerun when it has anything to write. Plain staging and a set's own
+# layout job have no shared set to move.
+layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded host>... -> LAYOUT_RERUN+=
+    local job=$1 x g m h nf by re kept out
+    shift
+    [ -n "$AUTO_LEVEL" ] && [ "$LAYOUT_OWN" -eq 0 ] || return 0
+    for x in "$@"; do
+        g=1; m=""
+        [ ! -s "$WORK_DIR/groups" ] || g=$(awk -v h="$x" '$1 == h { print $2; exit }' "$WORK_DIR/groups")
+        for h in "${HOSTS[@]}"; do
+            [ "$(awk -v h="$h" 'BEGIN { g = 1 } $1 == h { g = $2 } END { print g }' "$WORK_DIR/groups" 2>&1)" = "$g" ] || continue
+            m=$h; break
+        done
+        if [ -z "$m" ]; then
+            log "layout: no host of $x's filesystem group is left; its shared read set stays as it is"
+            continue
+        fi
+        # the excluded hosts leave the staged host list the derivation groups by
+        awk -v ex=" $* " '!(substr($0, 1, 2) == "H " && index(ex, " " substr($0, 3) " "))' "$WORK_DIR/staged.kinds" > "$WORK_DIR/staged.kinds.new" \
+            && mv "$WORK_DIR/staged.kinds.new" "$WORK_DIR/staged.kinds" || die "cannot update the staged host list"
+        derive_layouts auto "$AUTO_LEVEL" "$DIRECTORY" "$m" || die "cannot re-derive $m's layout for the shared read set"
+        rm -f "${WORK_DIR:?}/grid/$m/$job"
+        sweep_layout_grid again
+        out=$(layout_writes "$job" 1 "$m") || die "cannot stage $m's layout from the sweep"
+        IFS=$'\t' read -r h nf by re kept <<<"$out"
+        if [ "${nf:-0}" -gt 0 ]; then
+            copy_to_master "$WORK_DIR/jobs/$m" "$TARGET_DIR/" || die "failed to copy $m's layout to $MASTER"
+            ensure_layout_dirs "$job"
+            case " ${LAYOUT_RERUN[*]} " in (*" $m "*) ;; (*) LAYOUT_RERUN+=("$m") ;; esac
+            log "layout: $m lays out its group's shared read set in $x's place ($nf file(s), $by bytes)"
+        else
+            log "layout: $x's group: the shared read set is complete on $m; nothing moves"
+        fi
+    done
+}
+
+# A layout or unlink job over the clients named, as the measured jobs'
+# recover_dropped: a host present with a job error, or no results, is
+# today's failure; hosts missing from the results climb the ladder and the
+# rejoined rerun the job among themselves, once per host (a second drop
+# excludes), an excluded group-first host's shared set moving to the next
+# member. AUX_RUNS: "<results file>\t<hosts>" per run, for the summary.
+# The fleet byte check (LAYOUT_CUT) applies to a layout that ran whole.
+run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
+    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost
+    shift 2
+    LAYOUT_RERUN=("$@")
+    AUX_RUNS=(); AUX_PARTIAL=0
+    while [ ${#LAYOUT_RERUN[@]} -gt 0 ]; do
+        set -- "${LAYOUT_RERUN[@]}"; LAYOUT_RERUN=()
+        out="$RUN_DIR/results_${job%.job}.json"
+        [ "$n" -eq 0 ] || { out="$RUN_DIR/results_${job%.job}-rerun$n.json"; log "$kind: rerunning $job on $# host(s): $*"; }
+        cmd=$(fio_client_cmd "$job" "$@")
+        if run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
+        plan=""; [ "$kind" != layout ] || [ "$n" -gt 0 ] || plan=$LAYOUT_WRITE_BYTES
+        ok=1
+        if ! check_fio_errors "$out" layout "$plan"; then
+            ok=0
+            if [ -z "$LAYOUT_CUT" ]; then
+                [ "$kind" != layout ] || postmortem_hosts layout "$job" "$WORK_DIR/jobs" "$TARGET_DIR" "$RUN_DIR/parse.${job%.job}" "$@"
+                [ "$kind" != layout ] || die "layout $job failed -- the files were not created (raw output in $out)"
+                die "unlink $job failed -- test files may remain (raw output in $out)"
+            fi
+        fi
+        present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+        dropped=(); keep=()
+        for host in "$@"; do
+            case $'\n'"$present"$'\n' in
+                (*$'\n'"$host"$'\n'*) keep+=("$host") ;;
+                (*) dropped+=("$host") ;;
+            esac
+        done
+        AUX_RUNS+=("$out"$'\t'"${keep[*]}")
+        if [ ${#dropped[@]} -eq 0 ]; then
+            [ "$ok" -eq 1 ] || die "layout $job was cut short -- its files are left short, and the next run writes what is missing (raw output in $out)"
+            [ "$rc" -eq 0 ] || die "$kind failed for $job (partial output in $out)"
+            return 0
+        fi
+        AUX_PARTIAL=1
+        how="answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min)"
+        [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
+        lost=()
+        for host in "${dropped[@]}"; do
+            DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
+            log "dropped: $host $how; its $kind is incomplete"
+            if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
+                exclude_host "$host" "$job" "dropped twice in this run"; lost+=("$host")
+            elif client_ladder "$host"; then
+                log "rejoined: $host ($LADDER_WHY); the $kind reruns on it"
+                LAYOUT_RERUN+=("$host")
+            else
+                exclude_host "$host" "$job" "$LADDER_WHY"; lost+=("$host")
+            fi
+        done
+        [ ${#HOSTS[@]} -gt 0 ] || die "every host is excluded; nothing is left to finish $job"
+        if [ ${#lost[@]} -gt 0 ]; then
+            [ "$kind" != layout ] || layout_reassign_shared "$job" "${lost[@]}"
+            [ "$kind" != unlink ] || log "unlink: test files remain on ${lost[*]} (excluded; not removed)"
+        fi
+        n=$((n + 1))
+    done
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
@@ -10239,6 +10357,7 @@ summ_job_failed() {   # summ_job_failed <job>
 # the run. START_HOSTS: the list the run began with, the 5% rule's
 # denominator.
 START_HOSTS=(); EXCLUDED_HOSTS=(); LADDER_WHY=""
+LAYOUT_RERUN=(); AUX_RUNS=(); AUX_PARTIAL=0   # run_aux_job's state
 declare -gA DROP_COUNT=()
 CLIENT_CHECK_S=20     # each remote step of the ladder
 CLIENT_RELAUNCH_S=30  # the kill (3 s before -9) and the launch
@@ -10348,7 +10467,7 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio
 }
 
 run_jobs() {
-    local job outfile report cmd t0 rc lclients=()
+    local job outfile report cmd t0 rc part lclients=()
     echo
     for job in "${JOBFILES[@]}"; do
         cmd=$(fio_client_cmd "$job")
@@ -10369,25 +10488,23 @@ run_jobs() {
             fi
             [ ${#lclients[@]} -eq ${#HOSTS[@]} ] \
                 || debug "layout: $(( ${#HOSTS[@]} - ${#lclients[@]} )) host(s) have nothing to write (their files are complete, or their group's first host lays out the shared read set)"
-            cmd=$(fio_client_cmd "$job" "${lclients[@]}")
             log "laying out files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
-            run_host "$MASTER" "$cmd" > "$outfile" \
-                || die "layout failed for $job (partial output in $outfile)"
-            if ! check_fio_errors "$outfile" layout "$LAYOUT_WRITE_BYTES"; then
-                # no job failed: the files exist, short, and no parse is to blame
-                [ -z "$LAYOUT_CUT" ] || die "layout $job was cut short -- its files are left short, and the next run writes what is missing (raw output in $outfile)"
-                postmortem_hosts layout "$job" "$WORK_DIR/jobs" "$TARGET_DIR" \
-                    "$RUN_DIR/parse.${job%.job}" "${lclients[@]}"
-                die "layout $job failed -- the files were not created (raw output in $outfile)"
-            fi
-            [ "$LAYOUT_OWN" -eq 0 ] || check_own_layout "$job"
+            # a dropped host: the ladder, a rerun on the rejoined, the shared
+            # set to the next member (run_aux_job); a job error dies as before
+            run_aux_job layout "$job" "${lclients[@]}"
+            # a layout a host dropped from has no fleet byte count: the sweep checks it
+            [ "$LAYOUT_OWN" -eq 0 ] && [ "$AUX_PARTIAL" -eq 0 ] || check_own_layout "$job"
             log "layout: complete in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
             if [ "$LAYOUT_OWN" -eq 0 ]; then
-                # a sequential write of what was missing: reported as a test
+                # a sequential write of what was missing: reported as a test,
+                # each part on the hosts that finished it
                 log "layout sequential write ($job), the data the sweep found missing, on ${#lclients[@]} host(s):"
-                summ_one "$outfile" "$outfile" layout "${lclients[*]}" file \
-                    || summ_job_failed "$job"
+                for part in "${AUX_RUNS[@]}"; do
+                    [ -n "${part#*$'\t'}" ] || continue
+                    summ_one "${part%%$'\t'*}" "${part%%$'\t'*}" layout "${part#*$'\t'}" file \
+                        || summ_job_failed "$job"
+                done
                 continue
             fi
             echo
@@ -10402,13 +10519,9 @@ run_jobs() {
                 echo
                 continue
             fi
-            cmd=$(fio_client_cmd "$job" "${lclients[@]}")
             log "removing test files ($job) on ${#lclients[@]} host(s)..."
             t0=$SECONDS
-            run_host "$MASTER" "$cmd" > "$outfile" \
-                || die "unlink failed for $job (partial output in $outfile)"
-            check_fio_errors "$outfile" layout \
-                || die "unlink $job failed -- test files may remain (raw output in $outfile)"
+            run_aux_job unlink "$job" "${lclients[@]}"
             log "unlink: test files removed in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
             echo
             continue
@@ -10417,8 +10530,6 @@ run_jobs() {
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         PHASE_T0=$SECONDS   # -vvv times the measured job alone
         debug2 "running on $MASTER: $cmd"
-        # a dropped client is recovered here only; a drop during the layout
-        # or unlink job above stays fatal (the layout check would fail anyway).
         # fio keys client_stats by the --client= name, not the worker hostname;
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
