@@ -136,6 +136,7 @@ CAL_ENGINE_RUNTIME=${CAL_ENGINE_RUNTIME:-10}   # seconds per engine-comparison
 CAL_SETTLE=${CAL_SETTLE:-10}   # seconds after every write cell and after a
                          # seed: a write leaves a destage backlog the next cell
                          # would otherwise start inside
+CAL_LIST_S=60   # the seed's dataset listing and df on a client, bounded
 # One amount of data per job (README, Calibration measures what the test will
 # run): FILESIZE_MIB split over the files, so the file ladder moves the file
 # count and nothing else.
@@ -351,9 +352,13 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     # GNU -printf it must fail loudly, or every run re-seeds everything. Only
     # the names the seed can ask for: a shared destination holds every
     # member's write set.
-    run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
-        > "$WORK_DIR/cal/$host/scratch.raw" \
-        || die "$host: cannot inspect the calibration dataset or its free space"
+    # Bounded, and a host that cannot be read is dropped (3): the host may
+    # have been lost since the cell before (the ladder decides)
+    if RUN_HOST_TIMEOUT=$CAL_LIST_S run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
+        > "$WORK_DIR/cal/$host/scratch.raw"; then :; else
+        log "cal: $host dropped before its calibration $tag seed: cannot inspect the dataset or its free space (rc $?, bound $CAL_LIST_S s)"
+        return 3
+    fi
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
     awk 'f {print; exit} /^WEKATESTER_DF$/ {f = 1}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/dfline"
     # fio never mkdirs. A flat shape needs nothing beyond the dataset root; a
