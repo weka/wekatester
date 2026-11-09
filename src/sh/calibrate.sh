@@ -1016,7 +1016,9 @@ cal_exclude_client() {   # cal_exclude_client <client> <why> -> 3 restart, 4 sha
 cal_restart_survivors() {
     local h
     for h in $CAL_SHAPE_CLIENTS; do
-        if client_ladder "$h"; then log "cal: shape $CAL_SID: $h $LADDER_WHY before the restart (a stopped cell's job ran on)"
+        # lost until its ladder passes: no other shape's seed lists it meanwhile
+        cal_mark_lost "$h"
+        if client_ladder "$h"; then cal_unmark_lost "$h"; log "cal: shape $CAL_SID: $h $LADDER_WHY before the restart (a stopped cell's job ran on)"
         else cal_exclude_client "$h" "$LADDER_WHY" || return 1; fi
     done
 }

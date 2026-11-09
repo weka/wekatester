@@ -1025,12 +1025,15 @@ exclude_host() {   # exclude_host <host> <job|phase> <why> [later: the caller ru
 }
 
 # Excluded hosts over 5% of the starting list stop the run (below 20 hosts,
-# any exclusion does), unless --ignore-failed-clients.
+# any exclusion does), unless --ignore-failed-clients: then one WARNING
+# per count (EXCLUDED_WARNED), however many callers check it.
+EXCLUDED_WARNED=0
 check_excluded_share() {
     local n=${#START_HOSTS[@]} x=${#EXCLUDED_HOSTS[@]}
     [ "$x" -gt 0 ] && [ "$n" -gt 0 ] && [ $((x * 20)) -gt "$n" ] || return 0
+    [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] || [ "$x" -ne "$EXCLUDED_WARNED" ] || return 0
     [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] \
-        || { log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
+        || { EXCLUDED_WARNED=$x; log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
     die "$x of the $n starting host(s) excluded (${EXCLUDED_HOSTS[*]}), over 5% of the host list; --ignore-failed-clients (WT_IGNORE_FAILED_CLIENTS=1) runs on without them"
 }
 

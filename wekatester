@@ -4216,7 +4216,9 @@ cal_exclude_client() {   # cal_exclude_client <client> <why> -> 3 restart, 4 sha
 cal_restart_survivors() {
     local h
     for h in $CAL_SHAPE_CLIENTS; do
-        if client_ladder "$h"; then log "cal: shape $CAL_SID: $h $LADDER_WHY before the restart (a stopped cell's job ran on)"
+        # lost until its ladder passes: no other shape's seed lists it meanwhile
+        cal_mark_lost "$h"
+        if client_ladder "$h"; then cal_unmark_lost "$h"; log "cal: shape $CAL_SID: $h $LADDER_WHY before the restart (a stopped cell's job ran on)"
         else cal_exclude_client "$h" "$LADDER_WHY" || return 1; fi
     done
 }
@@ -10625,12 +10627,15 @@ exclude_host() {   # exclude_host <host> <job|phase> <why> [later: the caller ru
 }
 
 # Excluded hosts over 5% of the starting list stop the run (below 20 hosts,
-# any exclusion does), unless --ignore-failed-clients.
+# any exclusion does), unless --ignore-failed-clients: then one WARNING
+# per count (EXCLUDED_WARNED), however many callers check it.
+EXCLUDED_WARNED=0
 check_excluded_share() {
     local n=${#START_HOSTS[@]} x=${#EXCLUDED_HOSTS[@]}
     [ "$x" -gt 0 ] && [ "$n" -gt 0 ] && [ $((x * 20)) -gt "$n" ] || return 0
+    [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] || [ "$x" -ne "$EXCLUDED_WARNED" ] || return 0
     [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] \
-        || { log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
+        || { EXCLUDED_WARNED=$x; log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
     die "$x of the $n starting host(s) excluded (${EXCLUDED_HOSTS[*]}), over 5% of the host list; --ignore-failed-clients (WT_IGNORE_FAILED_CLIENTS=1) runs on without them"
 }
 
