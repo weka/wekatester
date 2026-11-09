@@ -10738,12 +10738,14 @@ aux_bound_s() {   # aux_bound_s <layout|unlink> <job> <rerun n> <host>...
 # The hosts missing from client_stats were dropped: mid-job (fio exits
 # non-zero) or at connect time (fio drops a client it cannot reach and
 # exits 0 while any other connects). Each goes up the ladder, the
-# survivors' results are summarized, the job is not rerun.
-recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio rc>
-    local job=$1 out=$2 report=$3 rc=$4 host present dropped=() keep=() how
+# survivors' results are summarized, the job is not rerun. A job whose
+# bound fired has no results: run_jobs reruns it once (<rerun>: a second
+# firing ladders the hosts again without counting a second drop).
+recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio rc> [rerun]
+    local job=$1 out=$2 report=$3 rc=$4 again=${5:-} fired=0 host present dropped=() keep=() how
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         # the bound fired: no result from anyone, every host goes up the ladder
-        present=""
+        present=""; fired=1
     else
         check_fio_errors "$out" measured \
             || die "job $job failed on at least one host (raw output in $out)"
@@ -10764,7 +10766,7 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio
     [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
     [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || how="gave no result for $job within $RUN_BOUND_S s, the job bound; fio was stopped"
     for host in "${dropped[@]}"; do
-        DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
+        [ "$fired" -eq 1 ] && [ -n "$again" ] || DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
         log "dropped: $host $how and its result for this job is lost"
         if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
             exclude_host "$host" "$job" "dropped twice in this run"
@@ -10854,6 +10856,18 @@ run_jobs() {
         if RUN_HOST_TIMEOUT=$RUN_BOUND_S run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
         [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || coord_kill "$TARGET_DIR/${HOSTS[0]}/$job.coord"
         recover_dropped "$job" "$outfile" "$report" "$rc"
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            # the bound fired and nothing came back: once more, on the hosts
+            # that rejoined (recover_dropped and the 5% rule left some)
+            log "job $job: rerunning it once on ${#HOSTS[@]} host(s): ${HOSTS[*]}"
+            cmd=$(fio_client_cmd "$job")
+            if RUN_HOST_TIMEOUT=$RUN_BOUND_S run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                coord_kill "$TARGET_DIR/${HOSTS[0]}/$job.coord"
+                log "job $job: no result from its rerun either; the job is lost and the run goes on"
+            fi
+            recover_dropped "$job" "$outfile" "$report" "$rc" rerun
+        fi
         phase_done "job $job"
     done
 }
