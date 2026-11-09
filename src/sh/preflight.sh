@@ -356,10 +356,13 @@ collect_fs_groups() {
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        # the sum first, then the lines the host read and the path, for the
+        # bundle (fs-groups.detail): a split that should not be carries its
+        # evidence
+        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE' && cat '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
         pids[$i]=$!
     done
-    : > "$WORK_DIR/fsgroup/sums"
+    : > "$WORK_DIR/fsgroup/sums"; : > "$WORK_DIR/fsgroup/detail"
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
         sum=""
@@ -368,6 +371,7 @@ collect_fs_groups() {
             (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
         esac
         printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
+        printf '%s\t%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$sum" "$(tail -n +2 "$WORK_DIR/fsgroup/$i.sum" | tr '\n' ' ')" >> "$WORK_DIR/fsgroup/detail"
         [ -n "${first[$sum]+set}" ] || first[$sum]=$i
     done
     # every hash is in: one removal per group, from its first host
@@ -384,6 +388,8 @@ collect_fs_groups() {
     # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
     [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
         || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
+    [ -z "$RUN_DIR" ] || cp "$WORK_DIR/fsgroup/detail" "$RUN_DIR/fs-groups.detail" \
+        || log "WARNING: could not record the filesystem-group detail in $RUN_DIR/fs-groups.detail" >&2
     # the count, then each group's members, from one awk: a pass per group
     # was groups x hosts when every host has its own directory
     summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")

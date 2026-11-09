@@ -105,6 +105,9 @@ BEGIN {
         if (F[1] != last) { last = F[1]; take = !(last in NJOB); if (take) NJOB[last] = 0 }
         if (take && F[2] != "") JOB[last, ++NJOB[last]] = F[2]
     }
+    # "<host>\t<cpus>\t<engine>" per host excluded in calibration (writeback_targets)
+    n = readlines(work "/cal.fallback", L)
+    for (i = 1; i <= n; i++) if (split(L[i], F, "\t") >= 3) { FBC[F[1]] = F[2]; FBE[F[1]] = F[3] }
     nup = 0
     for (a = 5; a < ARGC; a++) {
         h = ARGV[a]; split("", D); split("", DP)
@@ -115,6 +118,10 @@ BEGIN {
         # the subset its job count runs on
         v = slurp(work "/usable/" h)
         if (slurped && !("cpus" in DP)) { D["cpus"] = v; DP["cpus"] = 1 }
+        # a host excluded in calibration was never staged: its cpus and its
+        # shape's engine pick come from the calibration record (cal.fallback)
+        if ((h in FBC) && !("cpus" in DP) && FBC[h] != "") { D["cpus"] = FBC[h]; DP["cpus"] = 1 }
+        if ((h in FBE) && !("engine" in DP) && FBE[h] != "" && !(NJOB[h] + 0)) { D["engine"] = FBE[h]; DP["engine"] = 1 }
         for (j = 1; j <= NJOB[h] + 0; j++) {
             p = JOB[h, j]; job = p; sub(/.*\//, "", job)
             if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)

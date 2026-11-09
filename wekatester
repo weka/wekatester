@@ -5273,10 +5273,13 @@ collect_fs_groups() {
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        # the sum first, then the lines the host read and the path, for the
+        # bundle (fs-groups.detail): a split that should not be carries its
+        # evidence
+        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE' && cat '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
         pids[$i]=$!
     done
-    : > "$WORK_DIR/fsgroup/sums"
+    : > "$WORK_DIR/fsgroup/sums"; : > "$WORK_DIR/fsgroup/detail"
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
         sum=""
@@ -5285,6 +5288,7 @@ collect_fs_groups() {
             (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
         esac
         printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
+        printf '%s\t%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$sum" "$(tail -n +2 "$WORK_DIR/fsgroup/$i.sum" | tr '\n' ' ')" >> "$WORK_DIR/fsgroup/detail"
         [ -n "${first[$sum]+set}" ] || first[$sum]=$i
     done
     # every hash is in: one removal per group, from its first host
@@ -5301,6 +5305,8 @@ collect_fs_groups() {
     # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
     [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
         || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
+    [ -z "$RUN_DIR" ] || cp "$WORK_DIR/fsgroup/detail" "$RUN_DIR/fs-groups.detail" \
+        || log "WARNING: could not record the filesystem-group detail in $RUN_DIR/fs-groups.detail" >&2
     # the count, then each group's members, from one awk: a pass per group
     # was groups x hosts when every host has its own directory
     summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")
@@ -7491,6 +7497,10 @@ writeback_targets() {
     # as empty: the merge's own-row protection rests on them.
     # a host excluded mid-run (run.sh) still gets its row: what converged
     local all=("${HOSTS[@]}" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"})
+    # a host excluded in calibration has no staged jobs and no usable/<host>:
+    # its row records the cpus the probe found and its shape's engine pick
+    # (cal/hostinfo, cal/shapes, cal/s<id>/engine), the searches left open
+    cal_fallback_rows "$WORK_DIR/cal.fallback" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"}
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${all[@]}" \
         > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
     local h ident="" tmp="$WORK_DIR/hostfile.writeback"
@@ -7610,6 +7620,9 @@ writeback_targets() {
             if (F[1] != last) { last = F[1]; take = !(last in NJOB); if (take) NJOB[last] = 0 }
             if (take && F[2] != "") JOB[last, ++NJOB[last]] = F[2]
         }
+        # "<host>\t<cpus>\t<engine>" per host excluded in calibration (writeback_targets)
+        n = readlines(work "/cal.fallback", L)
+        for (i = 1; i <= n; i++) if (split(L[i], F, "\t") >= 3) { FBC[F[1]] = F[2]; FBE[F[1]] = F[3] }
         nup = 0
         for (a = 5; a < ARGC; a++) {
             h = ARGV[a]; split("", D); split("", DP)
@@ -7620,6 +7633,10 @@ writeback_targets() {
             # the subset its job count runs on
             v = slurp(work "/usable/" h)
             if (slurped && !("cpus" in DP)) { D["cpus"] = v; DP["cpus"] = 1 }
+            # a host excluded in calibration was never staged: its cpus and its
+            # shape'\''s engine pick come from the calibration record (cal.fallback)
+            if ((h in FBC) && !("cpus" in DP) && FBC[h] != "") { D["cpus"] = FBC[h]; DP["cpus"] = 1 }
+            if ((h in FBE) && !("engine" in DP) && FBE[h] != "" && !(NJOB[h] + 0)) { D["engine"] = FBE[h]; DP["engine"] = 1 }
             for (j = 1; j <= NJOB[h] + 0; j++) {
                 p = JOB[h, j]; job = p; sub(/.*\//, "", job)
                 if ((n = readlines(p, L)) < 0) awk_fail("cannot read " p)
@@ -7962,6 +7979,27 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
                 if (ENSEL[e = GL[q]] == 4 && !(e in GHIT))
                     print "WARNING: " path ":" ELINE[e] ": host pattern \047" EPAT[e] "\047 matches none of this run\047s hosts" > "/dev/stderr"
         }' "$@"
+}
+
+# "<host>\t<cpus>\t<engine>" for the hosts named that calibration excluded
+# (no usable/<host>): cpus from cal/hostinfo, the engine from the shape's
+# pick when it made one. An empty file when there is nothing to say.
+cal_fallback_rows() {   # cal_fallback_rows <outfile> <host>...
+    local out=$1 h a e p cpus eng sid members m
+    shift
+    : > "$out" || die "cannot write $out"
+    [ $# -gt 0 ] && [ -s "$WORK_DIR/cal/hostinfo" ] || return 0
+    for h in "$@"; do
+        [ ! -s "$WORK_DIR/usable/$h" ] || continue
+        cpus=""; eng=""
+        while IFS=$'\t' read -r m a e p; do [ "$m" != "$h" ] || { cpus=$a; break; }; done < "$WORK_DIR/cal/hostinfo"
+        [ ! -s "$WORK_DIR/cal/shapes" ] || while IFS=$'\t' read -r sid _ _ _ _ _ _ _ _ _ _ members; do
+            case " $members " in (*" $h "*) ;; (*) continue ;; esac
+            [ ! -s "$WORK_DIR/cal/s$sid/engine" ] || IFS= read -r eng < "$WORK_DIR/cal/s$sid/engine" || :
+            break
+        done < "$WORK_DIR/cal/shapes"
+        printf '%s\t%s\t%s\n' "$h" "$cpus" "$eng" >> "$out"
+    done
 }
 
 # --- settings (WT_*) -------------------------------------------------------------

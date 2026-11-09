@@ -395,6 +395,10 @@ writeback_targets() {
     # as empty: the merge's own-row protection rests on them.
     # a host excluded mid-run (run.sh) still gets its row: what converged
     local all=("${HOSTS[@]}" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"})
+    # a host excluded in calibration has no staged jobs and no usable/<host>:
+    # its row records the cpus the probe found and its shape's engine pick
+    # (cal/hostinfo, cal/shapes, cal/s<id>/engine), the searches left open
+    cal_fallback_rows "$WORK_DIR/cal.fallback" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"}
     resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${all[@]}" \
         > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
     local h ident="" tmp="$WORK_DIR/hostfile.writeback"
@@ -486,4 +490,25 @@ resolve_targets() {   # resolve_targets <phase1|phase2|hostonly|engines> <csv> <
     [ -z "$ENGINE" ] || de=""
     WEKATESTER_HOST_ALIAS=$(host_alias_env "${@:6}") WEKATESTER_DEFAULT_ENGINE=$de \
         awkrun '#@awk resolve_targets' "$@"
+}
+
+# "<host>\t<cpus>\t<engine>" for the hosts named that calibration excluded
+# (no usable/<host>): cpus from cal/hostinfo, the engine from the shape's
+# pick when it made one. An empty file when there is nothing to say.
+cal_fallback_rows() {   # cal_fallback_rows <outfile> <host>...
+    local out=$1 h a e p cpus eng sid members m
+    shift
+    : > "$out" || die "cannot write $out"
+    [ $# -gt 0 ] && [ -s "$WORK_DIR/cal/hostinfo" ] || return 0
+    for h in "$@"; do
+        [ ! -s "$WORK_DIR/usable/$h" ] || continue
+        cpus=""; eng=""
+        while IFS=$'\t' read -r m a e p; do [ "$m" != "$h" ] || { cpus=$a; break; }; done < "$WORK_DIR/cal/hostinfo"
+        [ ! -s "$WORK_DIR/cal/shapes" ] || while IFS=$'\t' read -r sid _ _ _ _ _ _ _ _ _ _ members; do
+            case " $members " in (*" $h "*) ;; (*) continue ;; esac
+            [ ! -s "$WORK_DIR/cal/s$sid/engine" ] || IFS= read -r eng < "$WORK_DIR/cal/s$sid/engine" || :
+            break
+        done < "$WORK_DIR/cal/shapes"
+        printf '%s\t%s\t%s\n' "$h" "$cpus" "$eng" >> "$out"
+    done
 }
