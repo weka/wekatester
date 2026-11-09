@@ -274,8 +274,10 @@ write_mount_lines() {   # write_mount_lines <dir> <line>...
 check_mounts_unchanged() {
     debug "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
     [ -s "$WORK_DIR/mount/sums" ] || die "no mount record from the mount check in $WORK_DIR/mount"
-    local td i line was pids=() rcs=() now=() old=() new=() changed=()
+    local td i j line was pids=() rcs=() now=() changed=() base=()
     td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
+    # the mount check's host order: HOSTS may have lost hosts since
+    mapfile -t base < "$WORK_DIR/mount/hosts" || die "no host order from the mount check in $WORK_DIR/mount"
     load_host_dirs
     for i in "${!HOSTS[@]}"; do
         mount_line_cmd_v "'${HOST_DIRS[$i]}'"
@@ -288,12 +290,14 @@ check_mounts_unchanged() {
         now[$i]=$line
         [ -z "$line" ] || debug3 "${HOSTS[$i]}: mount: $line"
     done
-    write_mount_lines "$td/now" "${now[@]}"
-    mapfile -t old < "$WORK_DIR/mount/sums"
-    mapfile -t new < "$td/now/sums"
     for i in "${!HOSTS[@]}"; do
-        [ "${rcs[$i]}" -ne 0 ] || [ -z "${now[$i]}" ] || [ "${old[$i]:-}" != "${new[$i]:-}" ] || continue
-        was=""; IFS= read -r was < "$WORK_DIR/mount/$i" || :
+        was=""
+        for j in "${!base[@]}"; do
+            [ "${base[$j]}" = "${HOSTS[$i]}" ] || continue
+            IFS= read -r was < "$WORK_DIR/mount/$j" || :
+            break
+        done
+        [ "${rcs[$i]}" -ne 0 ] || [ -z "${now[$i]}" ] || [ "$was" != "${now[$i]}" ] || continue
         if [ "${rcs[$i]}" -ne 0 ]; then line="unreadable (rc=${rcs[$i]})"
         elif [ -z "${now[$i]}" ]; then line="no /proc/mounts line"
         else line="\"${now[$i]}\""; fi
@@ -669,5 +673,9 @@ verify_mount_mode() {
     # destination's line is its parent's, the mount it was created on. The
     # suite calls this phase without a work dir.
     [ -z "${WORK_DIR:-}" ] || write_mount_lines "$WORK_DIR/mount" "${procs[@]}"
+    # the hosts the lines belong to, in order: a host excluded in
+    # calibration shifts HOSTS, and the recheck looks its line up by name
+    [ -z "${WORK_DIR:-}" ] || printf '%s\n' "${HOSTS[@]}" > "$WORK_DIR/mount/hosts" \
+        || die "cannot record the mount check's host order"
     debug "mount mode and writability ok on all hosts"
 }
