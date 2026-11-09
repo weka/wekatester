@@ -1157,7 +1157,7 @@ summarize_report() {   # summarize_report <path> <items> <expected>
     if [ -s "$path" ] && list=$(tar -tf "$path" 2>&1) && [ -n "$list" ]; then
         tmp=$(mktemp -d "${TMPDIR:-/tmp}/wt.summ.XXXXXX") || return 1
         tar -xf "$path" -C "$tmp" 2> "$tmp/tar.err" || { echo "cannot extract $path" >&2; rm -rf "${tmp:?}"; return 1; }
-        local f job skip results e rds=()
+        local f job base skip results e rds=()
         for e in "$tmp"/*; do [ ! -d "$e" ] || rds+=("$e"); done
         if [ ${#rds[@]} -eq 1 ]; then
             summary_header "${rds[0]}" "${path##*/}" || echo "(no synopsis: it could not be read from $path)"
@@ -1182,9 +1182,11 @@ summarize_report() {   # summarize_report <path> <items> <expected>
         results=$(find "$tmp" -name 'results_*.json' -type f | LC_ALL=C awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2-)
         [ -z "$results" ] || while IFS= read -r f; do
             job=${f##*/}; job=${job#results_}; job=${job%.json}
-            case "$skip" in *" $job "*) continue ;; esac
+            # a rerun after a dropped host (run_aux_job) is its job's kind
+            base=${job%-rerun[0-9]*}
+            case "$skip" in *" $base "*) continue ;; esac
             case "$lay" in
-                (*" $job "*) echo "==== $job (layout sequential write) ===="
+                (*" $base "*) echo "==== $job (layout sequential write) ===="
                              summ_one "$f" "${f##*/}" layout "" bundle; continue ;;
             esac
             echo "==== $job ===="

@@ -511,7 +511,9 @@ cal_shape_clients() {   # cal_shape_clients <id> <rep>
 cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
     local sid rep usable phys allc linerate engines pinned memcap aio cached members n m take list
     : > "$WORK_DIR/cal/clients" || die "cannot write $WORK_DIR/cal/clients"
+    : > "$WORK_DIR/cal/members" || die "cannot write $WORK_DIR/cal/members"
     while IFS=$'\t' read -r sid rep usable phys allc linerate engines pinned memcap aio cached members; do
+        printf '%s\t%s\n' "$sid" "$members" >> "$WORK_DIR/cal/members"
         set -- $members; n=$#
         take=$n; [ "$CAL_CLIENTS" = all ] || take=$CAL_CLIENTS
         if [ "$take" -gt "$n" ]; then
@@ -644,7 +646,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         # Absent (dropped mid-cell) or no JSON at all (fio never connected):
         # the dispatcher's to recover, exit 3
         json_load "$json"
-        if [ "$JSON_RC" -ne 2 ] && ! json_awk -F'\t' -v h="$rep" '$1 ~ /^client_stats\.[0-9]+\.hostname$/ && $2 == h { f = 1 } END { exit !f }'; then
+        if [ "$JSON_RC" -eq 2 ] || { [ "$JSON_RC" -eq 0 ] && ! json_awk -F'\t' -v h="$rep" '$1 ~ /^client_stats\.[0-9]+\.hostname$/ && $2 == h { f = 1 } END { exit !f }'; }; then
             log "cal: shape $CAL_SID: $rep dropped from the $what (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -894,10 +896,26 @@ cal_reap_dropped() {   # cal_reap_dropped <client> <engines|searches> <index> <c
 }
 
 cal_exclude_client() {   # cal_exclude_client <client> <why> -> 3 restart, 4 shape excluded
-    local c=$1 keep="" h rep=${CAL_SHAPE_CLIENTS%% *}
+    local c=$1 keep="" h rep=${CAL_SHAPE_CLIENTS%% *} id members m
     printf '%s\t%s\t%s\n' "$c" "$CAL_SID" "$2" >> "$WORK_DIR/cal/excluded"
     CAL_EXCLUDED_CLIENTS="$CAL_EXCLUDED_CLIENTS${CAL_EXCLUDED_CLIENTS:+ }$c"
     for h in $CAL_SHAPE_CLIENTS; do [ "$h" = "$c" ] || keep="$keep${keep:+ }$h"; done
+    # the shape's next member not yet used or lost joins in the lost one's
+    # place (--cal-clients sets how many run side by side, not who may
+    # join), once: the restart below is the cap
+    if [ "$CAL_SHAPE_RESTARTED" -eq 0 ] && [ -s "$WORK_DIR/cal/members" ]; then
+        while IFS=$'\t' read -r id members; do
+            [ "$id" = "$CAL_SID" ] || continue
+            for m in $members; do
+                case " $CAL_SHAPE_CLIENTS " in (*" $m "*) continue ;; esac
+                awk -F'\t' -v h="$m" '$1 == h { f = 1 } END { exit !f }' "$WORK_DIR/cal/excluded" && continue
+                keep="$keep${keep:+ }$m"; mkdir -p "$WORK_DIR/cal/$m" || die "cannot create $WORK_DIR/cal/$m"
+                log "cal: shape $CAL_SID: $m joins the shape's clients in $c's place"
+                break
+            done
+            break
+        done < "$WORK_DIR/cal/members"
+    fi
     CAL_SHAPE_CLIENTS=$keep
     printf '%s\n' "$keep" > "$WORK_DIR/cal/s$CAL_SID/clients"
     if [ -z "$keep" ]; then
@@ -911,6 +929,18 @@ cal_exclude_client() {   # cal_exclude_client <client> <why> -> 3 restart, 4 sha
     [ "$c" != "$rep" ] || log "cal: shape $CAL_SID: ${keep%% *} promoted to representative in $c's place"
     log "cal: shape $CAL_SID: $c excluded ($2); the shape restarts from the beginning on $keep, its readings so far discarded"
     return 3
+}
+
+# A stopped cell's fio job runs on in the client's server (run.sh, the
+# ladder) and would contend with the restart's first cells, so every
+# surviving client's server is restarted first. 1: one could not be, and
+# the shape is excluded (cal_exclude_client after a restart).
+cal_restart_survivors() {
+    local h
+    for h in $CAL_SHAPE_CLIENTS; do
+        if client_ladder "$h"; then log "cal: shape $CAL_SID: $h $LADDER_WHY before the restart (a stopped cell's job ran on)"
+        else cal_exclude_client "$h" "$LADDER_WHY" || return 1; fi
+    done
 }
 
 # The shape's state before a restart: no history, tuples, engine pick or
@@ -1100,7 +1130,8 @@ BUDEOF
     while :; do
         cal_shape_pass && return 0
         case $? in
-            (3) cal_shape_reset ;;
+            (3) cal_restart_survivors || { cal_shape_excluded; return 0; }
+                cal_shape_reset ;;
             (4) cal_shape_excluded; return 0 ;;
             (*) return 1 ;;
         esac
@@ -1113,6 +1144,7 @@ cal_shape_pass() {
     # engine cells: one per candidate per type (bw, iops, lat; lat1m stands in
     # for lat only when no 4k latency search is asked for)
     cal_shape_clients "$sid" "$rep"
+    E_CELL=(); E_RES=()   # a restart builds its engine cells again
     # a restart runs on the rest: its first client is the representative
     rep=${CAL_SHAPE_CLIENTS%% *}
     set -- $CAL_SHAPE_CLIENTS; nclients=$#
