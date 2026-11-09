@@ -2958,7 +2958,7 @@ SUBDIREOF
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
     cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
     log "cal: seeding $host's calibration $side${by}..."
-    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=30s"
+    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=15s"
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed leaves its evidence outside the tmpfs workdir
     # shellcheck disable=SC2086 -- active is a list of host names
@@ -3820,7 +3820,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     [ -n "$n" ] || { CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS; }
     [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
-    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=30s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
+    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
         cal_evidence "$what" "$json" "$base.job" say "$rep"
         die "calibration $what failed on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
@@ -9493,7 +9493,7 @@ dry_run_report() {
     echo
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
-    log "would run, per job in the order above: fio --output-format=json --eta-interval=30s --client=<host> $TARGET_DIR/<host>/<job>"
+    log "would run, per job in the order above: fio --output-format=json --eta-interval=15s --client=<host> $TARGET_DIR/<host>/<job>"
     log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
 }
 
@@ -10021,12 +10021,14 @@ check_own_layout() {   # check_own_layout <layout job>
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
-# jobfile>" per worker. --eta-interval=30s: the coordinator drops a client on
-# its 7th unanswered SEND_ETA poll in a row, so a dead client costs ~3.5 min
-# of silence, not the run; fio's 1 s default dropped a saturated worker
-# mid-layout after 7 s, and --eta=never never dropped a dead one.
+# jobfile>" per worker. --eta-interval=15s: the coordinator drops a client on
+# its 7th unanswered SEND_ETA poll in a row, and each miss costs two
+# intervals (the timed-out poll clears at the tick that finds it, the next
+# goes out a tick later): ~14 intervals, so a dead client costs ~3.5 min of
+# silence, not the run. fio's 1 s default dropped a saturated worker
+# mid-layout after ~40 s, and --eta=never never dropped a dead one.
 fio_client_cmd() {   # fio_client_cmd <job> [host...]: every host, or the ones named
-    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=30s"
+    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=15s"
     shift
     [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     for host in "$@"; do
@@ -10095,17 +10097,16 @@ summ_job_failed() {   # summ_job_failed <job>
 # fio drops a client that answers no poll (fio_client_cmd) and exits non-zero
 # with the survivors' stats; the dropped host has no client_stats entry. The
 # ladder below decides whether it runs the next job: ssh alive (or reopened),
-# then its fio server ours and listening (else restarted once). A host that
-# fails the ladder, or is dropped twice, leaves HOSTS for the rest of the run.
-# START_HOSTS: the list the run began with, the 5% rule's denominator.
+# then its fio server killed and relaunched, never kept: the dropped job's
+# child (fio forks one per connection) runs on after the coordinator lets
+# go and would skew the next job, and a stopped server still accepts. A host
+# that fails the ladder, or is dropped twice, leaves HOSTS for the rest of
+# the run. START_HOSTS: the list the run began with, the 5% rule's
+# denominator.
 START_HOSTS=(); EXCLUDED_HOSTS=(); LADDER_WHY=""
 declare -gA DROP_COUNT=()
-CLIENT_CHECK_S=20   # each remote step of the ladder
-
-# A host-local check: the pidfile's pid is our server (base.sh _wt_srv).
-fio_server_alive_cmd() {   # fio_server_alive_cmd -> remote snippet
-    printf '%s' "$PROC_FN; [ -f '$FIO_PIDFILE' ] && _p=\$(cat '$FIO_PIDFILE') && _wt_args \"\$_p\" && _wt_srv '$FIO_PIDFILE'"
-}
+CLIENT_CHECK_S=20     # each remote step of the ladder
+CLIENT_RELAUNCH_S=30  # the kill (3 s before -9) and the launch
 
 fio_port_open() {   # fio_port_open <host>: the master reaches <host>:$FIO_PORT
     local out
@@ -10115,12 +10116,12 @@ fio_port_open() {   # fio_port_open <host>: the master reaches <host>:$FIO_PORT
     return 1
 }
 
-# client_ladder <host>: 0 and LADDER_WHY (stalled, ssh reconnected, fio
-# server restarted) when the host can take the next job; 1 and the reason
-# when it cannot. Every remote step is bounded.
+# client_ladder <host>: 0 and LADDER_WHY ("fio restarted", "ssh reconnected,
+# fio restarted") when the host can take the next job; 1 and the reason when
+# it cannot. Every remote step is bounded.
 client_ladder() {
-    local host=$1 out rc=0 line
-    LADDER_WHY=stalled
+    local host=$1 out line
+    LADDER_WHY=""
     if [ "$LOCAL_MODE" -eq 0 ]; then
         host_ssh_opts_v "$host"
         # shellcheck disable=SC2086 -- option words
@@ -10132,23 +10133,19 @@ client_ladder() {
                 LADDER_WHY="gone: ssh does not answer"
                 return 1
             fi
-            LADDER_WHY="ssh reconnected"
+            LADDER_WHY="ssh reconnected, "
         fi
     fi
-    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$(fio_server_alive_cmd)" 2>&1) || rc=$?
-    [ "$rc" -eq 0 ] || debug "$host: fio server check: rc $rc${out:+: $out}"
-    [ "$rc" -ne 0 ] || fio_port_open "$host" || rc=1
-    [ "$rc" -ne 0 ] || return 0
     fio_launch_cmd_v "$host"
-    if ! RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" \
+    if ! RUN_HOST_TIMEOUT=$CLIENT_RELAUNCH_S run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" \
             > "$WORK_DIR/relaunch.$host" 2> "$WORK_DIR/relaunch.$host.err"; then
-        LADDER_WHY="fio server could not be restarted"
+        LADDER_WHY="${LADDER_WHY}fio server could not be restarted"
         return 1
     fi
     while IFS= read -r line; do log "$host: $line" >&2; done < "$WORK_DIR/relaunch.$host.err"
     sleep "${WT_SETTLE:-2}"
-    fio_port_open "$host" || { LADDER_WHY="fio server restarted, but $MASTER cannot reach port $FIO_PORT"; return 1; }
-    LADDER_WHY="fio server restarted"
+    fio_port_open "$host" || { LADDER_WHY="${LADDER_WHY}fio restarted, but $MASTER cannot reach port $FIO_PORT"; return 1; }
+    LADDER_WHY="${LADDER_WHY}fio restarted"
     return 0
 }
 
@@ -10193,7 +10190,7 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items>
     [ ${#dropped[@]} -gt 0 ] || die "fio run failed for $job (partial output in $out)"
     for host in "${dropped[@]}"; do
         DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
-        log "dropped: $host answered no poll during $job; fio dropped it (7 polls of 30 s) and its result for this job is lost"
+        log "dropped: $host answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min) and its result for this job is lost"
         if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
             exclude_host "$host" "$job" "dropped twice in this run"
         elif client_ladder "$host"; then
