@@ -762,12 +762,17 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
     shift
     [ -n "$AUTO_LEVEL" ] && [ "$LAYOUT_OWN" -eq 0 ] || return 0
     for x in "$@"; do
+        # no groups file: every host is one group (as fs_groups reads it)
         g=1; m=""
-        [ ! -s "$WORK_DIR/groups" ] || g=$(awk -v h="$x" '$1 == h { print $2; exit }' "$WORK_DIR/groups")
-        for h in "${HOSTS[@]}"; do
-            [ "$(awk -v h="$h" 'BEGIN { g = 1 } $1 == h { g = $2 } END { print g }' "$WORK_DIR/groups" 2>&1)" = "$g" ] || continue
-            m=$h; break
-        done
+        if [ -s "$WORK_DIR/groups" ]; then
+            g=$(awk -v h="$x" 'BEGIN { g = 1 } $1 == h { g = $2 } END { print g }' "$WORK_DIR/groups")
+            for h in "${HOSTS[@]}"; do
+                [ "$(awk -v h="$h" 'BEGIN { g = 1 } $1 == h { g = $2 } END { print g }' "$WORK_DIR/groups")" = "$g" ] || continue
+                m=$h; break
+            done
+        else
+            m=${HOSTS[0]:-}
+        fi
         if [ -z "$m" ]; then
             log "layout: no host of $x's filesystem group is left; its shared read set stays as it is"
             continue
