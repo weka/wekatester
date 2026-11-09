@@ -387,14 +387,16 @@ SUBDIREOF
     # Writers: the rep, except the unified read side, which its filesystem
     # group seeds round-robin by file (their fio servers are idle). A member
     # line is "<host> <dir> <cpus> <engine>", the rep first.
-    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- margs=()
+    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- ex margs=()
     printf '%s\t%s\t%s\t%s\n' "$host" "$root" "$cpus" "$eng" > "$members"
     if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ]; then
         # the rest of the group, one awk for all (a group can be the fleet)
         load_host_dirs
         [ ! -s "$WORK_DIR/groups" ] || gf="$WORK_DIR/groups"
         for i in "${!HOSTS[@]}"; do margs+=("${HOSTS[$i]}" "${HOST_DIRS[$i]}"); done
-        awk '#@awk cal_seed_rep.members' "$host" "$eng" "$gf" "$WORK_DIR/cal/hostinfo" "${margs[@]}" >> "$members" \
+        # a client lost during calibration (cal/excluded) writes none of it
+        ex=-; [ ! -s "$WORK_DIR/cal/excluded" ] || ex="$WORK_DIR/cal/excluded"
+        awk '#@awk cal_seed_rep.members' "$host" "$eng" "$gf" "$WORK_DIR/cal/hostinfo" "$ex" "${margs[@]}" >> "$members" \
             || die "$host: cannot list its filesystem group for the shared seed"
     fi
     # each member's seed jobfile lands in its own directory under cal/: one
@@ -1104,6 +1106,8 @@ cal_shape_pass() {
     # engine cells: one per candidate per type (bw, iops, lat; lat1m stands in
     # for lat only when no 4k latency search is asked for)
     cal_shape_clients "$sid" "$rep"
+    # a restart runs on the rest: its first client is the representative
+    rep=${CAL_SHAPE_CLIENTS%% *}
     set -- $CAL_SHAPE_CLIENTS; nclients=$#
     # on k clients the cells of a search's independent ladders run side by
     # side, so the whole takes at most the solo time and nearer a k-th of it

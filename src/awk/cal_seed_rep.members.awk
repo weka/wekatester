@@ -9,9 +9,13 @@ BEGIN {
         split(line, F, "\t")
         if (!(F[1] in CPU)) { CPU[F[1]] = F[2]; ENG[F[1]] = F[3] }
     }
-    for (a = 5; a + 1 < ARGC; a += 2) {
+    # cal/excluded: "<host>\t<shape>\t<why>", the clients lost so far
+    if (ARGV[5] != "-")
+        while ((getline line < ARGV[5]) > 0)
+            if (split(line, F, "\t") >= 1) EX[F[1]] = 1
+    for (a = 6; a + 1 < ARGC; a += 2) {
         m = ARGV[a]
-        if (m == rep) continue
+        if (m == rep || (m in EX)) continue
         if (ng && !((rep in G) && (m in G) && G[m] == G[rep])) continue
         printf "%s\t%s\t%s\t%s\n", m, ARGV[a + 1], CPU[m], (ENG[m] != "" ? ENG[m] : eng)
     }
