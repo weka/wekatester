@@ -817,6 +817,7 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         # dropped by fio
         bound=$(aux_bound_s "$kind" "$job" "$n" "$@") || die "cannot size the $kind job $job for its time bound"
         if RUN_HOST_TIMEOUT=$bound run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || coord_kill "$TARGET_DIR/$1/$job.coord"
         plan=""; [ "$kind" != layout ] || [ "$n" -gt 0 ] || plan=$LAYOUT_WRITE_BYTES
         ok=1
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
@@ -877,14 +878,30 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
 # goes out a tick later): ~14 intervals, so a dead client costs ~3.5 min of
 # silence, not the run. fio's 1 s default dropped a saturated worker
 # mid-layout after ~40 s, and --eta=never never dropped a dead one.
+# The coordinator fio on MASTER, under a pidfile: run_bounded ends the ssh
+# session, not the remote fio, so a fired bound kills it by that file
+# (coord_kill), bounded; only a pid whose args still read as a coordinator.
+coord_cmd() {   # coord_cmd <pidfile> <fio args...>
+    local pf=$1; shift
+    printf '( %sexec '\''%s'\'' --output-format=json --eta-interval=15s %s ) & _wt_c=$!; echo "$_wt_c" > '\''%s'\''; wait "$_wt_c"' \
+        "${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }" "$FIO_BIN" "$*" "$pf"
+}
+coord_kill() {   # coord_kill <pidfile>
+    local out r
+    # the remote: our pid only while its args still read as a coordinator
+    r="$PROC_FN; if _p=\$(cat '$1') && _wt_args \"\$_p\"; then case \$_wt_a in *'--client='*) kill \"\$_p\"; i=0; while _wt_args \"\$_p\" && [ \"\$i\" -lt 15 ]; do sleep 0.2; i=\$((i+1)); done; if _wt_args \"\$_p\"; then kill -9 \"\$_p\"; fi; echo killed ;; esac; fi; rm -f '$1'"
+    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$MASTER" "$r" 2>&1) \
+        || log "WARNING: $MASTER: the coordinator fio of the bounded job may still run (${1##*/}): $out" >&2
+    [ -n "$out" ] || log "WARNING: $MASTER: no coordinator fio found to stop (${1##*/})" >&2
+}
 fio_client_cmd() {   # fio_client_cmd <job> [host...]: every host, or the ones named
-    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=15s"
+    local job=$1 host args=""
     shift
     [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     for host in "$@"; do
-        cmd="$cmd --client=$host '$TARGET_DIR/$host/$job'"
+        args="$args --client=$host '$TARGET_DIR/$host/$job'"
     done
-    printf '%s' "$cmd"
+    coord_cmd "$TARGET_DIR/$1/$job.coord" "$args"
 }
 
 # Hosts whose staged <job> holds a job section. A group follower whose files
@@ -1160,6 +1177,7 @@ run_jobs() {
         # runtime runs to its size, unbounded.
         RUN_BOUND_S=$(job_bound_s "$WORK_DIR/jobs/${HOSTS[0]}/$job") || die "cannot read the runtime of $job"
         if RUN_HOST_TIMEOUT=$RUN_BOUND_S run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || coord_kill "$TARGET_DIR/${HOSTS[0]}/$job.coord"
         recover_dropped "$job" "$outfile" "$report" "$rc"
         phase_done "job $job"
     done

@@ -438,8 +438,9 @@ SUBDIREOF
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
     cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
     log "cal: seeding $host's calibration $side${by}..."
-    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=15s"
+    cmd=""
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
+    cmd=$(coord_cmd "$TARGET_DIR.cal/$job-$host.coord" "$cmd")
     # a failed seed leaves its evidence outside the tmpfs workdir
     # shellcheck disable=SC2086 -- active is a list of host names
     # bounded at the bytes over 10 MiB/s plus 60 s: a client lost before
@@ -447,6 +448,7 @@ SUBDIREOF
     if RUN_HOST_TIMEOUT=$((nmib / 10 + 60)) run_host "$MASTER" "$cmd" > "$res"; then :; else
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            coord_kill "$TARGET_DIR.cal/$job-$host.coord"
             log "cal: $host dropped from its calibration $side seed: no result in $((nmib / 10 + 60)) s, the seed bound (${res##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -679,9 +681,10 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
     # Bounded: fio never drops a client lost before its job starts (it polls
     # only running ones), so the coordinator gets 2 x the cell plus 60 s.
-    if RUN_HOST_TIMEOUT=$((2 * (rt + 2) + 60)) run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then :; else
+    if RUN_HOST_TIMEOUT=$((2 * (rt + 2) + 60)) run_host "$MASTER" "$(coord_cmd "$TARGET_DIR.cal/$rep/$base.job.coord" "--client=$rep '$TARGET_DIR.cal/$rep/$base.job'")" > "$json"; then :; else
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            coord_kill "$TARGET_DIR.cal/$rep/$base.job.coord"
             log "cal: shape $CAL_SID: $rep dropped from the $what: no result in $((2 * (rt + 2) + 60)) s, the cell bound (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
