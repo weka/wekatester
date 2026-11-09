@@ -567,11 +567,20 @@ cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
 
 # A seed's host dropped (its bound fired): laddered and the seed retried
 # once, else the client leaves the shape (cal_exclude_client: 3 restart,
-# 4 shape excluded). Per shape, CAL_RETRIED is the cells' too.
+# 4 shape excluded). Per shape, CAL_RETRIED is the cells' too. A shared
+# seed has other writers (its filesystem group): when the host itself
+# still answers, the stall was another writer's (lost, and in cal/excluded
+# by its own shape by now), so the seed is retried once as it is.
 cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
     local c=$1 why rc=0
     if [ -n "${CAL_RETRIED[$c]:-}" ]; then
         why="dropped again after its retry"
+    elif [ -z "${CAL_SEED_STALLED[$c]:-}" ] && fio_port_open "$c"; then
+        CAL_SEED_STALLED[$c]=1
+        log "cal: shape $CAL_SID: $c still answers; its seed stalled on another writer and is retried once"
+        cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
+        [ "$rc" -eq 3 ] || return "$rc"
+        cal_seed_lost "$c" "$2" "$3" "$4"; return $?
     elif client_ladder "$c"; then
         CAL_RETRIED[$c]=1
         log "cal: shape $CAL_SID: $c $LADDER_WHY; its seed is retried once"
@@ -1167,7 +1176,7 @@ BUDEOF
     mins=$(( (budget * (CAL_RUNTIME + 5) + wcells * CAL_SETTLE) / 60 + 1 ))
     # one pass; a lost client restarts the shape once on the rest (3), a
     # second loss excludes it (4) with what converged kept (cal_reap_dropped)
-    local -A CAL_RETRIED=()
+    local -A CAL_RETRIED=() CAL_SEED_STALLED=()
     CAL_SHAPE_RESTARTED=0; CAL_EXCLUDED_CLIENTS=""
     while :; do
         cal_shape_pass && return 0
@@ -1201,8 +1210,9 @@ cal_shape_pass() {
     # the dataset every first-pass cell reads or writes; wider cells seed
     # their own extra files as they come
     if [ "$pinned" != "-" ]; then CAL_SEED_ENG=$pinned; else CAL_SEED_ENG=${engines%%,*}; fi
-    [ "$any_read" -eq 0 ] || cal_seed_clients read "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
-    [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS
+    # a seed-time loss ends the pass like a cell's (3 restart, 4 excluded)
+    [ "$any_read" -eq 0 ] || cal_seed_clients read "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS || return $?
+    [ "$any_write" -eq 0 ] || cal_seed_clients write "$usable" "$CAL_NR" $CAL_SHAPE_CLIENTS || return $?
     if [ "$pinned" != "-" ]; then
         eng=$pinned
         debug "cal: shape $sid: ioengine $eng (pinned by -e or the host file; -g re-chooses it)"
