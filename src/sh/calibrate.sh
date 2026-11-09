@@ -336,7 +336,7 @@ seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <availmib|""> <dir
 cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-nr> <engine> <cpus>
     local host=$1 rnj=$2 rnr=$3 wnj=$4 wnr=$5 eng=$6 cpus=$7
     local hd root unified=0 want nfiles nmib src totkb availmib maxf subdirs sd cmd
-    local wantnj tag job res
+    local wantnj tag job res rc
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag-$host.json"   # several clients seed at once
@@ -437,7 +437,14 @@ SUBDIREOF
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed leaves its evidence outside the tmpfs workdir
     # shellcheck disable=SC2086 -- active is a list of host names
-    if ! run_host "$MASTER" "$cmd" > "$res"; then
+    # bounded at the bytes over 10 MiB/s plus 60 s: a client lost before
+    # its job starts is never dropped by fio. 3: the seed's host is dropped
+    if RUN_HOST_TIMEOUT=$((nmib / 10 + 60)) run_host "$MASTER" "$cmd" > "$res"; then :; else
+        rc=$?
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            log "cal: $host dropped from its calibration $side seed: no result in $((nmib / 10 + 60)) s, the seed bound (${res##*/} is in the run bundle under cal/)"
+            return 3
+        fi
         cal_evidence seed "$res" "$job" say $active
         die "calibration seed failed (${res##*/} and $job are in the run bundle under cal/)"
     fi
@@ -451,7 +458,7 @@ SUBDIREOF
 # Seed what a cell of nj jobs x nr files needs in one direction, on the
 # host's own cpus; skips the listing and df when already covered.
 cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
-    local host=$1 dirn=$2 nj=$3 nr=$4 cov a b
+    local host=$1 dirn=$2 nj=$3 nr=$4 cov a b rc=0
     cov="$WORK_DIR/cal/$host/seeded.$dirn"
     if [ -s "$cov" ]; then
         while read -r a b; do
@@ -465,14 +472,15 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
             # calibrating at once take turns seeding it (and the second
             # finds the first's files complete)
             cal_group_lock "$host"
-            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
             cal_group_unlock "$host"
         else
-            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
         fi
     else
-        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
     fi
+    [ "$rc" -eq 0 ] || return "$rc"
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
 }
@@ -534,7 +542,7 @@ cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
 # (its group seeds it, as cal_seed_rep does); in the scratch every client
 # seeds both sides. A failure names the client.
 cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
-    local dirn=$1 nj=$2 nr=$3 m g pids=() hs=() i seen=" "
+    local dirn=$1 nj=$2 nr=$3 m g pids=() hs=() i seen=" " rc
     shift 3
     for m in "$@"; do
         if [ "$dirn" = read ] && [ "${CAL_NS_DIR-unset}" = "" ]; then
@@ -546,8 +554,29 @@ cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
         pids+=($!); hs+=("$m")
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "the calibration $dirn seed failed on ${hs[$i]}"
+        if wait "${pids[$i]}"; then continue; else rc=$?; fi
+        [ "$rc" -eq 3 ] || die "the calibration $dirn seed failed on ${hs[$i]}"
+        cal_seed_lost "${hs[$i]}" "$dirn" "$nj" "$nr" || return $?
     done
+}
+
+# A seed's host dropped (its bound fired): laddered and the seed retried
+# once, else the client leaves the shape (cal_exclude_client: 3 restart,
+# 4 shape excluded). Per shape, CAL_RETRIED is the cells' too.
+cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
+    local c=$1 why rc=0
+    if [ -n "${CAL_RETRIED[$c]:-}" ]; then
+        why="dropped again after its retry"
+    elif client_ladder "$c"; then
+        CAL_RETRIED[$c]=1
+        log "cal: shape $CAL_SID: $c $LADDER_WHY; its seed is retried once"
+        cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
+        [ "$rc" -eq 3 ] || return "$rc"
+        why="dropped again after its retry"
+    else
+        why=$LADDER_WHY
+    fi
+    cal_exclude_client "$c" "$why"
 }
 
 # Client shapes in command-line order, the first host the representative
@@ -801,7 +830,15 @@ cal_dispatch() {   # cal_dispatch engines|searches
             rf="$sdir/reading-$n"; donef="$sdir/done-$n"; rm -f "$rf" "$donef"
             # the seed here, never in the cell: two clients' seeds of one
             # shared set must not overlap
-            cal_ensure_seed "$c" "$dirn" "$nj" "$nr"
+            if cal_ensure_seed "$c" "$dirn" "$nj" "$nr"; then :; else
+                rc=$?
+                [ "$rc" -eq 3 ] || die "the calibration $dirn seed failed on $c"
+                if cal_seed_lost "$c" "$dirn" "$nj" "$nr"; then :; else
+                    rc=$?
+                    [ ${#pids[@]} -eq 0 ] || cal_stop_tree "${pids[@]}"
+                    return "$rc"
+                fi
+            fi
             inflight=$(( ${#pids[@]} + 1 ))
             set -m   # the cell is a process group of its own (cal_stop_tree)
             { ( CAL_PIN_FS=$pinfs; cal_run_cell "$c" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt" "$n" "$rf" ); printf '%s\n' "$?" > "$donef"; } &

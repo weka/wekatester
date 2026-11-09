@@ -2753,7 +2753,7 @@ seed_estimate_line() {   # seed_estimate_line <nfiles> <nmib> <availmib|""> <dir
 cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-nr> <engine> <cpus>
     local host=$1 rnj=$2 rnr=$3 wnj=$4 wnr=$5 eng=$6 cpus=$7
     local hd root unified=0 want nfiles nmib src totkb availmib maxf subdirs sd cmd
-    local wantnj tag job res
+    local wantnj tag job res rc
     tag=all
     if [ "$wnj" -eq 0 ]; then tag=read; elif [ "$rnj" -eq 0 ]; then tag=write; fi
     job="cal-seed-$tag.job"; res="$WORK_DIR/cal/res-seed-$tag-$host.json"   # several clients seed at once
@@ -2968,7 +2968,14 @@ SUBDIREOF
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed leaves its evidence outside the tmpfs workdir
     # shellcheck disable=SC2086 -- active is a list of host names
-    if ! run_host "$MASTER" "$cmd" > "$res"; then
+    # bounded at the bytes over 10 MiB/s plus 60 s: a client lost before
+    # its job starts is never dropped by fio. 3: the seed's host is dropped
+    if RUN_HOST_TIMEOUT=$((nmib / 10 + 60)) run_host "$MASTER" "$cmd" > "$res"; then :; else
+        rc=$?
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            log "cal: $host dropped from its calibration $side seed: no result in $((nmib / 10 + 60)) s, the seed bound (${res##*/} is in the run bundle under cal/)"
+            return 3
+        fi
         cal_evidence seed "$res" "$job" say $active
         die "calibration seed failed (${res##*/} and $job are in the run bundle under cal/)"
     fi
@@ -2982,7 +2989,7 @@ SUBDIREOF
 # Seed what a cell of nj jobs x nr files needs in one direction, on the
 # host's own cpus; skips the listing and df when already covered.
 cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
-    local host=$1 dirn=$2 nj=$3 nr=$4 cov a b
+    local host=$1 dirn=$2 nj=$3 nr=$4 cov a b rc=0
     cov="$WORK_DIR/cal/$host/seeded.$dirn"
     if [ -s "$cov" ]; then
         while read -r a b; do
@@ -2996,14 +3003,15 @@ cal_ensure_seed() {   # cal_ensure_seed <host> <read|write> <nj> <nr>
             # calibrating at once take turns seeding it (and the second
             # finds the first's files complete)
             cal_group_lock "$host"
-            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
             cal_group_unlock "$host"
         else
-            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+            cal_seed_rep "$host" "$nj" "$nr" 0 0 "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
         fi
     else
-        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL"
+        cal_seed_rep "$host" 0 0 "$nj" "$nr" "$CAL_SEED_ENG" "$CAL_HOST_ALL" || rc=$?
     fi
+    [ "$rc" -eq 0 ] || return "$rc"
     mkdir -p "$WORK_DIR/cal/$host"
     printf '%s %s\n' "$nj" "$nr" >> "$cov"
 }
@@ -3065,7 +3073,7 @@ cal_list_clients() {   # cal_list_clients <shapes-file> -> cal/clients
 # (its group seeds it, as cal_seed_rep does); in the scratch every client
 # seeds both sides. A failure names the client.
 cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
-    local dirn=$1 nj=$2 nr=$3 m g pids=() hs=() i seen=" "
+    local dirn=$1 nj=$2 nr=$3 m g pids=() hs=() i seen=" " rc
     shift 3
     for m in "$@"; do
         if [ "$dirn" = read ] && [ "${CAL_NS_DIR-unset}" = "" ]; then
@@ -3077,8 +3085,29 @@ cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
         pids+=($!); hs+=("$m")
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "the calibration $dirn seed failed on ${hs[$i]}"
+        if wait "${pids[$i]}"; then continue; else rc=$?; fi
+        [ "$rc" -eq 3 ] || die "the calibration $dirn seed failed on ${hs[$i]}"
+        cal_seed_lost "${hs[$i]}" "$dirn" "$nj" "$nr" || return $?
     done
+}
+
+# A seed's host dropped (its bound fired): laddered and the seed retried
+# once, else the client leaves the shape (cal_exclude_client: 3 restart,
+# 4 shape excluded). Per shape, CAL_RETRIED is the cells' too.
+cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
+    local c=$1 why rc=0
+    if [ -n "${CAL_RETRIED[$c]:-}" ]; then
+        why="dropped again after its retry"
+    elif client_ladder "$c"; then
+        CAL_RETRIED[$c]=1
+        log "cal: shape $CAL_SID: $c $LADDER_WHY; its seed is retried once"
+        cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
+        [ "$rc" -eq 3 ] || return "$rc"
+        why="dropped again after its retry"
+    else
+        why=$LADDER_WHY
+    fi
+    cal_exclude_client "$c" "$why"
 }
 
 # Client shapes in command-line order, the first host the representative
@@ -4000,7 +4029,15 @@ cal_dispatch() {   # cal_dispatch engines|searches
             rf="$sdir/reading-$n"; donef="$sdir/done-$n"; rm -f "$rf" "$donef"
             # the seed here, never in the cell: two clients' seeds of one
             # shared set must not overlap
-            cal_ensure_seed "$c" "$dirn" "$nj" "$nr"
+            if cal_ensure_seed "$c" "$dirn" "$nj" "$nr"; then :; else
+                rc=$?
+                [ "$rc" -eq 3 ] || die "the calibration $dirn seed failed on $c"
+                if cal_seed_lost "$c" "$dirn" "$nj" "$nr"; then :; else
+                    rc=$?
+                    [ ${#pids[@]} -eq 0 ] || cal_stop_tree "${pids[@]}"
+                    return "$rc"
+                fi
+            fi
             inflight=$(( ${#pids[@]} + 1 ))
             set -m   # the cell is a process group of its own (cal_stop_tree)
             { ( CAL_PIN_FS=$pinfs; cal_run_cell "$c" "$type" "$dirn" "$eng" "$nj" "$qd" "$nr" "$rt" "$n" "$rf" ); printf '%s\n' "$?" > "$donef"; } &
@@ -10266,7 +10303,7 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
 # member. AUX_RUNS: "<results file>\t<hosts>" per run, for the summary.
 # The fleet byte check (LAYOUT_CUT) applies to a layout that ran whole.
 run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
-    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost
+    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost bound
     shift 2
     LAYOUT_RERUN=("$@")
     AUX_RUNS=(); AUX_PARTIAL=0
@@ -10275,10 +10312,15 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         out="$RUN_DIR/results_${job%.job}.json"
         [ "$n" -eq 0 ] || { out="$RUN_DIR/results_${job%.job}-rerun$n.json"; log "$kind: rerunning $job on $# host(s): $*"; }
         cmd=$(fio_client_cmd "$job" "$@")
-        if run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
+        # bounded (job_bound_s): a client lost before its job starts is never
+        # dropped by fio
+        bound=$(aux_bound_s "$kind" "$job" "$n" "$@") || die "cannot size the $kind job $job for its time bound"
+        if RUN_HOST_TIMEOUT=$bound run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
         plan=""; [ "$kind" != layout ] || [ "$n" -gt 0 ] || plan=$LAYOUT_WRITE_BYTES
         ok=1
-        if ! check_fio_errors "$out" layout "$plan"; then
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            : # the bound fired: no result from anyone, every host goes up the ladder
+        elif ! check_fio_errors "$out" layout "$plan"; then
             ok=0
             if [ -z "$LAYOUT_CUT" ]; then
                 [ "$kind" != layout ] || postmortem_hosts layout "$job" "$WORK_DIR/jobs" "$TARGET_DIR" "$RUN_DIR/parse.${job%.job}" "$@"
@@ -10286,7 +10328,8 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
                 die "unlink $job failed -- test files may remain (raw output in $out)"
             fi
         fi
-        present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+        present=""
+        [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
         dropped=(); keep=()
         for host in "$@"; do
             case $'\n'"$present"$'\n' in
@@ -10303,6 +10346,7 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         AUX_PARTIAL=1
         how="answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min)"
         [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || how="gave no result for $job within $bound s, the $kind bound; fio was stopped"
         lost=()
         for host in "${dropped[@]}"; do
             DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
@@ -10484,9 +10528,11 @@ check_excluded_share() {
 # nothing when no section has a runtime.
 job_bound_s() {   # job_bound_s <staged jobfile>
     local b
-    b=$(awkrun '# A staged jobfile'\''s longest timed section: runtime plus ramp_time, in
-    # seconds (fio'\''s units: s default, ms, us, m, h, d), the longest section
-    # counted. Prints nothing when no section has a runtime (it runs to size).
+    b=$(awkrun '# A staged jobfile, by mode (ARGV[2]): "secs" (default) its longest timed
+    # section, runtime plus ramp_time in seconds (fio units: s default, us, ms,
+    # m, h, d), nothing when no section has a runtime (it runs to size);
+    # "files" the files its sections write (numjobs x nrfiles); "bytes" those
+    # files'\'' bytes (filesize, else size).
     function fio_secs(s,    v, u) {
         s = strip(s)
         if (s !~ /^[0-9]+(\.[0-9]+)?(us|ms|s|m|h|d)?$/) return ""
@@ -10499,16 +10545,77 @@ job_bound_s() {   # job_bound_s <staged jobfile>
         return v
     }
     BEGIN {
+        mode = ARGC > 2 ? ARGV[2] : "secs"
         if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
-        ns = ini_parse(L, n, SN, KV); best = ""
+        ns = ini_parse(L, n, SN, KV); best = ""; files = 0; bytes = 0
         for (s = (ns ? 1 : "g"); s != ""; s = (s == "g" || s == ns ? "" : s + 1)) {
+            if (mode != "secs") {
+                nj = py_int(ini_get(KV, s, "numjobs", "1")); nr = py_int(ini_get(KV, s, "nrfiles", "1"))
+                if (nj == "" || nr == "") continue
+                fs = ini_get(KV, s, "filesize", ini_get(KV, s, "size", "0")); b = parse_size(fs)
+                files += nj * nr; bytes += nj * nr * (b == "" ? 0 : b)
+                continue
+            }
             rt = fio_secs(ini_get(KV, s, "runtime", "")); rp = fio_secs(ini_get(KV, s, "ramp_time", "0"))
             if (rt == "" || rp == "") continue
             if (best == "" || rt + rp > best) best = rt + rp
         }
-        if (best != "") printf "%d\n", (best == int(best) ? best : int(best) + 1)
-    }' "$1") || return 1
+        if (mode == "files") printf "%d\n", files
+        else if (mode == "bytes") printf "%.0f\n", bytes
+        else if (best != "") printf "%d\n", (best == int(best) ? best : int(best) + 1)
+    }' "$1" secs) || return 1
     [ -z "$b" ] || echo $((2 * b + 60))
+}
+# A layout's bound: its bytes (the sweep's fleet total on the first run,
+# else the hosts' staged jobfiles) over 10 MiB/s, plus 60; an unlink's: 60
+# plus one per file.
+aux_bound_s() {   # aux_bound_s <layout|unlink> <job> <rerun n> <host>...
+    local kind=$1 job=$2 n=$3 host v t=0
+    shift 3
+    if [ "$kind" = layout ] && [ "$n" -eq 0 ] && [ -n "$LAYOUT_WRITE_BYTES" ]; then
+        t=$LAYOUT_WRITE_BYTES
+    else
+        for host in "$@"; do
+            v=$(awkrun '# A staged jobfile, by mode (ARGV[2]): "secs" (default) its longest timed
+            # section, runtime plus ramp_time in seconds (fio units: s default, us, ms,
+            # m, h, d), nothing when no section has a runtime (it runs to size);
+            # "files" the files its sections write (numjobs x nrfiles); "bytes" those
+            # files'\'' bytes (filesize, else size).
+            function fio_secs(s,    v, u) {
+                s = strip(s)
+                if (s !~ /^[0-9]+(\.[0-9]+)?(us|ms|s|m|h|d)?$/) return ""
+                match(s, /^[0-9]+(\.[0-9]+)?/); v = substr(s, 1, RLENGTH) + 0; u = substr(s, RLENGTH + 1)
+                if (u == "us") return v / 1000000
+                if (u == "ms") return v / 1000
+                if (u == "m") return v * 60
+                if (u == "h") return v * 3600
+                if (u == "d") return v * 86400
+                return v
+            }
+            BEGIN {
+                mode = ARGC > 2 ? ARGV[2] : "secs"
+                if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+                ns = ini_parse(L, n, SN, KV); best = ""; files = 0; bytes = 0
+                for (s = (ns ? 1 : "g"); s != ""; s = (s == "g" || s == ns ? "" : s + 1)) {
+                    if (mode != "secs") {
+                        nj = py_int(ini_get(KV, s, "numjobs", "1")); nr = py_int(ini_get(KV, s, "nrfiles", "1"))
+                        if (nj == "" || nr == "") continue
+                        fs = ini_get(KV, s, "filesize", ini_get(KV, s, "size", "0")); b = parse_size(fs)
+                        files += nj * nr; bytes += nj * nr * (b == "" ? 0 : b)
+                        continue
+                    }
+                    rt = fio_secs(ini_get(KV, s, "runtime", "")); rp = fio_secs(ini_get(KV, s, "ramp_time", "0"))
+                    if (rt == "" || rp == "") continue
+                    if (best == "" || rt + rp > best) best = rt + rp
+                }
+                if (mode == "files") printf "%d\n", files
+                else if (mode == "bytes") printf "%.0f\n", bytes
+                else if (best != "") printf "%d\n", (best == int(best) ? best : int(best) + 1)
+            }' "$WORK_DIR/jobs/$host/$job" "$([ "$kind" = layout ] && echo bytes || echo files)") || return 1
+            t=$((t + v))
+        done
+    fi
+    if [ "$kind" = layout ]; then echo $((t / 10485760 + 60)); else echo $((60 + t)); fi
 }
 
 # The hosts missing from client_stats were dropped: mid-job (fio exits

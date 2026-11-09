@@ -804,7 +804,7 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
 # member. AUX_RUNS: "<results file>\t<hosts>" per run, for the summary.
 # The fleet byte check (LAYOUT_CUT) applies to a layout that ran whole.
 run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
-    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost
+    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost bound
     shift 2
     LAYOUT_RERUN=("$@")
     AUX_RUNS=(); AUX_PARTIAL=0
@@ -813,10 +813,15 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         out="$RUN_DIR/results_${job%.job}.json"
         [ "$n" -eq 0 ] || { out="$RUN_DIR/results_${job%.job}-rerun$n.json"; log "$kind: rerunning $job on $# host(s): $*"; }
         cmd=$(fio_client_cmd "$job" "$@")
-        if run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
+        # bounded (job_bound_s): a client lost before its job starts is never
+        # dropped by fio
+        bound=$(aux_bound_s "$kind" "$job" "$n" "$@") || die "cannot size the $kind job $job for its time bound"
+        if RUN_HOST_TIMEOUT=$bound run_host "$MASTER" "$cmd" > "$out"; then rc=0; else rc=$?; fi
         plan=""; [ "$kind" != layout ] || [ "$n" -gt 0 ] || plan=$LAYOUT_WRITE_BYTES
         ok=1
-        if ! check_fio_errors "$out" layout "$plan"; then
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            : # the bound fired: no result from anyone, every host goes up the ladder
+        elif ! check_fio_errors "$out" layout "$plan"; then
             ok=0
             if [ -z "$LAYOUT_CUT" ]; then
                 [ "$kind" != layout ] || postmortem_hosts layout "$job" "$WORK_DIR/jobs" "$TARGET_DIR" "$RUN_DIR/parse.${job%.job}" "$@"
@@ -824,7 +829,8 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
                 die "unlink $job failed -- test files may remain (raw output in $out)"
             fi
         fi
-        present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+        present=""
+        [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
         dropped=(); keep=()
         for host in "$@"; do
             case $'\n'"$present"$'\n' in
@@ -841,6 +847,7 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         AUX_PARTIAL=1
         how="answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min)"
         [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || how="gave no result for $job within $bound s, the $kind bound; fio was stopped"
         lost=()
         for host in "${dropped[@]}"; do
             DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
@@ -1016,8 +1023,24 @@ check_excluded_share() {
 # nothing when no section has a runtime.
 job_bound_s() {   # job_bound_s <staged jobfile>
     local b
-    b=$(awkrun '#@awk job_bound' "$1") || return 1
+    b=$(awkrun '#@awk job_bound' "$1" secs) || return 1
     [ -z "$b" ] || echo $((2 * b + 60))
+}
+# A layout's bound: its bytes (the sweep's fleet total on the first run,
+# else the hosts' staged jobfiles) over 10 MiB/s, plus 60; an unlink's: 60
+# plus one per file.
+aux_bound_s() {   # aux_bound_s <layout|unlink> <job> <rerun n> <host>...
+    local kind=$1 job=$2 n=$3 host v t=0
+    shift 3
+    if [ "$kind" = layout ] && [ "$n" -eq 0 ] && [ -n "$LAYOUT_WRITE_BYTES" ]; then
+        t=$LAYOUT_WRITE_BYTES
+    else
+        for host in "$@"; do
+            v=$(awkrun '#@awk job_bound' "$WORK_DIR/jobs/$host/$job" "$([ "$kind" = layout ] && echo bytes || echo files)") || return 1
+            t=$((t + v))
+        done
+    fi
+    if [ "$kind" = layout ]; then echo $((t / 10485760 + 60)); else echo $((60 + t)); fi
 }
 
 # The hosts missing from client_stats were dropped: mid-job (fio exits
