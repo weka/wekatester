@@ -45,7 +45,7 @@ DRY_RUN=0           # -n: create/generate and print what would run; execute noth
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
-GROUP_FILE=""       # this run's filesystem-group file in every destination (collect_fs_groups)
+GROUP_FILE=""       # this run's filesystem-group marker prefix in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s
@@ -2773,7 +2773,8 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     # have been lost since the cell before (the ladder decides)
     if RUN_HOST_TIMEOUT=$CAL_LIST_S run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
         > "$WORK_DIR/cal/$host/scratch.raw"; then :; else
-        log "cal: $host dropped before its calibration $tag seed: cannot inspect the dataset or its free space (rc $?, bound $CAL_LIST_S s)"
+        rc=$?; cal_mark_lost "$host"
+        log "cal: $host dropped before its calibration $tag seed: cannot inspect the dataset or its free space (rc $rc, bound $CAL_LIST_S s)"
         return 3
     fi
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
@@ -2809,15 +2810,20 @@ SUBDIREOF
     # Writers: the rep, except the unified read side, which its filesystem
     # group seeds round-robin by file (their fio servers are idle). A member
     # line is "<host> <dir> <cpus> <engine>", the rep first.
-    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- ex margs=()
+    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- ex lf margs=()
     printf '%s\t%s\t%s\t%s\n' "$host" "$root" "$cpus" "$eng" > "$members"
     if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ]; then
         # the rest of the group, one awk for all (a group can be the fleet)
         load_host_dirs
         [ ! -s "$WORK_DIR/groups" ] || gf="$WORK_DIR/groups"
         for i in "${!HOSTS[@]}"; do margs+=("${HOSTS[$i]}" "${HOST_DIRS[$i]}"); done
-        # a client lost during calibration (cal/excluded) writes none of it
-        ex=-; [ ! -s "$WORK_DIR/cal/excluded" ] || ex="$WORK_DIR/cal/excluded"
+        # a client lost during calibration (cal/excluded), or dropped and
+        # not back yet (cal/lost), writes none of it
+        ex="$WORK_DIR/cal/$host/seed.skip"
+        { [ ! -s "$WORK_DIR/cal/excluded" ] || cat "$WORK_DIR/cal/excluded"
+          for lf in "$WORK_DIR"/cal/lost/*; do [ ! -e "$lf" ] || printf '%s\t%s\tlost\n' "${lf##*/}" "$CAL_SID"; done; } > "$ex" \
+            || die "$host: cannot list the clients its shared seed skips"
+        [ -s "$ex" ] || ex=-
         awk 'BEGIN {
             rep = ARGV[1]; eng = ARGV[2]; ng = 0
             # group_members: the groups file says who shares the rep group;
@@ -2829,7 +2835,8 @@ SUBDIREOF
                 split(line, F, "\t")
                 if (!(F[1] in CPU)) { CPU[F[1]] = F[2]; ENG[F[1]] = F[3] }
             }
-            # cal/excluded: "<host>\t<shape>\t<why>", the clients lost so far
+            # seed.skip: "<host>\t<shape>\t<why>", cal/excluded'\''s lines and one
+            # per cal/lost marker: the clients lost so far, or dropped and not back
             if (ARGV[5] != "-")
                 while ((getline line < ARGV[5]) > 0)
                     if (split(line, F, "\t") >= 1) EX[F[1]] = 1
@@ -2980,6 +2987,7 @@ SUBDIREOF
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
             coord_kill "$TARGET_DIR.cal/$job-$host.coord"
+            cal_mark_lost "$host"
             log "cal: $host dropped from its calibration $side seed: no result in $((nmib / 10 + 60)) s, the seed bound (${res##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -3098,12 +3106,24 @@ cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
     done
 }
 
+# A client that dropped is lost until its ladder, or a retry as it is,
+# brings it back: cal/lost/<host> keeps every other shape's shared seed
+# from listing it as a writer in that window (cal_seed_rep, with
+# cal/excluded). Written at each "dropped" line, before the ladder.
+cal_mark_lost() {   # cal_mark_lost <host>
+    mkdir -p "$WORK_DIR/cal/lost" && : > "$WORK_DIR/cal/lost/$1" || die "cannot mark $1 lost in $WORK_DIR/cal/lost"
+}
+cal_unmark_lost() {   # cal_unmark_lost <host>
+    rm -f "$WORK_DIR/cal/lost/$1"
+}
+
 # A seed's host dropped (its bound fired): laddered and the seed retried
 # once, else the client leaves the shape (cal_exclude_client: 3 restart,
 # 4 shape excluded). Per shape, CAL_RETRIED is the cells' too. A shared
 # seed has other writers (its filesystem group): when the host itself
-# still answers, the stall was another writer's (lost, and in cal/excluded
-# by its own shape by now), so the seed is retried once as it is.
+# still answers, the stall was another writer's (lost, and in cal/lost or
+# cal/excluded by its own shape by now), so the seed is retried once as it
+# is. A host back in the shape is unmarked first.
 cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
     local c=$1 why rc=0
     if [ -n "${CAL_RETRIED[$c]:-}" ]; then
@@ -3111,12 +3131,14 @@ cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
     elif [ -z "${CAL_SEED_STALLED[$c]:-}" ] && fio_port_open "$c"; then
         CAL_SEED_STALLED[$c]=1
         log "cal: shape $CAL_SID: $c still answers; its seed stalled on another writer and is retried once"
+        cal_unmark_lost "$c"
         cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
         [ "$rc" -eq 3 ] || return "$rc"
         cal_seed_lost "$c" "$2" "$3" "$4"; return $?
     elif client_ladder "$c"; then
         CAL_RETRIED[$c]=1
         log "cal: shape $CAL_SID: $c $LADDER_WHY; its seed is retried once"
+        cal_unmark_lost "$c"
         cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
         [ "$rc" -eq 3 ] || return "$rc"
         why="dropped again after its retry"
@@ -3884,6 +3906,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
             coord_kill "$TARGET_DIR.cal/$rep/$base.job.coord"
+            cal_mark_lost "$rep"
             log "cal: shape $CAL_SID: $rep dropped from the $what: no result in $((2 * (rt + 2) + 60)) s, the cell bound (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -3892,6 +3915,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         # the dispatcher's to recover, exit 3
         json_load "$json"
         if [ "$JSON_RC" -eq 2 ] || { [ "$JSON_RC" -eq 0 ] && ! json_awk -F'\t' -v h="$rep" '$1 ~ /^client_stats\.[0-9]+\.hostname$/ && $2 == h { f = 1 } END { exit !f }'; }; then
+            cal_mark_lost "$rep"
             log "cal: shape $CAL_SID: $rep dropped from the $what (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -4139,6 +4163,7 @@ cal_reap_dropped() {   # cal_reap_dropped <client> <engines|searches> <index> <c
     elif client_ladder "$c"; then
         CAL_RETRIED[$c]=1
         log "cal: shape $CAL_SID: $c $LADDER_WHY; its cell is retried once"
+        cal_unmark_lost "$c"
         if [ "$mode" = engines ]; then E_RETRY+=("$i")
         else S_Q[i]="cell $line"$'\n'"${S_Q[$i]}"; S_INFL[i]=$(( S_INFL[i] - 1 )); fi
         return 0
@@ -4970,10 +4995,10 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; kout; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; [ -z \"\$ev\" ] || { _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; }; fi"
-        # every earlier run's group file in this host's destination (dd,
+        # every earlier run's group markers in this host's destination (dd,
         # set per host by preflight), evidence or not: cleanup released the
         # lock of a run that died before collect_fs_groups
-        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*.lst; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
+        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
     else
         LOCK_CMD+="; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
@@ -5253,55 +5278,60 @@ missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
 # One probe file as the fio user; on a shared filesystem one failing host
 # usually means all.
 probe_writable() {   # probe_writable <host> <dir>
-    # the same session drops the host's name into the run's group file
-    # there: collect_fs_groups hashes it once every host is through
+    # the same session leaves the host's group marker there, a file named
+    # after the host: collect_fs_groups looks the markers up once every
+    # host is through
     host_name_v "$1"
-    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$HOST_NAME' >> '$2/$GROUP_FILE'}"
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && : > '$2/$GROUP_FILE.$HOST_NAME'}"
 }
 
 # --- filesystem groups ---
-# Each client appends its name to the run group file in its destination; equal
-# sha256 means one directory, one group. Distinct files cannot hash alike: each
-# ends with a name only its own clients appended. Writes $WORK_DIR/groups,
-# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes the file.
+# Each client left a marker named after itself in its destination (the write
+# probe). Each then looks every host's marker up by name in one session; the
+# names it finds are its key, and equal keys mean one directory, one group. A
+# lookup by a name never seen goes to the server, where a shared appended
+# file could be read stale or lose a line. Writes $WORK_DIR/groups,
+# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes each
+# host's marker.
 GROUP_FILE_REMOVED=0
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
-    local i h pids=() sum n=0 line summary
+    local i h pids=() key n=0 line summary names="" rm
     local -A at=() first=()
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
     load_host_dirs
+    for h in "${HOSTS[@]}"; do host_name_v "$h"; names="$names '$HOST_NAME'"; done
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        # the sum first, then the lines the host read and the path, for the
-        # bundle (fs-groups.detail): a split that should not be carries its
-        # evidence
-        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE' && cat '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        ( run_host "$h" "cd '${HOST_DIRS[$i]}' || exit 1; for n in$names; do if [ -e \"$GROUP_FILE.\$n\" ]; then printf '%s\\n' \"\$n\"; fi; done" > "$WORK_DIR/fsgroup/$i.key" ) &
         pids[$i]=$!
     done
-    : > "$WORK_DIR/fsgroup/sums"; : > "$WORK_DIR/fsgroup/detail"
+    : > "$WORK_DIR/fsgroup/keys"; : > "$WORK_DIR/fsgroup/detail"
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        sum=""
-        if wait "${pids[$i]}"; then read -r sum _ < "$WORK_DIR/fsgroup/$i.sum" || sum=""; fi
-        case "$sum" in
-            (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
-        esac
-        printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
-        printf '%s\t%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$sum" "$(tail -n +2 "$WORK_DIR/fsgroup/$i.sum" | tr '\n' ' ')" >> "$WORK_DIR/fsgroup/detail"
-        [ -n "${first[$sum]+set}" ] || first[$sum]=$i
+        key=""
+        if wait "${pids[$i]}"; then key=$(tr '\n' ' ' < "$WORK_DIR/fsgroup/$i.key"); key=${key% }; fi
+        [ -n "$key" ] || die "$h: cannot find its filesystem-group marker ${HOST_DIRS[$i]}/$GROUP_FILE.* (written by the mount check; the destination must not change after it)"
+        printf '%s\t%s\n' "$h" "$key" >> "$WORK_DIR/fsgroup/keys"
+        # the bundle (fs-groups.detail) keeps what each host saw: a split
+        # that should not be carries its evidence
+        printf '%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$key" >> "$WORK_DIR/fsgroup/detail"
+        [ -n "${first[$key]+set}" ] || first[$key]=$i
     done
-    # every hash is in: one removal per group, from its first host
+    # every key is in: one removal per group, from its first host, of the
+    # markers it saw, by name
     pids=()
-    for i in "${first[@]}"; do
-        run_host "${HOSTS[$i]}" "rm -f '${HOST_DIRS[$i]}/$GROUP_FILE'" &
+    for key in "${!first[@]}"; do
+        i=${first[$key]}; rm=""
+        for n in $key; do rm="$rm '${HOST_DIRS[$i]}/$GROUP_FILE.$n'"; done
+        run_host "${HOSTS[$i]}" "rm -f$rm" &
         pids[$i]=$!
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
+        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove its group's markers ${HOST_DIRS[$i]}/$GROUP_FILE.*" >&2
     done
     GROUP_FILE_REMOVED=1
-    awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
+    awk -F'\t' '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/keys" > "$WORK_DIR/groups"
     # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
     [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
         || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
@@ -5372,9 +5402,9 @@ confirm_create_dirs() {   # confirm_create_dirs <count>
 # under --any-fs), after one question (README, Caveats).
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
-    # one name per run, so two runs sharing a destination never read each
-    # other's group lines (collect_fs_groups)
-    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
+    # one marker prefix per run, so two runs sharing a destination never
+    # see each other's markers (collect_fs_groups)
+    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s' -1 "$$"
     local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
     local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
     local cached_hosts=() cached_modes=() mode who n sw anyfs_hosts=() anyfs_types=() off
@@ -5909,14 +5939,15 @@ cleanup() {
         port_fail_report
     fi
     # the locks last, held through the capture so no other run lands in its
-    # slice; with this run's group file when collect_fs_groups has not removed
-    # it (every host holds a lock by then; fio starts after it)
+    # slice; with this run's group marker when collect_fs_groups has not
+    # removed it (every host holds a lock by then; fio starts after it)
     if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
         ph=()
         if [ -n "$GROUP_FILE" ] && [ "$GROUP_FILE_REMOVED" -eq 0 ]; then
             load_host_dirs
             for i in "${!HOSTS[@]}"; do
-                grm[${HOSTS[$i]}]="rm -f '${HOST_DIRS[$i]:?}/${GROUP_FILE:?}'; "
+                host_name_v "${HOSTS[$i]}"
+                grm[${HOSTS[$i]}]="rm -f '${HOST_DIRS[$i]:?}/${GROUP_FILE:?}.$HOST_NAME'; "
             done
         fi
         for host in "${!RUN_LOCKS[@]}"; do

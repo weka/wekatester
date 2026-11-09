@@ -9,7 +9,8 @@ BEGIN {
         split(line, F, "\t")
         if (!(F[1] in CPU)) { CPU[F[1]] = F[2]; ENG[F[1]] = F[3] }
     }
-    # cal/excluded: "<host>\t<shape>\t<why>", the clients lost so far
+    # seed.skip: "<host>\t<shape>\t<why>", cal/excluded's lines and one
+    # per cal/lost marker: the clients lost so far, or dropped and not back
     if (ARGV[5] != "-")
         while ((getline line < ARGV[5]) > 0)
             if (split(line, F, "\t") >= 1) EX[F[1]] = 1

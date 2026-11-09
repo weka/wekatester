@@ -61,10 +61,10 @@ lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
         LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
         LOCK_CMD+="; kout; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
         LOCK_CMD+="; [ -z \"\$ev\" ] || { _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; }; fi"
-        # every earlier run's group file in this host's destination (dd,
+        # every earlier run's group markers in this host's destination (dd,
         # set per host by preflight), evidence or not: cleanup released the
         # lock of a run that died before collect_fs_groups
-        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*.lst; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
+        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
     else
         LOCK_CMD+="; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
     fi
@@ -336,55 +336,60 @@ missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
 # One probe file as the fio user; on a shared filesystem one failing host
 # usually means all.
 probe_writable() {   # probe_writable <host> <dir>
-    # the same session drops the host's name into the run's group file
-    # there: collect_fs_groups hashes it once every host is through
+    # the same session leaves the host's group marker there, a file named
+    # after the host: collect_fs_groups looks the markers up once every
+    # host is through
     host_name_v "$1"
-    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && printf '%s\\n' '$HOST_NAME' >> '$2/$GROUP_FILE'}"
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && : > '$2/$GROUP_FILE.$HOST_NAME'}"
 }
 
 # --- filesystem groups ---
-# Each client appends its name to the run group file in its destination; equal
-# sha256 means one directory, one group. Distinct files cannot hash alike: each
-# ends with a name only its own clients appended. Writes $WORK_DIR/groups,
-# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes the file.
+# Each client left a marker named after itself in its destination (the write
+# probe). Each then looks every host's marker up by name in one session; the
+# names it finds are its key, and equal keys mean one directory, one group. A
+# lookup by a name never seen goes to the server, where a shared appended
+# file could be read stale or lose a line. Writes $WORK_DIR/groups,
+# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes each
+# host's marker.
 GROUP_FILE_REMOVED=0
 collect_fs_groups() {
     [ -n "$GROUP_FILE" ] || return 0
-    local i h pids=() sum n=0 line summary
+    local i h pids=() key n=0 line summary names="" rm
     local -A at=() first=()
     mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
     load_host_dirs
+    for h in "${HOSTS[@]}"; do host_name_v "$h"; names="$names '$HOST_NAME'"; done
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        # the sum first, then the lines the host read and the path, for the
-        # bundle (fs-groups.detail): a split that should not be carries its
-        # evidence
-        ( run_host "$h" "sha256sum '${HOST_DIRS[$i]}/$GROUP_FILE' && cat '${HOST_DIRS[$i]}/$GROUP_FILE'" > "$WORK_DIR/fsgroup/$i.sum" ) &
+        ( run_host "$h" "cd '${HOST_DIRS[$i]}' || exit 1; for n in$names; do if [ -e \"$GROUP_FILE.\$n\" ]; then printf '%s\\n' \"\$n\"; fi; done" > "$WORK_DIR/fsgroup/$i.key" ) &
         pids[$i]=$!
     done
-    : > "$WORK_DIR/fsgroup/sums"; : > "$WORK_DIR/fsgroup/detail"
+    : > "$WORK_DIR/fsgroup/keys"; : > "$WORK_DIR/fsgroup/detail"
     for i in "${!HOSTS[@]}"; do
         h=${HOSTS[$i]}
-        sum=""
-        if wait "${pids[$i]}"; then read -r sum _ < "$WORK_DIR/fsgroup/$i.sum" || sum=""; fi
-        case "$sum" in
-            (*[!0-9a-f]*|"") die "$h: cannot hash the filesystem-group file ${HOST_DIRS[$i]}/$GROUP_FILE (written by the mount check; the destination must not change after it)" ;;
-        esac
-        printf '%s %s\n' "$h" "$sum" >> "$WORK_DIR/fsgroup/sums"
-        printf '%s\t%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$sum" "$(tail -n +2 "$WORK_DIR/fsgroup/$i.sum" | tr '\n' ' ')" >> "$WORK_DIR/fsgroup/detail"
-        [ -n "${first[$sum]+set}" ] || first[$sum]=$i
+        key=""
+        if wait "${pids[$i]}"; then key=$(tr '\n' ' ' < "$WORK_DIR/fsgroup/$i.key"); key=${key% }; fi
+        [ -n "$key" ] || die "$h: cannot find its filesystem-group marker ${HOST_DIRS[$i]}/$GROUP_FILE.* (written by the mount check; the destination must not change after it)"
+        printf '%s\t%s\n' "$h" "$key" >> "$WORK_DIR/fsgroup/keys"
+        # the bundle (fs-groups.detail) keeps what each host saw: a split
+        # that should not be carries its evidence
+        printf '%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$key" >> "$WORK_DIR/fsgroup/detail"
+        [ -n "${first[$key]+set}" ] || first[$key]=$i
     done
-    # every hash is in: one removal per group, from its first host
+    # every key is in: one removal per group, from its first host, of the
+    # markers it saw, by name
     pids=()
-    for i in "${first[@]}"; do
-        run_host "${HOSTS[$i]}" "rm -f '${HOST_DIRS[$i]}/$GROUP_FILE'" &
+    for key in "${!first[@]}"; do
+        i=${first[$key]}; rm=""
+        for n in $key; do rm="$rm '${HOST_DIRS[$i]}/$GROUP_FILE.$n'"; done
+        run_host "${HOSTS[$i]}" "rm -f$rm" &
         pids[$i]=$!
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove ${HOST_DIRS[$i]}/$GROUP_FILE" >&2
+        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove its group's markers ${HOST_DIRS[$i]}/$GROUP_FILE.*" >&2
     done
     GROUP_FILE_REMOVED=1
-    awk '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/sums" > "$WORK_DIR/groups"
+    awk -F'\t' '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/keys" > "$WORK_DIR/groups"
     # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
     [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
         || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
@@ -455,9 +460,9 @@ confirm_create_dirs() {   # confirm_create_dirs <count>
 # under --any-fs), after one question (README, Caveats).
 verify_mount_mode() {
     log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
-    # one name per run, so two runs sharing a destination never read each
-    # other's group lines (collect_fs_groups)
-    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s.lst' -1 "$$"
+    # one marker prefix per run, so two runs sharing a destination never
+    # see each other's markers (collect_fs_groups)
+    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s' -1 "$$"
     local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
     local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
     local cached_hosts=() cached_modes=() mode who n sw anyfs_hosts=() anyfs_types=() off

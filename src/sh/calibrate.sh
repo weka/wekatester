@@ -356,7 +356,8 @@ cal_seed_rep() {   # cal_seed_rep <host> <read-nj> <read-nr> <write-nj> <write-n
     # have been lost since the cell before (the ladder decides)
     if RUN_HOST_TIMEOUT=$CAL_LIST_S run_host "$host" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$hname$sep*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'" \
         > "$WORK_DIR/cal/$host/scratch.raw"; then :; else
-        log "cal: $host dropped before its calibration $tag seed: cannot inspect the dataset or its free space (rc $?, bound $CAL_LIST_S s)"
+        rc=$?; cal_mark_lost "$host"
+        log "cal: $host dropped before its calibration $tag seed: cannot inspect the dataset or its free space (rc $rc, bound $CAL_LIST_S s)"
         return 3
     fi
     awk '/^WEKATESTER_DF$/ {exit} {print}' "$WORK_DIR/cal/$host/scratch.raw" > "$WORK_DIR/cal/$host/scratch.list"
@@ -392,15 +393,20 @@ SUBDIREOF
     # Writers: the rep, except the unified read side, which its filesystem
     # group seeds round-robin by file (their fio servers are idle). A member
     # line is "<host> <dir> <cpus> <engine>", the rep first.
-    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- ex margs=()
+    local members="$WORK_DIR/cal/$host/seed.members" active i gf=- ex lf margs=()
     printf '%s\t%s\t%s\t%s\n' "$host" "$root" "$cpus" "$eng" > "$members"
     if [ "$unified" -eq 1 ] && [ "$rnj" -gt 0 ]; then
         # the rest of the group, one awk for all (a group can be the fleet)
         load_host_dirs
         [ ! -s "$WORK_DIR/groups" ] || gf="$WORK_DIR/groups"
         for i in "${!HOSTS[@]}"; do margs+=("${HOSTS[$i]}" "${HOST_DIRS[$i]}"); done
-        # a client lost during calibration (cal/excluded) writes none of it
-        ex=-; [ ! -s "$WORK_DIR/cal/excluded" ] || ex="$WORK_DIR/cal/excluded"
+        # a client lost during calibration (cal/excluded), or dropped and
+        # not back yet (cal/lost), writes none of it
+        ex="$WORK_DIR/cal/$host/seed.skip"
+        { [ ! -s "$WORK_DIR/cal/excluded" ] || cat "$WORK_DIR/cal/excluded"
+          for lf in "$WORK_DIR"/cal/lost/*; do [ ! -e "$lf" ] || printf '%s\t%s\tlost\n' "${lf##*/}" "$CAL_SID"; done; } > "$ex" \
+            || die "$host: cannot list the clients its shared seed skips"
+        [ -s "$ex" ] || ex=-
         awk '#@awk cal_seed_rep.members' "$host" "$eng" "$gf" "$WORK_DIR/cal/hostinfo" "$ex" "${margs[@]}" >> "$members" \
             || die "$host: cannot list its filesystem group for the shared seed"
     fi
@@ -449,6 +455,7 @@ SUBDIREOF
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
             coord_kill "$TARGET_DIR.cal/$job-$host.coord"
+            cal_mark_lost "$host"
             log "cal: $host dropped from its calibration $side seed: no result in $((nmib / 10 + 60)) s, the seed bound (${res##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -567,12 +574,24 @@ cal_seed_clients() {   # cal_seed_clients <read|write> <nj> <nr> <client>...
     done
 }
 
+# A client that dropped is lost until its ladder, or a retry as it is,
+# brings it back: cal/lost/<host> keeps every other shape's shared seed
+# from listing it as a writer in that window (cal_seed_rep, with
+# cal/excluded). Written at each "dropped" line, before the ladder.
+cal_mark_lost() {   # cal_mark_lost <host>
+    mkdir -p "$WORK_DIR/cal/lost" && : > "$WORK_DIR/cal/lost/$1" || die "cannot mark $1 lost in $WORK_DIR/cal/lost"
+}
+cal_unmark_lost() {   # cal_unmark_lost <host>
+    rm -f "$WORK_DIR/cal/lost/$1"
+}
+
 # A seed's host dropped (its bound fired): laddered and the seed retried
 # once, else the client leaves the shape (cal_exclude_client: 3 restart,
 # 4 shape excluded). Per shape, CAL_RETRIED is the cells' too. A shared
 # seed has other writers (its filesystem group): when the host itself
-# still answers, the stall was another writer's (lost, and in cal/excluded
-# by its own shape by now), so the seed is retried once as it is.
+# still answers, the stall was another writer's (lost, and in cal/lost or
+# cal/excluded by its own shape by now), so the seed is retried once as it
+# is. A host back in the shape is unmarked first.
 cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
     local c=$1 why rc=0
     if [ -n "${CAL_RETRIED[$c]:-}" ]; then
@@ -580,12 +599,14 @@ cal_seed_lost() {   # cal_seed_lost <host> <read|write> <nj> <nr>
     elif [ -z "${CAL_SEED_STALLED[$c]:-}" ] && fio_port_open "$c"; then
         CAL_SEED_STALLED[$c]=1
         log "cal: shape $CAL_SID: $c still answers; its seed stalled on another writer and is retried once"
+        cal_unmark_lost "$c"
         cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
         [ "$rc" -eq 3 ] || return "$rc"
         cal_seed_lost "$c" "$2" "$3" "$4"; return $?
     elif client_ladder "$c"; then
         CAL_RETRIED[$c]=1
         log "cal: shape $CAL_SID: $c $LADDER_WHY; its seed is retried once"
+        cal_unmark_lost "$c"
         cal_ensure_seed "$c" "$2" "$3" "$4" || rc=$?
         [ "$rc" -eq 3 ] || return "$rc"
         why="dropped again after its retry"
@@ -685,6 +706,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         rc=$?
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
             coord_kill "$TARGET_DIR.cal/$rep/$base.job.coord"
+            cal_mark_lost "$rep"
             log "cal: shape $CAL_SID: $rep dropped from the $what: no result in $((2 * (rt + 2) + 60)) s, the cell bound (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -693,6 +715,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
         # the dispatcher's to recover, exit 3
         json_load "$json"
         if [ "$JSON_RC" -eq 2 ] || { [ "$JSON_RC" -eq 0 ] && ! json_awk -F'\t' -v h="$rep" '$1 ~ /^client_stats\.[0-9]+\.hostname$/ && $2 == h { f = 1 } END { exit !f }'; }; then
+            cal_mark_lost "$rep"
             log "cal: shape $CAL_SID: $rep dropped from the $what (${json##*/} is in the run bundle under cal/)"
             return 3
         fi
@@ -940,6 +963,7 @@ cal_reap_dropped() {   # cal_reap_dropped <client> <engines|searches> <index> <c
     elif client_ladder "$c"; then
         CAL_RETRIED[$c]=1
         log "cal: shape $CAL_SID: $c $LADDER_WHY; its cell is retried once"
+        cal_unmark_lost "$c"
         if [ "$mode" = engines ]; then E_RETRY+=("$i")
         else S_Q[i]="cell $line"$'\n'"${S_Q[$i]}"; S_INFL[i]=$(( S_INFL[i] - 1 )); fi
         return 0

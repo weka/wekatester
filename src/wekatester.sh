@@ -44,7 +44,7 @@ DRY_RUN=0           # -n: create/generate and print what would run; execute noth
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove the workload's data files after the last job
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
-GROUP_FILE=""       # this run's filesystem-group file in every destination (collect_fs_groups)
+GROUP_FILE=""       # this run's filesystem-group marker prefix in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
 LINE_RATE_GBPS=""   # --line-rate: every client's dataplane line rate in Gb/s,
                     # in place of what ethtool reports (a cloud VF says 100 Gb/s

@@ -304,14 +304,15 @@ cleanup() {
         port_fail_report
     fi
     # the locks last, held through the capture so no other run lands in its
-    # slice; with this run's group file when collect_fs_groups has not removed
-    # it (every host holds a lock by then; fio starts after it)
+    # slice; with this run's group marker when collect_fs_groups has not
+    # removed it (every host holds a lock by then; fio starts after it)
     if [ ${#RUN_LOCKS[@]} -gt 0 ]; then
         ph=()
         if [ -n "$GROUP_FILE" ] && [ "$GROUP_FILE_REMOVED" -eq 0 ]; then
             load_host_dirs
             for i in "${!HOSTS[@]}"; do
-                grm[${HOSTS[$i]}]="rm -f '${HOST_DIRS[$i]:?}/${GROUP_FILE:?}'; "
+                host_name_v "${HOSTS[$i]}"
+                grm[${HOSTS[$i]}]="rm -f '${HOST_DIRS[$i]:?}/${GROUP_FILE:?}.$HOST_NAME'; "
             done
         fi
         for host in "${!RUN_LOCKS[@]}"; do
