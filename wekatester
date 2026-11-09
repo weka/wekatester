@@ -3819,7 +3819,7 @@ cal_pin_fs() {   # cal_pin_fs <shape-dir> <type> <dirn> -> the pinned fs, or not
 }
 
 cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime> [<n> [<reading-file>]]
-    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 n=${9:-} rf=${10:-} base json vals h v a what cpus
+    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 n=${9:-} rf=${10:-} base json vals h v a what cpus rc
     base="cal-$type-$dirn-$eng-nj$nj-qd$qd-nr$nr-${rt}s"
     what="cell $type-$dirn $eng numjobs=$nj iodepth=$qd nrfiles=$nr"
     host_dir_v "$rep"; host_name_v "$rep"; cal_host_cpus "$rep"
@@ -3831,7 +3831,14 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     [ -n "$n" ] || { CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS; }
     [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
-    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
+    # Bounded: fio never drops a client lost before its job starts (it polls
+    # only running ones), so the coordinator gets 2 x the cell plus 60 s.
+    if RUN_HOST_TIMEOUT=$((2 * (rt + 2) + 60)) run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then :; else
+        rc=$?
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            log "cal: shape $CAL_SID: $rep dropped from the $what: no result in $((2 * (rt + 2) + 60)) s, the cell bound (${json##*/} is in the run bundle under cal/)"
+            return 3
+        fi
         # the client present in the results failed the cell: today's death.
         # Absent (dropped mid-cell) or no JSON at all (fio never connected):
         # the dispatcher's to recover, exit 3
@@ -10441,15 +10448,51 @@ check_excluded_share() {
 
 # Every measured job, whatever fio's exit. A host present in the results
 # with an error, or no results at all, is today's failure (check_fio_errors).
+# 2 x (runtime + ramp_time) + 60, from a staged jobfile's longest section;
+# nothing when no section has a runtime.
+job_bound_s() {   # job_bound_s <staged jobfile>
+    local b
+    b=$(awkrun '# A staged jobfile'\''s longest timed section: runtime plus ramp_time, in
+    # seconds (fio'\''s units: s default, ms, us, m, h, d), the longest section
+    # counted. Prints nothing when no section has a runtime (it runs to size).
+    function fio_secs(s,    v, u) {
+        s = strip(s)
+        if (s !~ /^[0-9]+(\.[0-9]+)?(us|ms|s|m|h|d)?$/) return ""
+        match(s, /^[0-9]+(\.[0-9]+)?/); v = substr(s, 1, RLENGTH) + 0; u = substr(s, RLENGTH + 1)
+        if (u == "us") return v / 1000000
+        if (u == "ms") return v / 1000
+        if (u == "m") return v * 60
+        if (u == "h") return v * 3600
+        if (u == "d") return v * 86400
+        return v
+    }
+    BEGIN {
+        if ((n = readlines(ARGV[1], L)) < 0) awk_fail("cannot read " ARGV[1])
+        ns = ini_parse(L, n, SN, KV); best = ""
+        for (s = (ns ? 1 : "g"); s != ""; s = (s == "g" || s == ns ? "" : s + 1)) {
+            rt = fio_secs(ini_get(KV, s, "runtime", "")); rp = fio_secs(ini_get(KV, s, "ramp_time", "0"))
+            if (rt == "" || rp == "") continue
+            if (best == "" || rt + rp > best) best = rt + rp
+        }
+        if (best != "") printf "%d\n", (best == int(best) ? best : int(best) + 1)
+    }' "$1") || return 1
+    [ -z "$b" ] || echo $((2 * b + 60))
+}
+
 # The hosts missing from client_stats were dropped: mid-job (fio exits
 # non-zero) or at connect time (fio drops a client it cannot reach and
 # exits 0 while any other connects). Each goes up the ladder, the
 # survivors' results are summarized, the job is not rerun.
 recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio rc>
     local job=$1 out=$2 report=$3 rc=$4 host present dropped=() keep=() how
-    check_fio_errors "$out" measured \
-        || die "job $job failed on at least one host (raw output in $out)"
-    present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        # the bound fired: no result from anyone, every host goes up the ladder
+        present=""
+    else
+        check_fio_errors "$out" measured \
+            || die "job $job failed on at least one host (raw output in $out)"
+        present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+    fi
     for host in "${HOSTS[@]}"; do
         case $'\n'"$present"$'\n' in
             (*$'\n'"$host"$'\n'*) keep+=("$host") ;;
@@ -10463,6 +10506,7 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio
     fi
     how="answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min)"
     [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
+    [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || how="gave no result for $job within $RUN_BOUND_S s, the job bound; fio was stopped"
     for host in "${dropped[@]}"; do
         DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
         log "dropped: $host $how and its result for this job is lost"
@@ -10476,11 +10520,12 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio
     done
     [ ${#HOSTS[@]} -gt 0 ] || die "every host is excluded; nothing is left to run the jobs after $job"
     log "job $job: results from ${#keep[@]} host(s); dropped: ${dropped[*]}"
+    [ ${#keep[@]} -gt 0 ] || return 0
     summ_one "$out" "$out" "$report" "${keep[*]}" file || summ_job_failed "$job"
 }
 
 run_jobs() {
-    local job outfile report cmd t0 rc part lclients=()
+    local job outfile report cmd t0 rc part lclients=() RUN_BOUND_S
     echo
     for job in "${JOBFILES[@]}"; do
         cmd=$(fio_client_cmd "$job")
@@ -10546,7 +10591,11 @@ run_jobs() {
         # fio keys client_stats by the --client= name, not the worker hostname;
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
-        if run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
+        # Bounded at 2 x (runtime + ramp) + 60 s: fio never drops a client lost
+        # before its job starts (it polls only running ones). A job with no
+        # runtime runs to its size, unbounded.
+        RUN_BOUND_S=$(job_bound_s "$WORK_DIR/jobs/${HOSTS[0]}/$job") || die "cannot read the runtime of $job"
+        if RUN_HOST_TIMEOUT=$RUN_BOUND_S run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
         recover_dropped "$job" "$outfile" "$report" "$rc"
         phase_done "job $job"
     done

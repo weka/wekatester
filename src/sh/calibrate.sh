@@ -620,7 +620,7 @@ cal_pin_fs() {   # cal_pin_fs <shape-dir> <type> <dirn> -> the pinned fs, or not
 }
 
 cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engine> <nj> <qd> <nr> <runtime> [<n> [<reading-file>]]
-    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 n=${9:-} rf=${10:-} base json vals h v a what cpus
+    local rep=$1 type=$2 dirn=$3 eng=$4 nj=$5 qd=$6 nr=$7 rt=$8 n=${9:-} rf=${10:-} base json vals h v a what cpus rc
     base="cal-$type-$dirn-$eng-nj$nj-qd$qd-nr$nr-${rt}s"
     what="cell $type-$dirn $eng numjobs=$nj iodepth=$qd nrfiles=$nr"
     host_dir_v "$rep"; host_name_v "$rep"; cal_host_cpus "$rep"
@@ -632,7 +632,14 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     [ -n "$n" ] || { CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS; }
     [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
-    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
+    # Bounded: fio never drops a client lost before its job starts (it polls
+    # only running ones), so the coordinator gets 2 x the cell plus 60 s.
+    if RUN_HOST_TIMEOUT=$((2 * (rt + 2) + 60)) run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then :; else
+        rc=$?
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            log "cal: shape $CAL_SID: $rep dropped from the $what: no result in $((2 * (rt + 2) + 60)) s, the cell bound (${json##*/} is in the run bundle under cal/)"
+            return 3
+        fi
         # the client present in the results failed the cell: today's death.
         # Absent (dropped mid-cell) or no JSON at all (fio never connected):
         # the dispatcher's to recover, exit 3
