@@ -2107,6 +2107,27 @@ t_assert "fio version: a dry run runs the check (preflight, before the dry-run b
     sed -n "/^main() {/,/^}/p" ./wekatester | awk "/^    preflight$/ {p = NR} /DRY_RUN\" -eq 1/ {d = NR} END {exit !(p && d > p)}" || { echo "check not on the dry-run path" >&2; exit 1; }
     out=$(source ./wekatester; HOSTS=(h1 h2); MASTER=h1; JOBFILES=(); FIO_VERSION_NOTE="fio-3.35 on all 2 hosts"; dry_run_report 2>&1)
     printf "%s\n" "$out" | grep -q "fio version: fio-3.35 on all 2 hosts$" || { echo "$out" >&2; false; }'
+# the coordinator parses --eta-interval (fio 3.3): a floor for the master only
+t_assert "fio version: a master (first host) below fio 3.3 stops the run, named; 3.3, 3.10, a git build and 4.0 pass; a client below 3.3 does not stop it" bash -c '
+    source ./tests/helpers.sh
+    for v in fio-3.2 fio-2.99 fio-3.2.1; do
+        lock_fixture; out=$(fv_preflight 0 h1=$v) && { echo "$v passed: $out" >&2; exit 1; }
+        printf "%s\n" "$out" | grep -q "ERROR: h1: $v is older than fio 3.3, which the coordinator needs for --eta-interval: install fio 3.3 or newer on the master (or name a newer host first)$" || { echo "$v: $out" >&2; exit 1; }
+    done
+    for v in fio-3.3 fio-3.10 fio-3.3-12-gabc fio-4.0; do
+        lock_fixture; out=$(fv_preflight 0 h1=$v) || { echo "$v stopped: $out" >&2; exit 1; }
+        case "$out" in *ERROR*|*WARNING*) echo "$v: $out" >&2; exit 1;; esac
+    done
+    lock_fixture; out=$(fv_preflight 1 h1=fio-3.35 h2=fio-3.2) || { echo "client below 3.3 stopped: $out" >&2; exit 1; }
+    case "$out" in *"older than fio 3.3"*|*"needs fio 3.3"*) echo "$out" >&2; false;; esac'
+t_assert "fio version: a master version line with no number warns and the run goes on; a master whose fio --version fails or prints nothing gets only its ERROR" bash -c '
+    source ./tests/helpers.sh
+    lock_fixture; out=$(fv_preflight 0 "h1=fio 3.36") || { echo "stopped: $out" >&2; exit 1; }
+    printf "%s\n" "$out" | grep -q "WARNING: h1: cannot read a version number from \"fio 3.36\"; the coordinator needs fio 3.3 or newer (--eta-interval)$" || { echo "$out" >&2; exit 1; }
+    for v in FAIL EMPTY; do
+        lock_fixture; out=$(fv_preflight 0 h1=$v h2=fio-3.35) && { echo "$v passed: $out" >&2; exit 1; }
+        case "$out" in *"cannot read a version number"*|*"fio 3.3 or newer"*) echo "$v: $out" >&2; exit 1;; esac
+    done'
 
 # A findmnt failure means the mount mode is UNKNOWN, not wrong. Telling the
 # operator to remount forcedirect then points away from the real fault, which
@@ -10709,7 +10730,7 @@ t_assert "staging: a --client list that overflows one shell argument dies before
      HOSTS=(h1 h2); check_client_cmdline) &&
     # run_jobs builds the very line the guard measures
     c=$( (source ./wekatester; FIO_BIN=/usr/bin/fio; TARGET_DIR=/dev/shm/x; HOSTS=(h1 h2); fio_client_cmd 011-bw.job) ) &&
-    [ "$c" = "'"'"'/usr/bin/fio'"'"' --output-format=json --eta=never --client=h1 '"'"'/dev/shm/x/h1/011-bw.job'"'"' --client=h2 '"'"'/dev/shm/x/h2/011-bw.job'"'"'" ] || { echo "$c" >&2; false; }'
+    [ "$c" = "'"'"'/usr/bin/fio'"'"' --output-format=json --eta-interval=30s --client=h1 '"'"'/dev/shm/x/h1/011-bw.job'"'"' --client=h2 '"'"'/dev/shm/x/h2/011-bw.job'"'"'" ] || { echo "$c" >&2; false; }'
 
 # --- fio JSON in awk (Frank, 2026-10-05: no jq, no python) ---
 t_assert "json_flat: fio one-key-per-line and compact JSON flatten alike; strings unescape; an empty object leaves a mark; no JSON is 2, broken JSON is 3" bash -c '
