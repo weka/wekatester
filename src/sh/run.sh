@@ -472,7 +472,7 @@ dry_run_report() {
     echo
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
-    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
+    log "would run, per job in the order above: fio --output-format=json --eta-interval=30s --client=<host> $TARGET_DIR/<host>/<job>"
     log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
 }
 
@@ -744,10 +744,12 @@ check_own_layout() {   # check_own_layout <layout job>
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
-# jobfile>" per worker. --eta=never: the SEND_ETA polls are how a saturated
-# worker gets dropped mid-layout.
+# jobfile>" per worker. --eta-interval=30s: the coordinator drops a client on
+# its 7th unanswered SEND_ETA poll in a row, so a dead client costs ~3.5 min
+# of silence, not the run; fio's 1 s default dropped a saturated worker
+# mid-layout after 7 s, and --eta=never never dropped a dead one.
 fio_client_cmd() {   # fio_client_cmd <job> [host...]: every host, or the ones named
-    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
+    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=30s"
     shift
     [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     for host in "$@"; do

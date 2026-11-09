@@ -155,10 +155,24 @@ preflight() {
 # fio's client/server protocol is version-sensitive (README, Caveats): every
 # host's fio --version must print one first line. A failed or empty one
 # stops the run; differing versions do too, unless --allow-fio-mismatch
-# (a warning). FIO_VERSION_NOTE says what was found.
+# (a warning). FIO_VERSION_NOTE says what was found. The coordinator parses
+# --eta-interval (fio 3.3, 2017), so the master alone has a version floor.
 FIO_VERSION_NOTE=""
 check_fio_versions() {
     local i k v rc bad=() vers=() cnt=() who=() rows=() why
+    for i in "${!HOSTS[@]}"; do
+        [ "${HOSTS[$i]}" = "$MASTER" ] || continue
+        v=${FIO_VERSIONS[$i]:-}; v=${v#* }
+        case $v in
+            (fio-[0-9]*.[0-9]*)
+                k=${v#fio-}; k=${k%%[!0-9.]*}; rc=${k#*.}; rc=${rc%%.*}
+                if [ "${k%%.*}" -lt 3 ] || { [ "${k%%.*}" -eq 3 ] && [ "$rc" -lt 3 ]; }; then
+                    die "$MASTER: $v is older than fio 3.3, which the coordinator needs for --eta-interval: install fio 3.3 or newer on the master (or name a newer host first)"
+                fi ;;
+            (*) [ -z "$v" ] || warn_prerun "$MASTER: cannot read a version number from \"$v\"; the coordinator needs fio 3.3 or newer (--eta-interval)" ;;
+        esac
+        break
+    done
     for i in "${!HOSTS[@]}"; do
         if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
             bad+=("${HOSTS[$i]}: no fio --version line came back from its preflight session"); continue

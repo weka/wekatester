@@ -2950,7 +2950,7 @@ SUBDIREOF
     [ "${nfiles:-0}" -gt 0 ] && [ -n "$active" ] || return 0
     cal_push "$job" $active || die "cannot copy the calibration seed to $MASTER"
     log "cal: seeding $host's calibration $side${by}..."
-    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
+    cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=30s"
     for m in $active; do cmd="$cmd --client=$m '$TARGET_DIR.cal/$m/$job'"; done
     # a failed seed leaves its evidence outside the tmpfs workdir
     # shellcheck disable=SC2086 -- active is a list of host names
@@ -3812,7 +3812,7 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     [ -n "$n" ] || { CAL_CELLS=$((CAL_CELLS + 1)); n=$CAL_CELLS; }
     [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
-    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta=never --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
+    if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=30s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
         cal_evidence "$what" "$json" "$base.job" say "$rep"
         die "calibration $what failed on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
@@ -4821,10 +4821,24 @@ preflight() {
 # fio's client/server protocol is version-sensitive (README, Caveats): every
 # host's fio --version must print one first line. A failed or empty one
 # stops the run; differing versions do too, unless --allow-fio-mismatch
-# (a warning). FIO_VERSION_NOTE says what was found.
+# (a warning). FIO_VERSION_NOTE says what was found. The coordinator parses
+# --eta-interval (fio 3.3, 2017), so the master alone has a version floor.
 FIO_VERSION_NOTE=""
 check_fio_versions() {
     local i k v rc bad=() vers=() cnt=() who=() rows=() why
+    for i in "${!HOSTS[@]}"; do
+        [ "${HOSTS[$i]}" = "$MASTER" ] || continue
+        v=${FIO_VERSIONS[$i]:-}; v=${v#* }
+        case $v in
+            (fio-[0-9]*.[0-9]*)
+                k=${v#fio-}; k=${k%%[!0-9.]*}; rc=${k#*.}; rc=${rc%%.*}
+                if [ "${k%%.*}" -lt 3 ] || { [ "${k%%.*}" -eq 3 ] && [ "$rc" -lt 3 ]; }; then
+                    die "$MASTER: $v is older than fio 3.3, which the coordinator needs for --eta-interval: install fio 3.3 or newer on the master (or name a newer host first)"
+                fi ;;
+            (*) [ -z "$v" ] || warn_prerun "$MASTER: cannot read a version number from \"$v\"; the coordinator needs fio 3.3 or newer (--eta-interval)" ;;
+        esac
+        break
+    done
     for i in "${!HOSTS[@]}"; do
         if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
             bad+=("${HOSTS[$i]}: no fio --version line came back from its preflight session"); continue
@@ -9459,7 +9473,7 @@ dry_run_report() {
     echo
     [ ${#HOSTS[@]} -le 1 ] || \
         log "one variant per host is staged for ${#HOSTS[@]} hosts (shown: $MASTER's)"
-    log "would run, per job in the order above: fio --output-format=json --eta=never --client=<host> $TARGET_DIR/<host>/<job>"
+    log "would run, per job in the order above: fio --output-format=json --eta-interval=30s --client=<host> $TARGET_DIR/<host>/<job>"
     log "results would land in: $OUTPUT_DIR/<date>-<time>.tgz (fio JSON, wekatester.log, fio-jobfiles/)"
 }
 
@@ -9987,10 +10001,12 @@ check_own_layout() {   # check_own_layout <layout job>
 }
 
 # The coordinator command line: fio on the master, "--client=<host> <its
-# jobfile>" per worker. --eta=never: the SEND_ETA polls are how a saturated
-# worker gets dropped mid-layout.
+# jobfile>" per worker. --eta-interval=30s: the coordinator drops a client on
+# its 7th unanswered SEND_ETA poll in a row, so a dead client costs ~3.5 min
+# of silence, not the run; fio's 1 s default dropped a saturated worker
+# mid-layout after 7 s, and --eta=never never dropped a dead one.
 fio_client_cmd() {   # fio_client_cmd <job> [host...]: every host, or the ones named
-    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta=never"
+    local job=$1 host cmd="${COORD_NOFILE:+ulimit -Sn $COORD_NOFILE && }'$FIO_BIN' --output-format=json --eta-interval=30s"
     shift
     [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     for host in "$@"; do
