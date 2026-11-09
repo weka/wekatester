@@ -16,6 +16,7 @@ WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
 WT_ANY_FS switch --any-fs any_fs
 WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
 WT_ALLOW_CACHED_MOUNT switch --allow-cached-mount allow_cached_mount
+WT_IGNORE_FAILED_CLIENTS switch --ignore-failed-clients ignore_failed_clients
 WT_IDENTITY flag --identity identity
 WT_PASSWORD count --password password
 WT_BULK switch --bulk bulk
@@ -30,7 +31,8 @@ WT_CLIENTS env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
-    [WT_ALLOW_FIO_MISMATCH]=0 [WT_ALLOW_CACHED_MOUNT]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_ALLOW_CACHED_MOUNT]=0 [WT_IGNORE_FAILED_CLIENTS]=0
+    [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0
     [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
     [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
 declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
@@ -75,6 +77,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
             (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
             (--allow-cached-mount) CLI_SET[WT_ALLOW_CACHED_MOUNT]=1 ;;
+            (--ignore-failed-clients) CLI_SET[WT_IGNORE_FAILED_CLIENTS]=1 ;;
             (-i*|--identity|--identity=*) CLI_SET[WT_IDENTITY]=1 ;;
             (-p*|--password|--password=*) CLI_SET[WT_PASSWORD]=1 ;;
             (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
@@ -237,6 +240,7 @@ setting_value() {   # setting_value <name>
         (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
         (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
         (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;
+        (WT_IGNORE_FAILED_CLIENTS) printf '%s' "$IGNORE_FAILED_CLIENTS" ;;
         (WT_ALLOW_CACHED_MOUNT) printf '%s' "$ALLOW_CACHED_MOUNT" ;;
         (WT_IDENTITY) printf '%s' "${IDENT_RAW[*]}" ;;
         (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;

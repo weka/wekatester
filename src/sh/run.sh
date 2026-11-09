@@ -808,6 +808,122 @@ summ_job_failed() {   # summ_job_failed <job>
     log "ERROR: could not summarize $1 (its raw results are in the bundle: results_${1%.job}.json)" >&2
 }
 
+# --- a client that dies mid-run ---------------------------------------------
+# fio drops a client that answers no poll (fio_client_cmd) and exits non-zero
+# with the survivors' stats; the dropped host has no client_stats entry. The
+# ladder below decides whether it runs the next job: ssh alive (or reopened),
+# then its fio server ours and listening (else restarted once). A host that
+# fails the ladder, or is dropped twice, leaves HOSTS for the rest of the run.
+# START_HOSTS: the list the run began with, the 5% rule's denominator.
+START_HOSTS=(); EXCLUDED_HOSTS=(); LADDER_WHY=""
+declare -gA DROP_COUNT=()
+CLIENT_CHECK_S=20   # each remote step of the ladder
+
+# A host-local check: the pidfile's pid is our server (base.sh _wt_srv).
+fio_server_alive_cmd() {   # fio_server_alive_cmd -> remote snippet
+    printf '%s' "$PROC_FN; [ -f '$FIO_PIDFILE' ] && _p=\$(cat '$FIO_PIDFILE') && _wt_args \"\$_p\" && _wt_srv '$FIO_PIDFILE'"
+}
+
+fio_port_open() {   # fio_port_open <host>: the master reaches <host>:$FIO_PORT
+    local out
+    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$MASTER" "$(port_probe_cmd "$1")" 2>&1)
+    case $out in (*"FAIL $1"*) return 1 ;; (*DONE*) return 0 ;; esac
+    debug "$1: port probe from $MASTER did not finish: $out"
+    return 1
+}
+
+# client_ladder <host>: 0 and LADDER_WHY (stalled, ssh reconnected, fio
+# server restarted) when the host can take the next job; 1 and the reason
+# when it cannot. Every remote step is bounded.
+client_ladder() {
+    local host=$1 out rc=0 line
+    LADDER_WHY=stalled
+    if [ "$LOCAL_MODE" -eq 0 ]; then
+        host_ssh_opts_v "$host"
+        # shellcheck disable=SC2086 -- option words
+        if ! out=$(run_bounded "$CLIENT_CHECK_S" ssh -O check $SSH_OPTS $HOST_SSH_OPTS "$host" 2>&1); then
+            debug "$host: ssh master check failed: $out"
+            # ControlMaster=auto: a plain session replaces the dead master
+            if ! out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" true 2>&1); then
+                debug "$host: ssh reconnect failed: $out"
+                LADDER_WHY="gone: ssh does not answer"
+                return 1
+            fi
+            LADDER_WHY="ssh reconnected"
+        fi
+    fi
+    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$(fio_server_alive_cmd)" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || debug "$host: fio server check: rc $rc${out:+: $out}"
+    [ "$rc" -ne 0 ] || fio_port_open "$host" || rc=1
+    [ "$rc" -ne 0 ] || return 0
+    fio_launch_cmd_v "$host"
+    if ! RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" \
+            > "$WORK_DIR/relaunch.$host" 2> "$WORK_DIR/relaunch.$host.err"; then
+        LADDER_WHY="fio server could not be restarted"
+        return 1
+    fi
+    while IFS= read -r line; do log "$host: $line" >&2; done < "$WORK_DIR/relaunch.$host.err"
+    sleep "${WT_SETTLE:-2}"
+    fio_port_open "$host" || { LADDER_WHY="fio server restarted, but $MASTER cannot reach port $FIO_PORT"; return 1; }
+    LADDER_WHY="fio server restarted"
+    return 0
+}
+
+# The host leaves HOSTS for the rest of the run; its fio server, staging and
+# lock are torn down at exit with the others (cleanup), its test files stay.
+exclude_host() {   # exclude_host <host> <job> <why>
+    local h keep=()
+    for h in "${HOSTS[@]}"; do [ "$h" = "$1" ] || keep+=("$h"); done
+    HOSTS=(${keep[@]+"${keep[@]}"})
+    EXCLUDED_HOSTS+=("$1")
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$WORK_DIR/excluded"
+    host_dir_v "$1"
+    log "excluded: $1 ($3) -- the rest of the run skips it; its test files stay under $HOST_DIR"
+    check_excluded_share
+}
+
+# Excluded hosts over 5% of the starting list stop the run (below 20 hosts,
+# any exclusion does), unless --ignore-failed-clients.
+check_excluded_share() {
+    local n=${#START_HOSTS[@]} x=${#EXCLUDED_HOSTS[@]}
+    [ "$x" -gt 0 ] && [ "$n" -gt 0 ] && [ $((x * 20)) -gt "$n" ] || return 0
+    [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] \
+        || { log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
+    die "$x of the $n starting host(s) excluded (${EXCLUDED_HOSTS[*]}), over 5% of the host list; --ignore-failed-clients (WT_IGNORE_FAILED_CLIENTS=1) runs on without them"
+}
+
+# A measured job whose fio exited non-zero. A host present in the results
+# with an error, or no results at all, is today's failure (check_fio_errors).
+# Otherwise the hosts missing from client_stats were dropped: each goes up
+# the ladder, the survivors' results are summarized, the job is not rerun.
+recover_dropped() {   # recover_dropped <job> <results-file> <report items>
+    local job=$1 out=$2 report=$3 host present dropped=() keep=()
+    check_fio_errors "$out" measured \
+        || die "job $job failed on at least one host (raw output in $out)"
+    present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+    for host in "${HOSTS[@]}"; do
+        case $'\n'"$present"$'\n' in
+            (*$'\n'"$host"$'\n'*) keep+=("$host") ;;
+            (*) dropped+=("$host") ;;
+        esac
+    done
+    [ ${#dropped[@]} -gt 0 ] || die "fio run failed for $job (partial output in $out)"
+    for host in "${dropped[@]}"; do
+        DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
+        log "dropped: $host answered no poll during $job; fio dropped it (7 polls of 30 s) and its result for this job is lost"
+        if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
+            exclude_host "$host" "$job" "dropped twice in this run"
+        elif client_ladder "$host"; then
+            log "rejoined: $host ($LADDER_WHY); it runs the next job"
+        else
+            exclude_host "$host" "$job" "$LADDER_WHY"
+        fi
+    done
+    [ ${#HOSTS[@]} -gt 0 ] || die "every host is excluded; nothing is left to run the jobs after $job"
+    log "job $job: results from ${#keep[@]} host(s); dropped: ${dropped[*]}"
+    summ_one "$out" "$out" "$report" "${keep[*]}" file || summ_job_failed "$job"
+}
+
 run_jobs() {
     local job outfile report cmd t0 lclients=()
     echo
@@ -878,8 +994,13 @@ run_jobs() {
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         PHASE_T0=$SECONDS   # -vvv times the measured job alone
         debug2 "running on $MASTER: $cmd"
-        run_host "$MASTER" "$cmd" > "$outfile" \
-            || die "fio run failed for $job (partial output in $outfile)"
+        # a dropped client is recovered here only; a drop during the layout
+        # or unlink job above stays fatal (the layout check would fail anyway)
+        if ! run_host "$MASTER" "$cmd" > "$outfile"; then
+            recover_dropped "$job" "$outfile" "$report"
+            phase_done "job $job"
+            continue
+        fi
         check_fio_errors "$outfile" measured \
             || die "job $job failed on at least one host (raw output in $outfile)"
         # fio keys client_stats by the --client= name, not the worker hostname;

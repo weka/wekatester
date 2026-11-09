@@ -77,6 +77,11 @@ WT_ALLOW_FIO_MISMATCH=0
 #                           numbers include the client cache)
 WT_ALLOW_CACHED_MOUNT=0
 #
+#   --ignore-failed-clients run on when the hosts excluded for dying mid-run are
+#                           more than 5% of the starting host list (else the run
+#                           stops, naming them)
+WT_IGNORE_FAILED_CLIENTS=0
+#
 #   -i, --identity [login:]keyfile[,...]
 #                           ssh key(s) to try, each optionally bound to a login;
 #                           repeatable, tried in the order given

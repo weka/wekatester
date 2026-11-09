@@ -34,28 +34,33 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
         if [ \"\$i\" -ge 15 ] && _wt_srvs '$FIO_PIDFILE'; then _wt_ek -9 \$_wt_l || true; fi"
 }
 
+# One host's server launch, as the start and a mid-run restart both run it:
+# LAUNCH_CMD, and KILL_FIO_CMD under the same escalator. A cpu list pins the
+# server (children inherit the mask). The escalation is for the taskset
+# only: fio drops back to the login user via runuser, so test files stay
+# user-owned; no runuser means a root fio, and start_fio_servers' NOTE says so.
+fio_launch_cmd_v() {   # fio_launch_cmd_v <host> -> LAUNCH_CMD, KILL_FIO_CMD
+    local priv="" cpus="" base
+    [ ! -s "$AUTH_DIR/$1.priv" ] || IFS= read -r priv < "$AUTH_DIR/$1.priv" || :
+    [ ! -s "$AUTH_DIR/$1.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$1.cpus" || :
+    base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
+    LAUNCH_CMD=$base
+    [ -z "$cpus" ] || LAUNCH_CMD="taskset -c $cpus $LAUNCH_CMD"
+    if [ -n "$priv" ] && [ -n "$cpus" ]; then
+        LAUNCH_CMD="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
+    elif [ -n "$priv" ]; then
+        LAUNCH_CMD="$priv $LAUNCH_CMD"
+    fi
+    kill_fio_cmd_v "$priv"
+}
+
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch base line kc=()
+    local pids=() failed=() host i line kc=()
     for host in "${HOSTS[@]}"; do
-        priv=""; cpus=""
-        [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
-        [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
-        base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
-        # a cpu list pins the server (children inherit the mask). The
-        # escalation is for the taskset only: fio drops back to the login user
-        # via runuser, so test files stay user-owned; no runuser means a root
-        # fio, and the NOTE says so.
-        launch=$base
-        [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
-        if [ -n "$priv" ] && [ -n "$cpus" ]; then
-            launch="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
-        elif [ -n "$priv" ]; then
-            launch="$priv $launch"
-        fi
-        kill_fio_cmd_v "$priv"
-        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
+        fio_launch_cmd_v "$host"
+        run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
         pids+=($!)
         kc+=("$host" "$KILL_FIO_CMD")
     done
@@ -262,7 +267,8 @@ cleanup() {
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
-        for host in "${HOSTS[@]}"; do
+        # a host excluded mid-run (run.sh) still holds its server and staging
+        for host in "${HOSTS[@]}" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"}; do
             # a privileged launch made a root-owned server: the kill needs the
             # same escalator or the run leaks a root fio
             priv=""

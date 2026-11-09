@@ -94,6 +94,7 @@ BREAK_LOCK=0        # 1: kill every fio and clear a dead run's lock before takin
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
 ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
+IGNORE_FAILED_CLIENTS=0   # 1: hosts excluded mid-run over 5% of the list warn, not stop
 
 # --- logging -----------------------------------------------------------------
 # Until the pre-log relays start (start_prelog), the main shell's lines are
@@ -471,7 +472,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
-                  [--allow-fio-mismatch] [--allow-cached-mount]
+                  [--allow-fio-mismatch] [--allow-cached-mount] [--ignore-failed-clients]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -497,7 +498,7 @@ EOF
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
 USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
-    break_lock any_fs allow_fio_mismatch allow_cached_mount identity password targets bulk
+    break_lock any_fs allow_fio_mismatch allow_cached_mount ignore_failed_clients identity password targets bulk
     fast dry regen duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
     case $1 in
@@ -571,6 +572,12 @@ EOF
     (ignore_capacity) cat <<EOF
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+EOF
+    ;;
+    (ignore_failed_clients) cat <<EOF
+  --ignore-failed-clients run on when the hosts excluded for dying mid-run are
+                          more than 5% of the starting host list (else the run
+                          stops, naming them)
 EOF
     ;;
     (break_lock) cat <<EOF
@@ -2139,6 +2146,7 @@ parse_args() {
             --any-fs) ANY_FS=1; shift ;;
             --allow-fio-mismatch) ALLOW_FIO_MISMATCH=1; shift ;;
             --allow-cached-mount) ALLOW_CACHED_MOUNT=1; shift ;;
+            --ignore-failed-clients) IGNORE_FAILED_CLIENTS=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
@@ -5382,28 +5390,33 @@ kill_fio_cmd_v() {   # kill_fio_cmd_v [priv] -> KILL_FIO_CMD
         if [ \"\$i\" -ge 15 ] && _wt_srvs '$FIO_PIDFILE'; then _wt_ek -9 \$_wt_l || true; fi"
 }
 
+# One host's server launch, as the start and a mid-run restart both run it:
+# LAUNCH_CMD, and KILL_FIO_CMD under the same escalator. A cpu list pins the
+# server (children inherit the mask). The escalation is for the taskset
+# only: fio drops back to the login user via runuser, so test files stay
+# user-owned; no runuser means a root fio, and start_fio_servers' NOTE says so.
+fio_launch_cmd_v() {   # fio_launch_cmd_v <host> -> LAUNCH_CMD, KILL_FIO_CMD
+    local priv="" cpus="" base
+    [ ! -s "$AUTH_DIR/$1.priv" ] || IFS= read -r priv < "$AUTH_DIR/$1.priv" || :
+    [ ! -s "$AUTH_DIR/$1.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$1.cpus" || :
+    base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
+    LAUNCH_CMD=$base
+    [ -z "$cpus" ] || LAUNCH_CMD="taskset -c $cpus $LAUNCH_CMD"
+    if [ -n "$priv" ] && [ -n "$cpus" ]; then
+        LAUNCH_CMD="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
+    elif [ -n "$priv" ]; then
+        LAUNCH_CMD="$priv $LAUNCH_CMD"
+    fi
+    kill_fio_cmd_v "$priv"
+}
+
 start_fio_servers() {
     echo
     log "starting fio servers on ${#HOSTS[@]} host(s)..."
-    local pids=() failed=() host i priv cpus launch base line kc=()
+    local pids=() failed=() host i line kc=()
     for host in "${HOSTS[@]}"; do
-        priv=""; cpus=""
-        [ ! -s "$AUTH_DIR/$host.priv" ] || IFS= read -r priv < "$AUTH_DIR/$host.priv" || :
-        [ ! -s "$AUTH_DIR/$host.cpus" ] || IFS= read -r cpus < "$AUTH_DIR/$host.cpus" || :
-        base="'$FIO_BIN' --server --daemonize='$FIO_PIDFILE'"
-        # a cpu list pins the server (children inherit the mask). The
-        # escalation is for the taskset only: fio drops back to the login user
-        # via runuser, so test files stay user-owned; no runuser means a root
-        # fio, and the NOTE says so.
-        launch=$base
-        [ -z "$cpus" ] || launch="taskset -c $cpus $launch"
-        if [ -n "$priv" ] && [ -n "$cpus" ]; then
-            launch="u=\$(id -un); if _o=\$(command -v runuser) && $priv runuser -u \"\$u\" -- true </dev/null; then echo WEKATESTER_FIO_AS=user; $priv taskset -c $cpus runuser -u \"\$u\" -- $base; else echo WEKATESTER_FIO_AS=root; $priv taskset -c $cpus $base; fi"
-        elif [ -n "$priv" ]; then
-            launch="$priv $launch"
-        fi
-        kill_fio_cmd_v "$priv"
-        run_host "$host" "$KILL_FIO_CMD; $launch" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
+        fio_launch_cmd_v "$host"
+        run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" > "$WORK_DIR/launch.$host" 2> "$WORK_DIR/launch.$host.err" &
         pids+=($!)
         kc+=("$host" "$KILL_FIO_CMD")
     done
@@ -5610,7 +5623,8 @@ cleanup() {
     if [ "$FIO_STARTED" -eq 1 ]; then
         FIO_STARTED=0   # idempotent: EXIT trap may follow an INT trap
         log "stopping fio servers..."
-        for host in "${HOSTS[@]}"; do
+        # a host excluded mid-run (run.sh) still holds its server and staging
+        for host in "${HOSTS[@]}" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"}; do
             # a privileged launch made a root-owned server: the kill needs the
             # same escalator or the run leaks a root fio
             priv=""
@@ -7723,6 +7737,7 @@ WT_IGNORE_CAPACITY switch --ignore-capacity ignore_capacity
 WT_ANY_FS switch --any-fs any_fs
 WT_ALLOW_FIO_MISMATCH switch --allow-fio-mismatch allow_fio_mismatch
 WT_ALLOW_CACHED_MOUNT switch --allow-cached-mount allow_cached_mount
+WT_IGNORE_FAILED_CLIENTS switch --ignore-failed-clients ignore_failed_clients
 WT_IDENTITY flag --identity identity
 WT_PASSWORD count --password password
 WT_BULK switch --bulk bulk
@@ -7737,7 +7752,8 @@ WT_CLIENTS env - -"
 # the built-in values, taken before any parse moves them
 declare -gA SETTING_DEFAULT=([WT_DIRECTORY]=$DIRECTORY [WT_WORKLOAD]=$WORKLOAD
     [WT_FIO_BIN]=$FIO_BIN [WT_OUTPUT]=$OUTPUT_DIR [WT_IGNORE_CAPACITY]=0 [WT_ANY_FS]=0
-    [WT_ALLOW_FIO_MISMATCH]=0 [WT_ALLOW_CACHED_MOUNT]=0 [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0
+    [WT_ALLOW_FIO_MISMATCH]=0 [WT_ALLOW_CACHED_MOUNT]=0 [WT_IGNORE_FAILED_CLIENTS]=0
+    [WT_PASSWORD]=0 [WT_BULK]=0 [WT_UNLINK]=0
     [WT_VERBOSE]=0 [WT_CAL_CLIENTS]=1
     [WT_ENGINE_TEST_TIMEOUT]=15 [WT_SYSINFO_TIMEOUT]=300 [WT_SETTLE]=2 [WT_STAGE_BASE]=shm)
 declare -gA SETTING_SRC=()   # name -> where its value came from, for errors
@@ -7782,6 +7798,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (--any-fs) CLI_SET[WT_ANY_FS]=1 ;;
             (--allow-fio-mismatch) CLI_SET[WT_ALLOW_FIO_MISMATCH]=1 ;;
             (--allow-cached-mount) CLI_SET[WT_ALLOW_CACHED_MOUNT]=1 ;;
+            (--ignore-failed-clients) CLI_SET[WT_IGNORE_FAILED_CLIENTS]=1 ;;
             (-i*|--identity|--identity=*) CLI_SET[WT_IDENTITY]=1 ;;
             (-p*|--password|--password=*) CLI_SET[WT_PASSWORD]=1 ;;
             (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
@@ -7962,6 +7979,7 @@ setting_value() {   # setting_value <name>
         (WT_IGNORE_CAPACITY) printf '%s' "$IGNORE_CAPACITY" ;;
         (WT_ANY_FS) printf '%s' "$ANY_FS" ;;
         (WT_ALLOW_FIO_MISMATCH) printf '%s' "$ALLOW_FIO_MISMATCH" ;;
+        (WT_IGNORE_FAILED_CLIENTS) printf '%s' "$IGNORE_FAILED_CLIENTS" ;;
         (WT_ALLOW_CACHED_MOUNT) printf '%s' "$ALLOW_CACHED_MOUNT" ;;
         (WT_IDENTITY) printf '%s' "${IDENT_RAW[*]}" ;;
         (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;
@@ -10073,6 +10091,122 @@ summ_job_failed() {   # summ_job_failed <job>
     log "ERROR: could not summarize $1 (its raw results are in the bundle: results_${1%.job}.json)" >&2
 }
 
+# --- a client that dies mid-run ---------------------------------------------
+# fio drops a client that answers no poll (fio_client_cmd) and exits non-zero
+# with the survivors' stats; the dropped host has no client_stats entry. The
+# ladder below decides whether it runs the next job: ssh alive (or reopened),
+# then its fio server ours and listening (else restarted once). A host that
+# fails the ladder, or is dropped twice, leaves HOSTS for the rest of the run.
+# START_HOSTS: the list the run began with, the 5% rule's denominator.
+START_HOSTS=(); EXCLUDED_HOSTS=(); LADDER_WHY=""
+declare -gA DROP_COUNT=()
+CLIENT_CHECK_S=20   # each remote step of the ladder
+
+# A host-local check: the pidfile's pid is our server (base.sh _wt_srv).
+fio_server_alive_cmd() {   # fio_server_alive_cmd -> remote snippet
+    printf '%s' "$PROC_FN; [ -f '$FIO_PIDFILE' ] && _p=\$(cat '$FIO_PIDFILE') && _wt_args \"\$_p\" && _wt_srv '$FIO_PIDFILE'"
+}
+
+fio_port_open() {   # fio_port_open <host>: the master reaches <host>:$FIO_PORT
+    local out
+    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$MASTER" "$(port_probe_cmd "$1")" 2>&1)
+    case $out in (*"FAIL $1"*) return 1 ;; (*DONE*) return 0 ;; esac
+    debug "$1: port probe from $MASTER did not finish: $out"
+    return 1
+}
+
+# client_ladder <host>: 0 and LADDER_WHY (stalled, ssh reconnected, fio
+# server restarted) when the host can take the next job; 1 and the reason
+# when it cannot. Every remote step is bounded.
+client_ladder() {
+    local host=$1 out rc=0 line
+    LADDER_WHY=stalled
+    if [ "$LOCAL_MODE" -eq 0 ]; then
+        host_ssh_opts_v "$host"
+        # shellcheck disable=SC2086 -- option words
+        if ! out=$(run_bounded "$CLIENT_CHECK_S" ssh -O check $SSH_OPTS $HOST_SSH_OPTS "$host" 2>&1); then
+            debug "$host: ssh master check failed: $out"
+            # ControlMaster=auto: a plain session replaces the dead master
+            if ! out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" true 2>&1); then
+                debug "$host: ssh reconnect failed: $out"
+                LADDER_WHY="gone: ssh does not answer"
+                return 1
+            fi
+            LADDER_WHY="ssh reconnected"
+        fi
+    fi
+    out=$(RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$(fio_server_alive_cmd)" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || debug "$host: fio server check: rc $rc${out:+: $out}"
+    [ "$rc" -ne 0 ] || fio_port_open "$host" || rc=1
+    [ "$rc" -ne 0 ] || return 0
+    fio_launch_cmd_v "$host"
+    if ! RUN_HOST_TIMEOUT=$CLIENT_CHECK_S run_host "$host" "$KILL_FIO_CMD; $LAUNCH_CMD" \
+            > "$WORK_DIR/relaunch.$host" 2> "$WORK_DIR/relaunch.$host.err"; then
+        LADDER_WHY="fio server could not be restarted"
+        return 1
+    fi
+    while IFS= read -r line; do log "$host: $line" >&2; done < "$WORK_DIR/relaunch.$host.err"
+    sleep "${WT_SETTLE:-2}"
+    fio_port_open "$host" || { LADDER_WHY="fio server restarted, but $MASTER cannot reach port $FIO_PORT"; return 1; }
+    LADDER_WHY="fio server restarted"
+    return 0
+}
+
+# The host leaves HOSTS for the rest of the run; its fio server, staging and
+# lock are torn down at exit with the others (cleanup), its test files stay.
+exclude_host() {   # exclude_host <host> <job> <why>
+    local h keep=()
+    for h in "${HOSTS[@]}"; do [ "$h" = "$1" ] || keep+=("$h"); done
+    HOSTS=(${keep[@]+"${keep[@]}"})
+    EXCLUDED_HOSTS+=("$1")
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$WORK_DIR/excluded"
+    host_dir_v "$1"
+    log "excluded: $1 ($3) -- the rest of the run skips it; its test files stay under $HOST_DIR"
+    check_excluded_share
+}
+
+# Excluded hosts over 5% of the starting list stop the run (below 20 hosts,
+# any exclusion does), unless --ignore-failed-clients.
+check_excluded_share() {
+    local n=${#START_HOSTS[@]} x=${#EXCLUDED_HOSTS[@]}
+    [ "$x" -gt 0 ] && [ "$n" -gt 0 ] && [ $((x * 20)) -gt "$n" ] || return 0
+    [ "$IGNORE_FAILED_CLIENTS" -eq 0 ] \
+        || { log "WARNING: $x of the $n starting host(s) excluded, over 5%; --ignore-failed-clients runs on (${EXCLUDED_HOSTS[*]})" >&2; return 0; }
+    die "$x of the $n starting host(s) excluded (${EXCLUDED_HOSTS[*]}), over 5% of the host list; --ignore-failed-clients (WT_IGNORE_FAILED_CLIENTS=1) runs on without them"
+}
+
+# A measured job whose fio exited non-zero. A host present in the results
+# with an error, or no results at all, is today's failure (check_fio_errors).
+# Otherwise the hosts missing from client_stats were dropped: each goes up
+# the ladder, the survivors' results are summarized, the job is not rerun.
+recover_dropped() {   # recover_dropped <job> <results-file> <report items>
+    local job=$1 out=$2 report=$3 host present dropped=() keep=()
+    check_fio_errors "$out" measured \
+        || die "job $job failed on at least one host (raw output in $out)"
+    present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
+    for host in "${HOSTS[@]}"; do
+        case $'\n'"$present"$'\n' in
+            (*$'\n'"$host"$'\n'*) keep+=("$host") ;;
+            (*) dropped+=("$host") ;;
+        esac
+    done
+    [ ${#dropped[@]} -gt 0 ] || die "fio run failed for $job (partial output in $out)"
+    for host in "${dropped[@]}"; do
+        DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
+        log "dropped: $host answered no poll during $job; fio dropped it (7 polls of 30 s) and its result for this job is lost"
+        if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
+            exclude_host "$host" "$job" "dropped twice in this run"
+        elif client_ladder "$host"; then
+            log "rejoined: $host ($LADDER_WHY); it runs the next job"
+        else
+            exclude_host "$host" "$job" "$LADDER_WHY"
+        fi
+    done
+    [ ${#HOSTS[@]} -gt 0 ] || die "every host is excluded; nothing is left to run the jobs after $job"
+    log "job $job: results from ${#keep[@]} host(s); dropped: ${dropped[*]}"
+    summ_one "$out" "$out" "$report" "${keep[*]}" file || summ_job_failed "$job"
+}
+
 run_jobs() {
     local job outfile report cmd t0 lclients=()
     echo
@@ -10143,8 +10277,13 @@ run_jobs() {
         log "starting test run for job $job on $MASTER with ${#HOSTS[@]} workers:"
         PHASE_T0=$SECONDS   # -vvv times the measured job alone
         debug2 "running on $MASTER: $cmd"
-        run_host "$MASTER" "$cmd" > "$outfile" \
-            || die "fio run failed for $job (partial output in $outfile)"
+        # a dropped client is recovered here only; a drop during the layout
+        # or unlink job above stays fatal (the layout check would fail anyway)
+        if ! run_host "$MASTER" "$cmd" > "$outfile"; then
+            recover_dropped "$job" "$outfile" "$report"
+            phase_done "job $job"
+            continue
+        fi
         check_fio_errors "$outfile" measured \
             || die "job $job failed on at least one host (raw output in $outfile)"
         # fio keys client_stats by the --client= name, not the worker hostname;
@@ -10978,7 +11117,9 @@ main() {
     start_fio_servers
     verify_fio_ports
     phase_done "fio servers"
+    START_HOSTS=("${HOSTS[@]}")   # the 5% rule's denominator, both phases
     calibrate
+    check_excluded_share
     phase_done calibration
     stage_jobfiles
     phase_done stage
@@ -10995,6 +11136,8 @@ main() {
     phase_done push
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
+    [ ${#EXCLUDED_HOSTS[@]} -eq 0 ] \
+        || log "excluded during the run (their test files were not removed): ${EXCLUDED_HOSTS[*]}"
     # every job ran; a summary that failed (summ_job_failed) makes the
     # run's status 1, the bundle kept as always
     [ "$SUMM_FAILED" -eq 0 ] \

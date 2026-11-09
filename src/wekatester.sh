@@ -93,6 +93,7 @@ BREAK_LOCK=0        # 1: kill every fio and clear a dead run's lock before takin
 ANY_FS=0            # 1: -d may be on any filesystem, not only wekafs
 ALLOW_FIO_MISMATCH=0   # 1: differing fio versions across the hosts warn, not stop
 ALLOW_CACHED_MOUNT=0   # 1: a wekafs destination not mounted forcedirect warns, not stop
+IGNORE_FAILED_CLIENTS=0   # 1: hosts excluded mid-run over 5% of the list warn, not stop
 
 #@include sh/base.sh
 
@@ -101,7 +102,7 @@ usage() {
 usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [-e engine] [-a [safe|max|cal|brutal[:secs]]] [--cal-clients n|all]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
-                  [--allow-fio-mismatch] [--allow-cached-mount]
+                  [--allow-fio-mismatch] [--allow-cached-mount] [--ignore-failed-clients]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
                   [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
                   [--] [server ...]
@@ -127,7 +128,7 @@ EOF
 # The options in -h order, one help block each: usage prints them all, and
 # the host-file template quotes a setting's block (README, Settings).
 USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
-    break_lock any_fs allow_fio_mismatch allow_cached_mount identity password targets bulk
+    break_lock any_fs allow_fio_mismatch allow_cached_mount ignore_failed_clients identity password targets bulk
     fast dry regen duration unlink summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
     case $1 in
@@ -201,6 +202,12 @@ EOF
     (ignore_capacity) cat <<EOF
   --ignore-capacity       when the workload needs more space than is available,
                           ask (no timeout) and run anyway instead of aborting
+EOF
+    ;;
+    (ignore_failed_clients) cat <<EOF
+  --ignore-failed-clients run on when the hosts excluded for dying mid-run are
+                          more than 5% of the starting host list (else the run
+                          stops, naming them)
 EOF
     ;;
     (break_lock) cat <<EOF
@@ -506,6 +513,7 @@ parse_args() {
             --any-fs) ANY_FS=1; shift ;;
             --allow-fio-mismatch) ALLOW_FIO_MISMATCH=1; shift ;;
             --allow-cached-mount) ALLOW_CACHED_MOUNT=1; shift ;;
+            --ignore-failed-clients) IGNORE_FAILED_CLIENTS=1; shift ;;
             # Accumulates in order; validate_credentials checks it. An empty
             # =-form is refused here, where need_arg cannot see it.
             -i|--identity) need_arg "$1" $# "${2:-}"; IDENT_RAW+=("$2"); shift 2 ;;
@@ -789,7 +797,9 @@ main() {
     start_fio_servers
     verify_fio_ports
     phase_done "fio servers"
+    START_HOSTS=("${HOSTS[@]}")   # the 5% rule's denominator, both phases
     calibrate
+    check_excluded_share
     phase_done calibration
     stage_jobfiles
     phase_done stage
@@ -806,6 +816,8 @@ main() {
     phase_done push
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
+    [ ${#EXCLUDED_HOSTS[@]} -eq 0 ] \
+        || log "excluded during the run (their test files were not removed): ${EXCLUDED_HOSTS[*]}"
     # every job ran; a summary that failed (summ_job_failed) makes the
     # run's status 1, the bundle kept as always
     [ "$SUMM_FAILED" -eq 0 ] \
