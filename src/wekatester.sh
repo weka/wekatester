@@ -799,6 +799,7 @@ main() {
     phase_done "fio servers"
     START_HOSTS=("${HOSTS[@]}")   # the 5% rule's denominator, both phases
     calibrate
+    cal_apply_exclusions
     check_excluded_share
     phase_done calibration
     stage_jobfiles

@@ -868,7 +868,7 @@ client_ladder() {
 
 # The host leaves HOSTS for the rest of the run; its fio server, staging and
 # lock are torn down at exit with the others (cleanup), its test files stay.
-exclude_host() {   # exclude_host <host> <job> <why>
+exclude_host() {   # exclude_host <host> <job|phase> <why> [later: the caller runs the 5% check]
     local h keep=()
     for h in "${HOSTS[@]}"; do [ "$h" = "$1" ] || keep+=("$h"); done
     HOSTS=(${keep[@]+"${keep[@]}"})
@@ -876,7 +876,7 @@ exclude_host() {   # exclude_host <host> <job> <why>
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$WORK_DIR/excluded"
     host_dir_v "$1"
     log "excluded: $1 ($3) -- the rest of the run skips it; its test files stay under $HOST_DIR"
-    check_excluded_share
+    [ "${4:-}" = later ] || check_excluded_share
 }
 
 # Excluded hosts over 5% of the starting list stop the run (below 20 hosts,
@@ -889,12 +889,14 @@ check_excluded_share() {
     die "$x of the $n starting host(s) excluded (${EXCLUDED_HOSTS[*]}), over 5% of the host list; --ignore-failed-clients (WT_IGNORE_FAILED_CLIENTS=1) runs on without them"
 }
 
-# A measured job whose fio exited non-zero. A host present in the results
+# Every measured job, whatever fio's exit. A host present in the results
 # with an error, or no results at all, is today's failure (check_fio_errors).
-# Otherwise the hosts missing from client_stats were dropped: each goes up
-# the ladder, the survivors' results are summarized, the job is not rerun.
-recover_dropped() {   # recover_dropped <job> <results-file> <report items>
-    local job=$1 out=$2 report=$3 host present dropped=() keep=()
+# The hosts missing from client_stats were dropped: mid-job (fio exits
+# non-zero) or at connect time (fio drops a client it cannot reach and
+# exits 0 while any other connects). Each goes up the ladder, the
+# survivors' results are summarized, the job is not rerun.
+recover_dropped() {   # recover_dropped <job> <results-file> <report items> <fio rc>
+    local job=$1 out=$2 report=$3 rc=$4 host present dropped=() keep=() how
     check_fio_errors "$out" measured \
         || die "job $job failed on at least one host (raw output in $out)"
     present=$(json_awk -F'\t' '$1 ~ /^client_stats\.[0-9]+\.hostname$/ { print $2 }')
@@ -904,10 +906,16 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items>
             (*) dropped+=("$host") ;;
         esac
     done
-    [ ${#dropped[@]} -gt 0 ] || die "fio run failed for $job (partial output in $out)"
+    if [ ${#dropped[@]} -eq 0 ]; then
+        [ "$rc" -eq 0 ] || die "fio run failed for $job (partial output in $out)"
+        summ_one "$out" "$out" "$report" "${HOSTS[*]}" file || summ_job_failed "$job"
+        return 0
+    fi
+    how="answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min)"
+    [ "$rc" -ne 0 ] || how="did not connect for $job; fio ran it on the others"
     for host in "${dropped[@]}"; do
         DROP_COUNT[$host]=$(( ${DROP_COUNT[$host]:-0} + 1 ))
-        log "dropped: $host answered no poll during $job; fio dropped it (~14 polls of 15 s, ~3.5 min) and its result for this job is lost"
+        log "dropped: $host $how and its result for this job is lost"
         if [ "${DROP_COUNT[$host]}" -ge 2 ]; then
             exclude_host "$host" "$job" "dropped twice in this run"
         elif client_ladder "$host"; then
@@ -922,7 +930,7 @@ recover_dropped() {   # recover_dropped <job> <results-file> <report items>
 }
 
 run_jobs() {
-    local job outfile report cmd t0 lclients=()
+    local job outfile report cmd t0 rc lclients=()
     echo
     for job in "${JOBFILES[@]}"; do
         cmd=$(fio_client_cmd "$job")
@@ -992,19 +1000,12 @@ run_jobs() {
         PHASE_T0=$SECONDS   # -vvv times the measured job alone
         debug2 "running on $MASTER: $cmd"
         # a dropped client is recovered here only; a drop during the layout
-        # or unlink job above stays fatal (the layout check would fail anyway)
-        if ! run_host "$MASTER" "$cmd" > "$outfile"; then
-            recover_dropped "$job" "$outfile" "$report"
-            phase_done "job $job"
-            continue
-        fi
-        check_fio_errors "$outfile" measured \
-            || die "job $job failed on at least one host (raw output in $outfile)"
+        # or unlink job above stays fatal (the layout check would fail anyway).
         # fio keys client_stats by the --client= name, not the worker hostname;
         # local mode reports as localhost. A results file, never a bundle: no
         # tar probe (GNU tar reads the whole file looking for a header).
-        summ_one "$outfile" "$outfile" "$report" "${HOSTS[*]}" file \
-            || summ_job_failed "$job"
+        if run_host "$MASTER" "$cmd" > "$outfile"; then rc=0; else rc=$?; fi
+        recover_dropped "$job" "$outfile" "$report" "$rc"
         phase_done "job $job"
     done
 }

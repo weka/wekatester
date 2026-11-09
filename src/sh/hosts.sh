@@ -393,7 +393,9 @@ writeback_targets() {
     # row in fill mode too. What does each host OWN row provide? A file that
     # no longer resolves (edited mid-run) stops here, its rows never taken
     # as empty: the merge's own-row protection rests on them.
-    resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${HOSTS[@]}" \
+    # a host excluded mid-run (run.sh) still gets its row: what converged
+    local all=("${HOSTS[@]}" ${EXCLUDED_HOSTS[@]+"${EXCLUDED_HOSTS[@]}"})
+    resolve_targets hostonly "$wb" - - "${WORK_DIR}/engine.results" "${all[@]}" \
         > "$WORK_DIR/targets.hostrows" || die "host file writeback: cannot read the host rows of $wb (above)"
     local h ident="" tmp="$WORK_DIR/hostfile.writeback"
     [ -w "$wb" ] || die "host file writeback: $wb is not writable; nothing was recorded"
@@ -402,10 +404,10 @@ writeback_targets() {
     # then does one write go into the host file itself (its inode, mode,
     # owner and any symlink kept). "nothing to record" writes no temp.
     list_staged "$WORK_DIR/staged.list" &&
-    WEKATESTER_HOST_ALIAS=$(host_alias_env "${HOSTS[@]}") \
+    WEKATESTER_HOST_ALIAS=$(host_alias_env "${all[@]}") \
     WEKATESTER_HOST_IDENT=$ident WEKATESTER_WB_TMP=$tmp WEKATESTER_HOST_FOLD=$HOST_FOLD_ROWS \
     awkrun '
-    #@awk writeback_targets' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${HOSTS[@]}" \
+    #@awk writeback_targets' "$wb" "$mode" "$WORK_DIR" "${LINE_RATE_GBPS:--}" "${all[@]}" \
         || { rm -f -- "${tmp:?}"; die "host file writeback failed ($wb)"; }
     [ -e "$tmp" ] || return 0
     cat -- "$tmp" > "$wb" \

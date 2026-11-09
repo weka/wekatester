@@ -496,6 +496,11 @@ cal_group_unlock() {   # cal_group_unlock <host>
 cal_shape_clients() {   # cal_shape_clients <id> <rep>
     local id h
     CAL_SHAPE_CLIENTS=$2
+    # a shape that lost a client keeps its reduced list (cal_exclude_client)
+    if [ -s "$WORK_DIR/cal/s$1/clients" ]; then
+        IFS= read -r CAL_SHAPE_CLIENTS < "$WORK_DIR/cal/s$1/clients" || :
+        return 0
+    fi
     [ -s "$WORK_DIR/cal/clients" ] || return 0
     while IFS=$'\t' read -r id h; do
         [ "$id" != "$1" ] || { CAL_SHAPE_CLIENTS=$h; return 0; }
@@ -626,6 +631,14 @@ cal_run_cell() {   # cal_run_cell <host> <bw|iops|lat|lat1m> <read|write> <engin
     [ -n "$rf" ] || rf="$WORK_DIR/cal/reading"
     json="$WORK_DIR/cal/res-s$CAL_SID-$n-$rep-$base.json"
     if ! run_host "$MASTER" "'$FIO_BIN' --output-format=json --eta-interval=15s --client=$rep '$TARGET_DIR.cal/$rep/$base.job'" > "$json"; then
+        # the client present in the results failed the cell: today's death.
+        # Absent (dropped mid-cell) or no JSON at all (fio never connected):
+        # the dispatcher's to recover, exit 3
+        json_load "$json"
+        if [ "$JSON_RC" -ne 2 ] && ! json_awk -F'\t' -v h="$rep" '$1 ~ /^client_stats\.[0-9]+\.hostname$/ && $2 == h { f = 1 } END { exit !f }'; then
+            log "cal: shape $CAL_SID: $rep dropped from the $what (${json##*/} is in the run bundle under cal/)"
+            return 3
+        fi
         cal_evidence "$what" "$json" "$base.job" say "$rep"
         die "calibration $what failed on $rep (${json##*/} and the cell jobfile are in the run bundle under cal/)"
     fi
@@ -734,7 +747,7 @@ cal_dispatch() {   # cal_dispatch engines|searches
     local c i j n pid line phase nj qd nr rt type dirn eng pinfs what rf donef rc v inflight started any left pids=() p others=()
     set -- $CAL_DISPATCH_ARGS; eng=${1:-}
     CAL_NCLIENTS=${#clients[@]}
-    [ "$mode" != engines ] || { E_RES=(); j=0; }
+    [ "$mode" != engines ] || { E_RES=(); E_RETRY=(); j=0; }
     : > "$sdir/pids"
     while :; do
         [ "${CAL_SHAPE_TERM:-0}" -eq 0 ] || cal_shape_stop   # a TERM during a wait
@@ -752,8 +765,10 @@ cal_dispatch() {   # cal_dispatch engines|searches
             [ -z "${BUSY[$c]:-}" ] || continue
             line=""; i=""
             if [ "$mode" = engines ]; then
-                [ "$j" -lt ${#E_CELL[@]} ] || break
-                set -- ${E_CELL[$j]}; i=$j; j=$((j + 1))
+                # a cell handed back for a retry goes first
+                if [ ${#E_RETRY[@]} -gt 0 ]; then i=${E_RETRY[0]}; E_RETRY=("${E_RETRY[@]:1}")
+                else [ "$j" -lt ${#E_CELL[@]} ] || break; i=$j; j=$((j + 1)); fi
+                set -- ${E_CELL[$i]}
                 # etype ctype edirn engine nj qd nr pinfs; the engine runtime
                 line="engine $5 $6 $7 $CAL_ENGINE_RUNTIME"; type=$2; dirn=$3; eng=$4; pinfs=$8
                 [ "$8" != - ] || pinfs=""
@@ -802,6 +817,21 @@ cal_dispatch() {   # cal_dispatch engines|searches
             wait "$pid" || :
             read -r rc < "${P_DONEF[$pid]}"
             c=${P_CLIENT[$pid]}; i=${P_SRCH[$pid]}; read -r phase nj qd nr rt <<<"${P_CELL[$pid]}"
+            if [ "$rc" -eq 3 ]; then
+                # the client was dropped: retried, or the client excluded,
+                # which restarts (3) or excludes (4) the shape
+                cal_reap_dropped "$c" "$mode" "$i" "${P_CELL[$pid]}"; rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    others=()
+                    for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done
+                    [ ${#others[@]} -eq 0 ] || cal_stop_tree "${others[@]}"
+                    return "$rc"
+                fi
+                unset "BUSY[$c]"
+                others=(); for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done; pids=("${others[@]}")
+                any=1
+                continue
+            fi
             if [ "$rc" -ne 0 ]; then
                 others=()
                 for p in "${pids[@]}"; do [ "$p" = "$pid" ] || others+=("$p"); done
@@ -828,6 +858,92 @@ cal_dispatch() {   # cal_dispatch engines|searches
         done
         [ "$any" -eq 1 ] || [ ${#pids[@]} -eq 0 ] || cal_pause 0.1
     done
+}
+
+# --- a client lost during calibration ------------------------------------
+# A dropped client climbs run.sh's ladder (foreground in the shape, each
+# step bounded: a TERM waits for it). Passed, and not retried before: its
+# cell goes back to the front of its queue, once per client. Otherwise the
+# client leaves the shape; the first loss restarts the shape on the rest,
+# with the lost client's readings discarded, a second loss excludes the
+# shape. Per shape: CAL_RETRIED, CAL_SHAPE_RESTARTED, CAL_EXCLUDED_CLIENTS;
+# cal/excluded lists every lost client for main (cal_apply_exclusions).
+cal_reap_dropped() {   # cal_reap_dropped <client> <engines|searches> <index> <cell line> -> 0 requeued, 3 restart, 4 shape excluded
+    local c=$1 mode=$2 i=$3 line=$4 why
+    if [ -n "${CAL_RETRIED[$c]:-}" ]; then
+        why="dropped again after its retry"
+    elif client_ladder "$c"; then
+        CAL_RETRIED[$c]=1
+        log "cal: shape $CAL_SID: $c $LADDER_WHY; its cell is retried once"
+        if [ "$mode" = engines ]; then E_RETRY+=("$i")
+        else S_Q[i]="cell $line"$'\n'"${S_Q[$i]}"; S_INFL[i]=$(( S_INFL[i] - 1 )); fi
+        return 0
+    else
+        why=$LADDER_WHY
+    fi
+    cal_exclude_client "$c" "$why"
+}
+
+cal_exclude_client() {   # cal_exclude_client <client> <why> -> 3 restart, 4 shape excluded
+    local c=$1 keep="" h rep=${CAL_SHAPE_CLIENTS%% *}
+    printf '%s\t%s\t%s\n' "$c" "$CAL_SID" "$2" >> "$WORK_DIR/cal/excluded"
+    CAL_EXCLUDED_CLIENTS="$CAL_EXCLUDED_CLIENTS${CAL_EXCLUDED_CLIENTS:+ }$c"
+    for h in $CAL_SHAPE_CLIENTS; do [ "$h" = "$c" ] || keep="$keep${keep:+ }$h"; done
+    CAL_SHAPE_CLIENTS=$keep
+    printf '%s\n' "$keep" > "$WORK_DIR/cal/s$CAL_SID/clients"
+    if [ -z "$keep" ]; then
+        log "cal: shape $CAL_SID: $c excluded ($2) and no client of the shape is left: the shape is excluded"
+        return 4
+    elif [ "$CAL_SHAPE_RESTARTED" -eq 1 ]; then
+        log "cal: shape $CAL_SID: $c excluded ($2), the second client lost: the shape is excluded"
+        return 4
+    fi
+    CAL_SHAPE_RESTARTED=1
+    [ "$c" != "$rep" ] || log "cal: shape $CAL_SID: ${keep%% *} promoted to representative in $c's place"
+    log "cal: shape $CAL_SID: $c excluded ($2); the shape restarts from the beginning on $keep, its readings so far discarded"
+    return 3
+}
+
+# The shape's state before a restart: no history, tuples, engine pick or
+# seed coverage (cal_ensure_seed re-verifies the files on disk).
+cal_shape_reset() {
+    local sdir="$WORK_DIR/cal/s$CAL_SID" h
+    rm -f "${sdir:?}"/hist-* "${sdir:?}"/ran-* "${sdir:?}"/tuple-* "$sdir/engines" "$sdir/engine"
+    for h in $CAL_SHAPE_CLIENTS; do rm -f "${WORK_DIR:?}/cal/$h/seeded.read" "$WORK_DIR/cal/$h/seeded.write"; done
+}
+
+# An excluded shape keeps a converged search only when no excluded client
+# ran a cell of it (ran-*); the same for the engine pick (ran-engines). The
+# rest stays open ("-" in the host file: a rerun searches it).
+cal_shape_excluded() {
+    local sdir="$WORK_DIR/cal/s$CAL_SID" f t kept=""
+    for f in "$sdir"/ran-*; do
+        [ -s "$f" ] || continue
+        awk -v ex=" $CAL_EXCLUDED_CLIENTS " 'index(ex, " " $2 " ") { f = 1 } END { exit !f }' "$f" || continue
+        t=${f##*/ran-}
+        if [ "$t" = engines ]; then rm -f "$sdir/engine"; else rm -f "$sdir/tuple-$t"; fi
+    done
+    for f in "$sdir"/tuple-*; do [ -s "$f" ] && kept="$kept${kept:+, }${f##*/tuple-}"; done
+    : > "$sdir/excluded"
+    log "cal: shape $CAL_SID excluded: ${kept:+kept $kept; }the other searches are left open for a rerun"
+}
+
+# main, after calibrate: every client lost (cal/excluded) and every member
+# of an excluded shape leave HOSTS, then the 5% rule once over all of them.
+cal_apply_exclusions() {
+    local host sid why m members
+    [ -s "$WORK_DIR/cal/excluded" ] || return 0
+    while IFS=$'\t' read -r host sid why; do
+        exclude_host "$host" "calibration, shape $sid" "$why" later
+    done < "$WORK_DIR/cal/excluded"
+    while IFS=$'\t' read -r sid _ _ _ _ _ _ _ _ _ _ members; do
+        [ -e "$WORK_DIR/cal/s$sid/excluded" ] || continue
+        for m in $members; do
+            case " ${EXCLUDED_HOSTS[*]} " in (*" $m "*) continue ;; esac
+            exclude_host "$m" "calibration, shape $sid" "its shape was excluded from calibration" later
+        done
+    done < "$WORK_DIR/cal/shapes"
+    check_excluded_share
 }
 
 # Whether a process still runs: one that has exited is a zombie until its
@@ -968,6 +1084,23 @@ SLOTEOF
 $todo
 BUDEOF
     mins=$(( (budget * (CAL_RUNTIME + 5) + wcells * CAL_SETTLE) / 60 + 1 ))
+    # one pass; a lost client restarts the shape once on the rest (3), a
+    # second loss excludes it (4) with what converged kept (cal_reap_dropped)
+    local -A CAL_RETRIED=()
+    CAL_SHAPE_RESTARTED=0; CAL_EXCLUDED_CLIENTS=""
+    while :; do
+        cal_shape_pass && return 0
+        case $? in
+            (3) cal_shape_reset ;;
+            (4) cal_shape_excluded; return 0 ;;
+            (*) return 1 ;;
+        esac
+    done
+}
+
+# The shape's clients, seeds, engine pick and searches: cal_shape_run's
+# locals are in scope. Returns cal_dispatch's verdict.
+cal_shape_pass() {
     # engine cells: one per candidate per type (bw, iops, lat; lat1m stands in
     # for lat only when no 4k latency search is asked for)
     cal_shape_clients "$sid" "$rep"
@@ -1037,7 +1170,7 @@ BUDEOF
         done
         # the engine cells are independent of each other: all the clients
         CAL_DISPATCH_ARGS=""
-        cal_dispatch engines
+        cal_dispatch engines || return $?
         for i in "${!E_CELL[@]}"; do
             set -- ${E_CELL[$i]}
             printf '%s %s %s\n' "$1" "$4" "${E_RES[$i]}" >> "$sdir/engines"
