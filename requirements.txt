@@ -1,8 +1,0 @@
-python.dateutil
-#setuptools_rust==1.6.0
-setuptools_rust
-paramiko
-scp
-urllib3
-wekalib>=1.1.1
-wekapyutils

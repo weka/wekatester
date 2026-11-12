@@ -1,0 +1,692 @@
+# --- phase 1: preflight --------------------------------------------------------
+# One run per host (README): a lock directory in each host's tmpfs whose owner
+# line names this run, taken in preflight's own session before anything is
+# written, and released by cleanup.
+declare -gA RUN_LOCKS=()   # host -> 1 while this run holds its lock
+# -n with a missing -d (verify_mount_mode): host -> its stand-in,
+# <nearest parent>/<DRYRUN_NAME>, one name per run so hosts on one
+# filesystem share it; the host's directory for the rest of the dry run
+# (hosts.sh), removed by cleanup. DRYRUN_MADE: hosts that created it.
+# DRYRUN_SAY: "host<tab>-d<tab>parent".
+declare -gA DRYRUN_DIR=() DRYRUN_MADE=()
+DRYRUN_NAME=""; DRYRUN_SAY=()
+LOCK_TOKEN=""
+lock_token() {   # lock_token -> LOCK_TOKEN
+    # the stamp carries its UTC offset: another machine reads it in its own zone
+    printf -v LOCK_TOKEN '%s pid %s user %s since %(%Y-%m-%d %H:%M:%S %z)T' \
+        "$(local_short_hostname)" "$$" "$(id -un)" -1
+    LOCK_TOKEN=${LOCK_TOKEN//\'/}
+}
+
+# preflight's remote command: no executable fio exits 1. Another run's traces
+# (its lock, staging, or any fio of wekatester's) print "held ..." and exit 75;
+# fio wekatester did not start prints "alien ..." and exits 76. --break-lock
+# kills every fio (a "killed <pid> <user> <start> <command>" row per foreign
+# one), clears the traces and prints "healed ...".
+lock_take_cmd() {   # lock_take_cmd -> LOCK_CMD
+    local fb=${FIO_BIN##*/} names=fio mine
+    fb=${fb:0:15}   # a process name (comm) holds 15 bytes
+    [ "$fb" = fio ] || names="fio '$fb'"
+    # wekatester's fio, by its args: its server (also _wt_srv below), the
+    # runs that read its staging, its engine tests
+    mine="'$FIO_BIN --server --daemonize=$FIO_PIDFILE'*|*'$TARGET_DIR'*|*.wekatester-enginetest.*"
+    LOCK_CMD="$PROC_FN; _o=\$(command -v '$FIO_BIN') && [ -f \"\$_o\" ] && [ -x \"\$_o\" ] || exit 1; lk='$LOCK_DIR'; td='$TARGET_DIR'; ev=; al=; alp=; ours=; seen=' '"
+    LOCK_CMD+="; if [ -d \"\$lk\" ]; then o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] || ev=\"\$ev lock(\${o:-no owner})\"; fi"
+    LOCK_CMD+="; [ ! -e \"\$td\" ] || ev=\"\$ev staged(\$td)\"; [ ! -e \"\$td.cal\" ] || ev=\"\$ev staged(\$td.cal)\""
+    LOCK_CMD+="; for p in \$(_wt_comm $names); do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \""
+    LOCK_CMD+="; _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) ours=\"\$ours \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then ours=\"\$ours \$p\"; else al=\"\$al \$p:\${a%% *}\"; alp=\"\$alp \$p\"; fi ;; esac; done"
+    # a server of ours under any name (a -f wrapper's real binary, an
+    # earlier version's leak) is this tool's trace, not foreign fio
+    LOCK_CMD+="; ! _wt_srvs '$FIO_PIDFILE' || for p in \$_wt_l; do case \"\$seen\" in *\" \$p \"*) continue ;; esac; seen=\"\$seen\$p \"; ours=\"\$ours \$p\"; done"
+    LOCK_CMD+="; [ -z \"\$ours\" ] || ev=\"\$ev fio(\${ours# })\""
+    if [ "$BREAK_LOCK" -eq 1 ]; then
+        # TERM, then -9, then -9 under the first escalator that works (the
+        # probe's order; the kill binary, else, with no procps, its sh's
+        # own kill): a root fio needs one. still() keeps the pids alive and
+        # still ours, or foreign and still named fio: a zombie is gone.
+        escalator_words_v "'"
+        LOCK_CMD+="; fcn() { case \"\$1\" in fio|'$fb') return 0 ;; esac; return 1; }"
+        LOCK_CMD+="; still() { l2=; for p in \$left; do _wt_args \$p || continue; a=\$_wt_a; case \"\$a\" in *'<defunct>') ;; $mine) l2=\"\$l2 \$p\" ;; *) if _wt_srv '$FIO_PIDFILE'; then l2=\"\$l2 \$p\"; else case \" \$alp \" in *\" \$p \"*) _c=\$(cat \"\${_wt_proc:-/proc}/\$p/comm\" 2>&1) && fcn \"\$_c\" && l2=\"\$l2 \$p\" ;; esac; fi ;; esac; done; left=\$l2; }"
+        # a row per foreign fio, read before the kill: user and start from
+        # ps when it gives them, else the /proc Uid and -; printed after
+        # the kill for each pid that is gone (kout)
+        LOCK_CMD+="; nl=\$(printf '\\n_'); nl=\${nl%_}; kr=; for p in \$alp; do _wt_args \$p || continue; c=\$_wt_a; u=-; s=-"
+        LOCK_CMD+="; if _q=\$(ps -o user=,lstart= -p \$p 2>&1) && [ -n \"\$_q\" ]; then set -- \$_q; u=\$1; shift; s=\"\$*\"; elif [ -r \"\${_wt_proc:-/proc}/\$p/status\" ]; then while read -r k v r; do [ \"\$k\" != Uid: ] || { u=\$v; break; }; done < \"\${_wt_proc:-/proc}/\$p/status\"; fi"
+        LOCK_CMD+="; kr=\"\$kr\$p \$u \$s \$c\$nl\"; done"
+        LOCK_CMD+="; kout() { printf '%s' \"\$kr\" | while IFS= read -r r; do case \" \$left \" in *\" \${r%% *} \"*) ;; *) printf 'killed %s\\n' \"\$r\" ;; esac; done; }"
+        LOCK_CMD+="; if [ -n \"\$ev\" ] || [ -n \"\$alp\" ]; then left=\"\$ours\$alp\"; for p in \$left; do _o=\$(kill \$p 2>&1) || :; done"
+        LOCK_CMD+="; i=0; while [ -n \"\$left\" ] && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); still; done"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _o=\$(kill -9 \$left 2>&1) || :; sleep 1; still; fi"
+        LOCK_CMD+="; if [ -n \"\$left\" ]; then _wt_k=\$(_wt_kbin) || _wt_k=; for pc in $ESCALATOR_WORDS; do set -- \$pc; _o=\$(command -v \$1) || continue"
+        LOCK_CMD+="; _o=\$(if [ -n \"\$_wt_k\" ]; then timeout $ESCALATOR_TIMEOUT \$pc \"\$_wt_k\" -9 \$left; else timeout $ESCALATOR_TIMEOUT \$pc sh -c 'kill -9 \"\$@\"' sh \$left; fi 2>&1) && break; done; sleep 1; still; fi"
+        LOCK_CMD+="; kout; [ -z \"\$left\" ] || { echo \"held\$ev unkillable(\${left# })\"; exit 75; }"
+        LOCK_CMD+="; [ -z \"\$ev\" ] || { _o=\$(rm -rf \"\${td:?}\" \"\${td:?}.cal\" \"\${lk:?}\" 2>&1) || :; _o=\$(rm -f '$FIO_PIDFILE' 2>&1) || :; echo \"healed\$ev\"; }; fi"
+        # every earlier run's group markers in this host's destination (dd,
+        # set per host by preflight), evidence or not: cleanup released the
+        # lock of a run that died before collect_fs_groups
+        LOCK_CMD+="; for g in \"\${dd:?}\"/.wekatester-group.*; do [ -e \"\$g\" ] || continue; _o=\$(rm -f \"\$g\" 2>&1) || :; done"
+    else
+        LOCK_CMD+="; [ -z \"\$al\" ] || { echo \"alien\$al\"; exit 76; }; [ -z \"\$ev\" ] || { echo \"held\$ev\"; exit 75; }"
+    fi
+    # mkdir is the atomic take; one machine under two names (parse_args refuses
+    # one name twice) finds this run's own lock. mkdir's message is captured:
+    # it says why for nolock, and is noise otherwise
+    LOCK_CMD+="; if ! _mk=\$(mkdir \"\$lk\" 2>&1); then [ -d \"\$lk\" ] || { echo \"nolock \$_mk\"; exit 77; }; o=; [ ! -r \"\$lk/owner\" ] || read -r o < \"\$lk/owner\" || :; [ \"\$o\" = '$LOCK_TOKEN' ] && exit 0; echo \"held lock(\${o:-no owner})\"; exit 75; fi"
+    LOCK_CMD+="; printf '%s\\n' '$LOCK_TOKEN' > \"\$lk/owner\""
+}
+# cleanup's half: the lock goes only when it is still this run's
+lock_release_cmd() {   # lock_release_cmd -> LOCK_RELEASE
+    LOCK_RELEASE="o=; [ ! -r '$LOCK_DIR/owner' ] || read -r o < '$LOCK_DIR/owner' || :; [ \"\$o\" != '$LOCK_TOKEN' ] || rm -rf '$LOCK_DIR'"
+}
+
+# Every host reachable over ssh with $FIO_BIN, checked in parallel, every
+# failure reported. Each check opens the host ControlMaster for the run, and
+# takes the run lock. The same session first prints fio --version as
+# "fio-version <rc> <first line>", for check_fio_versions.
+FIO_VERSIONS=()   # per host index: "<rc> <first line>" of fio --version
+preflight() {
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        debug "checking $FIO_BIN on the local host..."
+    else
+        log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
+    fi
+    local pids=() failed=() host i rc held=0 line l got fv="" nolock lc=() kd
+    [ -n "$LOCK_TOKEN" ] || lock_token
+    lock_take_cmd
+    mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
+    load_host_dirs
+    fv="_fv=\$('$FIO_BIN' --version 2>&1); _fr=\$?; echo \"fio-version \$_fr \$(printf '%s\\n' \"\$_fv\" | head -n 1)\"; "
+    FIO_VERSIONS=()
+    for i in "${!HOSTS[@]}"; do
+        run_host "${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD" > "$WORK_DIR/lock/$i" &
+        pids+=($!)
+        lc+=("${HOSTS[$i]}" "${fv}dd='${HOST_DIRS[$i]}'; $LOCK_CMD")
+    done
+    debug3_cmds "lock command" ${lc[@]+"${lc[@]}"}
+    for i in "${!HOSTS[@]}"; do
+        host=${HOSTS[$i]}
+        wait "${pids[$i]}"
+        rc=$?
+        # the lock's line is the first one that is not the version's
+        line=""; got=0; nolock=""; kd=""
+        while IFS= read -r l || [ -n "$l" ]; do
+            case $l in
+                ("fio-version "*) [ -n "${FIO_VERSIONS[$i]+set}" ] || FIO_VERSIONS[$i]=${l#fio-version } ;;
+                # mkdir's reason (after a --break-lock "healed" line, too)
+                ("nolock "*) nolock=${l#nolock } ;;
+                # --break-lock's foreign fio, one row each
+                ("killed "*) kd+="${kd:+; }${l#killed }" ;;
+                (*) [ "$got" -eq 1 ] || { line=$l; got=1; } ;;
+            esac
+        done < "$WORK_DIR/lock/$i"
+        [ -z "$kd" ] || log "WARNING: $host: --break-lock killed fio that wekatester did not start: $kd" >&2
+        # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
+        # a local command that happens to exit 255 is just a missing fio.
+        if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
+            failed+=("$host: ssh failed")
+        elif [ "$rc" -eq 0 ]; then
+            RUN_LOCKS[$host]=1
+            [ "${line%% *}" != healed ] || debug "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
+        elif [ "$rc" -eq 75 ]; then
+            held=1; failed+=("$host: another wekatester run is here, or one that did not clean up:${line#held}")
+        elif [ "$rc" -eq 76 ]; then
+            held=1; failed+=("$host: fio that wekatester did not start is running (pid:command${line#alien}); stop it, or rerun with --break-lock to kill it")
+        elif [ "$rc" -eq 77 ]; then
+            failed+=("$host: cannot create the run lock $LOCK_DIR${nolock:+ ($nolock)}")
+        elif [ -z "${FIO_VERSIONS[$i]+set}" ]; then
+            # the session's first command prints the version line, so its
+            # shell ran none of it: a command it could not parse
+            failed+=("$host: its shell ran none of preflight's command (exit $rc, no fio --version line${line:+, first line: $line}); its own error is above")
+        else
+            failed+=("$host: $FIO_BIN not found, or not an executable file")
+        fi
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        for host in "${failed[@]}"; do
+            log "ERROR: $host" >&2
+        done
+        [ "$held" -eq 0 ] || log "a run that is gone, or fio from elsewhere: rerun with --break-lock, which kills every fio on those hosts and clears wekatester's lock and staging" >&2
+        die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
+    fi
+    debug "preflight passed on all hosts"
+    check_fio_versions
+}
+
+# fio's client/server protocol is version-sensitive (README, Caveats): every
+# host's fio --version must print one first line. A failed or empty one
+# stops the run; differing versions do too, unless --allow-fio-mismatch
+# (a warning). FIO_VERSION_NOTE says what was found. The coordinator parses
+# --eta-interval (fio 3.3, 2017), so the master alone has a version floor.
+FIO_VERSION_NOTE=""
+check_fio_versions() {
+    local i k v rc bad=() vers=() cnt=() who=() rows=() why
+    for i in "${!HOSTS[@]}"; do
+        [ "${HOSTS[$i]}" = "$MASTER" ] || continue
+        # a failed or missing read is the loop below's error, not a warning here
+        v=${FIO_VERSIONS[$i]:-}; [ "${v%% *}" = 0 ] || break
+        v=${v#* }
+        case $v in
+            (fio-[0-9]*.[0-9]*)
+                k=${v#fio-}; k=${k%%[!0-9.]*}; rc=${k#*.}; rc=${rc%%.*}
+                if [ "${k%%.*}" -lt 3 ] || { [ "${k%%.*}" -eq 3 ] && [ "$rc" -lt 3 ]; }; then
+                    die "$MASTER: $v is older than fio 3.3, which the coordinator needs for --eta-interval: install fio 3.3 or newer on the master (or name a newer host first)"
+                fi ;;
+            (*) [ -z "$v" ] || warn_prerun "$MASTER: cannot read a version number from \"$v\"; the coordinator needs fio 3.3 or newer (--eta-interval)" ;;
+        esac
+        break
+    done
+    for i in "${!HOSTS[@]}"; do
+        if [ -z "${FIO_VERSIONS[$i]+set}" ]; then
+            bad+=("${HOSTS[$i]}: no fio --version line came back from its preflight session"); continue
+        fi
+        v=${FIO_VERSIONS[$i]}; rc=${v%% *}; v=${v#"$rc"}; v=${v# }
+        if [ "$rc" != 0 ]; then
+            bad+=("${HOSTS[$i]}: $FIO_BIN --version exited $rc${v:+: $v}"); continue
+        elif [ -z "$v" ]; then
+            bad+=("${HOSTS[$i]}: $FIO_BIN --version printed nothing"); continue
+        fi
+        # few distinct versions: a scan, never the version as an array key
+        for ((k = 0; k < ${#vers[@]}; k++)); do [ "${vers[$k]}" != "$v" ] || break; done
+        [ "$k" -lt ${#vers[@]} ] || { vers[$k]=$v; cnt[$k]=0; who[$k]=""; }
+        cnt[$k]=$((cnt[$k] + 1))
+        [ "${cnt[$k]}" -gt 8 ] || who[$k]+=${who[$k]:+ }${HOSTS[$i]}
+    done
+    for k in "${!vers[@]}"; do
+        rows[$k]="${vers[$k]} on ${cnt[$k]} host(s): ${who[$k]}"
+        [ "${cnt[$k]}" -le 8 ] || rows[$k]+=" (+$((cnt[$k] - 8)) more)"
+    done
+    if [ ${#bad[@]} -eq 0 ] && [ ${#vers[@]} -eq 1 ]; then
+        FIO_VERSION_NOTE="${vers[0]} on all ${#HOSTS[@]} hosts"
+        [ ${#HOSTS[@]} -gt 1 ] || FIO_VERSION_NOTE="${vers[0]} on the one host"
+        debug "fio version: $FIO_VERSION_NOTE"
+        return 0
+    fi
+    why="fio differs across the hosts, ${#vers[@]} versions on ${#HOSTS[@]} hosts, and fio's client/server protocol is version-sensitive"
+    if [ ${#bad[@]} -eq 0 ] && [ "$ALLOW_FIO_MISMATCH" -eq 1 ]; then
+        warn_prerun "$why; --allow-fio-mismatch runs anyway, so a failure may read confusingly"
+        FIO_VERSION_NOTE="versions differ, run anyway (--allow-fio-mismatch):"
+        for k in "${!rows[@]}"; do
+            warn_prerun "  ${rows[$k]}"
+            FIO_VERSION_NOTE+=" ${rows[$k]};"
+        done
+        FIO_VERSION_NOTE=${FIO_VERSION_NOTE%;}
+        return 0
+    fi
+    for k in "${!bad[@]}"; do log "ERROR: ${bad[$k]}" >&2; done
+    if [ ${#vers[@]} -gt 1 ]; then
+        log "ERROR: $why" >&2
+        for k in "${!rows[@]}"; do log "ERROR:   ${rows[$k]}" >&2; done
+    fi
+    [ ${#bad[@]} -eq 0 ] \
+        || die "cannot read the fio version on ${#bad[@]} of ${#HOSTS[@]} host(s): the run stopped before any fio server started"
+    die "fio differs across the hosts (${#vers[@]} versions): the run stopped before any fio server started -- install one fio version on every host, or --allow-fio-mismatch runs anyway"
+}
+
+# --- phase 1b: mount mode verification ----------------------------------------
+# -d must be wekafs, mounted forcedirect (direct=1 alone leaves the client
+# cache in the path; -r or --allow-cached-mount warn instead); other types,
+# an unmounted weka's root-disk mount point included, are refused unless
+# --any-fs. CACHED_MOUNT_NOTE: what the forcedirect check found.
+CACHED_MOUNT_NOTE=""
+
+# ok, "fail <mode>", or "other <type>", left in MOUNT_VERDICT, from a
+# /proc/mounts line: its 3rd field is the type, its 4th the options.
+classify_mount_line_v() {   # classify_mount_line_v <proc-mounts-line> -> MOUNT_VERDICT
+    local fstype="" opts=""
+    read -r _ _ fstype opts _ <<<"$1"
+    if [ "$fstype" = "wekafs" ]; then
+        case ",$opts," in
+            *,forcedirect,*) MOUNT_VERDICT=ok ;;
+            *,writecache,*)  MOUNT_VERDICT="fail writecache" ;;
+            *,readcache,*)   MOUNT_VERDICT="fail readcache" ;;
+            *)               MOUNT_VERDICT="fail unknown" ;;
+        esac
+    else
+        MOUNT_VERDICT="other $fstype"
+    fi
+}
+
+# One line: the /proc/mounts line of the mount holding <dir> (quoted for the
+# remote shell), or an empty one. The last line for its mount point wins, as
+# a stacked mount is the visible one; findmnt -T names the point once per
+# stacked mount. The check classifies this line, records it and rechecks it.
+mount_line_cmd_v() {   # mount_line_cmd_v <quoted-dir> -> MOUNT_LINE_CMD
+    local prog='#@awk proc_mount_line'
+    MOUNT_LINE_CMD="t=\$(findmnt -T $1 -n -o TARGET) && T=\"\$t\" awk '$prog' /proc/mounts"
+}
+
+# <dir>/<i> holds line i, and <dir>/sums one cksum over them all; the names
+# are the indexes, so an unchanged line gives an identical sums line.
+write_mount_lines() {   # write_mount_lines <dir> <line>...
+    local d=$1 i=0 l names=()
+    shift
+    mkdir -p "$d" || die "cannot create $d"
+    for l in "$@"; do
+        printf '%s\n' "$l" > "$d/$i" || die "cannot write $d/$i"
+        names+=("$i"); i=$((i + 1))
+    done
+    (cd "$d" && cksum "${names[@]}") > "$d/sums" || die "cannot checksum the mount lines in $d"
+}
+
+# Right before the measured run, one parallel round: every host's mount line
+# must be the one verify_mount_mode recorded. A change, or a line that cannot
+# be read, stops the run, -r included.
+check_mounts_unchanged() {
+    debug "checking that the destination mount is unchanged on ${#HOSTS[@]} host(s)..."
+    [ -s "$WORK_DIR/mount/sums" ] || die "no mount record from the mount check in $WORK_DIR/mount"
+    local td i j line was pids=() rcs=() now=() changed=() base=()
+    td=$(mktemp -d "$WORK_DIR/mnt.XXXXXX") || die "cannot create a scratch dir for the mount recheck"
+    # the mount check's host order: HOSTS may have lost hosts since
+    mapfile -t base < "$WORK_DIR/mount/hosts" || die "no host order from the mount check in $WORK_DIR/mount"
+    load_host_dirs
+    for i in "${!HOSTS[@]}"; do
+        mount_line_cmd_v "'${HOST_DIRS[$i]}'"
+        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.out" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}"; rcs[$i]=$?
+        line=""; IFS= read -r line < "$td/$i.out" || :
+        now[$i]=$line
+        [ -z "$line" ] || debug3 "${HOSTS[$i]}: mount: $line"
+    done
+    for i in "${!HOSTS[@]}"; do
+        was=""
+        for j in "${!base[@]}"; do
+            [ "${base[$j]}" = "${HOSTS[$i]}" ] || continue
+            IFS= read -r was < "$WORK_DIR/mount/$j" || :
+            break
+        done
+        [ "${rcs[$i]}" -ne 0 ] || [ -z "${now[$i]}" ] || [ "$was" != "${now[$i]}" ] || continue
+        if [ "${rcs[$i]}" -ne 0 ]; then line="unreadable (rc=${rcs[$i]})"
+        elif [ -z "${now[$i]}" ]; then line="no /proc/mounts line"
+        else line="\"${now[$i]}\""; fi
+        changed+=("${HOSTS[$i]}: the mount at ${HOST_DIRS[$i]} changed since the mount check -- was \"$was\", now $line")
+    done
+    rm -rf "${td:?}"
+    if [ ${#changed[@]} -gt 0 ]; then
+        for line in "${changed[@]}"; do log "ERROR: $line" >&2; done
+        die "the destination mount changed on ${#changed[@]} of ${#HOSTS[@]} host(s) after it was verified; the measured run did not start"
+    fi
+    debug "destination mount unchanged on all hosts"
+}
+
+# Creates a missing destination only when its nearest existing parent is
+# wekafs in this same session: a weka client that restarted since the check
+# leaves a root-disk mount point. Exit 4: not wekafs now. The type is the 3rd
+# field of the parent's /proc/mounts line, the line the check classified.
+# --any-fs: a plain mkdir -p.
+create_dest_cmd() {   # create_dest_cmd <dir>
+    if [ "$ANY_FS" -eq 1 ]; then
+        printf '%s' "mkdir -p -- '$1'"
+        return 0
+    fi
+    mount_line_cmd_v '"$p"'
+    printf '%s' "p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 4; p=\$q; done; [ \"\$($MOUNT_LINE_CMD | awk '{print \$3}')\" = wekafs ] || exit 4; mkdir -p -- '$1'"
+}
+
+# For a missing destination: the nearest existing ancestor, then its mount's
+# /proc/mounts line. Nonzero when it does exist, or nothing does. dirname
+# handles a trailing slash and stops at /.
+missing_dir_probe_cmd() {   # missing_dir_probe_cmd <dir>
+    mount_line_cmd_v '"$p"'
+    printf '%s' "[ ! -e '$1' ] || exit 1; p='$1'; while [ ! -e \"\$p\" ]; do q=\$(dirname \"\$p\"); [ \"\$q\" != \"\$p\" ] || exit 1; p=\$q; done; printf '%s\\n' \"\$p\"; $MOUNT_LINE_CMD"
+}
+
+# One probe file as the fio user; on a shared filesystem one failing host
+# usually means all.
+probe_writable() {   # probe_writable <host> <dir>
+    # the same session leaves the host's group marker there, a file named
+    # after the host: collect_fs_groups looks the markers up once every
+    # host is through
+    host_name_v "$1"
+    run_host "$1" "p='$2'/.wekatester-write-probe.\$\$; : > \"\$p\" && rm -f \"\$p\"${GROUP_FILE:+ && : > '$2/$GROUP_FILE.$HOST_NAME'}"
+}
+
+# --- filesystem groups ---
+# Each client left a marker named after itself in its destination (the write
+# probe). Each then looks every host's marker up by name in one session; the
+# names it finds are its key, and equal keys mean one directory, one group. A
+# lookup by a name never seen goes to the server, where a shared appended
+# file could be read stale or lose a line. Writes $WORK_DIR/groups,
+# "<host> <group>". Until it sets GROUP_FILE_REMOVED, cleanup removes each
+# host's marker.
+GROUP_FILE_REMOVED=0
+collect_fs_groups() {
+    [ -n "$GROUP_FILE" ] || return 0
+    local i h pids=() key n=0 line summary names="" rm
+    local -A at=() first=()
+    mkdir -p "$WORK_DIR/fsgroup" || die "cannot create $WORK_DIR/fsgroup"
+    load_host_dirs
+    for h in "${HOSTS[@]}"; do host_name_v "$h"; names="$names '$HOST_NAME'"; done
+    for i in "${!HOSTS[@]}"; do
+        h=${HOSTS[$i]}
+        ( run_host "$h" "cd '${HOST_DIRS[$i]}' || exit 1; for n in$names; do if [ -e \"$GROUP_FILE.\$n\" ]; then printf '%s\\n' \"\$n\"; fi; done" > "$WORK_DIR/fsgroup/$i.key" ) &
+        pids[$i]=$!
+    done
+    : > "$WORK_DIR/fsgroup/keys"; : > "$WORK_DIR/fsgroup/detail"
+    for i in "${!HOSTS[@]}"; do
+        h=${HOSTS[$i]}
+        key=""
+        if wait "${pids[$i]}"; then key=$(tr '\n' ' ' < "$WORK_DIR/fsgroup/$i.key"); key=${key% }; fi
+        [ -n "$key" ] || die "$h: cannot find its filesystem-group marker ${HOST_DIRS[$i]}/$GROUP_FILE.* (written by the mount check; the destination must not change after it)"
+        printf '%s\t%s\n' "$h" "$key" >> "$WORK_DIR/fsgroup/keys"
+        # the bundle (fs-groups.detail) keeps what each host saw: a split
+        # that should not be carries its evidence
+        printf '%s\t%s\t%s\n' "$h" "${HOST_DIRS[$i]}" "$key" >> "$WORK_DIR/fsgroup/detail"
+        [ -n "${first[$key]+set}" ] || first[$key]=$i
+    done
+    # every key is in: one removal per group, from its first host, of the
+    # markers it saw, by name
+    pids=()
+    for key in "${!first[@]}"; do
+        i=${first[$key]}; rm=""
+        for n in $key; do rm="$rm '${HOST_DIRS[$i]}/$GROUP_FILE.$n'"; done
+        run_host "${HOSTS[$i]}" "rm -f$rm" &
+        pids[$i]=$!
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || log "WARNING: ${HOSTS[$i]}: could not remove its group's markers ${HOST_DIRS[$i]}/$GROUP_FILE.*" >&2
+    done
+    GROUP_FILE_REMOVED=1
+    awk -F'\t' '!($2 in g) {g[$2] = ++n} {print $1, g[$2]}' "$WORK_DIR/fsgroup/keys" > "$WORK_DIR/groups"
+    # the bundle keeps it for -s ("<host> <group>"); a dry run has no bundle
+    [ -z "$RUN_DIR" ] || cp "$WORK_DIR/groups" "$RUN_DIR/fs-groups" \
+        || log "WARNING: could not record the filesystem groups in $RUN_DIR/fs-groups" >&2
+    [ -z "$RUN_DIR" ] || cp "$WORK_DIR/fsgroup/detail" "$RUN_DIR/fs-groups.detail" \
+        || log "WARNING: could not record the filesystem-group detail in $RUN_DIR/fs-groups.detail" >&2
+    # the count, then each group's members, from one awk: a pass per group
+    # was groups x hosts when every host has its own directory
+    summary=$(awk '{ if ($2 in m) m[$2] = m[$2] " " $1; else m[$2] = $1; if ($2 + 0 > n) n = $2 + 0 } END { print n + 0; for (i = 1; i <= n; i++) print i "\t" m[i] }' "$WORK_DIR/groups")
+    n=${summary%%$'\n'*}
+    if [ "$n" -le 1 ]; then
+        debug "filesystem groups: all ${#HOSTS[@]} host(s) share ${HOST_DIRS[0]}"
+        return 0
+    fi
+    for i in "${!HOSTS[@]}"; do [ -n "${at[${HOSTS[$i]}]+set}" ] || at[${HOSTS[$i]}]=$i; done
+    log "filesystem groups: $n -- each lays out and is priced for its own fleet-shared read set"
+    while IFS=$'\t' read -r i line; do
+        h=${line%% *}
+        debug "  group $i: $line (at ${HOST_DIRS[${at[$h]}]} on $h)"
+    done <<<"${summary#*$'\n'}"
+}
+
+# The first host of <host> group lays out, prices and removes its shared read
+# set; every host is one group when collect_fs_groups did not run.
+group_first() {   # group_first <host>
+    if [ -s "$WORK_DIR/groups" ]; then
+        awk -v h="$1" '$1 == h {g = $2} {if (!($2 in f)) f[$2] = $1} END {print (g != "" ? f[g] : h)}' "$WORK_DIR/groups"
+    else
+        printf '%s\n' "${HOSTS[0]}"
+    fi
+}
+
+# Every host of <host>'s filesystem group, in host order, one per line.
+group_members() {   # group_members <host>
+    if [ -s "$WORK_DIR/groups" ]; then
+        awk -v h="$1" 'NR == FNR {if ($1 == h) g = $2; next} $2 == g {print $1}' \
+            "$WORK_DIR/groups" "$WORK_DIR/groups"
+    else
+        printf '%s\n' "${HOSTS[@]}"
+    fi
+}
+
+write_fix_hint() {   # write_fix_hint <dir> -> how to fix a directory the login user cannot write
+    printf '%s' "fix the root's owner/mode (a one-time 'sudo chmod 1777 $1' on any host persists in the filesystem) or run as a user that can write"
+}
+
+# Asked once for every host that lacks the destination. -r: 5s, default
+# create, and created outright without a terminal; otherwise only a y creates.
+# -n never asks: verify_mount_mode gives it a stand-in (DRYRUN_DIR).
+confirm_create_dirs() {   # confirm_create_dirs <count>
+    local msg="create the missing destination directory on $1 host(s)?"
+    if [ "$FAST_TRACK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+        if try_interactive; then
+            confirm_timed 5 yes "$msg" \
+                || die "destination directory does not exist on $1 host(s)"
+        else
+            log "destination directory does not exist on $1 host(s); creating it (unattended)"
+        fi
+    else
+        require_interactive "creating the destination directory" "create it yourself, or use -r"
+        confirm_explicit "$msg" \
+            || die "destination directory does not exist on $1 host(s)"
+    fi
+}
+
+# All workers: -d must not be a cached-mode wekafs mount, and must be writable
+# by the login user (fio reports a worker EACCES so quietly the run "succeeds"
+# with zero IO). A missing -d is created only under a wekafs mount (anywhere
+# under --any-fs), after one question (README, Caveats).
+verify_mount_mode() {
+    log "checking mount mode and writability of the destination on ${#HOSTS[@]} host(s)..."
+    # one marker prefix per run, so two runs sharing a destination never
+    # see each other's markers (collect_fs_groups)
+    [ -n "$GROUP_FILE" ] || printf -v GROUP_FILE '.wekatester-group.%(%s)T.%s' -1 "$$"
+    local host line verdict failed=() mode_fail=0 write_fail=0 type_fail=0 gone_fail=0 proc_fail=0 hd anc i ft pl=()
+    local missing=() missing_dirs=() missing_parents=() missing_types=() procs=()
+    local cached_hosts=() cached_modes=() mode who n sw anyfs_hosts=() anyfs_types=() off
+    local -A said=()
+    # Three fan-outs: every host gets the same commands in the same order and
+    # the messages come back in host order, as a serial walk produced them;
+    # only the waiting overlaps. Per-host output goes to files under the work
+    # dir, or a temp dir when the suite calls this phase alone.
+    local td pids=() hds=() rcs=() ancs=() msgs=() probe=()
+    td=$(mktemp -d "${WORK_DIR:-${TMPDIR:-/tmp}}/mnt.XXXXXX") \
+        || die "cannot create a scratch dir for the mount check"
+    load_host_dirs
+    for i in "${!HOSTS[@]}"; do
+        hds[$i]=${HOST_DIRS[$i]}
+        mount_line_cmd_v "'${hds[$i]}'"
+        ( run_host "${HOSTS[$i]}" "$MOUNT_LINE_CMD" > "$td/$i.mnt" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        wait "${pids[$i]}"; rcs[$i]=$?
+        line=""; IFS= read -r line < "$td/$i.mnt" || :
+        procs[$i]=$line
+    done
+    # findmnt fails for a path that does not exist: classify the nearest
+    # ancestor that does, and remember that the destination is missing
+    pids=()
+    for i in "${!HOSTS[@]}"; do
+        [ "${rcs[$i]}" -ne 0 ] || continue
+        ( run_host "${HOSTS[$i]}" "$(missing_dir_probe_cmd "${hds[$i]}")" > "$td/$i.anc" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        [ "${rcs[$i]}" -ne 0 ] || continue
+        pl=()
+        # the ancestor, then its mount's /proc/mounts line
+        if wait "${pids[$i]}"; then mapfile -t pl < "$td/$i.anc"; fi
+        if [ ${#pl[@]} -ge 2 ]; then
+            ancs[$i]=${pl[0]}; procs[$i]=${pl[1]}
+        else
+            msgs[$i]="${HOSTS[$i]}: findmnt failed for ${hds[$i]} -- does it exist? (wrong -d?)"
+        fi
+    done
+    # classification is local, of the line the record keeps and fio sees (a
+    # stacked mount's visible one); probe[i] marks the hosts that get the
+    # write probe: destination present, mode ok (or the cached-mount warning)
+    for i in "${!HOSTS[@]}"; do
+        [ -z "${msgs[$i]:-}" ] || continue
+        host=${HOSTS[$i]}; hd=${hds[$i]}; anc=${ancs[$i]:-}
+        # the line check_mounts_unchanged holds the run to
+        if [ -z "${procs[$i]:-}" ]; then
+            msgs[$i]="$host: no /proc/mounts line for the mount holding ${anc:-$hd} (findmnt -T TARGET names a mount point /proc/mounts does not list)"
+            proc_fail=1
+            continue
+        fi
+        debug3 "$host: mount: ${procs[$i]}"
+        classify_mount_line_v "${procs[$i]}"; verdict=$MOUNT_VERDICT
+        case "$verdict" in
+            ok)   ft=wekafs ;;
+            other*)
+                  ft=${verdict#other }; [ -n "$ft" ] || ft="a filesystem with no type in its /proc/mounts line"
+                  if [ "$ANY_FS" -eq 0 ]; then
+                      # refused before anything is written; an unmounted
+                      # weka leaves its mount point on the root disk
+                      type_fail=1
+                      if [ -n "$anc" ]; then
+                          msgs[$i]="$host: $hd does not exist, and $anc is on $ft, not wekafs -- check that weka is mounted on this host and that -d names a directory on it; --any-fs tests a filesystem other than wekafs"
+                      else
+                          msgs[$i]="$host: $hd is on $ft, not wekafs -- check that weka is mounted there on this host; --any-fs tests a filesystem other than wekafs"
+                      fi
+                      continue
+                  fi ;;
+            fail*) if [ "$FAST_TRACK" -eq 1 ] || [ "$ALLOW_CACHED_MOUNT" -eq 1 ]; then
+                       # said once per MODE after the loop: 111 identical
+                       # lines is noise, not information (field fleet D, 2026-09-09)
+                       cached_hosts+=("$host"); cached_modes+=("${verdict#fail }"); ft=wekafs
+                   else
+                       msgs[$i]="$host: wekafs mounted ${verdict#fail } (need forcedirect)"
+                       mode_fail=1
+                       continue
+                   fi ;;
+        esac
+        # said once per type after the loop, like the cached-mount warning
+        [ "$ANY_FS" -eq 0 ] || { anyfs_hosts+=("$host"); anyfs_types+=("$ft"); }
+        if [ -n "$anc" ]; then
+            missing+=("$host"); missing_dirs+=("$hd"); missing_parents+=("$anc"); missing_types+=("$ft")
+            continue   # created below, once the operator agrees, then probed
+        fi
+        probe[$i]=1
+    done
+    pids=()
+    for i in "${!HOSTS[@]}"; do
+        [ "${probe[$i]:-0}" -eq 1 ] || continue
+        ( probe_writable "${HOSTS[$i]}" "${hds[$i]}" ) &
+        pids[$i]=$!
+    done
+    for i in "${!HOSTS[@]}"; do
+        [ "${probe[$i]:-0}" -eq 1 ] || continue
+        wait "${pids[$i]}" \
+            || { msgs[$i]="${HOSTS[$i]}: cannot create files in ${hds[$i]} -- $(write_fix_hint "${hds[$i]}")"
+                 write_fail=1; }
+    done
+    for i in "${!HOSTS[@]}"; do
+        [ -z "${msgs[$i]:-}" ] || failed+=("${msgs[$i]}")
+    done
+    rm -rf "${td:?}"
+    # The cached-mount warning, one line per distinct cached mode, naming the
+    # switch that continued: the host alone when it is one host, "all N" when
+    # it is every host, the list otherwise.
+    CACHED_MOUNT_NOTE="no wekafs destination without forcedirect"
+    if [ ${#cached_hosts[@]} -gt 0 ]; then
+        CACHED_MOUNT_NOTE=""; sw=--allow-cached-mount
+        [ "$FAST_TRACK" -eq 0 ] || sw=-r
+        for mode in $(printf '%s\n' "${cached_modes[@]}" | sort -u); do
+            who=""; n=0
+            for i in "${!cached_hosts[@]}"; do
+                [ "${cached_modes[$i]}" = "$mode" ] || continue
+                who="$who${who:+ }${cached_hosts[$i]}"; n=$((n + 1))
+            done
+            CACHED_MOUNT_NOTE+="${CACHED_MOUNT_NOTE:+; }$mode on $n host(s): $who"
+            if [ "$n" -eq 1 ]; then
+                warn_prerun "$who: wekafs mounted $mode (need forcedirect); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
+            elif [ "$n" -eq ${#HOSTS[@]} ]; then
+                warn_prerun "wekafs mounted $mode (need forcedirect) on all $n hosts; $sw continues anyway -- the client cache is in the IO path and the numbers include it"
+            else
+                warn_prerun "wekafs mounted $mode (need forcedirect) on $n of ${#HOSTS[@]} hosts ($who); $sw continues anyway -- the client cache is in the IO path and the numbers include it"
+            fi
+        done
+    fi
+    # --any-fs: the run log says the type check was off and what -d is on,
+    # one line per type, in host order
+    off="the filesystem-type check is off (--any-fs): wekatester checks for wekafs only"
+    for ft in "${anyfs_types[@]}"; do
+        [ -z "${said[$ft]+set}" ] || continue
+        said[$ft]=1; who=""; n=0
+        for i in "${!anyfs_hosts[@]}"; do
+            [ "${anyfs_types[$i]}" = "$ft" ] || continue
+            who="$who${who:+ }${anyfs_hosts[$i]}"; n=$((n + 1))
+        done
+        if [ "$n" -eq 1 ]; then
+            warn_prerun "$who: the destination is on $ft; $off"
+        elif [ "$n" -eq ${#HOSTS[@]} ]; then
+            warn_prerun "the destination is on $ft on all $n hosts; $off"
+        else
+            warn_prerun "the destination is on $ft on $n of ${#HOSTS[@]} hosts ($who); $off"
+        fi
+    done
+    # Missing destinations are created only when nothing else is wrong: no
+    # mutation on a run that is about to stop anyway.
+    if [ ${#missing[@]} -gt 0 ]; then
+        if [ ${#failed[@]} -gt 0 ]; then
+            for i in "${!missing[@]}"; do
+                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; not created while other checks fail"
+            done
+        else
+            for i in "${!missing[@]}"; do
+                ft=${missing_types[$i]}
+                if [ "$ft" = wekafs ]; then ft="a wekafs mount"; else ft="on $ft (--any-fs)"; fi
+                log "${missing[$i]}: ${missing_dirs[$i]} does not exist; ${missing_parents[$i]} is $ft"
+            done
+            # -n creates no -d: the stand-in (DRYRUN_DIR) takes its place,
+            # recorded before it is made so cleanup removes it on any exit
+            if [ "$DRY_RUN" -eq 1 ]; then
+                [ -n "$DRYRUN_NAME" ] || printf -v DRYRUN_NAME 'wt-dryrun.%(%s)T.%s.%s%s' -1 "$$" "$RANDOM" "$RANDOM"
+                for i in "${!missing[@]}"; do
+                    DRYRUN_DIR[${missing[$i]}]=${missing_parents[$i]%/}/$DRYRUN_NAME
+                    DRYRUN_SAY+=("${missing[$i]}"$'\t'"${missing_dirs[$i]}"$'\t'"${missing_parents[$i]}")
+                    missing_dirs[$i]=${DRYRUN_DIR[${missing[$i]}]}
+                done
+            else
+                confirm_create_dirs "${#missing[@]}"
+            fi
+            # one fan-out, each host its mkdir and then its write probe
+            local rc
+            pids=()
+            for i in "${!missing[@]}"; do
+                ( run_host "${missing[$i]}" "$(create_dest_cmd "${missing_dirs[$i]}")"
+                  case $? in (0) ;; (4) exit 4 ;; (*) exit 2 ;; esac
+                  probe_writable "${missing[$i]}" "${missing_dirs[$i]}" || exit 3 ) &
+                pids[$i]=$!
+            done
+            for i in "${!missing[@]}"; do
+                host=${missing[$i]}; hd=${missing_dirs[$i]}
+                wait "${pids[$i]}"; rc=$?
+                if [ "$rc" -eq 4 ]; then
+                    failed+=("$host: $hd was not created -- the nearest directory above it is no longer on a wekafs mount (did the weka client restart?)")
+                    gone_fail=1
+                    continue
+                fi
+                if [ "$rc" -eq 2 ]; then
+                    failed+=("$host: cannot create $hd -- $(write_fix_hint "${missing_parents[$i]}")")
+                    write_fail=1
+                    continue
+                fi
+                debug "$host: created $hd"
+                [ -z "${DRYRUN_DIR[$host]+set}" ] || DRYRUN_MADE[$host]=1
+                [ "$rc" -eq 0 ] \
+                    || { failed+=("$host: cannot create files in $hd -- $(write_fix_hint "$hd")")
+                         write_fail=1; }
+            done
+        fi
+    fi
+    if [ ${#failed[@]} -gt 0 ]; then
+        for line in "${failed[@]}"; do log "ERROR: $line" >&2; done
+        # Advise a remount only when a mount mode was the problem: when findmnt
+        # failed everywhere, -d most likely does not exist.
+        [ "$mode_fail" -eq 0 ] || \
+            die "wekafs at $DIRECTORY must be mounted with forcedirect; remount and re-run, or run with --allow-cached-mount (the numbers then include the client cache)"
+        [ "$type_fail" -eq 0 ] || \
+            die "a destination is not on wekafs; wekatester checks for wekafs only, and --any-fs turns that check off -- nothing was written"
+        [ "$gone_fail" -eq 0 ] || \
+            die "the weka mount above a missing destination went away before it was created; nothing was created on a local disk -- check the weka client and re-run"
+        [ "$write_fail" -eq 0 ] || \
+            die "$DIRECTORY is not writable on every host; fio cannot lay out its files there"
+        [ "$proc_fail" -eq 0 ] || \
+            die "the destination mount's /proc/mounts line was not found on every host; the run is held to that line, so it cannot start"
+        die "cannot determine the mount at $DIRECTORY; check that it exists and that -d names the right directory"
+    fi
+    # the record check_mounts_unchanged compares against; a created
+    # destination's line is its parent's, the mount it was created on. The
+    # suite calls this phase without a work dir.
+    [ -z "${WORK_DIR:-}" ] || write_mount_lines "$WORK_DIR/mount" "${procs[@]}"
+    # the hosts the lines belong to, in order: a host excluded in
+    # calibration shifts HOSTS, and the recheck looks its line up by name
+    [ -z "${WORK_DIR:-}" ] || printf '%s\n' "${HOSTS[@]}" > "$WORK_DIR/mount/hosts" \
+        || die "cannot record the mount check's host order"
+    debug "mount mode and writability ok on all hosts"
+}

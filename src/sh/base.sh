@@ -1,0 +1,370 @@
+# --- logging -----------------------------------------------------------------
+# Until the pre-log relays start (start_prelog), the main shell's lines are
+# also kept here; they open the run log. While the relays are paused for a
+# prompt (run.sh relay_pause), LOG_DIRECT names the log file and each line is
+# appended to it here, in program order.
+LOG_BUFFERING=1; LOG_BUFFER=()
+LOG_DIRECT=""
+log()   { local ts; printf -v ts '%(%H:%M:%S)T' -1; [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts $*"); [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts $*" >> "$LOG_DIRECT"; echo "$ts $*"; }
+log_blank() { [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=(""); [ -z "$LOG_DIRECT" ] || echo >> "$LOG_DIRECT"; echo; }
+# A gated line. While a relay runs, every level reaches the file: the line
+# goes out marked with \037 and its level, and the relay shows it on the
+# console only at that verbosity (each line of a multi-line text is marked).
+# Otherwise it is buffered or written direct (above) and printed at its level.
+debug_at() {   # debug_at <level> <text>
+    local ts
+    printf -v ts '%(%H:%M:%S)T' -1
+    if [ ${#RELAY_PIDS[@]} -gt 0 ]; then
+        printf '\037%s%s DEBUG: %s\n' "$1" "$ts" "${2//$'\n'/$'\n\037'$1}"
+    else
+        [ "$LOG_BUFFERING" -eq 0 ] || LOG_BUFFER+=("$ts DEBUG: $2")
+        [ -z "$LOG_DIRECT" ] || printf '%s\n' "$ts DEBUG: $2" >> "$LOG_DIRECT"
+        [ "$VERBOSITY" -lt "$1" ] || echo "$ts DEBUG: $2"
+    fi
+    return 0
+}
+# README, -v: the console's level (the run log gets every line): -v per-host
+# outcomes and notes, -vv every connection attempt, -vvv the commands run on
+# the hosts and each phase's seconds
+debug()  { debug_at 1 "$*"; }
+debug2() { debug_at 2 "$*"; }
+debug3() { debug_at 3 "$*"; }
+die()   { log "ERROR: $*" >&2; exit 1; }
+
+# -vvv helpers, which do nothing when the line would go nowhere (no relay or
+# direct file, and a console below -vvv)
+debug3_on() { [ ${#RELAY_PIDS[@]} -gt 0 ] || [ -n "$LOG_DIRECT" ] || [ "$VERBOSITY" -ge 3 ]; }
+debug3_rows() {   # debug3_rows <prefix> <file>: each line of the file
+    debug3_on && [ -f "$2" ] || return 0
+    local l
+    while IFS= read -r l || [ -n "$l" ]; do debug3 "$1$l"; done < "$2"
+    return 0
+}
+# Each distinct command once, naming its hosts (eight, then +N more): every
+# run's log holds the -vvv lines, so per-host copies would bloat it.
+debug3_cmds() {   # debug3_cmds <what> <host> <command> [<host> <command>]...
+    debug3_on || return 0
+    local what=$1 c n s names cmds=()
+    local -A who=() cnt=()
+    shift
+    while [ $# -ge 2 ]; do
+        if [ -z "${who[$2]+set}" ]; then
+            cmds+=("$2"); who[$2]=$1; cnt[$2]=1
+        else
+            n=${cnt[$2]}; cnt[$2]=$((n + 1))
+            [ "$n" -ge 8 ] || who[$2]+=", $1"
+        fi
+        shift 2
+    done
+    for c in ${cmds[@]+"${cmds[@]}"}; do
+        n=${cnt[$c]}; names=${who[$c]}; s=s
+        [ "$n" -le 8 ] || names+=", +$((n - 8)) more"
+        [ "$n" -ne 1 ] || s=""
+        debug3 "$what ($n host$s: $names): $c"
+    done
+}
+# -vvv: a phase's seconds, from the end of the one before (PHASE_T0, main)
+PHASE_T0=0
+phase_done() { debug3 "$1: $((SECONDS - PHASE_T0))s"; PHASE_T0=$SECONDS; }
+
+# A warning raised before the run log opens: the pre-log relays carry it into
+# the file like any other line.
+warn_prerun() { log "WARNING: $*" >&2; }
+
+# --- transport ----------------------------------------------------------------
+# The only two places that know whether a host is remote. A command string
+# is bash: locally it runs under bash -c, remotely under the login shell, so
+# one that needs bash's own features wraps itself in bash -c
+# (verify_fio_ports does, for /dev/tcp).
+
+# stdin is /dev/null on both branches, or a child can eat the script's stdin.
+# host_ssh_opts: our ControlPath and User= per host; nothing for a host on a
+# user-owned master, or when AUTH_DIR is unset. The _v form, without the
+# subshell, is what every remote call uses.
+host_ssh_opts_v() {   # host_ssh_opts_v <host> -> HOST_SSH_OPTS
+    HOST_SSH_OPTS=""
+    if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.external" ]; then
+        return 0
+    fi
+    HOST_SSH_OPTS=$CONTROL_OPTS
+    if [ -n "$AUTH_DIR" ] && [ -f "$AUTH_DIR/$1.user" ]; then
+        local u=""
+        IFS= read -r u < "$AUTH_DIR/$1.user" || :
+        HOST_SSH_OPTS="$HOST_SSH_OPTS -o User=$u"
+    fi
+}
+host_ssh_opts() {   # host_ssh_opts <host>
+    host_ssh_opts_v "$1"
+    printf '%s' "$HOST_SSH_OPTS"
+}
+
+# timeout -k 5 <s>, with or without timeout(1). Without it, the command and
+# a watchdog each fork as a process group: TERM to the command's group at
+# <s>, KILL 5 s later; the watchdog and its sleep end with the command.
+# 124 (137 after the KILL): the bound fired.
+run_bounded() {   # run_bounded <seconds> <command> [<arg>]...
+    local jc=$- p w st said
+    if said=$(command -v timeout); then
+        timeout -k 5 "$@"
+        # $?, not a bare return: in a subshell of the EXIT trap, bash 5.1's
+        # bare return gave the trap's 130 instead of timeout's 124
+        return $?
+    fi
+    set -m
+    "${@:2}" &
+    p=$!
+    # the TERM below may land before a sleep here is forked and the group
+    # TERM reaches it: the trap ends the current sleep itself, or that sleep
+    # would hold the caller's fds (the run-log fifos, a $( ) pipe) to its end
+    ( st=0
+      trap 'said=$(kill -- "$!" 2>&1); exit $st' TERM
+      command sleep "$1" & wait "$!"
+      st=124; said=$(kill -TERM -- "-$p" 2>&1)
+      command sleep 5 & wait "$!"
+      st=137; said=$(kill -KILL -- "-$p" 2>&1)
+      exit $st ) &
+    w=$!
+    case $jc in (*m*) ;; (*) set +m ;; esac
+    wait_through "$p"
+    said=$(kill -TERM -- "-$w" 2>&1) || :
+    wait "$w" && st=0 || st=$?
+    case $st in (124|137) return "$st" ;; esac
+    return "$WAIT_RC"
+}
+
+# RUN_HOST_TIMEOUT=<s> bounds the whole session (run_bounded): exit 124
+# (137 when TERM was ignored) means the bound fired.
+run_host() {   # run_host <host> <command-string>
+    local b=()
+    [ -z "${RUN_HOST_TIMEOUT:-}" ] || b=(run_bounded "$RUN_HOST_TIMEOUT")
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        "${b[@]}" bash -c "$2" </dev/null
+    else
+        host_ssh_opts_v "$1"
+        "${b[@]}" ssh -n $SSH_OPTS $HOST_SSH_OPTS "$1" "$2"
+    fi
+}
+
+# One tar stream over the master's connection: scp pays a round trip per
+# file. The sources share one parent directory.
+copy_to_master() {   # copy_to_master <src>... <dst-dir-on-master>
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        cp -R "$@"
+        return
+    fi
+    # ${!#} is the last positional (the destination), ${@:1:$#-1} is
+    # everything before it
+    local dst=${!#} parent=${1%/*} names=() s
+    for s in "${@:1:$#-1}"; do
+        [ "${s%/*}" = "$parent" ] || { log "ERROR: copy_to_master: $s is not in $parent" >&2; return 1; }
+        names+=("${s##*/}")
+    done
+    local -
+    set -o pipefail
+    host_ssh_opts_v "$MASTER"
+    tar -C "$parent" -cf - -- "${names[@]}" \
+        | ssh $SSH_OPTS $HOST_SSH_OPTS "$MASTER" "mkdir -p '$dst' && tar -xf - -C '$dst'"
+}
+
+# For a worker that needs its own copy (the postmortem's fio --parse-only).
+copy_to_host() {   # copy_to_host <host> <src>... <dst-dir-on-host>
+    local host=$1; shift
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        cp -R "$@"
+    else
+        host_ssh_opts_v "$host"
+        scp $SSH_OPTS $HOST_SSH_OPTS -q -r "${@:1:$#-1}" "$host:${!#}"
+    fi
+}
+
+# A host may lack procps: remote commands walk /proc (_wt_proc, else /proc),
+# not ps, pgrep or pkill. _wt_args <pid> sets _wt_a to its args, <defunct>
+# for a zombie, or returns 1; _wt_comm <name>... prints the pids so named;
+# _wt_srv <pidfile>: _wt_a is wekatester's fio server, argv[1] --server and
+# argv[2] --daemonize=<pidfile> exactly, whatever argv[0] (a shell's argv[1]
+# is -c); _wt_srvs <pidfile> sets _wt_l to every such pid, any name;
+# _wt_kbin prints the kill binary on PATH (command -v names the builtin;
+# only an expansion splits on IFS, so the fallback dirs join a variable).
+PROC_FN="_wt_args() { _wt_a=; case \$1 in ''|*[!0-9]*) return 1 ;; esac; _wt_s=\$(tr '\\000' ' ' 2>&1 < \"\${_wt_proc:-/proc}/\$1/cmdline\") || return 1; _wt_a=\${_wt_s% }; [ -z \"\$_wt_a\" ] || return 0; _wt_s=\$(cat \"\${_wt_proc:-/proc}/\$1/stat\" 2>&1) || return 1; _wt_s=\${_wt_s##*') '}; case \$_wt_s in Z*) _wt_a='<defunct>' ;; *) return 1 ;; esac; }; \
+_wt_comm() { awk -v w=\"\$*\" 'BEGIN { n = split(w, N, \" \"); for (i = 1; i <= n; i++) W[N[i]]; for (i = 1; i < ARGC; i++) { f = ARGV[i] \"/comm\"; if (((getline c < f) > 0) && (c in W)) { p = ARGV[i]; sub(/.*\\//, \"\", p); print p }; close(f) } }' \"\${_wt_proc:-/proc}\"/[0-9]*; }; \
+_wt_srv() { case \${_wt_a#* } in \"--server --daemonize=\$1\"|\"--server --daemonize=\$1 \"*) return 0 ;; esac; return 1; }; \
+_wt_srvs() { _wt_l=; for _wt_f in \$(grep -l -s -F -e \"--daemonize=\$1\" \"\${_wt_proc:-/proc}\"/[0-9]*/cmdline); do _wt_q=\${_wt_f%/cmdline}; _wt_q=\${_wt_q##*/}; _wt_args \$_wt_q || continue; ! _wt_srv \"\$1\" || _wt_l=\"\$_wt_l \$_wt_q\"; done; [ -n \"\$_wt_l\" ]; }; \
+_wt_kbin() { (_wt_p=\$PATH:/usr/bin:/bin; IFS=:; for _wt_d in \$_wt_p; do if [ -n \"\$_wt_d\" ] && [ -f \"\$_wt_d/kill\" ] && [ -x \"\$_wt_d/kill\" ]; then echo \"\$_wt_d/kill\"; exit 0; fi; done; exit 1); }"
+
+# Every passwordless escalator a sweep tries, in this order (site tools
+# before sudo, each with its no-prompt flag), and how long each try may
+# take. Remote strings word the list with escalator_words_v.
+ESCALATORS=("dzdo -n" pbrun sesu pmrun "doas -n" "ksu -e" "sudo -n")
+ESCALATOR_TIMEOUT=5
+# a multi-word entry in <q> quotes, or with / the tool names for a message
+escalator_words_v() {   # escalator_words_v <'|"|/> -> ESCALATOR_WORDS
+    local e w=
+    for e in "${ESCALATORS[@]}"; do
+        if [ "$1" = / ]; then w+=${w:+/}${e%% *}
+        elif [ "$e" != "${e% *}" ]; then w+=${w:+ }$1$e$1
+        else w+=${w:+ }$e; fi
+    done
+    ESCALATOR_WORDS=$w
+}
+
+# No server given: benchmark this host over loopback; only the transport
+# changes.
+resolve_local_mode() {
+    [ ${#HOSTS[@]} -eq 0 ] || return 0
+    LOCAL_MODE=1
+    HOSTS=(localhost)
+    MASTER=localhost
+    LOCAL_NAME=$(local_short_hostname)
+    debug "no servers given: running on the local host (no ssh required)"
+    debug "local mode: data files are prefixed ${LOCAL_NAME:-localhost}. (host_name)"
+}
+
+# Split -i entries into (login, key) at the first colon, in order. Paths are
+# checked now: left to ssh, a typo fails every host and reads like a cluster
+# problem. Once per run: a second call would add every key again.
+CREDENTIALS_VALIDATED=""
+validate_credentials() {
+    local raw entry login key
+    [ -z "$CREDENTIALS_VALIDATED" ] || return 0
+    if [ "$LOCAL_MODE" -eq 1 ]; then
+        # Local mode: accepted and ignored, like --ignore-capacity outside -a.
+        [ ${#IDENT_RAW[@]} -eq 0 ] && [ "$PW_COUNT" -eq 0 ] \
+            || debug "local mode: ignoring -i/-p (no ssh involved)"
+        CREDENTIALS_VALIDATED=1
+        return 0
+    fi
+    for raw in ${IDENT_RAW[@]+"${IDENT_RAW[@]}"}; do
+        # ssh option lists are whitespace-split into argv; a login or path
+        # with whitespace would arrive as several options nobody wrote.
+        case "$raw" in
+            *[[:space:]]*) die "-i entries must not contain whitespace: '$raw'" ;;
+        esac
+        for entry in $(printf '%s' "$raw" | tr ',' ' '); do
+            case "$entry" in
+                *:*) login=${entry%%:*}; key=${entry#*:} ;;
+                *)   login=""; key=$entry ;;
+            esac
+            [ -n "$key" ] || die "empty key path in -i entry: '$entry'"
+            # the shell expands ~ only at a word's start, so login:~/k
+            # arrives as typed; ~user/ stays as typed
+            case $key in
+                '~') key=$HOME ;;
+                '~/'*) key=$HOME/${key#'~/'} ;;
+            esac
+            { [ -f "$key" ] && [ -r "$key" ]; } || \
+                die "identity file not readable: $key"
+            IDENT_LOGINS+=("$login")
+            IDENT_KEYS+=("$key")
+        done
+    done
+    CREDENTIALS_VALIDATED=1
+}
+
+# --- interactive prompting (-p, a missing host file or destination, capacity) ---
+# Prompts use /dev/tty on one rw fd: children get /dev/null on stdin and
+# stdout is often piped. read -s must read through a redirection (read -u
+# echoes), and partial -n input is discarded on timeout, so the escape drain
+# reads one byte at a time.
+PROMPT_TTY="${WEKATESTER_PROMPT_TTY:-/dev/tty}"   # test plumbing only, namespaced
+PROMPT_OPENED=0      # 1 = we own fd 3 and must close it
+PROMPT_IN_FD=""      # read side  -- the suite presets these two and then
+PROMPT_OUT_FD=""     # write side -- the tty gate below is a no-op
+PROMPT_DRAIN_SECS=0.2  # an escape sequence's bytes arrive together; 0.2 s is ample
+
+require_interactive() {   # require_interactive <what-needs-it> [advice]
+    try_interactive || die "$1 needs a terminal; ${2:-use -r for unattended runs}"
+}
+
+# Best effort, for prompts that have a default on unattended runs (-r/-n).
+try_interactive() {
+    if [ -n "$PROMPT_IN_FD" ] && [ -n "$PROMPT_OUT_FD" ]; then return 0; fi
+    # Probe the open in a subshell first: without a terminal, bash's own
+    # diagnostic (a line of the built tool, a device the user never typed)
+    # lands in err, shown only under -v, never raw on stderr.
+    local err
+    if err=$(exec 2>&1; exec 3<>"$PROMPT_TTY" && [ -t 3 ]) && exec 3<>"$PROMPT_TTY"; then
+        PROMPT_IN_FD=3; PROMPT_OUT_FD=3; PROMPT_OPENED=1
+        return 0
+    fi
+    err=${err#*line [0-9]*: }
+    debug "no terminal: ${err:-$PROMPT_TTY is not a terminal}"
+    return 1
+}
+
+# Hand the run phase back exactly the world it has today: no child inherits a
+# readable terminal fd behind the transport's /dev/null-ed stdin.
+close_interactive() {
+    [ "$PROMPT_OPENED" -eq 1 ] || return 0
+    exec 3<&-
+    PROMPT_OPENED=0; PROMPT_IN_FD=""; PROMPT_OUT_FD=""
+}
+
+prompt_say()  { printf '%s'   "$*" >&"$PROMPT_OUT_FD"; }
+prompt_line() { printf '%s\n' "$*" >&"$PROMPT_OUT_FD"; }
+
+# 0 when ESC starts a sequence (another byte within PROMPT_DRAIN_SECS); the
+# rest is swallowed so the next prompt does not read it as keys.
+prompt_drain_escape() {
+    local c rc=1
+    if IFS= read -r -s -n 1 -t "$PROMPT_DRAIN_SECS" c <&"$PROMPT_IN_FD"; then
+        rc=0
+        while IFS= read -r -s -n 1 -t "$PROMPT_DRAIN_SECS" c <&"$PROMPT_IN_FD"; do :; done
+    fi
+    return $rc
+}
+
+# Sets PROMPT_KEY to enter|space|esc|escseq|none|<char>; 0 waits forever (read
+# -t 0 means something else). IFS= keeps space apart from Enter, -r keeps \.
+prompt_key() {   # prompt_key <timeout-seconds|0>
+    local key rc
+    if [ "$1" -gt 0 ]; then
+        IFS= read -r -s -n 1 -t "$1" key <&"$PROMPT_IN_FD"; rc=$?
+    else
+        IFS= read -r -s -n 1 key <&"$PROMPT_IN_FD"; rc=$?
+    fi
+    # 3.2 returns 1 for both timeout and EOF; 4+ returns >128 for timeout.
+    # Only zero/nonzero is branched on, so the contract holds on both.
+    if [ "$rc" -ne 0 ]; then PROMPT_KEY=none; return 1; fi
+    case $key in
+        '')      PROMPT_KEY=enter ;;
+        ' ')     PROMPT_KEY=space ;;
+        $'\033') if prompt_drain_escape; then PROMPT_KEY=escseq
+                 else PROMPT_KEY=esc; fi ;;
+        *)       PROMPT_KEY=$key ;;
+    esac
+    return 0
+}
+
+# Enter/y/space yes, Esc/n no; any other key or none takes the default, so
+# there is no re-prompt loop. Returns 0 for yes. The log relays pause from
+# the question to the answer's log line (run.sh): nothing earlier is still
+# queued when the question shows, and the answer precedes the caller's die.
+confirm_timed() {   # confirm_timed <secs> <yes|no> <message>
+    local secs=$1 default=$2 msg=$3 answer
+    relay_pause
+    prompt_say "$msg [Enter/y = yes, Esc/n = no] (${secs}s -> $default) "
+    prompt_key "$secs"
+    case "$PROMPT_KEY" in
+        enter|space|y|Y) answer=yes ;;
+        esc|n|N)         answer=no  ;;
+        *)               answer=$default ;;
+    esac
+    prompt_line "$answer"
+    log "$msg $answer"
+    relay_resume
+    [ "$answer" = yes ]
+}
+
+# Untimed: only y means yes; Enter takes the no the prompt shows.
+confirm_explicit() {   # confirm_explicit <message>
+    local answer=no
+    relay_pause
+    prompt_say "$1 [y/N] "
+    if prompt_key 0; then
+        case "$PROMPT_KEY" in (y|Y) answer=yes ;; esac
+    fi
+    prompt_line "$answer"
+    log "$1 $answer"
+    relay_resume
+    [ "$answer" = yes ]
+}
