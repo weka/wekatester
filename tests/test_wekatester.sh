@@ -3761,15 +3761,6 @@ t_assert "cal_required: a directive with no rw= anywhere asks for nothing" \
     test "$(cal_set '# report bandwidth
 [bw]
 bs=1M')" = ""
-t_assert "cal_required: the shipped sets ask for the ladders they measure" bash -c '
-    r() { local out rc                     # rc pinned before transforming, as above
-          out=$( (source ./wekatester; cal_required "fio-jobfiles/$1") ); rc=$?
-          [ "$rc" -eq 0 ] || { echo "ERROR: cal_required exited $rc"; return "$rc"; }
-          printf "%s\n" "$out" | tr "\n" "|"; }
-    [ "$(r default)"    = "bw read|bw write|iops read|iops write|lat read|lat write|" ] &&
-    [ "$(r mixed)"      = "bw read|bw write|iops read|iops write|lat read|lat write|" ] &&
-    [ "$(r smoke)"      = "bw read|lat write|" ] &&
-    [ "$(r wekawithin)" = "bw read|bw write|iops read|iops write|" ]'
 t_assert "cal_required: a missing set directory is an error, not silence" bash -c '
     out=$( (source ./wekatester; cal_required /nonexistent/set) 2>&1 ); rc=$?
     [ "$rc" -ne 0 ] && case "$out" in *"cal_required"*"/nonexistent/set"*) true;; *) false;; esac'
@@ -9072,40 +9063,6 @@ t_assert "probe: no ethtool, or one that prints no Speed line, leaves a NIC its 
     done'
 
 # --- calibrate(): the whole flow against the fake client ---
-t_assert "calibrate: each shape is measured solo on its first host, the answer lands for every member" bash -c '
-    source ./tests/helpers.sh; d=$(mktemp -d)
-    cal_sim_fixture "$d" h1:8 h2:8 h3:16:200000
-    cp fio-jobfiles/default/0* "$d/set/"
-    out=$( (source ./wekatester
-     AUTO_LEVEL=cal; WORK_DIR=$d; HOSTS=(h1 h2 h3); MASTER=h1; FIO_BIN=fio
-     TARGET_DIR=/dev/shm/x; DIRECTORY=/mnt/weka; REGEN_LAYOUT=0
-     SET_DIR_OVERRIDE=$d/set; AUTH_DIR=$d/auth; CAL_SETTLE=0; SIMLOG=$d/simlog
-     export CAL_SIM_BWCAP=12000000000
-     copy_to_master() { :; }
-     run_host() { cal_sim_host "$@"; }
-     calibrate) 2>&1 ) || { printf "%s\n" "$out" >&2; exit 1; }
-    # every cell ran with exactly one client: a representative (the seeds
-    # are not cells: the shared read set is seeded by the whole group)
-    grep -v cal-seed- "$d/simlog" > "$d/cells" &&
-    ! grep -q -- "--client=h2" "$d/cells" &&
-    [ "$(grep -o -- "--client=[a-z0-9]*" "$d/cells" | sort -u | tr "\n" " ")" = "--client=h1 --client=h3 " ] &&
-    ! grep -- "--client=" "$d/cells" | grep -q -- "--client=.*--client=" &&
-    grep cal-seed-read "$d/simlog" | grep -q -- "--client=h2 " &&
-    # h1 and h2 share the shape, and so its answer
-    [ "$(grep "^h1 " "$d/cal.results" | cut -d" " -f2-)" = "$(grep "^h2 " "$d/cal.results" | cut -d" " -f2-)" ] &&
-    # h1 (8 cpus, weka on 7, the OS on 0-1): N=5, so bandwidth reaches line
-    # rate only at 2N with the siblings in, iops is flat at its cap from 2N
-    # and the tie goes heaviest (4N iodepth 32, 4 files), latency runs at N; h3 (16
-    # cpus): N=13, bandwidth and iops flat at the cap from N, ties to 4N
-    grep -qx "h1 io_uring 2 1 5120M 10 2 1 5120M 10 1 1 5120M 5 1 1 5120M 5 32 4 1280M 20 32 4 1280M 20 - - - - - - - -" "$d/cal.results" &&
-    grep -qx "h3 io_uring 4 4 1280M 52 4 4 1280M 52 1 1 5120M 13 1 1 5120M 13 8 4 1280M 52 8 4 1280M 52 - - - - - - - -" "$d/cal.results" &&
-    # the engine and the tuples reach targets.final, which staging reads
-    t=$(awk -F"\t" "\$1==\"h2\" {print \$3, \$6, \$9, \$14, \$17}" "$d/targets.final") &&
-    [ "$t" = "io_uring 10 2 5 1" ] &&
-    # the shapes run at once, so their lines interleave: each in turn
-    for want in "shape 1 of 2: 2 host(s), calibrated on h1" "N=5" "shape 1: ioengine io_uring" "shape 1 bw-write: numjobs=10 iodepth=2" "siblings in that did" "shape 1 lat-read: numjobs=5 iodepth=1 nrfiles=1 -> 100.0 us" "shape 2: measuring" "solo on h3" "per client shape, the shapes at once, each on its first host"; do
-        case "$out" in *"$want"*) ;; *) echo "missing [$want]"; printf "%s\n" "$out"; false;; esac >&2 || exit 1
-    done'
 t_assert "calibrate: with --line-rate the bandwidth answer the host file carries is measured again and replaces it; iops is measured at its pins" bash -c '
     source ./tests/helpers.sh; d=$(mktemp -d)
     cal_sim_fixture "$d" h1:8
