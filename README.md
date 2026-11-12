@@ -194,10 +194,11 @@ With no server given, the test runs on the local host -- no ssh required.
 # Workloads
 A workload is a directory of standard fio jobfiles, usually under `fio-jobfiles/`, run in sorted filename order. Shipped sets:
 
-- `default` — the classic 4-corners tests (read/write bandwidth, latency, iops)
-- `mixed` — 70/30 read/write workloads
+- `default` — read and write bandwidth and latency; the latency tests report their iops too
+- `mixed` — 70/30 read/write bandwidth and latency
 - `2x400Gb` — a heavier bandwidth-oriented variant
 - `wekawithin` — 1M/128k/4k reads, writes, and mixed IO
+- `stress_test` — the 4k random iops tests (read, write and 70/30 mixed): many jobs at a deep queue. On a large client count they load the cluster past its best point, so they show how it behaves under excessive load, not its best figure (`-w stress_test`)
 - `smoke` — a fast validation set for the harness itself: 256M files, 10s runs, and it removes its own files afterwards (`-w smoke`)
 
 Add your own directory under `fio-jobfiles/` and select it with `-w <name>`, or keep it anywhere and give `-w` its path. A few conventions, for both:
