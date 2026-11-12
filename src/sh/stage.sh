@@ -178,13 +178,15 @@ layout_variant_pristine() {   # layout_variant_pristine <dir>
 # the STAGED layout with unlink=1. Sizes become 4k so a missing file never
 # costs a full write; the marker is dropped so it does not sort first.
 UNLINK_JOB="999-wekatester-unlink.job"
-stage_unlink_variants() {
+stage_unlink_variants() {   # stage_unlink_variants [host...]: the fleet at staging; the hosts named when a layout was re-derived
     is_layout_file "$SET_DIR/${JOBFILES[0]}" \
         || die "no layout job at position one; cannot derive the -u unlink job"
     # one awk for the fleet, every host's from its own staged layout variant
-    awkrun '#@awk stage_unlink_variants' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "${HOSTS[@]}" \
+    local again=$#
+    [ $# -gt 0 ] || set -- "${HOSTS[@]}"
+    awkrun '#@awk stage_unlink_variants' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "$@" \
         || die "cannot derive the -u unlink job"
-    JOBFILES+=("$UNLINK_JOB")
+    [ "$again" -gt 0 ] || JOBFILES+=("$UNLINK_JOB")
 }
 
 # Stamp key=value into every staged variant, in one awk for the fleet

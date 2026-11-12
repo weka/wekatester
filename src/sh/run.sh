@@ -781,12 +781,17 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
         awk -v ex=" $* " '!(substr($0, 1, 2) == "H " && index(ex, " " substr($0, 3) " "))' "$WORK_DIR/staged.kinds" > "$WORK_DIR/staged.kinds.new" \
             && mv "$WORK_DIR/staged.kinds.new" "$WORK_DIR/staged.kinds" || die "cannot update the staged host list"
         derive_layouts auto "$AUTO_LEVEL" "$DIRECTORY" "$m" || die "cannot re-derive $m's layout for the shared read set"
+        # -u: its unlink job names what its layout names, so it is derived again
+        # here, before the sweep turns the layout into a write of what is missing
+        [ "$UNLINK" -eq 0 ] || stage_unlink_variants "$m"
         rm -f "${WORK_DIR:?}/grid/$m/$job"
         sweep_layout_grid again
         out=$(layout_writes "$job" 1 "$m") || die "cannot stage $m's layout from the sweep"
         IFS=$'\t' read -r h nf by re kept <<<"$out"
-        if [ "${nf:-0}" -gt 0 ]; then
+        if [ "${nf:-0}" -gt 0 ] || [ "$UNLINK" -ne 0 ]; then
             copy_to_master "$WORK_DIR/jobs/$m" "$TARGET_DIR/" || die "failed to copy $m's layout to $MASTER"
+        fi
+        if [ "${nf:-0}" -gt 0 ]; then
             ensure_layout_dirs "$job"
             case " ${LAYOUT_RERUN[*]} " in (*" $m "*) ;; (*) LAYOUT_RERUN+=("$m") ;; esac
             log "layout: $m lays out its group's shared read set in $x's place ($nf file(s), $by bytes)"

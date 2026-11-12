@@ -17,7 +17,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.3"
+VERSION="3.0.4"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -8895,10 +8895,12 @@ layout_variant_pristine() {   # layout_variant_pristine <dir>
 # the STAGED layout with unlink=1. Sizes become 4k so a missing file never
 # costs a full write; the marker is dropped so it does not sort first.
 UNLINK_JOB="999-wekatester-unlink.job"
-stage_unlink_variants() {
+stage_unlink_variants() {   # stage_unlink_variants [host...]: the fleet at staging; the hosts named when a layout was re-derived
     is_layout_file "$SET_DIR/${JOBFILES[0]}" \
         || die "no layout job at position one; cannot derive the -u unlink job"
     # one awk for the fleet, every host's from its own staged layout variant
+    local again=$#
+    [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     awkrun 'BEGIN {
         lay = ARGV[1]; unl = ARGV[2]; jobs = ARGV[3]
         for (a = 4; a < ARGC; a++) {
@@ -8918,9 +8920,9 @@ stage_unlink_variants() {
             m = override_lines(O, m, "unlink", "1")
             writelines(jobs "/" h "/" unl, O, m)
         }
-    }' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "${HOSTS[@]}" \
+    }' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "$@" \
         || die "cannot derive the -u unlink job"
-    JOBFILES+=("$UNLINK_JOB")
+    [ "$again" -gt 0 ] || JOBFILES+=("$UNLINK_JOB")
 }
 
 # Stamp key=value into every staged variant, in one awk for the fleet
@@ -10377,12 +10379,17 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
         awk -v ex=" $* " '!(substr($0, 1, 2) == "H " && index(ex, " " substr($0, 3) " "))' "$WORK_DIR/staged.kinds" > "$WORK_DIR/staged.kinds.new" \
             && mv "$WORK_DIR/staged.kinds.new" "$WORK_DIR/staged.kinds" || die "cannot update the staged host list"
         derive_layouts auto "$AUTO_LEVEL" "$DIRECTORY" "$m" || die "cannot re-derive $m's layout for the shared read set"
+        # -u: its unlink job names what its layout names, so it is derived again
+        # here, before the sweep turns the layout into a write of what is missing
+        [ "$UNLINK" -eq 0 ] || stage_unlink_variants "$m"
         rm -f "${WORK_DIR:?}/grid/$m/$job"
         sweep_layout_grid again
         out=$(layout_writes "$job" 1 "$m") || die "cannot stage $m's layout from the sweep"
         IFS=$'\t' read -r h nf by re kept <<<"$out"
-        if [ "${nf:-0}" -gt 0 ]; then
+        if [ "${nf:-0}" -gt 0 ] || [ "$UNLINK" -ne 0 ]; then
             copy_to_master "$WORK_DIR/jobs/$m" "$TARGET_DIR/" || die "failed to copy $m's layout to $MASTER"
+        fi
+        if [ "${nf:-0}" -gt 0 ]; then
             ensure_layout_dirs "$job"
             case " ${LAYOUT_RERUN[*]} " in (*" $m "*) ;; (*) LAYOUT_RERUN+=("$m") ;; esac
             log "layout: $m lays out its group's shared read set in $x's place ($nf file(s), $by bytes)"
