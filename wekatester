@@ -17,7 +17,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.4"
+VERSION="3.0.5"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -43,7 +43,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAST_TRACK=0        # -r: no prompts -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
-UNLINK=0            # -u: remove the workload's data files after the last job
+UNLINK=0            # -u: remove data files after the last job
+UNLINK_MODE=private # -u [private|full]: each client's own files; full: the shared read set and the calibration scratch too
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
 GROUP_FILE=""       # this run's filesystem-group marker prefix in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
@@ -474,7 +475,7 @@ usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch] [--allow-cached-mount] [--ignore-failed-clients]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u [full]] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
@@ -663,10 +664,12 @@ EOF
 EOF
     ;;
     (unlink) cat <<EOF
-  -u, --unlink   remove the workload's data files from -d after the last job
-                 that uses them (a failed run keeps them for the rerun), and
-                 the calibration scratch files, which are otherwise kept
-                 so the next calibration can reuse them
+  -u, --unlink [private|full]
+                 remove data files from -d after the last job that uses them
+                 (a failed run keeps them for the rerun). private, the
+                 default: each client's own files. full: also the shared
+                 read set and the calibration scratch files, which are
+                 otherwise kept so the next run can reuse them
 EOF
     ;;
     (summarize) cat <<EOF
@@ -2119,7 +2122,14 @@ parse_args() {
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
-            -u|--unlink) UNLINK=1; shift ;;
+            -u|--unlink)
+                UNLINK=1; UNLINK_MODE=private
+                case "${2:-}" in (private|full) UNLINK_MODE=$2; shift ;; esac
+                shift ;;
+            --unlink=*)
+                UNLINK=1; UNLINK_MODE=${opt#--unlink=}
+                case $UNLINK_MODE in (private|full) ;; (*) usage >&2; die "option --unlink takes private or full, not '$UNLINK_MODE'" ;; esac
+                shift ;;
             -b|--bulk) BULK=1; shift ;;
             # the load check re-tuned calibrated settings for the fleet run,
             # against calibration's intent (Frank, 2026-10-05): say so
@@ -4514,13 +4524,15 @@ cal_remove_cmd() {   # cal_remove_cmd <name> <sep> <fmt> <hd>
     awkrun 'BEGIN { print dataset_remove_cmd(ARGV[1] ARGV[2] ARGV[3], ARGV[4]) }' "$@"
 }
 
-# -u, after the last measured job: each host write set and, from each group
-# first host, the shared read set; or the whole scratch. Never from calibrate:
-# the measured jobs use the dataset, and a failed run keeps it.
+# -u, after the last measured job: each host write set and, under -u full,
+# from each group first host, the shared read set; or, under -u full, the
+# whole scratch. Never from calibrate: the measured jobs use the dataset, and
+# a failed run keeps it.
 cal_remove_dataset() {
     local i kind host ucmd args=() pids=() hs=() cmds="$WORK_DIR/cal-remove.cmds" gf=-
     load_host_dirs
     if [ -n "$CAL_NS_DIR" ]; then
+        [ "$UNLINK_MODE" = full ] || return 0
         for i in "${!HOSTS[@]}"; do
             run_host "${HOSTS[$i]}" "rm -rf '${HOST_DIRS[$i]}$CAL_NS_DIR'" &
             pids+=($!); hs+=("${HOSTS[$i]}")
@@ -4534,19 +4546,19 @@ cal_remove_dataset() {
             args+=("${HOSTS[$i]}" "$HOST_NAME" "${HOST_DIRS[$i]}")
         done
         awkrun 'BEGIN {
-            sep = ARGV[1]; fmt = ARGV[2]; ng = 0
+            sep = ARGV[1]; fmt = ARGV[2]; full = ARGV[4] == "full"; ng = 0
             # group_first: the first host of each group in the groups file;
             # a host it does not list is its own; no groups file, the first host
             if (ARGV[3] != "-")
                 while ((getline line < ARGV[3]) > 0)
                     if (split(line, F, " ") == 2) { ng++; G[F[1]] = F[2]; if (!(F[2] in FIRST)) FIRST[F[2]] = F[1] }
-            for (a = 4; a + 2 < ARGC; a += 3) {
+            for (a = 5; a + 2 < ARGC; a += 3) {
                 h = ARGV[a]
-                first = ng ? (!(h in G) || FIRST[G[h]] == h) : (a == 4)
-                if (first) print "S\t" h "\t" dataset_remove_cmd("shared." fmt, ARGV[a + 2])
+                first = ng ? (!(h in G) || FIRST[G[h]] == h) : (a == 5)
+                if (first && full) print "S\t" h "\t" dataset_remove_cmd("shared." fmt, ARGV[a + 2])
                 print "P\t" h "\t" dataset_remove_cmd(ARGV[a + 1] sep fmt, ARGV[a + 2])
             }
-        }' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" \
+        }' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" "$UNLINK_MODE" \
             "${args[@]}" > "$cmds" || die "cannot derive the dataset removal commands"
         # every shared set first, all at once (one at a time was minutes with
         # a group per host), so their pruning ends before the members' starts
@@ -4924,11 +4936,17 @@ calibrate() {
     # run keeps it for the rerun.
     if [ "$UNLINK" -eq 1 ]; then
         CAL_UNLINK_PENDING=1
-        debug "cal: -u: the calibration dataset is removed after the last measured job"
+        if [ "$UNLINK_MODE" = full ]; then
+            debug "cal: -u full: the calibration dataset is removed after the last measured job"
+        elif [ -z "$CAL_NS_DIR" ]; then
+            debug "cal: -u: each client's own files are removed after the last measured job; the shared read set is kept (-u full removes it)"
+        else
+            debug "cal: -u: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
+        fi
     elif [ -z "$CAL_NS_DIR" ]; then
-        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
+        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u full removes all of it"
     else
-        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
+        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2
@@ -8119,7 +8137,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (-p*|--password|--password=*) CLI_SET[WT_PASSWORD]=1 ;;
             (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
             (-x*|--duration|--duration=*) CLI_SET[WT_DURATION]=1 ;;
-            (-u|--unlink) CLI_SET[WT_UNLINK]=1 ;;
+            (-u|--unlink|--unlink=*) CLI_SET[WT_UNLINK]=1 ;;
             (-v|-vv|-vvv) CLI_SET[WT_VERBOSE]=1 ;;
             (-h|--help|--version) CLI_INFO=1 ;;
         esac
@@ -8132,9 +8150,11 @@ setting_args() {   # setting_args <source> <name> <kind> <option> <value>
     local src=$1 name=$2 kind=$3 opt=$4 v=$5 err i
     SETTING_ARGS=()
     case $kind in
-        (switch) case $v in
-                     (0) ;;
-                     (1) SETTING_ARGS=("$opt") ;;
+        (switch) case $name:$v in
+                     (WT_UNLINK:private|WT_UNLINK:full) SETTING_ARGS=("$opt=$v") ;;
+                     (*:0) ;;
+                     (*:1) SETTING_ARGS=("$opt") ;;
+                     (WT_UNLINK:*) die "$src: $name takes 0, 1, private or full, not '$v'" ;;
                      (*) die "$src: $name takes 0 or 1, not '$v'" ;;
                  esac ;;
         (count) case $v in
@@ -8301,7 +8321,7 @@ setting_value() {   # setting_value <name>
         (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;
         (WT_BULK) printf '%s' "$BULK" ;;
         (WT_DURATION) printf '%s' "$DURATION" ;;
-        (WT_UNLINK) printf '%s' "$UNLINK" ;;
+        (WT_UNLINK) if [ "$UNLINK" -eq 0 ]; then printf 0; else printf '%s' "$UNLINK_MODE"; fi ;;
         (WT_VERBOSE) printf '%s' "$VERBOSITY" ;;
         (*) printf '%s' "${!1-}" ;;
     esac
@@ -8791,9 +8811,13 @@ derive_layouts() {   # derive_layouts <plain|auto> <label|-> <directory> <host>.
             B[++nb] = layout_marker() (mode == "auto" ? " (re-derived by wekatester auto[" label "] from this host\047s tuned variants)" : " (re-derived by wekatester from this host\047s staged variants)")
             B[++nb] = "[global]"
             B[++nb] = "directory=" (hdir != "" ? hdir : directory)
+            # as stamp_unique_names leaves every staged file: a layout derived
+            # again after staging (a reassigned shared read set) is not stamped
+            B[++nb] = "unique_filename=0"
             if (mode == "auto") {
                 if (readlines(work "/usable/" h, U) < 1) awk_fail("cannot read " work "/usable/" h)
                 B[++nb] = "cpus_allowed=" U[1]
+                B[++nb] = "cpus_allowed_policy=split"
             }
             B[++nb] = "create_serialize=0"
             B[++nb] = "fallocate=none"
@@ -8895,21 +8919,35 @@ layout_variant_pristine() {   # layout_variant_pristine <dir>
 # the STAGED layout with unlink=1. Sizes become 4k so a missing file never
 # costs a full write; the marker is dropped so it does not sort first.
 UNLINK_JOB="999-wekatester-unlink.job"
-stage_unlink_variants() {   # stage_unlink_variants [host...]: the fleet at staging; the hosts named when a layout was re-derived
+stage_unlink_variants() {
     is_layout_file "$SET_DIR/${JOBFILES[0]}" \
         || die "no layout job at position one; cannot derive the -u unlink job"
     # one awk for the fleet, every host's from its own staged layout variant
-    local again=$#
-    [ $# -gt 0 ] || set -- "${HOSTS[@]}"
     awkrun 'BEGIN {
-        lay = ARGV[1]; unl = ARGV[2]; jobs = ARGV[3]
-        for (a = 4; a < ARGC; a++) {
+        mode = ARGV[1]; lay = ARGV[2]; unl = ARGV[3]; jobs = ARGV[4]
+        for (a = 5; a < ARGC; a++) {
             h = ARGV[a]; src = jobs "/" h "/" lay
             if ((n = readlines(src, L)) < 0)
                 awk_fail("no staged layout variant for " h "; cannot derive the -u unlink job")
-            m = 0; split("", O)
+            # private: a section on the shared read set (its own filename_format,
+            # else the one in [global], starts with "shared.") is left out, so its
+            # files stay
+            split("", SH); split("", OWN); split("", SEC); s = 0; gsh = 0
+            if (mode != "full")
+                for (i = 1; i <= n; i++) {
+                    t = strip(L[i])
+                    if (t ~ /^\[.+\]$/) { s++; SEC[s] = t; continue }
+                    if (jf_key(t) != "filename_format") continue
+                    v = index(jf_value(t), "shared.") == 1
+                    if (!s || SEC[s] == "[global]") gsh = v
+                    else { OWN[s] = 1; SH[s] = v }
+                }
+            m = 0; split("", O); s = 0; skip = 0
             for (i = 1; i <= n; i++) {
                 if (index(L[i], layout_marker()) == 1) continue
+                t = strip(L[i])
+                if (t ~ /^\[.+\]$/) { s++; skip = t != "[global]" && ((s in OWN) ? SH[s] : gsh) }
+                if (skip) continue
                 k = jf_key(L[i])
                 if (k == "filesize" || k == "size") O[++m] = "filesize=4k"
                 else if (k == "blocksize" || k == "bs") O[++m] = "blocksize=4k"
@@ -8920,9 +8958,9 @@ stage_unlink_variants() {   # stage_unlink_variants [host...]: the fleet at stag
             m = override_lines(O, m, "unlink", "1")
             writelines(jobs "/" h "/" unl, O, m)
         }
-    }' "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "$@" \
+    }' "$UNLINK_MODE" "${JOBFILES[0]}" "$UNLINK_JOB" "$WORK_DIR/jobs" "${HOSTS[@]}" \
         || die "cannot derive the -u unlink job"
-    [ "$again" -gt 0 ] || JOBFILES+=("$UNLINK_JOB")
+    JOBFILES+=("$UNLINK_JOB")
 }
 
 # Stamp key=value into every staged variant, in one awk for the fleet
@@ -10379,17 +10417,17 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
         awk -v ex=" $* " '!(substr($0, 1, 2) == "H " && index(ex, " " substr($0, 3) " "))' "$WORK_DIR/staged.kinds" > "$WORK_DIR/staged.kinds.new" \
             && mv "$WORK_DIR/staged.kinds.new" "$WORK_DIR/staged.kinds" || die "cannot update the staged host list"
         derive_layouts auto "$AUTO_LEVEL" "$DIRECTORY" "$m" || die "cannot re-derive $m's layout for the shared read set"
-        # -u: its unlink job names what its layout names, so it is derived again
-        # here, before the sweep turns the layout into a write of what is missing
-        [ "$UNLINK" -eq 0 ] || stage_unlink_variants "$m"
+        # -u: its unlink job is left as staged, without the shared set. A set
+        # whose first host failed stays for investigation (README, -u).
         rm -f "${WORK_DIR:?}/grid/$m/$job"
         sweep_layout_grid again
         out=$(layout_writes "$job" 1 "$m") || die "cannot stage $m's layout from the sweep"
         IFS=$'\t' read -r h nf by re kept <<<"$out"
-        if [ "${nf:-0}" -gt 0 ] || [ "$UNLINK" -ne 0 ]; then
-            copy_to_master "$WORK_DIR/jobs/$m" "$TARGET_DIR/" || die "failed to copy $m's layout to $MASTER"
-        fi
         if [ "${nf:-0}" -gt 0 ]; then
+            copy_to_master "$WORK_DIR/jobs/$m" "$TARGET_DIR/" || die "failed to copy $m's layout to $MASTER"
+            # the bundle holds the jobfiles that ran (snapshot_jobfiles was before the layout)
+            [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR/fio-jobfiles/$m" ] || cp -R "$WORK_DIR/jobs/$m/." "$RUN_DIR/fio-jobfiles/$m/" \
+                || log "WARNING: could not copy $m's changed jobfiles into $RUN_DIR/fio-jobfiles" >&2
             ensure_layout_dirs "$job"
             case " ${LAYOUT_RERUN[*]} " in (*" $m "*) ;; (*) LAYOUT_RERUN+=("$m") ;; esac
             log "layout: $m lays out its group's shared read set in $x's place ($nf file(s), $by bytes)"
@@ -10846,6 +10884,8 @@ run_jobs() {
             t0=$SECONDS
             run_aux_job unlink "$job" "${lclients[@]}"
             log "unlink: test files removed in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
+            [ "$UNLINK_MODE" = full ] || [ -z "$AUTO_LEVEL" ] \
+                || log "unlink: the shared read set and the calibration scratch files stay for the next run (-u full removes them)"
             echo
             continue
         fi

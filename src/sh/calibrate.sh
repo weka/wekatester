@@ -1314,13 +1314,15 @@ cal_remove_cmd() {   # cal_remove_cmd <name> <sep> <fmt> <hd>
     awkrun 'BEGIN { print dataset_remove_cmd(ARGV[1] ARGV[2] ARGV[3], ARGV[4]) }' "$@"
 }
 
-# -u, after the last measured job: each host write set and, from each group
-# first host, the shared read set; or the whole scratch. Never from calibrate:
-# the measured jobs use the dataset, and a failed run keeps it.
+# -u, after the last measured job: each host write set and, under -u full,
+# from each group first host, the shared read set; or, under -u full, the
+# whole scratch. Never from calibrate: the measured jobs use the dataset, and
+# a failed run keeps it.
 cal_remove_dataset() {
     local i kind host ucmd args=() pids=() hs=() cmds="$WORK_DIR/cal-remove.cmds" gf=-
     load_host_dirs
     if [ -n "$CAL_NS_DIR" ]; then
+        [ "$UNLINK_MODE" = full ] || return 0
         for i in "${!HOSTS[@]}"; do
             run_host "${HOSTS[$i]}" "rm -rf '${HOST_DIRS[$i]}$CAL_NS_DIR'" &
             pids+=($!); hs+=("${HOSTS[$i]}")
@@ -1333,7 +1335,7 @@ cal_remove_dataset() {
             host_name_v "${HOSTS[$i]}"
             args+=("${HOSTS[$i]}" "$HOST_NAME" "${HOST_DIRS[$i]}")
         done
-        awkrun '#@awk cal_remove_dataset' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" \
+        awkrun '#@awk cal_remove_dataset' "${CAL_SEP:-.}" "$CAL_FMT" "$gf" "$UNLINK_MODE" \
             "${args[@]}" > "$cmds" || die "cannot derive the dataset removal commands"
         # every shared set first, all at once (one at a time was minutes with
         # a group per host), so their pruning ends before the members' starts
@@ -1580,11 +1582,17 @@ calibrate() {
     # run keeps it for the rerun.
     if [ "$UNLINK" -eq 1 ]; then
         CAL_UNLINK_PENDING=1
-        debug "cal: -u: the calibration dataset is removed after the last measured job"
+        if [ "$UNLINK_MODE" = full ]; then
+            debug "cal: -u full: the calibration dataset is removed after the last measured job"
+        elif [ -z "$CAL_NS_DIR" ]; then
+            debug "cal: -u: each client's own files are removed after the last measured job; the shared read set is kept (-u full removes it)"
+        else
+            debug "cal: -u: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
+        fi
     elif [ -z "$CAL_NS_DIR" ]; then
-        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u removes it"
+        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u full removes all of it"
     else
-        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u removes it"
+        debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
     fi
     run_host "$MASTER" "rm -rf '$TARGET_DIR.cal'" \
         || log "WARNING: could not remove $TARGET_DIR.cal on $MASTER" >&2

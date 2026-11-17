@@ -36,9 +36,13 @@ BEGIN {
         B[++nb] = layout_marker() (mode == "auto" ? " (re-derived by wekatester auto[" label "] from this host\047s tuned variants)" : " (re-derived by wekatester from this host\047s staged variants)")
         B[++nb] = "[global]"
         B[++nb] = "directory=" (hdir != "" ? hdir : directory)
+        # as stamp_unique_names leaves every staged file: a layout derived
+        # again after staging (a reassigned shared read set) is not stamped
+        B[++nb] = "unique_filename=0"
         if (mode == "auto") {
             if (readlines(work "/usable/" h, U) < 1) awk_fail("cannot read " work "/usable/" h)
             B[++nb] = "cpus_allowed=" U[1]
+            B[++nb] = "cpus_allowed_policy=split"
         }
         B[++nb] = "create_serialize=0"
         B[++nb] = "fallocate=none"

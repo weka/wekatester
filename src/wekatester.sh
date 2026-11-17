@@ -16,7 +16,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.4"
+VERSION="3.0.5"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -42,7 +42,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FAST_TRACK=0        # -r: no prompts -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
-UNLINK=0            # -u: remove the workload's data files after the last job
+UNLINK=0            # -u: remove data files after the last job
+UNLINK_MODE=private # -u [private|full]: each client's own files; full: the shared read set and the calibration scratch too
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
 GROUP_FILE=""       # this run's filesystem-group marker prefix in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
@@ -104,7 +105,7 @@ usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch] [--allow-cached-mount] [--ignore-failed-clients]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-b] [-r] [-n] [-g] [-u] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u [full]] [-v] [-h]
                   [--] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
@@ -293,10 +294,12 @@ EOF
 EOF
     ;;
     (unlink) cat <<EOF
-  -u, --unlink   remove the workload's data files from -d after the last job
-                 that uses them (a failed run keeps them for the rerun), and
-                 the calibration scratch files, which are otherwise kept
-                 so the next calibration can reuse them
+  -u, --unlink [private|full]
+                 remove data files from -d after the last job that uses them
+                 (a failed run keeps them for the rerun). private, the
+                 default: each client's own files. full: also the shared
+                 read set and the calibration scratch files, which are
+                 otherwise kept so the next run can reuse them
 EOF
     ;;
     (summarize) cat <<EOF
@@ -486,7 +489,14 @@ parse_args() {
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
-            -u|--unlink) UNLINK=1; shift ;;
+            -u|--unlink)
+                UNLINK=1; UNLINK_MODE=private
+                case "${2:-}" in (private|full) UNLINK_MODE=$2; shift ;; esac
+                shift ;;
+            --unlink=*)
+                UNLINK=1; UNLINK_MODE=${opt#--unlink=}
+                case $UNLINK_MODE in (private|full) ;; (*) usage >&2; die "option --unlink takes private or full, not '$UNLINK_MODE'" ;; esac
+                shift ;;
             -b|--bulk) BULK=1; shift ;;
             # the load check re-tuned calibrated settings for the fleet run,
             # against calibration's intent (Frank, 2026-10-05): say so

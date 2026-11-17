@@ -104,10 +104,12 @@ WT_BULK=0
 #                           (time_based); layout and unlink keep their own timing
 WT_DURATION=
 #
-#   -u, --unlink   remove the workload's data files from -d after the last job
-#                  that uses them (a failed run keeps them for the rerun), and
-#                  the calibration scratch files, which are otherwise kept
-#                  so the next calibration can reuse them
+#   -u, --unlink [private|full]
+#                  remove data files from -d after the last job that uses them
+#                  (a failed run keeps them for the rerun). private, the
+#                  default: each client's own files. full: also the shared
+#                  read set and the calibration scratch files, which are
+#                  otherwise kept so the next run can reuse them
 WT_UNLINK=0
 #
 #   -v             more on the console (the run log in the bundle gets
