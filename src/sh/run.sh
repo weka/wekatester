@@ -1172,8 +1172,12 @@ run_jobs() {
             t0=$SECONDS
             run_aux_job unlink "$job" "${lclients[@]}"
             log "unlink: test files removed in $((SECONDS - t0))s across ${#lclients[@]} host(s)"
-            [ "$UNLINK_MODE" = full ] || [ -z "$AUTO_LEVEL" ] \
-                || log "unlink: the shared read set and the calibration scratch files stay for the next run (-u full removes them)"
+            # what this mode leaves for the next run, and the mode that removes it
+            if [ -n "$AUTO_LEVEL" ] && [ -z "$CAL_NS_DIR" ] && [ "$UNLINK_MODE" = private ]; then
+                log "unlink: the shared read set stays for the next run (-u shared removes it)"
+            elif [ -n "$AUTO_LEVEL" ] && [ -n "$CAL_NS_DIR" ] && [ "$UNLINK_MODE" != full ]; then
+                log "unlink: the calibration scratch files stay for the next run (-u full removes them)"
+            fi
             echo
             continue
         fi

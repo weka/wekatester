@@ -4,11 +4,11 @@ BEGIN {
         h = ARGV[a]; src = jobs "/" h "/" lay
         if ((n = readlines(src, L)) < 0)
             awk_fail("no staged layout variant for " h "; cannot derive the -u unlink job")
-        # private: a section on the shared read set (its own filename_format,
+        # private (shared and full keep them): a section on the shared read set (its own filename_format,
         # else the one in [global], starts with "shared.") is left out, so its
         # files stay
         split("", SH); split("", OWN); split("", SEC); s = 0; gsh = 0
-        if (mode != "full")
+        if (mode == "private")
             for (i = 1; i <= n; i++) {
                 t = strip(L[i])
                 if (t ~ /^\[.+\]$/) { s++; SEC[s] = t; continue }

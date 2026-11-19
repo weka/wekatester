@@ -22,6 +22,7 @@ WT_PASSWORD count --password password
 WT_BULK switch --bulk bulk
 WT_DURATION flag --duration duration
 WT_UNLINK switch --unlink unlink
+WT_SCRUB flag --scrub scrub
 WT_VERBOSE count -v verbose
 WT_ENGINE_TEST_TIMEOUT env - -
 WT_SYSINFO_TIMEOUT env - -
@@ -83,6 +84,7 @@ cli_settings_seen() {   # cli_settings_seen <arg>...
             (-b|--bulk) CLI_SET[WT_BULK]=1 ;;
             (-x*|--duration|--duration=*) CLI_SET[WT_DURATION]=1 ;;
             (-u|--unlink|--unlink=*) CLI_SET[WT_UNLINK]=1 ;;
+            (--scrub|--scrub=*) CLI_SET[WT_SCRUB]=1 ;;
             (-v|-vv|-vvv) CLI_SET[WT_VERBOSE]=1 ;;
             (-h|--help|--version) CLI_INFO=1 ;;
         esac
@@ -96,10 +98,10 @@ setting_args() {   # setting_args <source> <name> <kind> <option> <value>
     SETTING_ARGS=()
     case $kind in
         (switch) case $name:$v in
-                     (WT_UNLINK:private|WT_UNLINK:full) SETTING_ARGS=("$opt=$v") ;;
+                     (WT_UNLINK:private|WT_UNLINK:shared|WT_UNLINK:full|WT_UNLINK:all|WT_UNLINK:all:force) SETTING_ARGS=("$opt=$v") ;;
                      (*:0) ;;
                      (*:1) SETTING_ARGS=("$opt") ;;
-                     (WT_UNLINK:*) die "$src: $name takes 0, 1, private or full, not '$v'" ;;
+                     (WT_UNLINK:*) die "$src: $name takes 0, 1, private, shared, full, all or all:force, not '$v'" ;;
                      (*) die "$src: $name takes 0 or 1, not '$v'" ;;
                  esac ;;
         (count) case $v in
@@ -248,7 +250,10 @@ setting_value() {   # setting_value <name>
         (WT_PASSWORD) printf '%s' "$PW_COUNT" ;;
         (WT_BULK) printf '%s' "$BULK" ;;
         (WT_DURATION) printf '%s' "$DURATION" ;;
-        (WT_UNLINK) if [ "$UNLINK" -eq 0 ]; then printf 0; else printf '%s' "$UNLINK_MODE"; fi ;;
+        (WT_UNLINK) if [ "$UNLINK" -eq 0 ]; then printf 0
+                    elif [ "$UNLINK_FORCE" -eq 1 ]; then printf all:force
+                    else printf "%s" "$UNLINK_MODE"; fi ;;
+        (WT_SCRUB) [ "$SCRUB_FORCE" -eq 0 ] && printf "%s" "$SCRUB_MODE" || printf all:force ;;
         (WT_VERBOSE) printf '%s' "$VERBOSITY" ;;
         (*) printf '%s' "${!1-}" ;;
     esac

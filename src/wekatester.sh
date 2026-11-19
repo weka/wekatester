@@ -16,7 +16,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.5"
+VERSION="3.0.6"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -43,7 +43,14 @@ FAST_TRACK=0        # -r: no prompts -- create what is needed and run
 DRY_RUN=0           # -n: create/generate and print what would run; execute nothing
 REGEN_LAYOUT=0      # -g: force regeneration of existing layout jobfiles
 UNLINK=0            # -u: remove data files after the last job
-UNLINK_MODE=private # -u [private|full]: each client's own files; full: the shared read set and the calibration scratch too
+UNLINK_MODE=private # -u [mode]: private (each client own files), shared (also the shared read set),
+                    # full (also the calibration scratch), all (everything in the destination)
+UNLINK_FORCE=0      # -u all:force: no confirmation before all removes
+SCRUB_ONLY=0        # --scrub mode: the removal alone, no benchmark
+SCRUB_MODE=""; SCRUB_FORCE=0   # --scrub own mode: -u from another source never changes it
+SCRUB_ARMED=0       # 1 once the locks are held and the destinations checked: all may remove
+SCRUB_DONE=0        # all ran, or was declined: the teardown does not ask again
+SCRUB_FAILED=0      # all at the end of a run left something: the run exits 1
 CAL_UNLINK_PENDING=0   # calibrate under -u: cal_remove_dataset runs after the last job
 GROUP_FILE=""       # this run's filesystem-group marker prefix in every destination (collect_fs_groups)
 BULK=0              # -b: every latency test also runs at 1MiB, as its own test
@@ -105,8 +112,9 @@ usage: ${0##*/} [-d directory] [-w workload] [-f fio_bin] [-o output_dir]
                   [--ignore-capacity] [--line-rate Gb/s] [--break-lock] [--any-fs]
                   [--allow-fio-mismatch] [--allow-cached-mount] [--ignore-failed-clients]
                   [-i [login:]keyfile[,...]] [-p [n]] [-t [hostfile]]
-                  [-x secs] [-b] [-r] [-n] [-g] [-u [full]] [-v] [-h]
+                  [-x secs] [-b] [-r] [-n] [-g] [-u [mode]] [-v] [-h]
                   [--] [server ...]
+       ${0##*/} --scrub private|shared|full|all|all:force [-d directory] [server ...]
        ${0##*/} -s results.json
        ${0##*/} --version
 
@@ -130,7 +138,7 @@ EOF
 # the host-file template quotes a setting's block (README, Settings).
 USAGE_KEYS="directory workload fio_bin output engine auto cal_clients line_rate ignore_capacity
     break_lock any_fs allow_fio_mismatch allow_cached_mount ignore_failed_clients identity password targets bulk
-    fast dry regen duration unlink summarize verbose version help dashdash"
+    fast dry regen duration unlink scrub summarize verbose version help dashdash"
 opt_help() {   # opt_help <key>
     case $1 in
     (directory) cat <<EOF
@@ -294,12 +302,22 @@ EOF
 EOF
     ;;
     (unlink) cat <<EOF
-  -u, --unlink [private|full]
-                 remove data files from -d after the last job that uses them
-                 (a failed run keeps them for the rerun). private, the
-                 default: each client's own files. full: also the shared
-                 read set and the calibration scratch files, which are
-                 otherwise kept so the next run can reuse them
+  -u, --unlink [private|shared|full|all|all:force]
+                 remove data files from -d after the last job that uses them.
+                 private, the default: each client's own files. shared: also
+                 the shared read set. full: also the calibration scratch
+                 files. These three keep everything after a failed run, and
+                 keep the files of a client that failed. all: everything in
+                 the destination directory, whatever wrote it, after a failed
+                 run too; the directory itself stays. all asks first, with
+                 no timeout, and only y removes; all:force does not ask
+EOF
+    ;;
+    (scrub) cat <<EOF
+  --scrub private|shared|full|all|all:force
+                 remove what -u removes, without running a test: the files
+                 the -w workload names (private, shared, full), or everything
+                 in the destination directory (all, all:force)
 EOF
     ;;
     (summarize) cat <<EOF
@@ -402,6 +420,15 @@ set_duration() {   # set_duration <value> <flag, for the error message>
     DURATION=$1
 }
 
+# -u's and --scrub's value -> RM_MODE, RM_FORCE
+removal_mode() {   # removal_mode <value> <flag, for the error message>
+    case "$1" in
+        (private|shared|full|all) RM_MODE=$1; RM_FORCE=0 ;;
+        (all:force) RM_MODE=all; RM_FORCE=1 ;;
+        (*) usage >&2; die "option $2 takes private, shared, full, all or all:force, not '$1'" ;;
+    esac
+}
+
 parse_args() {
     HOSTS=()
     local opt arg servers_only=0
@@ -489,13 +516,25 @@ parse_args() {
             -r) FAST_TRACK=1; shift ;;
             -n) DRY_RUN=1; shift ;;
             -g) REGEN_LAYOUT=1; shift ;;
+            # the mode is consumed only when it is one
             -u|--unlink)
-                UNLINK=1; UNLINK_MODE=private
-                case "${2:-}" in (private|full) UNLINK_MODE=$2; shift ;; esac
+                UNLINK=1; UNLINK_MODE=private; UNLINK_FORCE=0
+                case "${2:-}" in
+                    (private|shared|full|all|all:force)
+                        removal_mode "$2" "$1"; UNLINK_MODE=$RM_MODE; UNLINK_FORCE=$RM_FORCE; shift ;;
+                esac
                 shift ;;
             --unlink=*)
-                UNLINK=1; UNLINK_MODE=${opt#--unlink=}
-                case $UNLINK_MODE in (private|full) ;; (*) usage >&2; die "option --unlink takes private or full, not '$UNLINK_MODE'" ;; esac
+                removal_mode "${opt#--unlink=}" --unlink
+                UNLINK=1; UNLINK_MODE=$RM_MODE; UNLINK_FORCE=$RM_FORCE
+                shift ;;
+            --scrub)
+                need_arg "$1" $# "${2:-}"; removal_mode "$2" --scrub
+                SCRUB_ONLY=1; SCRUB_MODE=$RM_MODE; SCRUB_FORCE=$RM_FORCE
+                shift 2 ;;
+            --scrub=*)
+                removal_mode "${opt#--scrub=}" --scrub
+                SCRUB_ONLY=1; SCRUB_MODE=$RM_MODE; SCRUB_FORCE=$RM_FORCE
                 shift ;;
             -b|--bulk) BULK=1; shift ;;
             # the load check re-tuned calibrated settings for the fleet run,
@@ -658,6 +697,8 @@ set_line_rate() {   # set_line_rate <Gb/s>
 
 #@include sh/run.sh
 
+#@include sh/scrub.sh
+
 # --- main ----------------------------------------------------------------------
 main() {
     # -s: offline re-summarize of an existing results file, no hosts involved
@@ -697,6 +738,7 @@ main() {
     resolve_local_mode
     # -i split and key paths checked before anything exists to clean up.
     validate_credentials
+    removal_setup
 
     log "wekatester $VERSION: ${#HOSTS[@]} worker(s), master $MASTER, workload $WORKLOAD"
     log_blank
@@ -737,6 +779,7 @@ main() {
             || die "host file resolution failed ($TARGETS_FILE)"
         debug3_rows "host file, phase 1: " "$WORK_DIR/targets.phase1"
     fi
+    removal_check_destinations
     check_controller_procs
     if [ "$LOCAL_MODE" -eq 0 ]; then establish_connections; phase_done connect; fi
     preflight
@@ -751,6 +794,7 @@ main() {
     # before calibration seeds anything from it
     check_jobfile_lines "${SET_DIR_OVERRIDE:-$(workload_src_dir)}"
     if [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$SCRUB_ONLY" -eq 1 ]; then scrub_only; exit 0; fi
         # every run probes: only the probe knows where weka's pinned cores
         # are, and fio never lands on them (Frank, 2026-09-29)
         probe_workers
@@ -773,6 +817,8 @@ main() {
         # under -a the staged sizes are the jobfiles' own until calibration
         # runs: a preview, not a verdict
         if cal_mode; then check_capacity preview; else check_capacity; fi
+        # all: what it would empty
+        ! removal_all || scrub_all
         dry_run_report
         exit 0
     fi
@@ -786,6 +832,9 @@ main() {
     mkdir "$RUN_DIR" || die "cannot create run directory $RUN_DIR"
     record_run
     start_run_log
+    # --scrub: the removal alone, logged and bundled as a run is
+    if [ "$SCRUB_ONLY" -eq 1 ]; then scrub_only; exit 0; fi
+    SCRUB_ARMED=1
     snapshot_sysinfo
     snapshot_pressure start
     phase_done sysinfo
@@ -827,12 +876,16 @@ main() {
     phase_done push
     run_jobs
     [ "$CAL_UNLINK_PENDING" -eq 0 ] || cal_remove_dataset
-    [ ${#EXCLUDED_HOSTS[@]} -eq 0 ] \
+    note_shared_left
+    removal_all && { scrub_all || SCRUB_FAILED=1; }
+    [ ${#EXCLUDED_HOSTS[@]} -eq 0 ] || removal_all \
         || log "excluded during the run (their test files were not removed): ${EXCLUDED_HOSTS[*]}"
     # every job ran; a summary that failed (summ_job_failed) makes the
     # run's status 1, the bundle kept as always
     [ "$SUMM_FAILED" -eq 0 ] \
         || die "$SUMM_FAILED job(s) could not be summarized (above); their raw results are in the bundle"
+    [ "$SCRUB_FAILED" -eq 0 ] \
+        || die "all: not everything could be removed from the destination (above)"
 }
 
 # run only when executed, not when sourced (tests source this file)

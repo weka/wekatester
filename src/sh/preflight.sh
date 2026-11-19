@@ -90,7 +90,7 @@ preflight() {
     else
         log "checking ssh connectivity and $FIO_BIN on ${#HOSTS[@]} host(s)..."
     fi
-    local pids=() failed=() host i rc held=0 line l got fv="" nolock lc=() kd
+    local pids=() failed=() host i rc held=0 line l got fv="" nolock lc=() kd gone=()
     [ -n "$LOCK_TOKEN" ] || lock_token
     lock_take_cmd
     mkdir -p "$WORK_DIR/lock" || die "cannot create $WORK_DIR/lock"
@@ -123,7 +123,8 @@ preflight() {
         # 255 is ssh's own "could not connect" status. Local mode has no ssh, so
         # a local command that happens to exit 255 is just a missing fio.
         if [ "$rc" -eq 255 ] && [ "$LOCAL_MODE" -eq 0 ]; then
-            failed+=("$host: ssh failed")
+            # --scrub goes on with the hosts it reached
+            if [ "$SCRUB_ONLY" -eq 1 ]; then gone+=("$host"); else failed+=("$host: ssh failed"); fi
         elif [ "$rc" -eq 0 ]; then
             RUN_LOCKS[$host]=1
             [ "${line%% *}" != healed ] || debug "NOTE: $host: --break-lock cleared another run's${line#healed}" >&2
@@ -147,6 +148,11 @@ preflight() {
         done
         [ "$held" -eq 0 ] || log "a run that is gone, or fio from elsewhere: rerun with --break-lock, which kills every fio on those hosts and clears wekatester's lock and staging" >&2
         die "preflight failed on ${#failed[@]} of ${#HOSTS[@]} host(s), exiting"
+    fi
+    # fio removes nothing under --scrub: its versions are not compared
+    if [ "$SCRUB_ONLY" -eq 1 ]; then
+        [ ${#gone[@]} -eq 0 ] || scrub_drop_hosts "cannot be reached (ssh failed)" "${gone[@]}"
+        return 0
     fi
     debug "preflight passed on all hosts"
     check_fio_versions

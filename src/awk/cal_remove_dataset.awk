@@ -1,5 +1,5 @@
 BEGIN {
-    sep = ARGV[1]; fmt = ARGV[2]; full = ARGV[4] == "full"; ng = 0
+    sep = ARGV[1]; fmt = ARGV[2]; full = ARGV[4] != "private"; ng = 0
     # group_first: the first host of each group in the groups file;
     # a host it does not list is its own; no groups file, the first host
     if (ARGV[3] != "-")

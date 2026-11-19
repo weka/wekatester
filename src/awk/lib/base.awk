@@ -80,13 +80,15 @@ function trim_dir(p) {
 }
 function squote(s) { return "\047" s "\047" }
 # Commands that delete the files <pattern> names under <hd>: find bounded at
-# the pattern depth, then the directories left empty.
-function dataset_remove_cmd(pattern, hd,    glob, depth, cmd) {
+# the pattern depth, then the directories left empty. <race>: hosts that share
+# <hd> run this at once, so a name another one removed first is passed over.
+function dataset_remove_cmd(pattern, hd, race,    glob, depth, cmd) {
+    race = race ? " -ignore_readdir_race" : ""
     glob = vars_to_glob(pattern)
     depth = 1 + count_char(glob, "/")
-    cmd = sprintf("find %s -maxdepth %d -type f -path %s -delete", squote(hd), depth, squote(hd "/" glob))
+    cmd = sprintf("find %s%s -maxdepth %d -type f -path %s -delete", squote(hd), race, depth, squote(hd "/" glob))
     if (index(glob, "/"))
-        cmd = cmd sprintf(" && find %s -maxdepth %d -type d -path %s -empty -delete", squote(hd), depth - 1, squote(hd "/" substr(glob, 1, match(glob, /\/[^\/]*$/) - 1)))
+        cmd = cmd sprintf(" && find %s%s -maxdepth %d -type d -path %s -empty -delete", squote(hd), race, depth - 1, squote(hd "/" substr(glob, 1, match(glob, /\/[^\/]*$/) - 1)))
     return cmd
 }
 

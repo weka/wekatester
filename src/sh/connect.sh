@@ -291,6 +291,8 @@ cleanup() {
     # through this fleet-wide pressure/sar round trip. It rides the masters,
     # which close only at the end of this function. A run stopped by a
     # signal collects nothing more.
+    # all, after a failed run: while the masters and the locks still hold
+    scrub_at_exit
     case $RUN_RC in (130|143) PRESSURE_END_DONE=1 ;; esac
     if [ "$PRESSURE_END_DONE" -eq 0 ]; then
         PRESSURE_END_DONE=1
@@ -577,6 +579,8 @@ establish_connections() {
     for h in "${REMAINING[@]}"; do
         log "WARNING: $h: no working ssh credentials (last tried ${AUTH_LAST_LABEL[$h]:-nothing}: ${AUTH_LAST_REASON[$h]:-ssh printed nothing})" >&2
     done
-    [ ${#REMAINING[@]} -eq 0 ] \
-        || die "no working ssh credentials for ${#REMAINING[@]} of ${#HOSTS[@]} host(s): ${REMAINING[*]}"
+    [ ${#REMAINING[@]} -eq 0 ] && return 0
+    # --scrub goes on with the hosts it reached
+    if [ "$SCRUB_ONLY" -eq 1 ]; then scrub_drop_hosts "has no working ssh credentials" "${REMAINING[@]}"; return 0; fi
+    die "no working ssh credentials for ${#REMAINING[@]} of ${#HOSTS[@]} host(s): ${REMAINING[*]}"
 }

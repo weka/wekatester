@@ -1580,17 +1580,21 @@ calibrate() {
     # Kept by default (re-seeding is the costliest part of a run). -u removes
     # it from main after the last measured job: those jobs use it, and a failed
     # run keeps it for the rerun.
-    if [ "$UNLINK" -eq 1 ]; then
+    if [ "$UNLINK" -eq 1 ] && [ "$UNLINK_MODE" = all ]; then
+        debug "cal: -u all: everything in the destination is removed after the last job"
+    elif [ "$UNLINK" -eq 1 ]; then
         CAL_UNLINK_PENDING=1
         if [ "$UNLINK_MODE" = full ]; then
             debug "cal: -u full: the calibration dataset is removed after the last measured job"
+        elif [ -z "$CAL_NS_DIR" ] && [ "$UNLINK_MODE" = shared ]; then
+            debug "cal: -u shared: the calibration dataset is removed after the last measured job"
         elif [ -z "$CAL_NS_DIR" ]; then
-            debug "cal: -u: each client's own files are removed after the last measured job; the shared read set is kept (-u full removes it)"
+            debug "cal: -u: each client's own files are removed after the last measured job; the shared read set is kept (-u shared removes it)"
         else
             debug "cal: -u: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
         fi
     elif [ -z "$CAL_NS_DIR" ]; then
-        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u full removes all of it"
+        debug "cal: keeping the measured dataset (the workload's own files) so the next run reuses it; -u shared removes all of it"
     else
         debug "cal: keeping the calibration scratch (${CAL_NS_DIR#/} under each destination) so the next calibration reuses it; -u full removes it"
     fi

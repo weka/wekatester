@@ -381,7 +381,8 @@ stage_jobfiles() {
     fi
     # after every per-host override, before the derived variants inherit it
     stamp_unique_names
-    [ "$UNLINK" -eq 0 ] || stage_unlink_variants
+    # all removes with find after the last job (scrub.sh), not with fio
+    [ "$UNLINK" -eq 0 ] || [ "$UNLINK_MODE" = all ] || stage_unlink_variants
     check_client_cmdline
 }
 
