@@ -8,6 +8,7 @@ function expand(s, S,    n, P, i, p, a, b, c) {
         if (index(p, "-")) {
             a = py_int(substr(p, 1, index(p, "-") - 1)); b = py_int(substr(p, index(p, "-") + 1))
             if (a == "" || b == "") awk_fail("pinning: not a cpu list: " s)
+            if (a + 0 > b + 0) awk_fail("pinning: not a cpu list: " s)   # backwards, 8-4: bad, as parse_cpulist reads it
             for (c = a; c <= b; c++) S[c] = 1
         } else {
             if ((a = py_int(p)) == "") awk_fail("pinning: not a cpu list: " s)
