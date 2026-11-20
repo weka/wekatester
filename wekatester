@@ -17,7 +17,7 @@ bash_floor_ok "${BASH_VERSINFO[0]:-0}" "${BASH_VERSINFO[1]:-0}" || {
 
 # The release version; the patch number moves with every change that
 # reaches the wekatester-v3 release.
-VERSION="3.0.6"
+VERSION="3.0.7"
 
 # --- defaults ----------------------------------------------------------------
 DIRECTORY="/mnt/weka"           # target directory on the workers for test files
@@ -11521,7 +11521,7 @@ summ_one() {
             if (missing == "") { n = split(k, kk, "."); missing = ((i "." kk[1]) in dirhas) ? kk[n] : kk[1] }
             return 0 }
         # per-host min and max of metric m ("bw", "iops", "lat.read", "lat.write"), when they differ
-        function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
+        function spread(m, kind,   h, x, lo, hi, loh, hih, first, i) {
             if (nh < 2) return ""
             first = 1
             for (h in hosts) {

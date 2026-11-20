@@ -12,7 +12,7 @@ function val(i, k,   kk, n) {
     if (missing == "") { n = split(k, kk, "."); missing = ((i "." kk[1]) in dirhas) ? kk[n] : kk[1] }
     return 0 }
 # per-host min and max of metric m ("bw", "iops", "lat.read", "lat.write"), when they differ
-function spread(m, kind,   h, x, lo, hi, loh, hih, first) {
+function spread(m, kind,   h, x, lo, hi, loh, hih, first, i) {
     if (nh < 2) return ""
     first = 1
     for (h in hosts) {
