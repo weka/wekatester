@@ -809,7 +809,7 @@ layout_reassign_shared() {   # layout_reassign_shared <layout job> <excluded hos
 # member. AUX_RUNS: "<results file>\t<hosts>" per run, for the summary.
 # The fleet byte check (LAYOUT_CUT) applies to a layout that ran whole.
 run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
-    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost bound
+    local kind=$1 job=$2 out cmd n=0 rc host present dropped keep how ok plan lost bound msg
     shift 2
     LAYOUT_RERUN=("$@")
     AUX_RUNS=(); AUX_PARTIAL=0
@@ -870,7 +870,11 @@ run_aux_job() {   # run_aux_job <layout|unlink> <job> <client>...
         [ ${#HOSTS[@]} -gt 0 ] || die "every host is excluded; nothing is left to finish $job"
         if [ ${#lost[@]} -gt 0 ]; then
             [ "$kind" != layout ] || layout_reassign_shared "$job" "${lost[@]}"
-            [ "$kind" != unlink ] || log "unlink: test files remain on ${lost[*]} (excluded; not removed)"
+            if [ "$kind" = unlink ]; then
+                msg="unlink: the files the unlink job names for ${lost[*]} stay in the destination (excluded; not removed)"
+                ! unlink_shared || msg+="; a shared read set (shared.*) is among them when the host was the first of its filesystem group"
+                log "$msg"
+            fi
         fi
         n=$((n + 1))
     done
