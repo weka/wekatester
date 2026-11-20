@@ -609,11 +609,13 @@ layout_grid_spec() {
 # deleted: a short file is extended, a sparse one rewritten from 0 or, for a
 # set's own layout, emptied first (stage_layout_writes).
 # A dry run lists too, which changes nothing, so it can say what would be written.
+SWEEP_BASE_S=300        # the listing on a client is bounded: this, plus
+SWEEP_FILES_PER_S=100   # 1 s for each this many files of the grid
 sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were said
     local lay=${JOBFILES[0]} again=${1:-}
     [ -n "$lay" ] && is_layout_file "$SET_DIR/$lay" || return 0
     mkdir -p "$WORK_DIR/probe"
-    local host hd spec cmd sz glob depth tot pids hs i args=() nofa lit dep sl
+    local host hd spec cmd sz glob depth tot pids hs i args=() nofa lit dep sl nfiles bound rc
     pids=(); hs=()
     # one awk derives every host's grid (was one per host plus a grep,
     # serial, ahead of a fan-out whose floor is one round trip)
@@ -630,6 +632,18 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
         log "WARNING: $host: the staged layout job does not set fallocate=none; an interrupted layout could leave full-size hollow files this sweep would credit as complete" >&2
     done
     load_host_dirs
+    # The listing is bounded, so a stuck destination cannot hold the run:
+    # SWEEP_BASE_S plus 1 s per SWEEP_FILES_PER_S files of every host's grid
+    # (hosts that share a directory each walk all of it).
+    nfiles=0
+    for host in "${HOSTS[@]}"; do
+        [ -s "$WORK_DIR/probe/$host.gridspec" ] || continue
+        while IFS=$'\t' read -r sz glob depth tot; do
+            [ -n "$sz" ] && [ "$sz" -gt 0 ] || continue
+            nfiles=$((nfiles + tot / sz))
+        done < "$WORK_DIR/probe/$host.gridspec"
+    done
+    bound=$((SWEEP_BASE_S + nfiles / SWEEP_FILES_PER_S))
     for i in "${!HOSTS[@]}"; do
         host=${HOSTS[$i]}
         : > "$WORK_DIR/probe/$host.sizes"
@@ -654,11 +668,15 @@ sweep_layout_grid() {   # sweep_layout_grid [again]: again, the warnings were sa
         [ -n "$cmd" ] || continue
         # a dead session fails the sweep: an empty listing would read as
         # nothing laid out
-        run_host "$host" "$cmd" > "$WORK_DIR/probe/$host.sizes" &
+        ( RUN_HOST_TIMEOUT=$bound run_host "$host" "$cmd" > "$WORK_DIR/probe/$host.sizes" ) &
         pids+=($!); hs+=("$host")
     done
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "layout grid sweep failed on ${hs[$i]}"
+        wait "${pids[$i]}" && continue || rc=$?
+        case $rc in
+            124|137) die "layout grid sweep: TIMEOUT after $bound s on ${hs[$i]} ($nfiles files in the grid)" ;;
+        esac
+        die "layout grid sweep failed on ${hs[$i]}"
     done
 }
 

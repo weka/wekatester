@@ -1378,12 +1378,17 @@ cal_capacity_check() {   # cal_capacity_check <shapes> <ladders>
             host_name_v "$rep"
             printf '%s\t%s\n' "$rep" "$HOST_NAME" >> "$WORK_DIR/cal/cap/names"
             # only the names the check prices: shared. and this client's own
-            ( run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
+            # bounded as the seed's listing is: a stuck destination must not hold the run
+            ( RUN_HOST_TIMEOUT=$CAL_LIST_S run_host "$rep" "if [ -d '$root' ]; then find '$root' -maxdepth $depth -type f \\( -path '$root/$HOST_NAME${CAL_SEP:-.cal.}*' -o -path '$root/shared.*' \\) -printf '%P %s\\n'; fi; echo WEKATESTER_DF; df -Pk '$hd' | awk 'NR==2 {print \$1, \$2, int(\$4/1024)}'; findmnt -T '$hd' -n -o FSTYPE 2>&1 || :" > "$WORK_DIR/cal/cap/$rep" ) &
             pids+=($!); hs+=("$rep")
         done
     done < "$shapes"
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || die "${hs[$i]}: cannot list the calibration dataset or its free space"
+        wait "${pids[$i]}" && continue || rc=$?
+        case $rc in
+            124|137) die "${hs[$i]}: TIMEOUT after $CAL_LIST_S s listing the calibration dataset and its free space" ;;
+        esac
+        die "${hs[$i]}: cannot list the calibration dataset or its free space"
     done
     awkrun '
     #@awk cal_capacity_check' "$WORK_DIR" "$shapes" "$ladders" "${CAL_NS_DIR-unset}" "${CAL_FMT:-\$jobnum.\$filenum}" \
